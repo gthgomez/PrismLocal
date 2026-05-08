@@ -1,0 +1,41 @@
+# Android and Gradle build output
+.gradle/
+.gradle-user/
+.kotlin/
+build/
+app/build/
+app/.cxx/
+out/
+*.class
+
+# IDE and machine-local state
+.idea/
+*.iml
+local.properties
+
+# Signing and packaged app outputs
+*.jks
+*.keystore
+*.apk
+*.aab
+release/
+validation/
+
+# Local inference/model artifacts
+*.gguf
+*.bin
+*.onnx
+*.tflite
+app/src/androidTest/assets/smoke-model/
+
+# Runtime logs and generated evidence
+*.log
+logcat-*.txt
+llm_host_prefs.xml
+
+# Native/intermediate outputs
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exe

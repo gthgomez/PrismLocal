@@ -1,0 +1,195 @@
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+fun signingValue(name: String): String? =
+    providers.gradleProperty(name)
+        .orElse(providers.environmentVariable(name))
+        .orNull
+        ?.takeIf { it.isNotBlank() }
+
+val releaseStoreFile = signingValue("LLMHOST_RELEASE_STORE_FILE")
+val releaseStorePassword = signingValue("LLMHOST_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = signingValue("LLMHOST_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = signingValue("LLMHOST_RELEASE_KEY_PASSWORD")
+val releaseSigningReady = listOf(
+    releaseStoreFile,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+).all { it != null }
+val kleidiAiEnabled = signingValue("LLMHOST_ENABLE_KLEIDIAI")
+    ?.let { value ->
+        value.equals("true", ignoreCase = true) ||
+            value.equals("on", ignoreCase = true) ||
+            value.equals("yes", ignoreCase = true) ||
+            value == "1"
+    }
+    ?: false
+
+android {
+    namespace = "com.example.llmhost"
+    compileSdk = 36
+    ndkVersion = "27.1.12297006"
+
+    defaultConfig {
+        applicationId = "com.example.llmhost"
+        minSdk = 26
+        targetSdk = 36
+        versionCode = 1
+        versionName = "1.0.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags += listOf("-std=c++20")
+                arguments += listOf(
+                    "-DLLMHOST_ENABLE_KLEIDIAI=${if (kleidiAiEnabled) "ON" else "OFF"}"
+                )
+            }
+        }
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    if (releaseSigningReady) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(requireNotNull(releaseStoreFile))
+                storePassword = requireNotNull(releaseStorePassword)
+                keyAlias = requireNotNull(releaseKeyAlias)
+                keyPassword = requireNotNull(releaseKeyPassword)
+            }
+        }
+    } else {
+        logger.lifecycle(
+            "Release signing disabled: set LLMHOST_RELEASE_STORE_FILE, " +
+                "LLMHOST_RELEASE_STORE_PASSWORD, LLMHOST_RELEASE_KEY_ALIAS, and " +
+                "LLMHOST_RELEASE_KEY_PASSWORD as Gradle properties or environment variables."
+        )
+    }
+
+    buildTypes {
+        debug {
+            isMinifyEnabled = false
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+            buildConfigField("boolean", "LLMHOST_DEBUG_HOOKS", "true")
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf("-DLLMHOST_DEBUG_HOOKS=ON")
+                }
+            }
+        }
+        release {
+            isMinifyEnabled = false
+            isDebuggable = false
+            isJniDebuggable = false
+            if (releaseSigningReady) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+            buildConfigField("boolean", "LLMHOST_DEBUG_HOOKS", "false")
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf("-DLLMHOST_DEBUG_HOOKS=OFF")
+                }
+            }
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+        create("benchmark") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".benchmark"
+            versionNameSuffix = "-benchmark"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+            buildConfigField("boolean", "LLMHOST_DEBUG_HOOKS", "false")
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf(
+                        "-DLLMHOST_DEBUG_HOOKS=OFF",
+                        "-DLLMHOST_ENABLE_KLEIDIAI=ON",
+                    )
+                }
+            }
+        }
+        create("profile") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".profile"
+            versionNameSuffix = "-profile"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+            buildConfigField("boolean", "LLMHOST_DEBUG_HOOKS", "false")
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf(
+                        "-DLLMHOST_DEBUG_HOOKS=OFF",
+                        "-DLLMHOST_ENABLE_KLEIDIAI=ON",
+                    )
+                }
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig = true
+        compose = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2026.04.01")
+    implementation(composeBom)
+    androidTestImplementation(composeBom)
+
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.annotation:annotation:1.10.0")
+    implementation("androidx.core:core-ktx:1.18.0")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
+    debugImplementation("androidx.compose.ui:ui-tooling")
+
+    testImplementation("junit:junit:4.13.2")
+
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test:runner:1.7.0")
+    androidTestImplementation("junit:junit:4.13.2")
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+}

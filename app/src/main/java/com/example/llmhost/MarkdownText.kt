@@ -1,19 +1,35 @@
 package com.example.llmhost
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.widget.Toast
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
 @Composable
@@ -44,6 +60,11 @@ internal fun MarkdownText(
                     color = color,
                     style = MaterialTheme.typography.bodyMedium,
                 )
+                MarkdownBlockKind.Code -> CodeBlock(
+                    code = block.text,
+                    language = block.language,
+                    color = color,
+                )
             }
         }
     }
@@ -55,29 +76,107 @@ internal enum class MarkdownBlockKind {
     Heading,
     Quote,
     Text,
+    Code,
 }
 
 internal data class MarkdownBlock(
     val kind: MarkdownBlockKind,
     val text: String,
+    val language: String? = null,
 )
 
-internal fun markdownBlocks(text: String): List<MarkdownBlock> =
-    text.lines().map { rawLine ->
+internal fun markdownBlocks(text: String): List<MarkdownBlock> {
+    val blocks = mutableListOf<MarkdownBlock>()
+    val lines = text.lines()
+    var index = 0
+    while (index < lines.size) {
+        val rawLine = lines[index]
         val line = rawLine.trimEnd()
         val trimmed = line.trim()
-        when {
-            trimmed.isBlank() -> MarkdownBlock(MarkdownBlockKind.Blank, "")
-            trimmed == "---" || trimmed == "***" -> MarkdownBlock(MarkdownBlockKind.Divider, "")
-            trimmed.startsWith("### ") -> MarkdownBlock(MarkdownBlockKind.Heading, trimmed.removePrefix("### ").trim())
-            trimmed.startsWith("## ") -> MarkdownBlock(MarkdownBlockKind.Heading, trimmed.removePrefix("## ").trim())
-            trimmed.startsWith("# ") -> MarkdownBlock(MarkdownBlockKind.Heading, trimmed.removePrefix("# ").trim())
-            trimmed.startsWith("> ") -> MarkdownBlock(MarkdownBlockKind.Quote, trimmed.removePrefix("> ").trim())
-            trimmed.startsWith("- ") -> MarkdownBlock(MarkdownBlockKind.Text, "• ${trimmed.removePrefix("- ").trim()}")
-            trimmed.startsWith("* ") -> MarkdownBlock(MarkdownBlockKind.Text, "• ${trimmed.removePrefix("* ").trim()}")
-            else -> MarkdownBlock(MarkdownBlockKind.Text, line)
+        if (trimmed.startsWith("```")) {
+            val language = trimmed.removePrefix("```").trim().takeIf { it.isNotBlank() }
+            val codeLines = mutableListOf<String>()
+            index += 1
+            while (index < lines.size && !lines[index].trim().startsWith("```")) {
+                codeLines += lines[index].trimEnd()
+                index += 1
+            }
+            if (index < lines.size) {
+                index += 1
+            }
+            blocks += MarkdownBlock(
+                kind = MarkdownBlockKind.Code,
+                text = codeLines.joinToString("\n").trimEnd(),
+                language = language,
+            )
+        } else {
+            blocks += when {
+                trimmed.isBlank() -> MarkdownBlock(MarkdownBlockKind.Blank, "")
+                trimmed == "---" || trimmed == "***" -> MarkdownBlock(MarkdownBlockKind.Divider, "")
+                trimmed.startsWith("### ") -> MarkdownBlock(MarkdownBlockKind.Heading, trimmed.removePrefix("### ").trim())
+                trimmed.startsWith("## ") -> MarkdownBlock(MarkdownBlockKind.Heading, trimmed.removePrefix("## ").trim())
+                trimmed.startsWith("# ") -> MarkdownBlock(MarkdownBlockKind.Heading, trimmed.removePrefix("# ").trim())
+                trimmed.startsWith("> ") -> MarkdownBlock(MarkdownBlockKind.Quote, trimmed.removePrefix("> ").trim())
+                trimmed.startsWith("- ") -> MarkdownBlock(MarkdownBlockKind.Text, "• ${trimmed.removePrefix("- ").trim()}")
+                trimmed.startsWith("* ") -> MarkdownBlock(MarkdownBlockKind.Text, "• ${trimmed.removePrefix("* ").trim()}")
+                else -> MarkdownBlock(MarkdownBlockKind.Text, line)
+            }
+            index += 1
         }
     }
+    return blocks
+}
+
+@Composable
+private fun CodeBlock(
+    code: String,
+    language: String?,
+    color: Color,
+) {
+    val context = LocalContext.current
+    Surface(
+        modifier = Modifier.padding(vertical = 4.dp),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surface,
+        contentColor = color,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Column(
+            modifier = Modifier
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.36f))
+                .padding(10.dp),
+        ) {
+            Row(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    modifier = Modifier.weight(1f),
+                    text = language ?: "code",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                TextButton(
+                    onClick = {
+                        val clipboard = context.getSystemService(ClipboardManager::class.java)
+                        clipboard?.setPrimaryClip(ClipData.newPlainText(language ?: "code", code))
+                        Toast.makeText(context, "Copied code", Toast.LENGTH_SHORT).show()
+                    },
+                ) {
+                    Text("Copy code", maxLines = 1, softWrap = false)
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                text = code,
+                color = color,
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            )
+        }
+    }
+}
 
 internal fun markdownPlainLinesForTesting(text: String): List<String> =
     markdownBlocks(text)

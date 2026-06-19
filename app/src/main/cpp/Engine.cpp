@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <thread>
 
 #define LOG_TAG "LlmHostNative"
@@ -30,6 +32,19 @@ constexpr int kMaxGeneratedTokens = 512;
 constexpr int kMinThreadCount = 1;
 constexpr int kDefaultThreadCount = 6;
 constexpr int kMaxThreadCount = 8;
+constexpr int kMinContextLength = 512;
+constexpr int kDefaultContextLength = 2048;
+constexpr int kMaxContextLength = 8192;
+constexpr int kMinBatchSize = 128;
+constexpr int kDefaultBatchSize = 512;
+constexpr int kMaxBatchSize = 2048;
+constexpr float kDefaultTemperature = 0.70f;
+constexpr int kDefaultTopK = 40;
+constexpr float kDefaultTopP = 0.95f;
+constexpr float kDefaultRepeatPenalty = 1.10f;
+constexpr int kMaxGpuLayers = 99;
+constexpr llama_seq_id kMainSequence = 0;
+constexpr int kContextHeadroom = 8;
 
 struct ControlBlock {
     std::atomic<uint32_t> state{static_cast<uint32_t>(StreamState::Idle)};
@@ -111,6 +126,23 @@ GenerationConfig sanitizeGenerationConfig(GenerationConfig config, int fallback_
         config.thread_count = fallback;
     }
     config.thread_count = std::clamp(config.thread_count, kMinThreadCount, kMaxThreadCount);
+    config.context_length = std::clamp(config.context_length, kMinContextLength, kMaxContextLength);
+    config.batch_size = std::clamp(config.batch_size, kMinBatchSize, kMaxBatchSize);
+    config.batch_size = std::min(config.batch_size, config.context_length);
+    if (!std::isfinite(config.temperature)) {
+        config.temperature = kDefaultTemperature;
+    }
+    config.temperature = std::clamp(config.temperature, 0.05f, 1.50f);
+    config.top_k = std::clamp(config.top_k, 1, 100);
+    if (!std::isfinite(config.top_p)) {
+        config.top_p = kDefaultTopP;
+    }
+    config.top_p = std::clamp(config.top_p, 0.05f, 1.0f);
+    if (!std::isfinite(config.repeat_penalty)) {
+        config.repeat_penalty = kDefaultRepeatPenalty;
+    }
+    config.repeat_penalty = std::clamp(config.repeat_penalty, 1.0f, 1.50f);
+    config.gpu_layers = std::clamp(config.gpu_layers, 0, kMaxGpuLayers);
     return config;
 }
 
@@ -194,6 +226,10 @@ struct ModelRuntime {
     bool mock_model = false;
     bool mmap_used = false;
     int thread_count = kDefaultThreadCount;
+    int context_length = kDefaultContextLength;
+    int batch_size = kDefaultBatchSize;
+    int gpu_layers = 0;
+    llama_pos current_position = 0;
     std::string model_path;
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
@@ -235,7 +271,64 @@ struct GenerationSession {
 bool isTerminal(uint32_t state) {
     return state == static_cast<uint32_t>(StreamState::Eof) ||
            state == static_cast<uint32_t>(StreamState::Cancelled) ||
-           state == static_cast<uint32_t>(StreamState::Error);
+           state == static_cast<uint32_t>(StreamState::Error) ||
+           state == static_cast<uint32_t>(StreamState::MaxTokens);
+}
+
+void resetRuntimeContext(ModelRuntime& runtime, bool clear_data) {
+    if (runtime.ctx != nullptr) {
+        llama_memory_clear(llama_get_memory(runtime.ctx), clear_data);
+    }
+    runtime.current_position = 0;
+}
+
+bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens) {
+    if (runtime.ctx == nullptr) {
+        return false;
+    }
+    const llama_pos limit = static_cast<llama_pos>(runtime.context_length - kContextHeadroom);
+    if (runtime.current_position + required_tokens < limit) {
+        return true;
+    }
+    if (required_tokens >= limit) {
+        LOGW("context_required_too_large required=%d limit=%d; clearing kv", required_tokens, static_cast<int>(limit));
+        resetRuntimeContext(runtime, false);
+        return required_tokens < limit;
+    }
+
+    const llama_pos discard = std::max<llama_pos>(1, runtime.current_position / 2);
+    llama_memory_t memory = llama_get_memory(runtime.ctx);
+    const bool removed = llama_memory_seq_rm(memory, kMainSequence, 0, discard);
+    if (!removed) {
+        LOGW("context_shift_partial_remove_failed; clearing kv");
+        resetRuntimeContext(runtime, false);
+        return required_tokens < limit;
+    }
+    llama_memory_seq_add(memory, kMainSequence, discard, runtime.current_position, -discard);
+    runtime.current_position -= discard;
+    LOGI("context_shift discard=%d current_position=%d required=%d",
+         static_cast<int>(discard),
+         static_cast<int>(runtime.current_position),
+         required_tokens);
+    return runtime.current_position + required_tokens < limit;
+}
+
+int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t count, llama_pos start_pos) {
+    if (count <= 0) {
+        return 0;
+    }
+    llama_batch batch = llama_batch_init(count, 0, 1);
+    batch.n_tokens = count;
+    for (int32_t i = 0; i < count; i++) {
+        batch.token[i] = tokens[i];
+        batch.pos[i] = start_pos + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = kMainSequence;
+        batch.logits[i] = (i == count - 1) ? 1 : 0;
+    }
+    const int result = llama_decode(runtime.ctx, batch);
+    llama_batch_free(batch);
+    return result;
 }
 
 std::shared_ptr<ModelRuntime> makeMockRuntime() {
@@ -245,11 +338,12 @@ std::shared_ptr<ModelRuntime> makeMockRuntime() {
     return runtime;
 }
 
-std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_mmap) {
+std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_mmap, GenerationConfig requested_config) {
     ensureLlamaBackend();
+    const GenerationConfig config = sanitizeGenerationConfig(requested_config, kDefaultThreadCount);
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0;
+    model_params.n_gpu_layers = config.gpu_layers;
     model_params.use_mmap = use_mmap;
     model_params.use_mlock = false;
     model_params.check_tensors = true;
@@ -261,12 +355,12 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     }
 
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 512;
-    ctx_params.n_batch = 512;
-    ctx_params.n_ubatch = 512;
-    ctx_params.n_threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    ctx_params.n_ctx = config.context_length;
+    ctx_params.n_batch = config.batch_size;
+    ctx_params.n_ubatch = config.batch_size;
+    ctx_params.n_threads = config.thread_count;
     ctx_params.n_threads_batch = ctx_params.n_threads;
-    ctx_params.no_perf = true;
+    ctx_params.no_perf = false;
 
     llama_context* ctx = llama_init_from_model(model, ctx_params);
     if (ctx == nullptr) {
@@ -283,11 +377,16 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     runtime->ctx = ctx;
     runtime->vocab = llama_model_get_vocab(model);
     runtime->thread_count = ctx_params.n_threads;
-    LOGI("model_loaded path=%s mmap=%s n_ctx=%u threads=%d",
+    runtime->context_length = ctx_params.n_ctx;
+    runtime->batch_size = ctx_params.n_batch;
+    runtime->gpu_layers = config.gpu_layers;
+    LOGI("model_loaded path=%s mmap=%s n_ctx=%u n_batch=%u threads=%d gpu_layers=%d",
          path.c_str(),
          use_mmap ? "true" : "false",
          ctx_params.n_ctx,
-         ctx_params.n_threads);
+         ctx_params.n_batch,
+         ctx_params.n_threads,
+         config.gpu_layers);
     return runtime;
 }
 
@@ -337,6 +436,7 @@ struct Engine::Impl {
         buffers.control->state.store(static_cast<uint32_t>(final_state), std::memory_order_release);
         const char* terminal = final_state == StreamState::Cancelled ? "CANCELLED" :
             final_state == StreamState::Error ? "ERROR" :
+            final_state == StreamState::MaxTokens ? "MAX_TOKENS" :
             final_state == StreamState::Eof ? "EOF" : "UNKNOWN";
         LOGI("terminal=%s generation_id=%u", terminal, session->generation_id);
     }
@@ -396,64 +496,123 @@ struct Engine::Impl {
 
         const GenerationConfig config = sanitizeGenerationConfig(session->config, runtime->thread_count);
         llama_set_n_threads(runtime->ctx, config.thread_count, config.thread_count);
-        LOGI("generation_config generation_id=%u max_tokens=%d threads=%d",
+        LOGI("generation_config generation_id=%u max_tokens=%d threads=%d n_ctx=%d n_batch=%d temp=%.2f top_k=%d top_p=%.2f repeat=%.2f kv_pos=%d",
              session->generation_id,
              config.max_tokens,
-             config.thread_count);
+             config.thread_count,
+             runtime->context_length,
+             runtime->batch_size,
+             config.temperature,
+             config.top_k,
+             config.top_p,
+             config.repeat_penalty,
+             static_cast<int>(runtime->current_position));
 
-        llama_memory_clear(llama_get_memory(runtime->ctx), true);
+        llama_perf_context_reset(runtime->ctx);
+        if (config.continue_from_context) {
+            if (runtime->current_position <= 0) {
+                ctrl->error_code.store(427, std::memory_order_release);
+                LOGE("continue_failed_no_context generation_id=%u", session->generation_id);
+                finishSession(session, StreamState::Error);
+                return;
+            }
+            if (!shiftRuntimeContextIfNeeded(*runtime, config.max_tokens + kContextHeadroom)) {
+                ctrl->error_code.store(426, std::memory_order_release);
+                LOGE("continue_context_shift_failed n_ctx=%d current_position=%d required=%d",
+                     runtime->context_length,
+                     static_cast<int>(runtime->current_position),
+                     config.max_tokens);
+                finishSession(session, StreamState::Error);
+                return;
+            }
+            LOGI("continue_from_context generation_id=%u kv_pos=%d",
+                 session->generation_id,
+                 static_cast<int>(runtime->current_position));
+        } else {
+            const std::string formatted_prompt = formatPromptForGeneration(runtime->model, prompt);
+            LOGI("prompt_formatted generation_id=%u raw_bytes=%zu formatted_bytes=%zu",
+                 session->generation_id,
+                 prompt.size(),
+                formatted_prompt.size());
 
-        const std::string formatted_prompt = formatPromptForGeneration(runtime->model, prompt);
-        LOGI("prompt_formatted generation_id=%u raw_bytes=%zu formatted_bytes=%zu",
-             session->generation_id,
-             prompt.size(),
-             formatted_prompt.size());
+            const bool add_special = runtime->current_position == 0;
+            const int32_t token_count = -llama_tokenize(
+                runtime->vocab,
+                formatted_prompt.c_str(),
+                static_cast<int32_t>(formatted_prompt.size()),
+                nullptr,
+                0,
+                add_special,
+                true);
+            if (token_count <= 0) {
+                ctrl->error_code.store(422, std::memory_order_release);
+                LOGE("tokenize_size_failed count=%d", token_count);
+                finishSession(session, StreamState::Error);
+                return;
+            }
 
-        const int32_t token_count = -llama_tokenize(
-            runtime->vocab,
-            formatted_prompt.c_str(),
-            static_cast<int32_t>(formatted_prompt.size()),
-            nullptr,
-            0,
-            true,
-            true);
-        if (token_count <= 0 || token_count > 512) {
-            ctrl->error_code.store(422, std::memory_order_release);
-            LOGE("tokenize_size_failed count=%d", token_count);
-            finishSession(session, StreamState::Error);
-            return;
+            std::vector<llama_token> prompt_tokens(static_cast<size_t>(token_count));
+            const int32_t actual_tokens = llama_tokenize(
+                runtime->vocab,
+                formatted_prompt.c_str(),
+                static_cast<int32_t>(formatted_prompt.size()),
+                prompt_tokens.data(),
+                token_count,
+                add_special,
+                true);
+            if (actual_tokens < 0) {
+                ctrl->error_code.store(423, std::memory_order_release);
+                LOGE("tokenize_failed rc=%d", actual_tokens);
+                finishSession(session, StreamState::Error);
+                return;
+            }
+
+            int32_t usable_prompt_tokens = actual_tokens;
+            const int max_prompt_tokens = runtime->context_length - config.max_tokens - kContextHeadroom;
+            if (usable_prompt_tokens > max_prompt_tokens) {
+                if (max_prompt_tokens <= 0) {
+                    ctrl->error_code.store(422, std::memory_order_release);
+                    LOGE("context_too_small n_ctx=%d max_tokens=%d", runtime->context_length, config.max_tokens);
+                    finishSession(session, StreamState::Error);
+                    return;
+                }
+                const int32_t dropped = usable_prompt_tokens - max_prompt_tokens;
+                prompt_tokens.erase(prompt_tokens.begin(), prompt_tokens.begin() + dropped);
+                usable_prompt_tokens = static_cast<int32_t>(prompt_tokens.size());
+                LOGW("prompt_truncated generation_id=%u dropped_tokens=%d kept_tokens=%d",
+                     session->generation_id,
+                     dropped,
+                     usable_prompt_tokens);
+            }
+            if (!shiftRuntimeContextIfNeeded(*runtime, usable_prompt_tokens + config.max_tokens + kContextHeadroom)) {
+                ctrl->error_code.store(426, std::memory_order_release);
+                LOGE("context_shift_failed n_ctx=%d current_position=%d required=%d",
+                     runtime->context_length,
+                     static_cast<int>(runtime->current_position),
+                     usable_prompt_tokens + config.max_tokens);
+                finishSession(session, StreamState::Error);
+                return;
+            }
+
+            if (session->cancel_requested.load(std::memory_order_acquire)) {
+                finishSession(session, StreamState::Cancelled);
+                return;
+            }
+
+            const llama_pos prompt_start = runtime->current_position;
+            const int decode_result = decodeTokensAt(*runtime, prompt_tokens.data(), usable_prompt_tokens, prompt_start);
+            if (decode_result != 0) {
+                ctrl->error_code.store(static_cast<uint32_t>(5000 + std::abs(decode_result)), std::memory_order_release);
+                LOGE("prompt_eval_failed rc=%d", decode_result);
+                finishSession(session, StreamState::Error);
+                return;
+            }
+            runtime->current_position += usable_prompt_tokens;
+            LOGI("prompt_eval_done generation_id=%u prompt_tokens=%d kv_pos=%d",
+                 session->generation_id,
+                 usable_prompt_tokens,
+                 static_cast<int>(runtime->current_position));
         }
-
-        std::vector<llama_token> prompt_tokens(static_cast<size_t>(token_count));
-        const int32_t actual_tokens = llama_tokenize(
-            runtime->vocab,
-            formatted_prompt.c_str(),
-            static_cast<int32_t>(formatted_prompt.size()),
-            prompt_tokens.data(),
-            token_count,
-            true,
-            true);
-        if (actual_tokens < 0) {
-            ctrl->error_code.store(423, std::memory_order_release);
-            LOGE("tokenize_failed rc=%d", actual_tokens);
-            finishSession(session, StreamState::Error);
-            return;
-        }
-
-        if (session->cancel_requested.load(std::memory_order_acquire)) {
-            finishSession(session, StreamState::Cancelled);
-            return;
-        }
-
-        llama_batch batch = llama_batch_get_one(prompt_tokens.data(), actual_tokens);
-        const int decode_result = llama_decode(runtime->ctx, batch);
-        if (decode_result != 0) {
-            ctrl->error_code.store(static_cast<uint32_t>(5000 + std::abs(decode_result)), std::memory_order_release);
-            LOGE("prompt_eval_failed rc=%d", decode_result);
-            finishSession(session, StreamState::Error);
-            return;
-        }
-        LOGI("prompt_eval_done generation_id=%u prompt_tokens=%d", session->generation_id, actual_tokens);
 
         if (session->cancel_requested.load(std::memory_order_acquire) ||
             memory_pressure_level.load(std::memory_order_acquire) >= 3) {
@@ -467,14 +626,15 @@ struct Engine::Impl {
             finishSession(session, StreamState::Error);
             return;
         }
-        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, 1.10f, 0.0f, 0.0f));
-        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
-        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.95f, 1));
-        llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.70f));
+        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, config.repeat_penalty, 0.0f, 0.0f));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(config.top_k));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(config.top_p, 1));
+        llama_sampler_chain_add(sampler, llama_sampler_init_temp(config.temperature));
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
         const auto generation_start = std::chrono::steady_clock::now();
         int generated_tokens = 0;
+        bool stopped_by_eog = false;
         for (int i = 0; i < config.max_tokens; i++) {
             if (memory_pressure_level.load(std::memory_order_acquire) >= 3) {
                 session->cancel_requested.store(true, std::memory_order_release);
@@ -497,6 +657,7 @@ struct Engine::Impl {
 
             if (llama_vocab_is_eog(runtime->vocab, token)) {
                 LOGI("token_eog id=%d generation_id=%u", static_cast<int>(token), session->generation_id);
+                stopped_by_eog = true;
                 break;
             }
 
@@ -509,8 +670,7 @@ struct Engine::Impl {
                 return;
             }
 
-            llama_batch next_batch = llama_batch_get_one(&token, 1);
-            const int next_decode_result = llama_decode(runtime->ctx, next_batch);
+            const int next_decode_result = decodeTokensAt(*runtime, &token, 1, runtime->current_position);
             if (next_decode_result != 0) {
                 llama_sampler_free(sampler);
                 ctrl->error_code.store(static_cast<uint32_t>(5100 + std::abs(next_decode_result)), std::memory_order_release);
@@ -518,6 +678,7 @@ struct Engine::Impl {
                 finishSession(session, StreamState::Error);
                 return;
             }
+            runtime->current_position += 1;
         }
 
         const auto generation_end = std::chrono::steady_clock::now();
@@ -533,9 +694,10 @@ struct Engine::Impl {
              tokens_per_second);
 
         llama_sampler_free(sampler);
-        finishSession(session, session->cancel_requested.load(std::memory_order_acquire)
+        const StreamState final_state = session->cancel_requested.load(std::memory_order_acquire)
             ? StreamState::Cancelled
-            : StreamState::Eof);
+            : (!stopped_by_eog && generated_tokens >= config.max_tokens ? StreamState::MaxTokens : StreamState::Eof);
+        finishSession(session, final_state);
     }
 
     void runGeneration(const std::shared_ptr<GenerationSession>& session, std::string prompt) {
@@ -558,11 +720,12 @@ Engine::Engine(bool debug_hooks_enabled) : impl_(std::make_unique<Impl>(debug_ho
 
 Engine::~Engine() = default;
 
-bool Engine::loadModel(const std::string& path) {
+bool Engine::loadModel(const std::string& path, GenerationConfig config) {
     if (!impl_) {
         return false;
     }
     impl_->cancelAndJoinActiveSession();
+    const GenerationConfig safe_config = sanitizeGenerationConfig(config, kDefaultThreadCount);
 
 #if LLMHOST_DEBUG_HOOKS
     if (path == "DEBUG_MOCK_MODEL") {
@@ -572,6 +735,10 @@ bool Engine::loadModel(const std::string& path) {
         }
         std::lock_guard<std::mutex> lock(impl_->mu);
         impl_->active_runtime = makeMockRuntime();
+        impl_->active_runtime->thread_count = safe_config.thread_count;
+        impl_->active_runtime->context_length = safe_config.context_length;
+        impl_->active_runtime->batch_size = safe_config.batch_size;
+        impl_->active_runtime->gpu_layers = safe_config.gpu_layers;
         clearRing(impl_->buffers.control);
         impl_->buffers.control->state.store(static_cast<uint32_t>(StreamState::Idle), std::memory_order_release);
         return true;
@@ -582,10 +749,10 @@ bool Engine::loadModel(const std::string& path) {
         return false;
     }
 
-    auto runtime = loadRealRuntime(path, true);
+    auto runtime = loadRealRuntime(path, true, safe_config);
     if (!runtime) {
         LOGW("model_load_mmap_failed; retrying without mmap path=%s", path.c_str());
-        runtime = loadRealRuntime(path, false);
+        runtime = loadRealRuntime(path, false, safe_config);
     }
     if (!runtime) {
         return false;
@@ -596,6 +763,26 @@ bool Engine::loadModel(const std::string& path) {
     clearRing(impl_->buffers.control);
     impl_->buffers.control->state.store(static_cast<uint32_t>(StreamState::Idle), std::memory_order_release);
     return true;
+}
+
+void Engine::resetConversation() {
+    if (!impl_) {
+        return;
+    }
+    impl_->cancelAndJoinActiveSession();
+    std::shared_ptr<ModelRuntime> runtime;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        runtime = impl_->active_runtime;
+        clearRing(impl_->buffers.control);
+        impl_->buffers.control->state.store(static_cast<uint32_t>(StreamState::Idle), std::memory_order_release);
+    }
+    if (!runtime || runtime->mock_model) {
+        return;
+    }
+    std::lock_guard<std::mutex> decode_lock(runtime->decode_mu);
+    resetRuntimeContext(*runtime, false);
+    LOGI("conversation_reset path=%s", runtime->model_path.c_str());
 }
 
 void Engine::unloadModel() {
@@ -613,7 +800,7 @@ void Engine::unloadModel() {
 }
 
 int Engine::startGeneration(const std::string& prompt, int generation_id, GenerationConfig config) {
-    if (!impl_ || prompt.empty()) {
+    if (!impl_ || (prompt.empty() && !config.continue_from_context)) {
         return -1;
     }
 
@@ -653,6 +840,84 @@ int Engine::startGeneration(const std::string& prompt, int generation_id, Genera
         impl->runGeneration(session, prompt);
     });
     return generation_id;
+}
+
+std::string Engine::runBenchmark(GenerationConfig config, int prompt_tokens, int generation_tokens, int repetitions) {
+    if (!impl_) {
+        return "{}";
+    }
+    std::shared_ptr<ModelRuntime> runtime;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        runtime = impl_->active_runtime;
+    }
+    if (!runtime || runtime->mock_model || runtime->ctx == nullptr || runtime->vocab == nullptr) {
+        return "{\"error\":\"model_not_loaded\"}";
+    }
+
+    const GenerationConfig safe_config = sanitizeGenerationConfig(config, runtime->thread_count);
+    const int pp = std::clamp(prompt_tokens, 16, runtime->context_length / 2);
+    const int tg = std::clamp(generation_tokens, 16, 512);
+    const int nr = std::clamp(repetitions, 1, 5);
+    const llama_token token = llama_vocab_bos(runtime->vocab);
+
+    std::lock_guard<std::mutex> decode_lock(runtime->decode_mu);
+    llama_set_n_threads(runtime->ctx, safe_config.thread_count, safe_config.thread_count);
+    double prompt_ms_total = 0.0;
+    double decode_ms_total = 0.0;
+    int completed = 0;
+
+    for (int rep = 0; rep < nr; rep++) {
+        resetRuntimeContext(*runtime, false);
+        std::vector<llama_token> prompt(static_cast<size_t>(pp), token);
+        const auto prompt_start = std::chrono::steady_clock::now();
+        const int prompt_rc = decodeTokensAt(*runtime, prompt.data(), pp, 0);
+        const auto prompt_end = std::chrono::steady_clock::now();
+        if (prompt_rc != 0) {
+            LOGE("benchmark_prompt_failed rc=%d pp=%d rep=%d", prompt_rc, pp, rep);
+            continue;
+        }
+        runtime->current_position = pp;
+        prompt_ms_total += std::chrono::duration<double, std::milli>(prompt_end - prompt_start).count();
+
+        const auto decode_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < tg; i++) {
+            const int decode_rc = decodeTokensAt(*runtime, &token, 1, runtime->current_position);
+            if (decode_rc != 0) {
+                LOGE("benchmark_decode_failed rc=%d tg=%d rep=%d i=%d", decode_rc, tg, rep, i);
+                resetRuntimeContext(*runtime, false);
+                return "{\"error\":\"decode_failed\"}";
+            }
+            runtime->current_position += 1;
+        }
+        const auto decode_end = std::chrono::steady_clock::now();
+        decode_ms_total += std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+        completed++;
+    }
+    resetRuntimeContext(*runtime, false);
+
+    if (completed <= 0 || prompt_ms_total <= 0.0 || decode_ms_total <= 0.0) {
+        return "{\"error\":\"benchmark_failed\"}";
+    }
+    const double prompt_tps = static_cast<double>(pp * completed) * 1000.0 / prompt_ms_total;
+    const double decode_tps = static_cast<double>(tg * completed) * 1000.0 / decode_ms_total;
+
+    std::ostringstream out;
+    out.setf(std::ios::fixed);
+    out.precision(3);
+    out << "{\"source\":\"native\",\"pp\":" << pp
+        << ",\"tg\":" << tg
+        << ",\"nr\":" << completed
+        << ",\"prompt_ms\":" << prompt_ms_total
+        << ",\"decode_ms\":" << decode_ms_total
+        << ",\"prompt_tps\":" << prompt_tps
+        << ",\"decode_tps\":" << decode_tps
+        << ",\"thread_count\":" << safe_config.thread_count
+        << ",\"context_length\":" << runtime->context_length
+        << ",\"batch_size\":" << runtime->batch_size
+        << ",\"gpu_layers\":" << runtime->gpu_layers
+        << "}";
+    return out.str();
 }
 
 void Engine::cancelGeneration(int generation_id) {

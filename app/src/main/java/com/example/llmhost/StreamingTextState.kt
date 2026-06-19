@@ -14,9 +14,10 @@ class StreamingTextState {
     private var activeGenerationId: Int? = null
     private val throttleMs = 33L
 
-    fun beginGeneration(expectedGenerationId: Int? = null) {
+    fun beginGeneration(expectedGenerationId: Int? = null, initialText: String = "") {
         val text = synchronized(lock) {
             builder.clear()
+            builder.append(initialText)
             activeGenerationId = expectedGenerationId
             lastPublish = 0L
             builder.toString()

@@ -40,6 +40,20 @@ class ModelStorageManager(private val context: Context) {
         val ggufVersion: Int,
         val status: String,
         val validatedAt: String,
+        val metadata: GgufMetadataSummary? = null,
+    )
+
+    data class GgufMetadataSummary(
+        val architecture: String? = null,
+        val name: String? = null,
+        val sizeLabel: String? = null,
+        val fileType: Int? = null,
+        val contextLength: Int? = null,
+        val blockCount: Int? = null,
+        val embeddingLength: Int? = null,
+        val attentionHeadCount: Int? = null,
+        val attentionHeadCountKv: Int? = null,
+        val hasChatTemplate: Boolean = false,
     )
 
     data class ImportProgress(
@@ -358,6 +372,24 @@ class ModelStorageManager(private val context: Context) {
                         .put("gguf_version", validation.ggufVersion)
                         .put("status", validation.status)
                         .put("validated_at", validation.validatedAt)
+                        .apply {
+                            validation.metadata?.let { metadata ->
+                                put(
+                                    "metadata",
+                                    JSONObject()
+                                        .put("architecture", metadata.architecture)
+                                        .put("name", metadata.name)
+                                        .put("size_label", metadata.sizeLabel)
+                                        .put("file_type", metadata.fileType)
+                                        .put("context_length", metadata.contextLength)
+                                        .put("block_count", metadata.blockCount)
+                                        .put("embedding_length", metadata.embeddingLength)
+                                        .put("attention_head_count", metadata.attentionHeadCount)
+                                        .put("attention_head_count_kv", metadata.attentionHeadCountKv)
+                                        .put("has_chat_template", metadata.hasChatTemplate)
+                                )
+                            }
+                        }
                 )
         )
         return JSONObject()
@@ -413,25 +445,21 @@ class ModelStorageManager(private val context: Context) {
 
     private fun validateGguf(file: File): ModelValidation? {
         file.inputStream().use { input ->
-            val header = ByteArray(8)
-            if (input.read(header) != header.size) return null
-            if (header[0] != 'G'.code.toByte() ||
-                header[1] != 'G'.code.toByte() ||
-                header[2] != 'U'.code.toByte() ||
-                header[3] != 'F'.code.toByte()
-            ) {
+            val reader = GgufReader(input)
+            if (reader.readAscii(4) != "GGUF") {
                 return null
             }
-            val version = (header[4].toInt() and 0xff) or
-                ((header[5].toInt() and 0xff) shl 8) or
-                ((header[6].toInt() and 0xff) shl 16) or
-                ((header[7].toInt() and 0xff) shl 24)
+            val version = reader.readU32()
             if (version !in 1..4) return null
+            val metadata = runCatching { parseGgufMetadata(reader, version) }
+                .onFailure { error -> Log.w(TAG, "GGUF metadata parse failed file=${file.name}", error) }
+                .getOrNull()
             return ModelValidation(
                 format = "GGUF",
                 ggufVersion = version,
                 status = "verified",
                 validatedAt = Instant.now().toString(),
+                metadata = metadata,
             )
         }
     }
@@ -443,7 +471,176 @@ class ModelStorageManager(private val context: Context) {
             ggufVersion = validation.optInt("gguf_version", -1),
             status = validation.optString("status", "unknown"),
             validatedAt = validation.optString("validated_at", ""),
+            metadata = parseMetadataSummary(validation.optJSONObject("metadata")),
         ).takeIf { it.format == "GGUF" && it.ggufVersion in 1..4 }
+    }
+
+    private fun parseMetadataSummary(metadata: JSONObject?): GgufMetadataSummary? {
+        if (metadata == null) return null
+        return GgufMetadataSummary(
+            architecture = metadata.optString("architecture").takeIf { it.isNotBlank() },
+            name = metadata.optString("name").takeIf { it.isNotBlank() },
+            sizeLabel = metadata.optString("size_label").takeIf { it.isNotBlank() },
+            fileType = metadata.optIntOrNull("file_type"),
+            contextLength = metadata.optIntOrNull("context_length"),
+            blockCount = metadata.optIntOrNull("block_count"),
+            embeddingLength = metadata.optIntOrNull("embedding_length"),
+            attentionHeadCount = metadata.optIntOrNull("attention_head_count"),
+            attentionHeadCountKv = metadata.optIntOrNull("attention_head_count_kv"),
+            hasChatTemplate = metadata.optBoolean("has_chat_template", false),
+        )
+    }
+
+    private fun parseGgufMetadata(reader: GgufReader, version: Int): GgufMetadataSummary? {
+        if (version == 1) {
+            return null
+        }
+        reader.readU64() // tensor_count
+        val kvCount = reader.readU64().coerceAtMost(4096L)
+        var architecture: String? = null
+        var name: String? = null
+        var sizeLabel: String? = null
+        var fileType: Int? = null
+        var contextLength: Int? = null
+        var blockCount: Int? = null
+        var embeddingLength: Int? = null
+        var attentionHeadCount: Int? = null
+        var attentionHeadCountKv: Int? = null
+        var hasChatTemplate = false
+
+        repeat(kvCount.toInt()) {
+            val key = reader.readGgufString()
+            val type = reader.readU32()
+            val value = reader.readMetadataValue(type)
+            when (key) {
+                "general.architecture" -> architecture = value as? String
+                "general.name" -> name = value as? String
+                "general.size_label" -> sizeLabel = value as? String
+                "general.file_type" -> fileType = (value as? Number)?.toInt()
+                "tokenizer.chat_template" -> hasChatTemplate = (value as? String)?.isNotBlank() == true
+                else -> {
+                    val prefix = architecture?.let { "$it." }
+                    if (prefix != null && key.startsWith(prefix)) {
+                        when (key.removePrefix(prefix)) {
+                            "context_length" -> contextLength = (value as? Number)?.toInt()
+                            "block_count" -> blockCount = (value as? Number)?.toInt()
+                            "embedding_length" -> embeddingLength = (value as? Number)?.toInt()
+                            "attention.head_count" -> attentionHeadCount = (value as? Number)?.toInt()
+                            "attention.head_count_kv" -> attentionHeadCountKv = (value as? Number)?.toInt()
+                        }
+                    }
+                }
+            }
+        }
+
+        return GgufMetadataSummary(
+            architecture = architecture,
+            name = name,
+            sizeLabel = sizeLabel,
+            fileType = fileType,
+            contextLength = contextLength,
+            blockCount = blockCount,
+            embeddingLength = embeddingLength,
+            attentionHeadCount = attentionHeadCount,
+            attentionHeadCountKv = attentionHeadCountKv,
+            hasChatTemplate = hasChatTemplate,
+        )
+    }
+
+    private fun JSONObject.optIntOrNull(name: String): Int? =
+        if (has(name) && !isNull(name)) optInt(name) else null
+
+    private class GgufReader(private val input: InputStream) {
+        private val scratch = ByteArray(8)
+
+        fun readAscii(length: Int): String {
+            val bytes = ByteArray(length)
+            readFully(bytes)
+            return bytes.toString(Charsets.US_ASCII)
+        }
+
+        fun readU32(): Int {
+            readFully(scratch, 4)
+            return (scratch[0].toInt() and 0xff) or
+                ((scratch[1].toInt() and 0xff) shl 8) or
+                ((scratch[2].toInt() and 0xff) shl 16) or
+                ((scratch[3].toInt() and 0xff) shl 24)
+        }
+
+        fun readU64(): Long {
+            readFully(scratch, 8)
+            var value = 0L
+            for (index in 0 until 8) {
+                value = value or ((scratch[index].toLong() and 0xffL) shl (8 * index))
+            }
+            return value
+        }
+
+        fun readGgufString(): String {
+            val length = readU64().coerceAtMost(1_000_000L).toInt()
+            val bytes = ByteArray(length)
+            readFully(bytes)
+            return bytes.toString(Charsets.UTF_8)
+        }
+
+        fun readMetadataValue(type: Int): Any? =
+            when (type) {
+                0, 1 -> readScalar(1)
+                2, 3 -> readScalar(2)
+                4, 5, 6 -> readScalar(4)
+                7 -> readScalar(1) != 0L
+                8 -> readGgufString()
+                9 -> {
+                    val elementType = readU32()
+                    val count = readU64().coerceAtMost(1_000_000L).toInt()
+                    repeat(count) { skipMetadataValue(elementType) }
+                    null
+                }
+                10, 11, 12 -> readScalar(8)
+                else -> null
+            }
+
+        private fun skipMetadataValue(type: Int) {
+            when (type) {
+                0, 1, 7 -> skipFully(1)
+                2, 3 -> skipFully(2)
+                4, 5, 6 -> skipFully(4)
+                8 -> skipFully(readU64().coerceAtMost(1_000_000L))
+                10, 11, 12 -> skipFully(8)
+                else -> Unit
+            }
+        }
+
+        private fun readScalar(bytes: Int): Long {
+            readFully(scratch, bytes)
+            var value = 0L
+            for (index in 0 until bytes) {
+                value = value or ((scratch[index].toLong() and 0xffL) shl (8 * index))
+            }
+            return value
+        }
+
+        private fun readFully(buffer: ByteArray, length: Int = buffer.size) {
+            var offset = 0
+            while (offset < length) {
+                val read = input.read(buffer, offset, length - offset)
+                if (read < 0) throw IOException("Unexpected EOF")
+                offset += read
+            }
+        }
+
+        private fun skipFully(bytes: Long) {
+            var remaining = bytes
+            while (remaining > 0L) {
+                val skipped = input.skip(remaining)
+                if (skipped <= 0L) {
+                    if (input.read() == -1) throw IOException("Unexpected EOF")
+                    remaining--
+                } else {
+                    remaining -= skipped
+                }
+            }
+        }
     }
 
     private fun sha256(file: File): String {

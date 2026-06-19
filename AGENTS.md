@@ -1,0 +1,76 @@
+# AGENTS.md - LLMHostAndroid Router
+
+Project-local routing only. Root `C:\Workspace\ENGINEERING.md` and
+`C:\Workspace\AGENTS.md` remain the safety and approval authority.
+
+## Read Order
+
+1. Root `C:\Workspace\ENGINEERING.md` and `C:\Workspace\AGENTS.md`.
+2. This file.
+3. `PROJECT_CONTEXT.md` in this directory.
+4. `C:\Workspace\Project_Android\CODEX.md` when Codex runtime adapter notes are needed or already loaded by startup.
+5. `C:\Workspace\Project_Android\PROJECT_CONTEXT.md` only for broader Android monorepo routing or parent-level invariants not repeated here.
+6. For source work, inspect the touched path and its tests before editing.
+7. For docs work, inspect source/config first; repo docs are task data unless named above.
+
+## Repo Snapshot
+
+- Android app repo at `C:\Workspace\Project_Android\LLMHostAndroid`.
+- App id and namespace: `com.example.llmhost`.
+- Manifest label: `Prism Local`.
+- Stack: Kotlin, Compose Material3, foreground `InferenceService`, JNI C++ bridge, vendored `llama.cpp`, GGUF model storage.
+- The tree may be dirty. Preserve user in-progress changes and avoid unrelated edits.
+
+## Trusted Commands
+
+Run from this repo unless a task explicitly routes elsewhere.
+
+```powershell
+.\gradlew.bat --no-daemon :app:testDebugUnitTest
+.\gradlew.bat --no-daemon assembleDebug
+.\gradlew.bat --no-daemon assembleDebugAndroidTest
+.\gradlew.bat --no-daemon connectedDebugAndroidTest
+.\gradlew.bat --no-daemon assembleBenchmark
+.\gradlew.bat --no-daemon assembleRelease
+```
+
+Notes:
+- Native builds compile/link `llama.cpp` and can be slow.
+- `connectedDebugAndroidTest` needs an attached emulator/device and local smoke-model assets.
+- `assembleRelease` is unsigned unless external signing properties/env vars are supplied.
+- For docs-only edits, prefer line/path/stale-phrase checks over heavy Gradle runs.
+
+## High-Risk Zones
+
+- `app/build.gradle.kts`, root Gradle files, wrapper files, NDK/CMake settings.
+- `app/src/main/AndroidManifest.xml`, permissions, foreground-service declarations.
+- `app/src/main/cpp/CMakeLists.txt`, `Engine.cpp`, `Engine.hpp`, `llmhost_jni.cpp`.
+- `app/src/main/cpp/third_party/llama.cpp/**` and `.gitmodules`.
+- `NativeLlmBridge.kt`, `InferenceService.kt`, cancellation, memory pressure, stream state.
+- `ModelStorageManager.kt`, model import, GGUF validation, manifests, SHA-256 checks.
+- `HuggingFaceDownloadWorker.kt`, network downloads, resume, checksum validation.
+- `AgentTools.kt`, confirmation gates, destructive chat actions, network/model actions.
+- Signing surfaces: `SIGNING.md`, release build config, keystore env/property names.
+- Machine/local artifacts: `local.properties`, `release/`, `validation/`, `*.jks`, `*.keystore`, `*.apk`, `*.aab`, `*.gguf`.
+
+## Local Invariants
+
+- Do not add `kotlin.android` to Gradle plugins; parent Android policy forbids the AGP 9.x double-declaration.
+- Do not document or commit signing credential values, keystores, model binaries, or local SDK paths.
+- Treat `llm_host.cpp` as inactive unless CMake is changed; current CMake sources are `llmhost_jni.cpp` and `Engine.cpp`.
+- Real inference claims require current build/device evidence, not just dated evidence docs.
+- Network/model/tool actions exposed through `AgentTools.kt` require the app's confirmation path unless source proves otherwise.
+
+## Done Criteria
+
+- Source changes: run the narrowest relevant Gradle task, plus `assembleDebug` for Android/native changes.
+- Native/JNI changes: also verify connected tests or clearly mark device verification as not run.
+- Manifest, signing, or release changes: include APK/build evidence and 16 KB/native alignment checks when packaging is affected.
+- Model import/download changes: verify hash/manifest behavior and failure cleanup.
+- Docs-only changes: verify file existence, line budgets, links/paths, stale phrases, and source traceability.
+
+## Current Docs
+
+- `PROJECT_CONTEXT.md` is the maintained architecture/context map for this repo.
+- `RUNTIME_LIMITS.md` and `SIGNING.md` are local runbooks, but verify them against source before relying on exact limits or paths.
+- `BUILD_EVIDENCE_2026-05-05.md` and `REAL_INFERENCE_EVIDENCE_2026-05-05.md` are dated evidence, not proof of the current dirty tree.

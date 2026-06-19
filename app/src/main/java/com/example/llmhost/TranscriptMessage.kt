@@ -3,6 +3,7 @@ package com.example.llmhost
 enum class TranscriptRole {
     USER,
     ASSISTANT,
+    TOOL,
 }
 
 data class TranscriptMessage(

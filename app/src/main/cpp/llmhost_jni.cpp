@@ -142,6 +142,42 @@ Java_com_example_llmhost_NativeLlmBridge_nativeLoadModel(JNIEnv* env, jobject, j
     }
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_llmhost_NativeLlmBridge_nativeLoadModelWithSettings(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jstring path,
+    jint max_tokens,
+    jint thread_count,
+    jint context_length,
+    jint batch_size,
+    jfloat temperature,
+    jint top_k,
+    jfloat top_p,
+    jfloat repeat_penalty,
+    jint gpu_layers) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) {
+        return JNI_FALSE;
+    }
+    try {
+        llmhost::GenerationConfig config;
+        config.max_tokens = max_tokens;
+        config.thread_count = thread_count;
+        config.context_length = context_length;
+        config.batch_size = batch_size;
+        config.temperature = temperature;
+        config.top_k = top_k;
+        config.top_p = top_p;
+        config.repeat_penalty = repeat_penalty;
+        config.gpu_layers = gpu_layers;
+        return engine->loadModel(toString(env, path), config) ? JNI_TRUE : JNI_FALSE;
+    } catch (const std::exception&) {
+        return JNI_FALSE;
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_llmhost_NativeLlmBridge_nativeUnloadModel(JNIEnv*, jobject, jlong handle) {
     auto* engine = toEngine(handle);
@@ -149,6 +185,15 @@ Java_com_example_llmhost_NativeLlmBridge_nativeUnloadModel(JNIEnv*, jobject, jlo
         return;
     }
     engine->unloadModel();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_llmhost_NativeLlmBridge_nativeResetConversation(JNIEnv*, jobject, jlong handle) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) {
+        return;
+    }
+    engine->resetConversation();
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -159,7 +204,15 @@ Java_com_example_llmhost_NativeLlmBridge_nativeStartGeneration(
     jstring prompt,
     jint gen_id,
     jint max_tokens,
-    jint thread_count) {
+    jint thread_count,
+    jint context_length,
+    jint batch_size,
+    jfloat temperature,
+    jint top_k,
+    jfloat top_p,
+    jfloat repeat_penalty,
+    jint gpu_layers,
+    jboolean continue_from_context) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return -1;
@@ -168,9 +221,55 @@ Java_com_example_llmhost_NativeLlmBridge_nativeStartGeneration(
         llmhost::GenerationConfig config;
         config.max_tokens = max_tokens;
         config.thread_count = thread_count;
+        config.context_length = context_length;
+        config.batch_size = batch_size;
+        config.temperature = temperature;
+        config.top_k = top_k;
+        config.top_p = top_p;
+        config.repeat_penalty = repeat_penalty;
+        config.gpu_layers = gpu_layers;
+        config.continue_from_context = continue_from_context == JNI_TRUE;
         return engine->startGeneration(toString(env, prompt), gen_id, config);
     } catch (const std::exception&) {
         return -1;
+    }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_llmhost_NativeLlmBridge_nativeRunBenchmark(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jint max_tokens,
+    jint thread_count,
+    jint context_length,
+    jint batch_size,
+    jfloat temperature,
+    jint top_k,
+    jfloat top_p,
+    jfloat repeat_penalty,
+    jint gpu_layers,
+    jint prompt_tokens,
+    jint generation_tokens,
+    jint repetitions) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) {
+        return env->NewStringUTF("{}");
+    }
+    try {
+        llmhost::GenerationConfig config;
+        config.max_tokens = max_tokens;
+        config.thread_count = thread_count;
+        config.context_length = context_length;
+        config.batch_size = batch_size;
+        config.temperature = temperature;
+        config.top_k = top_k;
+        config.top_p = top_p;
+        config.repeat_penalty = repeat_penalty;
+        config.gpu_layers = gpu_layers;
+        return toJavaString(env, engine->runBenchmark(config, prompt_tokens, generation_tokens, repetitions));
+    } catch (const std::exception&) {
+        return env->NewStringUTF("{\"error\":\"exception\"}");
     }
 }
 

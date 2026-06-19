@@ -26,7 +26,25 @@ val kleidiAiEnabled = signingValue("LLMHOST_ENABLE_KLEIDIAI")
             value.equals("yes", ignoreCase = true) ||
             value == "1"
     }
+    ?: true
+val openClRequested = signingValue("LLMHOST_ENABLE_OPENCL")
+    ?.let { value ->
+        value.equals("true", ignoreCase = true) ||
+            value.equals("on", ignoreCase = true) ||
+            value.equals("yes", ignoreCase = true) ||
+            value == "1"
+    }
     ?: false
+val openClIncludeDir = signingValue("LLMHOST_OPENCL_INCLUDE_DIR")
+val openClLibrary = signingValue("LLMHOST_OPENCL_LIBRARY")
+val openClAvailable = openClRequested && openClIncludeDir != null && openClLibrary != null
+val openClCmakeArgs = buildList {
+    add("-DLLMHOST_ENABLE_OPENCL=${if (openClAvailable) "ON" else "OFF"}")
+    if (openClAvailable) {
+        add("-DOpenCL_INCLUDE_DIR=$openClIncludeDir")
+        add("-DOpenCL_LIBRARY=$openClLibrary")
+    }
+}
 
 android {
     namespace = "com.example.llmhost"
@@ -78,9 +96,14 @@ android {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
             buildConfigField("boolean", "LLMHOST_DEBUG_HOOKS", "true")
+            buildConfigField("boolean", "LLMHOST_PERFORMANCE_BUILD", "false")
+            buildConfigField("String", "LLMHOST_RUNTIME_BACKEND", "\"CPU\"")
             externalNativeBuild {
                 cmake {
-                    arguments += listOf("-DLLMHOST_DEBUG_HOOKS=ON")
+                    arguments += listOf(
+                        "-DLLMHOST_DEBUG_HOOKS=ON",
+                        "-DLLMHOST_ENABLE_OPENCL=OFF",
+                    )
                 }
             }
         }
@@ -92,9 +115,14 @@ android {
                 signingConfig = signingConfigs.getByName("release")
             }
             buildConfigField("boolean", "LLMHOST_DEBUG_HOOKS", "false")
+            buildConfigField("boolean", "LLMHOST_PERFORMANCE_BUILD", "true")
+            buildConfigField("String", "LLMHOST_RUNTIME_BACKEND", "\"CPU-KleidiAI\"")
             externalNativeBuild {
                 cmake {
-                    arguments += listOf("-DLLMHOST_DEBUG_HOOKS=OFF")
+                    arguments += listOf(
+                        "-DLLMHOST_DEBUG_HOOKS=OFF",
+                        "-DLLMHOST_ENABLE_OPENCL=OFF",
+                    )
                 }
             }
             proguardFiles(
@@ -109,6 +137,8 @@ android {
             signingConfig = signingConfigs.getByName("debug")
             matchingFallbacks += listOf("release")
             buildConfigField("boolean", "LLMHOST_DEBUG_HOOKS", "false")
+            buildConfigField("boolean", "LLMHOST_PERFORMANCE_BUILD", "true")
+            buildConfigField("String", "LLMHOST_RUNTIME_BACKEND", "\"CPU-KleidiAI\"")
             externalNativeBuild {
                 cmake {
                     arguments += listOf(
@@ -125,12 +155,32 @@ android {
             signingConfig = signingConfigs.getByName("debug")
             matchingFallbacks += listOf("release")
             buildConfigField("boolean", "LLMHOST_DEBUG_HOOKS", "false")
+            buildConfigField("boolean", "LLMHOST_PERFORMANCE_BUILD", "true")
+            buildConfigField("String", "LLMHOST_RUNTIME_BACKEND", "\"CPU-KleidiAI\"")
             externalNativeBuild {
                 cmake {
                     arguments += listOf(
                         "-DLLMHOST_DEBUG_HOOKS=OFF",
                         "-DLLMHOST_ENABLE_KLEIDIAI=ON",
                     )
+                }
+            }
+        }
+        create("adreno") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".adreno"
+            versionNameSuffix = "-adreno"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+            buildConfigField("boolean", "LLMHOST_DEBUG_HOOKS", "false")
+            buildConfigField("boolean", "LLMHOST_PERFORMANCE_BUILD", "true")
+            buildConfigField("String", "LLMHOST_RUNTIME_BACKEND", "\"${if (openClAvailable) "OpenCL-Adreno" else "CPU-KleidiAI"}\"")
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf(
+                        "-DLLMHOST_DEBUG_HOOKS=OFF",
+                        "-DLLMHOST_ENABLE_KLEIDIAI=ON",
+                    ) + openClCmakeArgs
                 }
             }
         }
@@ -182,6 +232,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
+    implementation("androidx.work:work-runtime-ktx:2.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
     debugImplementation("androidx.compose.ui:ui-tooling")

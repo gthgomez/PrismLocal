@@ -28,8 +28,8 @@ object BenchmarkPresets {
         ),
         BenchmarkPreset(
             id = "coding",
-            name = "Coding",
-            prompt = "Write a small Kotlin function that returns the median value from a list of Int values, and explain the edge cases.",
+            name = "Python Coding",
+            prompt = "Write a small Python function that returns the median value from a list of int values, include type hints, and explain the edge cases.",
         ),
         BenchmarkPreset(
             id = "json",

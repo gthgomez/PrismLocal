@@ -1,6 +1,7 @@
 package com.example.llmhost
 
 import android.content.Intent
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.RepeatMode
@@ -11,19 +12,30 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -33,6 +45,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
@@ -52,6 +65,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -59,14 +73,24 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
@@ -75,6 +99,8 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
+
+private const val MAX_PROMPT_ATTACHMENTS = 6
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -104,10 +130,16 @@ fun ChatScreen(
         }
 
         Box(modifier = Modifier.fillMaxSize()) {
-            Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Surface(modifier = Modifier.fillMaxSize(), color = PrismCanvas) {
+                PrismBackdrop(modifier = Modifier.fillMaxSize())
                 BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                     val minChatHeight = maxHeight * 0.70f
-                    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .statusBarsPadding()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                    ) {
                         val context = LocalContext.current
                         var refreshKey by remember { mutableIntStateOf(0) }
                         var models by remember(service) { mutableStateOf(service?.listModels() ?: emptyList()) }
@@ -143,11 +175,28 @@ fun ChatScreen(
                         val modelReadiness by (service?.modelReadiness ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
+                        val pendingAgentToolAction by (service?.pendingAgentToolAction ?: emptyFlow()).collectAsStateWithLifecycle(
+                            initialValue = null
+                        )
                         var prompt by remember { mutableStateOf("") }
+                        var attachments by remember { mutableStateOf<List<PromptAttachment>>(emptyList()) }
                         var importStatus by remember { mutableStateOf("") }
                         var pendingBenchmarkCsv by remember { mutableStateOf<String?>(null) }
                         var pendingBenchmarkJson by remember { mutableStateOf<String?>(null) }
                         val listState = rememberLazyListState()
+                        val bottomAnchorIndex = if (transcript.isEmpty()) 0 else transcript.size
+                        val isAtBottomAnchor by remember(transcript.size) {
+                            derivedStateOf {
+                                transcript.isEmpty() ||
+                                    listState.layoutInfo.visibleItemsInfo.any { item -> item.index == bottomAnchorIndex }
+                            }
+                        }
+                        val headerCollapsed by remember(transcript.size) {
+                            derivedStateOf {
+                                transcript.isNotEmpty() &&
+                                    (listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 16)
+                            }
+                        }
                         val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                             onImportPickerFinished()
                             if (uri == null) {
@@ -157,6 +206,40 @@ fun ChatScreen(
                                 context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
                             service?.importModel(uri)
+                        }
+                        val attachmentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                            onImportPickerFinished()
+                            if (uris.isEmpty()) {
+                                return@rememberLauncherForActivityResult
+                            }
+                            val importedModels = mutableListOf<String>()
+                            val attached = mutableListOf<PromptAttachment>()
+                            uris.forEach { uri ->
+                                runCatching {
+                                    context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                val name = AttachmentTextExtractor.displayName(context, uri)
+                                if (name.endsWith(".gguf", ignoreCase = true)) {
+                                    service?.importModel(uri)
+                                    importedModels += name
+                                } else {
+                                    attached += AttachmentTextExtractor.fromUri(context, uri)
+                                }
+                            }
+                            if (attached.isNotEmpty()) {
+                                attachments = (attachments + attached)
+                                    .distinctBy { it.uriString }
+                                    .takeLast(MAX_PROMPT_ATTACHMENTS)
+                            }
+                            snackbarMessage = when {
+                                importedModels.isNotEmpty() && attached.isNotEmpty() ->
+                                    "Importing ${importedModels.size} model(s), attached ${attached.size} file(s)"
+                                importedModels.isNotEmpty() ->
+                                    "Importing ${importedModels.size} model(s)"
+                                attached.isNotEmpty() ->
+                                    "Attached ${attached.size} file(s)"
+                                else -> null
+                            }
                         }
                         val benchmarkExportLauncher = rememberLauncherForActivityResult(
                             ActivityResultContracts.CreateDocument("text/csv")
@@ -225,9 +308,22 @@ fun ChatScreen(
                             }
                         }
 
-                        LaunchedEffect(transcript.size, transcript.lastOrNull()?.text, isGenerating) {
+                        LaunchedEffect(service) {
+                            service?.panelRequests?.collect { panel ->
+                                when (panel) {
+                                    "chats" -> chatsVisible = true
+                                    "model_manager",
+                                    "benchmarks",
+                                    "settings" -> controlsVisible = true
+                                }
+                            }
+                        }
+
+                        LaunchedEffect(transcript.size, isGenerating) {
                             if (transcript.isNotEmpty()) {
-                                listState.animateScrollToItem(transcript.lastIndex)
+                                if (!isGenerating || transcript.size <= 2 || isAtBottomAnchor) {
+                                    listState.animateScrollToItem(bottomAnchorIndex)
+                                }
                             }
                         }
 
@@ -237,15 +333,21 @@ fun ChatScreen(
                             modelName = currentModel,
                             importStatus = importStatus,
                             importState = importState,
+                            collapsed = headerCollapsed,
                             onOpenChats = { chatsVisible = true },
                             onOpenControls = { controlsVisible = true },
                         )
 
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(22.dp))
 
                         val activeAssistantMessageId = transcript
                             .lastOrNull { it.role == TranscriptRole.ASSISTANT }
                             ?.id
+                        val modelActionsEnabled = service != null &&
+                            !isGenerating &&
+                            runtimeStatus != RuntimeStatus.LOADING_MODEL &&
+                            importState !is ImportState.Running &&
+                            modelDownloadState !is ModelDownloadState.Running
 
                         LazyColumn(
                             modifier = Modifier
@@ -255,32 +357,82 @@ fun ChatScreen(
                             state = listState,
                             verticalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
-                            items(transcript, key = { it.id }) { message ->
-                                val isUser = message.role == TranscriptRole.USER
-                                MessageBubble(
-                                    label = if (isUser) "You" else "Assistant",
-                                    text = message.text.ifBlank { if (isGenerating && !isUser) "..." else "" },
-                                    isUser = isUser,
-                                    showLoading = isGenerating && !isUser && message.id == activeAssistantMessageId,
-                                    performance = generationPerformance.takeIf {
-                                        isGenerating && !isUser && message.id == activeAssistantMessageId
-                                    },
-                                )
+                            if (transcript.isEmpty()) {
+                                item(key = "model-onboarding") {
+                                    ModelOnboardingCard(
+                                        currentModel = currentModel,
+                                        installedModelCount = models.size,
+                                        recommendedModel = hfCatalog.firstOrNull(),
+                                        downloadState = modelDownloadState,
+                                        enabled = modelActionsEnabled,
+                                        onImportModel = {
+                                            onImportPickerStarted()
+                                            importLauncher.launch(arrayOf("*/*"))
+                                        },
+                                        onDownloadRecommended = { entry ->
+                                            service?.downloadHuggingFaceModel(entry.id)
+                                        },
+                                        onOpenControls = { controlsVisible = true },
+                                    )
+                                }
+                            } else {
+                                items(transcript, key = { it.id }) { message ->
+                                    when (message.role) {
+                                        TranscriptRole.TOOL -> ToolEventCard(message.text)
+                                        TranscriptRole.USER,
+                                        TranscriptRole.ASSISTANT -> {
+                                            val isUser = message.role == TranscriptRole.USER
+                                            val isActiveAssistant = isGenerating && !isUser && message.id == activeAssistantMessageId
+                                            if (!isUser && message.text.isBlank() && !isActiveAssistant) {
+                                                Spacer(modifier = Modifier.height(0.dp))
+                                            } else {
+                                                MessageBubble(
+                                                    label = if (isUser) "You" else "Assistant",
+                                                    text = message.text.ifBlank { if (isActiveAssistant) "..." else "" },
+                                                    isUser = isUser,
+                                                    showLoading = isActiveAssistant,
+                                                    performance = generationPerformance.takeIf { isActiveAssistant },
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                item(key = "bottom-anchor") {
+                                    Spacer(modifier = Modifier.fillMaxWidth().height(1.dp))
+                                }
                             }
                         }
 
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
 
                         PromptComposer(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .navigationBarsPadding()
+                                .imePadding(),
                             prompt = prompt,
-                            enabled = service != null && currentModel != null,
+                            enabled = service != null,
+                            hasModel = currentModel != null,
                             isGenerating = isGenerating,
+                            performance = generationPerformance,
+                            attachments = attachments,
+                            canContinue = generationPerformance?.terminalReason == "MAX_TOKENS" &&
+                                transcript.lastOrNull()?.role == TranscriptRole.ASSISTANT,
                             onPromptChange = { prompt = it },
+                            onAddAttachment = {
+                                onImportPickerStarted()
+                                attachmentLauncher.launch(arrayOf("*/*"))
+                            },
+                            onRemoveAttachment = { attachment ->
+                                attachments = attachments.filterNot { it.uriString == attachment.uriString }
+                            },
                             onCancel = { service?.cancelGeneration() },
+                            onContinue = { service?.continueGenerationSafely() },
                             onSend = {
-                                val text = prompt.trim()
+                                val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 if (text.isNotEmpty()) {
                                     prompt = ""
+                                    attachments = emptyList()
                                     service?.generateSafely(text)
                                 }
                             },
@@ -322,15 +474,16 @@ fun ChatScreen(
                                     onSettingsChange = { settings -> service?.updateGenerationSettings(settings) },
                                     onRunBenchmark = { presetId -> service?.runBenchmarkPreset(presetId) },
                                     onRunThreadSweep = { service?.runThreadSweepBenchmark() },
+                                    onRunNativeBenchmark = { service?.runNativePpTgBenchmark() },
                                     onExportBenchmarksCsv = {
                                         val csv = service?.benchmarkCsv().orEmpty()
                                         pendingBenchmarkCsv = csv
-                                        benchmarkExportLauncher.launch("llm-host-benchmarks-${System.currentTimeMillis()}.csv")
+                                        benchmarkExportLauncher.launch("prism-local-benchmarks-${System.currentTimeMillis()}.csv")
                                     },
                                     onExportBenchmarksJson = {
                                         val json = service?.benchmarkJson().orEmpty()
                                         pendingBenchmarkJson = json
-                                        benchmarkJsonExportLauncher.launch("llm-host-benchmarks-${System.currentTimeMillis()}.json")
+                                        benchmarkJsonExportLauncher.launch("prism-local-benchmarks-${System.currentTimeMillis()}.json")
                                     },
                                     onClearBenchmarks = { service?.clearBenchmarkRuns() },
                                 )
@@ -342,6 +495,7 @@ fun ChatScreen(
                                 sheetState = chatSheetState,
                                 containerColor = Color.White,
                                 contentColor = PrismText,
+                                dragHandle = { SheetDragHandle() },
                             ) {
                                 ChatListSheet(
                                     sessions = chatSessions,
@@ -363,6 +517,13 @@ fun ChatScreen(
                                 )
                             }
                         }
+                        pendingAgentToolAction?.let { action ->
+                            AgentToolConfirmationDialog(
+                                action = action,
+                                onConfirm = { service?.confirmPendingAgentTool() },
+                                onDismiss = { service?.cancelPendingAgentTool() },
+                            )
+                        }
                     }
                 }
             }
@@ -380,41 +541,449 @@ fun ChatScreen(
 }
 
 @Composable
+private fun PrismBackdrop(modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        drawRect(
+            brush = Brush.linearGradient(
+                colors = listOf(
+                    Color(0xFFF8FCFF),
+                    Color(0xFFF3F8FF),
+                    Color(0xFFFDF6FF),
+                ),
+                start = Offset.Zero,
+                end = Offset(size.width, size.height),
+            )
+        )
+        drawCircle(
+            color = PrismCyan.copy(alpha = 0.14f),
+            radius = size.minDimension * 0.28f,
+            center = Offset(size.width * 0.04f, size.height * 0.34f),
+        )
+        drawCircle(
+            color = PrismCyan.copy(alpha = 0.10f),
+            radius = size.minDimension * 0.22f,
+            center = Offset(size.width * 0.02f, size.height * 0.78f),
+        )
+        drawCircle(
+            color = PrismViolet.copy(alpha = 0.14f),
+            radius = size.minDimension * 0.30f,
+            center = Offset(size.width * 1.02f, size.height * 0.66f),
+        )
+        drawCircle(
+            color = Color.White.copy(alpha = 0.58f),
+            radius = size.minDimension * 0.38f,
+            center = Offset(size.width * 0.62f, size.height * 0.48f),
+        )
+    }
+}
+
+@Composable
 private fun ChatTopBar(
     runtimeStatus: RuntimeStatus,
     chatTitle: String?,
     modelName: String?,
     importStatus: String,
     importState: ImportState,
+    collapsed: Boolean,
     onOpenChats: () -> Unit,
     onOpenControls: () -> Unit,
 ) {
-    GlassSurface(modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
+    GlassSurface(modifier = Modifier.fillMaxWidth(), radius = 32.dp) {
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp)) {
+            val compact = maxWidth < 520.dp
+            if (collapsed) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    PrismLogoTile(size = 38.dp)
+                    Text(
+                        modifier = Modifier.weight(1f),
+                        text = buildAnnotatedString {
+                            withStyle(SpanStyle(color = PrismBlue)) {
+                                append("Prism ")
+                            }
+                            withStyle(SpanStyle(color = PrismViolet)) {
+                                append("Local")
+                            }
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    TopBarIconAction(label = "Chats", onClick = onOpenChats)
+                    TopBarIconAction(label = "Settings", onClick = onOpenControls)
+                }
+            } else if (compact) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        PrismLogoTile(size = 54.dp)
+                        TopBarTitle(
+                            modifier = Modifier.weight(1f),
+                            runtimeStatus = runtimeStatus,
+                            chatTitle = chatTitle,
+                            modelName = modelName,
+                            importStatus = importStatus,
+                            importState = importState,
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        TopBarAction(
+                            modifier = Modifier.weight(1f),
+                            label = "Chats",
+                            compact = true,
+                            onClick = onOpenChats,
+                        )
+                        TopBarAction(
+                            modifier = Modifier.weight(1f),
+                            label = "Settings",
+                            compact = true,
+                            onClick = onOpenControls,
+                        )
+                    }
+                }
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    PrismLogoTile()
+                    TopBarTitle(
+                        modifier = Modifier.weight(1f),
+                        runtimeStatus = runtimeStatus,
+                        chatTitle = chatTitle,
+                        modelName = modelName,
+                        importStatus = importStatus,
+                        importState = importState,
+                    )
+                    TopBarAction(label = "Chats", onClick = onOpenChats)
+                    TopBarAction(label = "Settings", onClick = onOpenControls)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TopBarIconAction(
+    label: String,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.size(44.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = Color.White.copy(alpha = 0.64f),
+        contentColor = PrismBlue,
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.76f)),
+        tonalElevation = 1.dp,
+        shadowElevation = 0.dp,
+        onClick = onClick,
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            TopBarActionIcon(label = label)
+        }
+    }
+}
+
+@Composable
+private fun TopBarTitle(
+    modifier: Modifier = Modifier,
+    runtimeStatus: RuntimeStatus,
+    chatTitle: String?,
+    modelName: String?,
+    importStatus: String,
+    importState: ImportState,
+) {
+    Column(modifier = modifier) {
+        Text(
+            text = buildAnnotatedString {
+                withStyle(SpanStyle(color = PrismBlue)) {
+                    append("Prism ")
+                }
+                withStyle(SpanStyle(color = PrismViolet)) {
+                    append("Local")
+                }
+            },
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            text = topBarSubtitle(runtimeStatus, modelName, importStatus, importState),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun SheetDragHandle() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 12.dp, bottom = 18.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            modifier = Modifier.size(width = 40.dp, height = 4.dp),
+            shape = RoundedCornerShape(999.dp),
+            color = Color(0xFFD1D5DB),
+            contentColor = Color.Transparent,
+            shadowElevation = 0.dp,
+        ) {}
+    }
+}
+
+@Composable
+private fun PrismLogoTile(size: Dp = 62.dp) {
+    Surface(
+        modifier = Modifier.size(size),
+        shape = RoundedCornerShape(24.dp),
+        color = Color.White.copy(alpha = 0.72f),
+        contentColor = PrismBlue,
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.74f)),
+        tonalElevation = 2.dp,
+        shadowElevation = 0.dp,
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            InfinityLoadingIndicator(modifier = Modifier.size(size * 0.68f), color = PrismViolet)
+        }
+    }
+}
+
+@Composable
+private fun TopBarAction(
+    modifier: Modifier = Modifier,
+    label: String,
+    compact: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = if (compact) {
+            modifier.height(56.dp)
+        } else {
+            modifier.size(width = 82.dp, height = 68.dp)
+        },
+        shape = RoundedCornerShape(22.dp),
+        color = Color.White.copy(alpha = 0.64f),
+        contentColor = PrismBlue,
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.76f)),
+        tonalElevation = 1.dp,
+        shadowElevation = 0.dp,
+        onClick = onClick,
+    ) {
+        val contentModifier = Modifier.padding(
+            vertical = if (compact) 7.dp else 8.dp,
+            horizontal = 8.dp,
+        )
+        if (compact) {
+            Row(
+                modifier = contentModifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TopBarActionIcon(label = label)
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "LLM Host",
-                    style = MaterialTheme.typography.titleLarge,
-                    color = PrismBlue,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Text(
-                    text = "${chatTitle ?: ChatTitles.DEFAULT_TITLE} | ${compactStatus(runtimeStatus, modelName, importStatus, importState)}",
+                    text = label,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = PrismSlate,
+                    fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    softWrap = false,
                 )
             }
-            TextButton(onClick = onOpenChats) {
-                Text("Chats")
+        } else {
+            Column(
+                modifier = contentModifier,
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                TopBarActionIcon(label = label)
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = PrismSlate,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    softWrap = false,
+                )
             }
-            TextButton(onClick = onOpenControls) {
-                Text("Settings")
+        }
+    }
+}
+
+@Composable
+private fun TopBarActionIcon(label: String) {
+    Canvas(modifier = Modifier.size(25.dp)) {
+        val stroke = Stroke(width = 2.5f, cap = StrokeCap.Round)
+        if (label == "Chats") {
+            drawRoundRect(
+                color = PrismBlue,
+                topLeft = Offset(size.width * 0.16f, size.height * 0.18f),
+                size = Size(size.width * 0.68f, size.height * 0.52f),
+                cornerRadius = CornerRadius(6f, 6f),
+                style = stroke,
+            )
+            drawLine(
+                color = PrismBlue,
+                start = Offset(size.width * 0.34f, size.height * 0.38f),
+                end = Offset(size.width * 0.66f, size.height * 0.38f),
+                strokeWidth = 2.2f,
+                cap = StrokeCap.Round,
+            )
+            drawLine(
+                color = PrismBlue,
+                start = Offset(size.width * 0.34f, size.height * 0.52f),
+                end = Offset(size.width * 0.56f, size.height * 0.52f),
+                strokeWidth = 2.2f,
+                cap = StrokeCap.Round,
+            )
+            drawLine(
+                color = PrismBlue,
+                start = Offset(size.width * 0.36f, size.height * 0.70f),
+                end = Offset(size.width * 0.26f, size.height * 0.84f),
+                strokeWidth = 2.5f,
+                cap = StrokeCap.Round,
+            )
+        } else {
+            drawCircle(
+                color = PrismSlate.copy(alpha = 0.72f),
+                radius = size.minDimension * 0.18f,
+                center = center,
+                style = stroke,
+            )
+            repeat(8) { index ->
+                val angle = (index * 45.0) * Math.PI / 180.0
+                val inner = size.minDimension * 0.34f
+                val outer = size.minDimension * 0.44f
+                drawLine(
+                    color = PrismSlate.copy(alpha = 0.72f),
+                    start = Offset(
+                        x = center.x + kotlin.math.cos(angle).toFloat() * inner,
+                        y = center.y + kotlin.math.sin(angle).toFloat() * inner,
+                    ),
+                    end = Offset(
+                        x = center.x + kotlin.math.cos(angle).toFloat() * outer,
+                        y = center.y + kotlin.math.sin(angle).toFloat() * outer,
+                    ),
+                    strokeWidth = 2.2f,
+                    cap = StrokeCap.Round,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModelOnboardingCard(
+    currentModel: String?,
+    installedModelCount: Int,
+    recommendedModel: HuggingFaceModelEntry?,
+    downloadState: ModelDownloadState,
+    enabled: Boolean,
+    onImportModel: () -> Unit,
+    onDownloadRecommended: (HuggingFaceModelEntry) -> Unit,
+    onOpenControls: () -> Unit,
+) {
+    GlassSurface(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                text = if (currentModel == null) "Choose a local model" else "Start a chat",
+                style = MaterialTheme.typography.titleMedium,
+                color = PrismBlue,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = when {
+                    currentModel != null -> compactModelName(currentModel)
+                    installedModelCount > 0 -> "$installedModelCount installed models available"
+                    recommendedModel != null -> "Starter pick: ${recommendedModel.name} (${recommendedModel.parameters}, ${recommendedModel.quantization})"
+                    else -> "Import a GGUF model to begin"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+
+            when (downloadState) {
+                is ModelDownloadState.Running -> {
+                    Text(
+                        text = "${downloadState.stage.label()} ${downloadState.entry.name}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    DownloadProgressBar(
+                        bytesDone = downloadState.bytesDone,
+                        totalBytes = downloadState.totalBytes,
+                    )
+                }
+                is ModelDownloadState.Success -> Text(
+                    text = "Downloaded ${downloadState.entryName}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = PrismGreen,
+                )
+                is ModelDownloadState.Failure -> Text(
+                    text = downloadState.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = PrismRed,
+                )
+                ModelDownloadState.Cancelled -> Text(
+                    text = "Download cancelled",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = PrismAmber,
+                )
+                ModelDownloadState.Idle -> Unit
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                recommendedModel?.let { entry ->
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = enabled,
+                        onClick = { onDownloadRecommended(entry) },
+                    ) {
+                        Text(
+                            text = "Download ${entry.name}",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                Button(
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = enabled,
+                    onClick = onImportModel,
+                ) {
+                    Text("Import GGUF", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                TextButton(
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = enabled || installedModelCount > 0,
+                    onClick = onOpenControls,
+                ) {
+                    Text("Model & Runtime", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
             }
         }
     }
@@ -422,35 +991,502 @@ private fun ChatTopBar(
 
 @Composable
 private fun PromptComposer(
+    modifier: Modifier = Modifier,
     prompt: String,
     enabled: Boolean,
+    hasModel: Boolean,
     isGenerating: Boolean,
+    performance: GenerationPerformance?,
+    attachments: List<PromptAttachment>,
+    canContinue: Boolean,
     onPromptChange: (String) -> Unit,
+    onAddAttachment: () -> Unit,
+    onRemoveAttachment: (PromptAttachment) -> Unit,
     onCancel: () -> Unit,
+    onContinue: () -> Unit,
     onSend: () -> Unit,
 ) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        OutlinedTextField(
-            modifier = Modifier.weight(1f),
-            value = prompt,
-            onValueChange = onPromptChange,
-            label = { Text("Prompt") },
-            enabled = enabled,
-            singleLine = false,
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        if (isGenerating) {
-            Button(onClick = onCancel) {
-                Text("Stop")
-            }
-        } else {
-            Button(
-                enabled = enabled && prompt.isNotBlank(),
-                onClick = onSend,
+    val placeholder = when {
+        !enabled -> "Reconnecting to Prism Local"
+        hasModel -> "Ask about code..."
+        else -> "Ask for model help or import a GGUF"
+    }
+    val density = LocalDensity.current
+    val imeVisible = WindowInsets.ime.getBottom(density) > 0
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(30.dp),
+        color = Color.White.copy(alpha = 0.78f),
+        contentColor = PrismText,
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.80f)),
+        shadowElevation = 6.dp,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text("Send")
+                ComposerIconButton(action = ComposerAction.Add, enabled = enabled && !isGenerating, onClick = onAddAttachment)
+                ComposerTextInput(
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 52.dp, max = 132.dp),
+                    value = prompt,
+                    onValueChange = onPromptChange,
+                    placeholder = placeholder,
+                    enabled = enabled,
+                )
+                if (isGenerating) {
+                    ComposerIconButton(
+                        action = ComposerAction.Stop,
+                        enabled = enabled,
+                        onClick = onCancel,
+                    )
+                } else {
+                    val hasPrompt = prompt.isNotBlank()
+                    val hasAttachments = attachments.isNotEmpty()
+                    ComposerIconButton(
+                        action = if (!hasPrompt && canContinue) ComposerAction.More else ComposerAction.Send,
+                        enabled = enabled && (hasPrompt || hasAttachments || canContinue),
+                        onClick = {
+                            if (hasPrompt || hasAttachments) {
+                                onSend()
+                            } else {
+                                onContinue()
+                            }
+                        },
+                    )
+                }
+            }
+            AttachmentTray(
+                attachments = attachments,
+                onRemove = onRemoveAttachment,
+            )
+            if (!imeVisible) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ComposerChip(label = "Local & Private", accent = PrismGreen)
+                ComposerChip(label = "Python", accent = PrismBlue)
+                ComposerChip(
+                    label = performance?.let { "${formatTokensPerSecond(it.tokensPerSecond)} tok/s" } ?: "Local LLM",
+                    accent = PrismViolet,
+                )
+                }
             }
         }
+    }
+}
+
+private enum class ComposerAction {
+    Add,
+    Send,
+    Stop,
+    More,
+}
+
+@Composable
+private fun AttachmentTray(
+    attachments: List<PromptAttachment>,
+    onRemove: (PromptAttachment) -> Unit,
+) {
+    if (attachments.isEmpty()) return
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        attachments.forEach { attachment ->
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = Color.White.copy(alpha = 0.54f),
+                contentColor = PrismText,
+                border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.70f)),
+                shadowElevation = 0.dp,
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = if (attachment.isImage) "Image" else "File",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (attachment.isImage) PrismViolet else PrismBlue,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        softWrap = false,
+                    )
+                    Text(
+                        modifier = Modifier.weight(1f),
+                        text = attachment.name,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = PrismText,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    attachment.sizeBytes?.let { size ->
+                        Text(
+                            text = formatBytes(size),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
+                    TextButton(onClick = { onRemove(attachment) }) {
+                        Text("Remove", maxLines = 1, softWrap = false)
+                    }
+                }
+            }
+        }
+        if (attachments.any { it.isImage }) {
+            Text(
+                text = "Images are attached as metadata in this build; true vision needs the native multimodal image bridge.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ComposerTextInput(
+    modifier: Modifier = Modifier,
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    enabled: Boolean,
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(20.dp),
+        color = Color.White.copy(alpha = 0.44f),
+        contentColor = PrismText,
+        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.68f)),
+        shadowElevation = 0.dp,
+    ) {
+        BasicTextField(
+            modifier = Modifier.fillMaxWidth(),
+            value = value,
+            onValueChange = onValueChange,
+            enabled = enabled,
+            maxLines = 4,
+            textStyle = MaterialTheme.typography.bodyMedium.merge(
+                TextStyle(color = if (enabled) PrismText else MaterialTheme.colorScheme.onSurfaceVariant)
+            ),
+            decorationBox = { innerTextField ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 14.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    if (value.isEmpty()) {
+                        Text(
+                            text = placeholder,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    innerTextField()
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun ComposerIconButton(
+    action: ComposerAction,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val isPrimary = action == ComposerAction.Send || action == ComposerAction.Stop || action == ComposerAction.More
+    Surface(
+        modifier = Modifier.size(52.dp),
+        shape = RoundedCornerShape(29.dp),
+        color = if (isPrimary) Color.Transparent else Color.White.copy(alpha = 0.72f),
+        contentColor = if (isPrimary) Color.White else PrismBlue,
+        border = if (isPrimary) null else BorderStroke(1.dp, PrismGlassBorder),
+        shadowElevation = if (enabled && isPrimary) 4.dp else 0.dp,
+        enabled = enabled,
+        onClick = onClick,
+    ) {
+        Box(
+            modifier = Modifier
+                .background(
+                    brush = if (enabled) {
+                        if (isPrimary) {
+                            Brush.linearGradient(listOf(PrismCyan, PrismViolet))
+                        } else {
+                            Brush.linearGradient(listOf(Color.White.copy(alpha = 0.72f), Color.White.copy(alpha = 0.72f)))
+                        }
+                    } else {
+                        Brush.linearGradient(listOf(Color(0xFFE5E7EB), Color(0xFFD1D5DB)))
+                    },
+                    shape = RoundedCornerShape(29.dp),
+                )
+                .padding(8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            ComposerActionGlyph(action = action, enabled = enabled, primary = isPrimary)
+        }
+    }
+}
+
+@Composable
+private fun ComposerActionGlyph(
+    action: ComposerAction,
+    enabled: Boolean,
+    primary: Boolean,
+) {
+    val color = when {
+        !enabled -> Color.White.copy(alpha = 0.72f)
+        primary -> Color.White
+        else -> PrismBlue
+    }
+    Canvas(modifier = Modifier.size(24.dp)) {
+        val strokeWidth = 2.8f
+        when (action) {
+            ComposerAction.Add -> {
+                drawLine(
+                    color = color,
+                    start = Offset(center.x, size.height * 0.22f),
+                    end = Offset(center.x, size.height * 0.78f),
+                    strokeWidth = strokeWidth,
+                    cap = StrokeCap.Round,
+                )
+                drawLine(
+                    color = color,
+                    start = Offset(size.width * 0.22f, center.y),
+                    end = Offset(size.width * 0.78f, center.y),
+                    strokeWidth = strokeWidth,
+                    cap = StrokeCap.Round,
+                )
+            }
+            ComposerAction.Send -> {
+                val path = Path().apply {
+                    moveTo(size.width * 0.16f, size.height * 0.84f)
+                    lineTo(size.width * 0.86f, size.height * 0.14f)
+                    lineTo(size.width * 0.62f, size.height * 0.86f)
+                    lineTo(size.width * 0.48f, size.height * 0.52f)
+                    close()
+                }
+                drawPath(path = path, color = color.copy(alpha = 0.18f))
+                drawLine(
+                    color = color,
+                    start = Offset(size.width * 0.16f, size.height * 0.84f),
+                    end = Offset(size.width * 0.86f, size.height * 0.14f),
+                    strokeWidth = strokeWidth,
+                    cap = StrokeCap.Round,
+                )
+                drawLine(
+                    color = color,
+                    start = Offset(size.width * 0.86f, size.height * 0.14f),
+                    end = Offset(size.width * 0.62f, size.height * 0.86f),
+                    strokeWidth = strokeWidth,
+                    cap = StrokeCap.Round,
+                )
+                drawLine(
+                    color = color,
+                    start = Offset(size.width * 0.48f, size.height * 0.52f),
+                    end = Offset(size.width * 0.62f, size.height * 0.86f),
+                    strokeWidth = strokeWidth,
+                    cap = StrokeCap.Round,
+                )
+            }
+            ComposerAction.Stop -> {
+                drawRoundRect(
+                    color = color,
+                    topLeft = Offset(size.width * 0.26f, size.height * 0.26f),
+                    size = Size(size.width * 0.48f, size.height * 0.48f),
+                    cornerRadius = CornerRadius(4f, 4f),
+                )
+            }
+            ComposerAction.More -> {
+                repeat(3) { index ->
+                    drawCircle(
+                        color = color,
+                        radius = size.minDimension * 0.08f,
+                        center = Offset(size.width * (0.30f + index * 0.20f), center.y),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ComposerChip(label: String, accent: Color) {
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = Color.White.copy(alpha = 0.54f),
+        contentColor = PrismSlate,
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.10f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Canvas(modifier = Modifier.size(7.dp)) {
+                drawCircle(color = accent)
+            }
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = PrismSlate,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun DashboardCard(
+    modifier: Modifier = Modifier,
+    tint: Color = Color.White,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = tint,
+        contentColor = PrismText,
+        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.58f)),
+        shadowElevation = 0.dp,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            content = content,
+        )
+    }
+}
+
+@Composable
+private fun SectionHeader(
+    title: String,
+    subtitle: String? = null,
+    action: (@Composable () -> Unit)? = null,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                color = PrismBlue,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            subtitle?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        action?.invoke()
+    }
+}
+
+@Composable
+private fun MetricGrid(items: List<Pair<String, String>>) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        items.chunked(2).forEach { rowItems ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                rowItems.forEach { (label, value) ->
+                    MetricTile(
+                        modifier = Modifier.weight(1f),
+                        label = label,
+                        value = value,
+                    )
+                }
+                if (rowItems.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MetricTile(
+    modifier: Modifier = Modifier,
+    label: String,
+    value: String,
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(10.dp),
+        color = PrismGlass.copy(alpha = 0.42f),
+        contentColor = PrismText,
+        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.34f)),
+        shadowElevation = 0.dp,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodySmall,
+                color = PrismText,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun InfoBadge(
+    text: String,
+    color: Color = PrismBlue,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(999.dp),
+        color = color.copy(alpha = 0.10f),
+        contentColor = color,
+        border = BorderStroke(1.dp, color.copy(alpha = 0.20f)),
+        shadowElevation = 0.dp,
+    ) {
+        Text(
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -482,6 +1518,7 @@ private fun ControlPlaneSheet(
     onSettingsChange: (GenerationSettings) -> Unit,
     onRunBenchmark: (String) -> Unit,
     onRunThreadSweep: () -> Unit,
+    onRunNativeBenchmark: () -> Unit,
     onExportBenchmarksCsv: () -> Unit,
     onExportBenchmarksJson: () -> Unit,
     onClearBenchmarks: () -> Unit,
@@ -506,103 +1543,109 @@ private fun ControlPlaneSheet(
             .padding(horizontal = 20.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Text(
-            text = "Model & Runtime",
-            style = MaterialTheme.typography.titleMedium,
-            color = PrismBlue,
-            fontWeight = FontWeight.SemiBold,
-        )
-
-        ExposedDropdownMenuBox(
-            expanded = menuExpanded,
-            onExpandedChange = { menuExpanded = !menuExpanded && serviceAvailable && !isLoadingModel && !isImporting },
-        ) {
-            OutlinedTextField(
-                modifier = Modifier
-                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
-                    .fillMaxWidth(),
-                readOnly = true,
-                value = compactModelName(pendingModelId ?: currentModel),
-                onValueChange = {},
-                label = { Text("Model") },
-                placeholder = { Text(if (models.isEmpty()) "No models installed" else "Select model") },
-                enabled = serviceAvailable && !isLoadingModel && !isImporting,
-                singleLine = true,
-                trailingIcon = {
-                    if (isLoadingModel) {
-                        InfinityLoadingIndicator(modifier = Modifier.size(28.dp))
-                    } else {
-                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = menuExpanded)
+        DashboardCard {
+            SectionHeader(
+                title = "Model & Runtime",
+                subtitle = "Choose a local model and manage imports",
+                action = {
+                    Button(
+                        enabled = serviceAvailable && !isImporting && !isLoadingModel,
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                        onClick = onImportModel,
+                    ) {
+                        Text("Import", maxLines = 1, softWrap = false)
                     }
                 },
             )
-            ExposedDropdownMenu(
+
+            ExposedDropdownMenuBox(
                 expanded = menuExpanded,
-                onDismissRequest = { menuExpanded = false },
+                onExpandedChange = { menuExpanded = !menuExpanded && serviceAvailable && !isLoadingModel && !isImporting },
             ) {
-                if (models.isEmpty()) {
-                    DropdownMenuItem(
-                        text = { Text("No models installed") },
-                        onClick = { menuExpanded = false },
-                        enabled = false,
-                    )
-                } else {
-                    models.forEach { modelId ->
-                        val readiness = modelReadiness.firstOrNull { it.info.id == modelId }
+                OutlinedTextField(
+                    modifier = Modifier
+                        .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                        .fillMaxWidth(),
+                    readOnly = true,
+                    value = compactModelName(pendingModelId ?: currentModel),
+                    onValueChange = {},
+                    label = { Text("Selected model") },
+                    placeholder = { Text(if (models.isEmpty()) "No models installed" else "Select model") },
+                    enabled = serviceAvailable && !isLoadingModel && !isImporting,
+                    singleLine = true,
+                    trailingIcon = {
+                        if (isLoadingModel) {
+                            InfinityLoadingIndicator(modifier = Modifier.size(28.dp))
+                        } else {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = menuExpanded)
+                        }
+                    },
+                )
+                ExposedDropdownMenu(
+                    expanded = menuExpanded,
+                    onDismissRequest = { menuExpanded = false },
+                ) {
+                    if (models.isEmpty()) {
                         DropdownMenuItem(
-                            text = {
-                                ModelPickerRow(
-                                    modelId = modelId,
-                                    readiness = readiness,
-                                )
-                            },
-                            enabled = !isLoadingModel && readiness?.fit?.rating != ModelFitRating.TOO_LARGE,
-                            onClick = {
-                                menuExpanded = false
-                                if (readiness?.fit?.rating == ModelFitRating.RISKY) {
-                                    riskyModel = readiness
-                                } else {
-                                    pendingModelId = modelId
-                                    onSwitchModel(modelId)
-                                }
-                            },
+                            text = { Text("No models installed") },
+                            onClick = { menuExpanded = false },
+                            enabled = false,
                         )
+                    } else {
+                        models.forEach { modelId ->
+                            val readiness = modelReadiness.firstOrNull { it.info.id == modelId }
+                            DropdownMenuItem(
+                                text = {
+                                    ModelPickerRow(
+                                        modelId = modelId,
+                                        readiness = readiness,
+                                    )
+                                },
+                                enabled = !isLoadingModel,
+                                onClick = {
+                                    menuExpanded = false
+                                    if (readiness?.fit?.rating != null && readiness.fit.rating != ModelFitRating.SAFE) {
+                                        riskyModel = readiness
+                                    } else {
+                                        pendingModelId = modelId
+                                        onSwitchModel(modelId)
+                                    }
+                                },
+                            )
+                        }
                     }
                 }
             }
-        }
 
-        if (isLoadingModel) {
-            LoadingModelStatus(
-                modelId = pendingModelId ?: currentModel,
-                diagnostics = modelLoadDiagnostics,
-            )
-        }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-                enabled = serviceAvailable && !isImporting && !isLoadingModel,
-                onClick = onImportModel,
-            ) {
-                Text("Import Model")
+            if (isLoadingModel) {
+                LoadingModelStatus(
+                    modelId = pendingModelId ?: currentModel,
+                    diagnostics = modelLoadDiagnostics,
+                )
             }
+
             if (isImporting) {
-                Button(onClick = onCancelImport) {
-                    Text("Cancel Import")
+                Button(
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = onCancelImport,
+                ) {
+                    Text("Cancel Import", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
-        }
 
-        if (importStatus.isNotEmpty()) {
-            Text(
-                text = importStatus,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+            if (importStatus.isNotEmpty()) {
+                Text(
+                    text = importStatus,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
 
-        if (importState is ImportState.Running) {
-            ImportProgressBar(importState)
+            if (importState is ImportState.Running) {
+                ImportProgressBar(importState)
+            }
         }
 
         HuggingFaceDownloadPanel(
@@ -654,12 +1697,14 @@ private fun ControlPlaneSheet(
             isGenerating = isGenerating,
             disabledReason = benchmarkDisabledReason(
                 serviceAvailable = serviceAvailable,
+                performanceBuild = BuildConfig.LLMHOST_PERFORMANCE_BUILD,
                 currentModel = currentModel,
                 isGenerating = isGenerating,
                 status = benchmarkStatus,
             ),
             onRunPreset = onRunBenchmark,
             onRunThreadSweep = onRunThreadSweep,
+            onRunNativeBenchmark = onRunNativeBenchmark,
             onExportCsv = onExportBenchmarksCsv,
             onExportJson = onExportBenchmarksJson,
             onClear = onClearBenchmarks,
@@ -667,9 +1712,12 @@ private fun ControlPlaneSheet(
     }
 
     riskyModel?.let { readiness ->
+        val isTooLarge = readiness.fit.rating == ModelFitRating.TOO_LARGE
         AlertDialog(
             onDismissRequest = { riskyModel = null },
-            title = { Text("Load risky model?") },
+            title = {
+                Text(if (isTooLarge) "Model too large right now" else "Load risky model?")
+            },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
@@ -681,6 +1729,12 @@ private fun ControlPlaneSheet(
                         text = "${readiness.fit.reason}. Estimated RAM need ${formatBytes(readiness.fit.requiredRamBytes)} with ${formatBytes(readiness.fit.availableRamAfterUnloadBytes)} available after unload.",
                         style = MaterialTheme.typography.bodySmall,
                     )
+                    if (isTooLarge) {
+                        Text(
+                            text = "This model is visible because it is installed, but the native loader will not start it until the current RAM estimate has enough headroom.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                     Text(
                         text = "Expected ${predictionRange(readiness.prediction)} ${readiness.prediction.basis}.",
                         style = MaterialTheme.typography.bodySmall,
@@ -688,20 +1742,28 @@ private fun ControlPlaneSheet(
                 }
             },
             confirmButton = {
-                TextButton(
-                    enabled = !isLoadingModel && !isImporting,
-                    onClick = {
-                        pendingModelId = readiness.info.id
-                        onSwitchModel(readiness.info.id)
-                        riskyModel = null
-                    },
-                ) {
-                    Text("Load Anyway")
+                if (isTooLarge) {
+                    TextButton(onClick = { riskyModel = null }) {
+                        Text("OK")
+                    }
+                } else {
+                    TextButton(
+                        enabled = !isLoadingModel && !isImporting,
+                        onClick = {
+                            pendingModelId = readiness.info.id
+                            onSwitchModel(readiness.info.id)
+                            riskyModel = null
+                        },
+                    ) {
+                        Text("Load Anyway")
+                    }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { riskyModel = null }) {
-                    Text("Cancel")
+                if (!isTooLarge) {
+                    TextButton(onClick = { riskyModel = null }) {
+                        Text("Cancel")
+                    }
                 }
             },
         )
@@ -757,7 +1819,7 @@ private fun ModelPickerRow(
         )
         readiness?.let { info ->
             Text(
-                text = "${info.performance.label} | ${info.fit.quantization ?: "quant unknown"} | expected ${predictionRange(info.prediction)}",
+                text = "${info.performance.label} • ${info.fit.quantization ?: "quant unknown"} • expected ${predictionRange(info.prediction)}",
                 style = MaterialTheme.typography.labelSmall,
                 color = performanceColor(info.performance.tier),
                 maxLines = 1,
@@ -769,44 +1831,28 @@ private fun ModelPickerRow(
 
 @Composable
 private fun DeviceCapabilityCard(profile: DeviceCapabilityProfile) {
-    GlassSurface(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            Text(
-                text = "Device",
-                style = MaterialTheme.typography.labelMedium,
-                color = PrismBlue,
-                fontWeight = FontWeight.SemiBold,
+    DashboardCard {
+        SectionHeader(title = "Device", subtitle = "Local runtime capacity")
+        MetricGrid(
+            listOf(
+                "RAM free" to formatBytes(profile.availableRamBytes),
+                "RAM total" to formatBytes(profile.totalRamBytes),
+                "App memory" to "${profile.memoryClassMb} MB",
+                "CPU" to "${profile.cpuCoreCount} cores",
+                "OS" to "Android ${profile.androidSdk}",
+                "ABI" to (profile.abis.firstOrNull() ?: "Unknown"),
+                "Storage" to "${formatBytes(profile.storageFreeBytes)} free",
+                "Battery" to (profile.batteryPercent?.let { "$it%" } ?: "Unknown"),
+                "Thermal" to (profile.thermalStatus?.replaceFirstChar { it.titlecase(Locale.US) } ?: "Unknown"),
             )
-            Text(
-                text = "RAM ${formatBytes(profile.availableRamBytes)} / ${formatBytes(profile.totalRamBytes)} | app ${profile.memoryClassMb} MB",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                text = "${profile.cpuCoreCount} cores | Android ${profile.androidSdk} | ${profile.abis.firstOrNull() ?: "ABI unknown"}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                text = "Storage ${formatBytes(profile.storageFreeBytes)} free | battery ${profile.batteryPercent?.let { "$it%" } ?: "unknown"} | thermal ${profile.thermalStatus ?: "unknown"}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (profile.lowMemory) {
-                Text(
-                    text = "Android reports low memory",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = PrismAmber,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
+        )
+        if (profile.lowMemory) {
+            InfoBadge(text = "Android reports low memory", color = PrismAmber)
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HuggingFaceDownloadPanel(
     entries: List<HuggingFaceModelEntry>,
@@ -816,21 +1862,13 @@ private fun HuggingFaceDownloadPanel(
     onDownload: (String) -> Unit,
     onCancel: () -> Unit,
 ) {
-    GlassSurface(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(
-                text = "Hugging Face Text Models",
-                style = MaterialTheme.typography.labelMedium,
-                color = PrismBlue,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = "Curated GGUF downloads only",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+    var menuExpanded by remember { mutableStateOf(false) }
+    var selectedEntryId by remember(entries) { mutableStateOf(entries.firstOrNull()?.id) }
+    val selectedEntry = entries.firstOrNull { it.id == selectedEntryId } ?: entries.firstOrNull()
+    DashboardCard {
+            SectionHeader(
+                title = "Hugging Face Text Models",
+                subtitle = "Curated GGUF downloads. Resumable. Size/hash verified when metadata is available.",
             )
             when (state) {
                 ModelDownloadState.Idle -> Unit
@@ -855,6 +1893,13 @@ private fun HuggingFaceDownloadPanel(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    state.message?.takeIf { it.isNotBlank() }?.let { message ->
+                        Text(
+                            text = message,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     DownloadProgressBar(
                         bytesDone = state.bytesDone,
                         totalBytes = state.totalBytes,
@@ -864,7 +1909,54 @@ private fun HuggingFaceDownloadPanel(
                     }
                 }
             }
-            entries.forEach { entry ->
+            if (entries.isNotEmpty()) {
+                ExposedDropdownMenuBox(
+                    expanded = menuExpanded,
+                    onExpandedChange = {
+                        if (enabled && state !is ModelDownloadState.Running) {
+                            menuExpanded = !menuExpanded
+                        }
+                    },
+                ) {
+                    OutlinedTextField(
+                        modifier = Modifier
+                            .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                            .fillMaxWidth(),
+                        value = selectedEntry?.name.orEmpty(),
+                        onValueChange = {},
+                        readOnly = true,
+                        enabled = enabled && state !is ModelDownloadState.Running,
+                        label = { Text("Download model") },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = menuExpanded)
+                        },
+                    )
+                    ExposedDropdownMenu(
+                        expanded = menuExpanded,
+                        onDismissRequest = { menuExpanded = false },
+                    ) {
+                        entries.forEach { entry ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text(entry.name, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            text = "${entry.parameters} | ${entry.quantization} | ${formatBytes(entry.expectedBytes)}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    selectedEntryId = entry.id
+                                    menuExpanded = false
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+            selectedEntry?.let { entry ->
                 DownloadCatalogRow(
                     entry = entry,
                     deviceCapabilityProfile = deviceCapabilityProfile,
@@ -872,7 +1964,6 @@ private fun HuggingFaceDownloadPanel(
                     onDownload = { onDownload(entry.id) },
                 )
             }
-        }
     }
 }
 
@@ -885,15 +1976,15 @@ private fun DownloadCatalogRow(
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = Color.White,
+        shape = RoundedCornerShape(12.dp),
+        color = PrismGlass.copy(alpha = 0.36f),
         contentColor = PrismText,
-        border = BorderStroke(1.dp, PrismGlassBorder),
+        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.44f)),
         shadowElevation = 0.dp,
     ) {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -901,12 +1992,14 @@ private fun DownloadCatalogRow(
                         text = entry.name,
                         style = MaterialTheme.typography.bodySmall,
                         fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
                     )
-                    Text(
-                        text = "${entry.parameters} | ${entry.quantization} | ${formatBytes(entry.expectedBytes)} | ${entry.license}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        InfoBadge(text = entry.parameters, color = PrismBlue)
+                        InfoBadge(text = entry.quantization, color = PrismViolet)
+                        InfoBadge(text = formatBytes(entry.expectedBytes), color = PrismSlate)
+                    }
                 }
                 Button(
                     enabled = enabled && hasEnoughFreeStorage(entry, deviceCapabilityProfile),
@@ -919,17 +2012,13 @@ private fun DownloadCatalogRow(
                 text = entry.notes,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                text = entry.repoId,
-                style = MaterialTheme.typography.labelSmall,
-                color = PrismBlue,
-                maxLines = 1,
+                maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
             )
+            MetricGrid(listOf("License" to entry.license, "Repository" to entry.repoId))
             if (!hasEnoughFreeStorage(entry, deviceCapabilityProfile)) {
                 Text(
-                    text = "Needs more free storage",
+                    text = "Needs more free storage for download plus installed copy",
                     style = MaterialTheme.typography.labelSmall,
                     color = PrismRed,
                     fontWeight = FontWeight.SemiBold,
@@ -961,7 +2050,10 @@ private fun DownloadProgressBar(bytesDone: Long, totalBytes: Long?) {
 }
 
 private fun ModelDownloadState.Running.Stage.label(): String = when (this) {
+    ModelDownloadState.Running.Stage.QUEUED -> "Queued"
+    ModelDownloadState.Running.Stage.VERIFYING_METADATA -> "Checking"
     ModelDownloadState.Running.Stage.DOWNLOADING -> "Downloading"
+    ModelDownloadState.Running.Stage.VERIFYING_FILE -> "Verifying"
     ModelDownloadState.Running.Stage.IMPORTING -> "Importing"
 }
 
@@ -969,7 +2061,7 @@ private fun hasEnoughFreeStorage(
     entry: HuggingFaceModelEntry,
     profile: DeviceCapabilityProfile?,
 ): Boolean =
-    profile?.let { it.storageFreeBytes > entry.expectedBytes + 512L * 1024L * 1024L } ?: true
+    profile?.let { it.storageFreeBytes > entry.expectedBytes * 2L + 512L * 1024L * 1024L } ?: true
 
 @Composable
 private fun ImportProgressBar(state: ImportState.Running) {
@@ -1057,32 +2149,49 @@ private fun ChatListSheet(
     var renameTarget by remember { mutableStateOf<ChatSession?>(null) }
     var renameTitle by remember { mutableStateOf("") }
     var deleteTarget by remember { mutableStateOf<ChatSession?>(null) }
+    var clearCurrentRequested by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
+            .padding(horizontal = 20.dp, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text(
-                modifier = Modifier.weight(1f),
-                text = "Chats",
-                style = MaterialTheme.typography.titleMedium,
-                color = PrismBlue,
-                fontWeight = FontWeight.SemiBold,
-            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Chats",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = PrismBlue,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = "${sessions.size} ${if (sessions.size == 1) "conversation" else "conversations"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+            }
             Button(
                 enabled = !isGenerating,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
                 onClick = onNewChat,
             ) {
-                Text("New Chat")
+                Text("+ New", maxLines = 1, softWrap = false)
             }
         }
+
+        Text(
+            text = "Offline AI workspace",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
 
         if (sessions.isEmpty()) {
             Text(
@@ -1108,19 +2217,10 @@ private fun ChatListSheet(
                             renameTitle = session.title
                         },
                         onDelete = { deleteTarget = session },
+                        onClearCurrent = { clearCurrentRequested = true },
                     )
                 }
             }
-        }
-
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-
-        TextButton(
-            enabled = hasCurrentTranscript && !isGenerating,
-            colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
-            onClick = onClearCurrentChat,
-        ) {
-            Text("Clear Current Chat")
         }
     }
 
@@ -1184,6 +2284,36 @@ private fun ChatListSheet(
             },
         )
     }
+
+    if (clearCurrentRequested) {
+        AlertDialog(
+            onDismissRequest = { clearCurrentRequested = false },
+            title = { Text("Clear current chat?") },
+            text = {
+                Text(
+                    text = "This removes the messages in the active chat but keeps the chat itself.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = hasCurrentTranscript && !isGenerating,
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    onClick = {
+                        onClearCurrentChat()
+                        clearCurrentRequested = false
+                    },
+                ) {
+                    Text("Clear")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { clearCurrentRequested = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
 }
 
 @Composable
@@ -1194,54 +2324,185 @@ private fun ChatSessionRow(
     onOpen: () -> Unit,
     onRename: () -> Unit,
     onDelete: () -> Unit,
+    onClearCurrent: () -> Unit,
 ) {
+    var menuExpanded by remember { mutableStateOf(false) }
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        color = if (selected) UserBubble else Color.White,
+        shape = RoundedCornerShape(14.dp),
+        color = if (selected) Color(0xFFF8FBFF) else Color.White,
         contentColor = PrismText,
-        border = BorderStroke(1.dp, if (selected) PrismBlue else PrismGlassBorder),
+        border = BorderStroke(1.dp, if (selected) PrismViolet.copy(alpha = 0.30f) else PrismGlassBorder),
+        shadowElevation = 0.dp,
+        enabled = !isGenerating,
+        onClick = {
+            if (!selected) {
+                onOpen()
+            }
+        },
+    ) {
+        Row(modifier = Modifier.fillMaxWidth()) {
+            if (selected) {
+                Box(
+                    modifier = Modifier
+                        .width(4.dp)
+                        .fillMaxHeight()
+                        .background(
+                            brush = Brush.verticalGradient(listOf(PrismCyan, PrismViolet)),
+                            shape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp),
+                        ),
+                )
+            }
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(
+                        start = if (selected) 12.dp else 14.dp,
+                        top = 12.dp,
+                        end = 10.dp,
+                        bottom = 12.dp,
+                    ),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Top,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        modifier = Modifier.weight(1f),
+                        text = polishedChatTitle(session.title),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (selected) {
+                        ActiveBadge()
+                    }
+                    Box {
+                        ChatOverflowButton(
+                            enabled = !isGenerating,
+                            onClick = { menuExpanded = true },
+                        )
+                        DropdownMenu(
+                            expanded = menuExpanded,
+                            onDismissRequest = { menuExpanded = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Rename") },
+                                enabled = !isGenerating,
+                                onClick = {
+                                    menuExpanded = false
+                                    onRename()
+                                },
+                            )
+                            if (selected) {
+                                DropdownMenuItem(
+                                    text = { Text("Clear messages") },
+                                    enabled = !isGenerating,
+                                    onClick = {
+                                        menuExpanded = false
+                                        onClearCurrent()
+                                    },
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                                enabled = !isGenerating,
+                                onClick = {
+                                    menuExpanded = false
+                                    onDelete()
+                                },
+                            )
+                        }
+                    }
+                }
+                ModelBadge(modelName = polishedModelName(session.modelId))
+                Text(
+                    text = "${session.messageCount} ${if (session.messageCount == 1) "message" else "messages"} • ${formatChatTimestamp(session.updatedAt)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActiveBadge() {
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = PrismViolet.copy(alpha = 0.10f),
+        contentColor = PrismViolet,
+        border = BorderStroke(1.dp, PrismViolet.copy(alpha = 0.24f)),
         shadowElevation = 0.dp,
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
         ) {
+            Canvas(modifier = Modifier.size(6.dp)) {
+                drawCircle(color = PrismGreen)
+            }
             Text(
-                text = session.title,
-                style = MaterialTheme.typography.bodyMedium,
+                text = "Active",
+                style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                softWrap = false,
             )
-            Text(
-                text = "${session.messageCount} messages | ${compactModelName(session.modelId)} | ${formatChatTimestamp(session.updatedAt)}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(
-                    enabled = !selected && !isGenerating,
-                    onClick = onOpen,
-                ) {
-                    Text(if (selected) "Current" else "Open")
-                }
-                TextButton(
-                    enabled = !isGenerating,
-                    onClick = onRename,
-                ) {
-                    Text("Rename")
-                }
-                TextButton(
-                    enabled = !isGenerating,
-                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                    onClick = onDelete,
-                ) {
-                    Text("Delete")
+        }
+    }
+}
+
+@Composable
+private fun ModelBadge(modelName: String) {
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = PrismBlue.copy(alpha = 0.08f),
+        contentColor = PrismBlue,
+        border = BorderStroke(1.dp, PrismBlue.copy(alpha = 0.14f)),
+        shadowElevation = 0.dp,
+    ) {
+        Text(
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+            text = modelName,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun ChatOverflowButton(
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.size(34.dp),
+        shape = RoundedCornerShape(17.dp),
+        color = Color.White.copy(alpha = 0.56f),
+        contentColor = PrismSlate,
+        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.70f)),
+        enabled = enabled,
+        onClick = onClick,
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Canvas(modifier = Modifier.size(18.dp)) {
+                repeat(3) { index ->
+                    drawCircle(
+                        color = PrismSlate,
+                        radius = size.minDimension * 0.08f,
+                        center = Offset(center.x, size.height * (0.28f + index * 0.22f)),
+                    )
                 }
             }
         }
@@ -1254,41 +2515,54 @@ private fun ModelMetadata(
     diagnostics: ModelLoadDiagnostics?,
     readiness: ModelReadiness?,
 ) {
-    GlassSurface(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            Text(
-                text = "${model.id} / ${model.versionId}",
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+    val metadata = model.validation.metadata
+    DashboardCard {
+        SectionHeader(
+            title = "Loaded model",
+            subtitle = polishedModelName(model.id),
+        )
+        MetricGrid(
+            listOfNotNull(
+                "Size" to formatBytes(model.bytes),
+                "Format" to "GGUF v${model.validation.ggufVersion}",
+                "Validation" to model.validation.status.replaceFirstChar { it.titlecase(Locale.US) },
+                "SHA-256" to shortHash(model.sha256),
+                metadata?.architecture?.let { "Family" to it.uppercase(Locale.US) },
+                metadata?.sizeLabel?.let { "Params" to it },
+                metadata?.contextLength?.let { "Context" to it.toString() },
+                metadata?.fileType?.let { "Type" to it.toString() },
+                "Template" to if (metadata?.hasChatTemplate == true) "Chat" else "Unknown",
+                diagnostics?.loadMs?.let { "Load time" to "$it ms" },
+                diagnostics?.availableMemoryMb?.let { "RAM free" to "$it MB" },
+                diagnostics?.state?.let { "Status" to it.replaceFirstChar { char -> char.titlecase(Locale.US) } },
             )
-            Text(
-                text = "${model.fileName} | ${formatBytes(model.bytes)} | GGUF v${model.validation.ggufVersion} ${model.validation.status}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                text = "SHA-256: ${shortHash(model.sha256)}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            diagnostics?.let { load ->
-                Text(
-                    text = "Load ${load.loadMs} ms | RAM ${load.availableMemoryMb ?: 0} MB | ${load.state}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            readiness?.let { modelReadiness ->
-                Text(
-                    text = "${modelReadiness.performance.label} | needs ${formatBytes(modelReadiness.fit.requiredRamBytes)} | expected ${predictionRange(modelReadiness.prediction)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = performanceColor(modelReadiness.performance.tier),
-                )
+        )
+        readiness?.let { modelReadiness ->
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = performanceColor(modelReadiness.performance.tier).copy(alpha = 0.10f),
+                contentColor = performanceColor(modelReadiness.performance.tier),
+                border = BorderStroke(1.dp, performanceColor(modelReadiness.performance.tier).copy(alpha = 0.22f)),
+                shadowElevation = 0.dp,
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = modelReadiness.performance.label,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "Needs ${formatBytes(modelReadiness.fit.requiredRamBytes)} • expected ${predictionRange(modelReadiness.prediction)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         }
     }
@@ -1301,14 +2575,11 @@ private fun RuntimeControls(
     enabled: Boolean,
     onSettingsChange: (GenerationSettings) -> Unit,
 ) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(
-            text = "Runtime",
-            style = MaterialTheme.typography.labelMedium,
-            fontWeight = FontWeight.SemiBold,
+    var advancedVisible by remember { mutableStateOf(false) }
+    DashboardCard {
+        SectionHeader(
+            title = "Runtime",
+            subtitle = "Generation limits and CPU scheduling",
         )
         SettingSlider(
             label = "Tokens",
@@ -1332,14 +2603,105 @@ private fun RuntimeControls(
                 onSettingsChange(settings.copy(threadCount = value.roundToInt()))
             },
         )
-        performance?.let { stats ->
-            Text(
-                text = "Perf: ${stats.generatedTokens} tok | ${formatTokensPerSecond(stats.tokensPerSecond)} tok/s | ${stats.totalMs} ms${stats.terminalSuffix()}",
-                style = MaterialTheme.typography.bodySmall,
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(10.dp),
+            color = PrismGlass.copy(alpha = 0.32f),
+            contentColor = PrismText,
+            border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.28f)),
+            onClick = { advancedVisible = !advancedVisible },
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    modifier = Modifier.weight(1f),
+                    text = "Advanced runtime settings",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = if (advancedVisible) "Hide" else "Show",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = PrismBlue,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = if (advancedVisible) "⌃" else "⌄",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (advancedVisible) {
+            SettingSlider(
+                label = "Context",
+                valueText = settings.contextLength.toString(),
+                value = settings.contextLength.toFloat(),
+                valueRange = GenerationSettings.MIN_CONTEXT_LENGTH.toFloat()..GenerationSettings.MAX_CONTEXT_LENGTH.toFloat(),
+                steps = ((GenerationSettings.MAX_CONTEXT_LENGTH - GenerationSettings.MIN_CONTEXT_LENGTH) / GenerationSettings.CONTEXT_LENGTH_STEP) - 1,
+                enabled = enabled,
+                onValueChange = { value ->
+                    onSettingsChange(settings.copy(contextLength = snapStep(value, GenerationSettings.CONTEXT_LENGTH_STEP)))
+                },
             )
-            Text(
-                text = "Prompt ${stats.promptEvalMs} ms | decode ${stats.decodeMs} ms",
-                style = MaterialTheme.typography.bodySmall,
+            SettingSlider(
+                label = "Batch",
+                valueText = settings.batchSize.toString(),
+                value = settings.batchSize.toFloat(),
+                valueRange = GenerationSettings.MIN_BATCH_SIZE.toFloat()..GenerationSettings.MAX_BATCH_SIZE.toFloat(),
+                steps = ((GenerationSettings.MAX_BATCH_SIZE - GenerationSettings.MIN_BATCH_SIZE) / GenerationSettings.BATCH_SIZE_STEP) - 1,
+                enabled = enabled,
+                onValueChange = { value ->
+                    onSettingsChange(settings.copy(batchSize = snapStep(value, GenerationSettings.BATCH_SIZE_STEP)))
+                },
+            )
+            SettingSlider(
+                label = "Temperature",
+                valueText = String.format(Locale.US, "%.2f", settings.temperature),
+                value = settings.temperature,
+                valueRange = GenerationSettings.MIN_TEMPERATURE..GenerationSettings.MAX_TEMPERATURE,
+                steps = 28,
+                enabled = enabled,
+                onValueChange = { value ->
+                    onSettingsChange(settings.copy(temperature = value))
+                },
+            )
+            SettingSlider(
+                label = "Top P",
+                valueText = String.format(Locale.US, "%.2f", settings.topP),
+                value = settings.topP,
+                valueRange = GenerationSettings.MIN_TOP_P..GenerationSettings.MAX_TOP_P,
+                steps = 18,
+                enabled = enabled,
+                onValueChange = { value ->
+                    onSettingsChange(settings.copy(topP = value))
+                },
+            )
+            SettingSlider(
+                label = "GPU layers",
+                valueText = settings.gpuLayers.toString(),
+                value = settings.gpuLayers.toFloat(),
+                valueRange = GenerationSettings.MIN_GPU_LAYERS.toFloat()..GenerationSettings.MAX_GPU_LAYERS.toFloat(),
+                steps = GenerationSettings.MAX_GPU_LAYERS - GenerationSettings.MIN_GPU_LAYERS - 1,
+                enabled = enabled,
+                onValueChange = { value ->
+                    onSettingsChange(settings.copy(gpuLayers = value.roundToInt()))
+                },
+            )
+        }
+        performance?.let { stats ->
+            MetricGrid(
+                listOf(
+                    "Speed" to "${formatTokensPerSecond(stats.tokensPerSecond)} tok/s",
+                    "Generated" to "${stats.generatedTokens} tok",
+                    "Total" to "${stats.totalMs} ms${stats.terminalSuffix()}",
+                    "Prompt/decode" to "${stats.promptEvalMs}/${stats.decodeMs} ms",
+                )
             )
         }
     }
@@ -1349,16 +2711,73 @@ private enum class BenchmarkTab(val label: String) {
     Runs("Runs"),
     Compare("Compare"),
     Models("Models"),
-    Export("Export"),
 }
 
 private data class BenchmarkSummary(
-    val count: Int,
-    val avgTokensPerSecond: Double?,
-    val bestTokensPerSecond: Double?,
+    val totalCount: Int,
+    val completedCount: Int,
+    val cleanCount: Int,
+    val truncatedCount: Int,
+    val errorCount: Int,
+    val interruptedCount: Int,
+    val avgCompletedTokensPerSecond: Double?,
+    val avgAllTokensPerSecond: Double?,
+    val bestCompletedTokensPerSecond: Double?,
     val avgPromptMs: Long?,
     val avgTotalMs: Long?,
+) {
+    val failedCount: Int
+        get() = errorCount + interruptedCount
+
+    val reliabilityScore: Double?
+        get() = avgCompletedTokensPerSecond?.let { average ->
+            if (totalCount == 0) {
+                average
+            } else {
+                average * ((cleanCount + truncatedCount).toDouble() / totalCount.toDouble())
+            }
+        }
+
+    companion object {
+        val Empty = BenchmarkSummary(
+            totalCount = 0,
+            completedCount = 0,
+            cleanCount = 0,
+            truncatedCount = 0,
+            errorCount = 0,
+            interruptedCount = 0,
+            avgCompletedTokensPerSecond = null,
+            avgAllTokensPerSecond = null,
+            bestCompletedTokensPerSecond = null,
+            avgPromptMs = null,
+            avgTotalMs = null,
+        )
+    }
+}
+
+private data class BenchmarkComparisonRow(
+    val modelId: String,
+    val run: BenchmarkRun?,
+    val summary: BenchmarkSummary,
+    val readiness: ModelReadiness?,
 )
+
+private data class BenchmarkAction(
+    val label: String,
+    val onClick: () -> Unit,
+)
+
+private enum class BenchmarkRunStatus(
+    val label: String,
+    val color: Color,
+) {
+    Clean("Clean", PrismGreen),
+    Truncated("Truncated", PrismAmber),
+    Error("Error", PrismRed),
+    Interrupted("Interrupted", PrismAmber),
+    Partial("Partial", PrismBlue),
+    Unknown("Unknown", PrismSlate),
+}
 
 @Composable
 private fun BenchmarkCenter(
@@ -1373,33 +2792,68 @@ private fun BenchmarkCenter(
     disabledReason: String?,
     onRunPreset: (String) -> Unit,
     onRunThreadSweep: () -> Unit,
+    onRunNativeBenchmark: () -> Unit,
     onExportCsv: () -> Unit,
     onExportJson: () -> Unit,
     onClear: () -> Unit,
 ) {
     var selectedTab by remember { mutableStateOf(BenchmarkTab.Runs) }
-    val summary = benchmarkSummary(runs)
+    var exportMenuExpanded by remember { mutableStateOf(false) }
+    val allSummary = benchmarkSummary(runs)
+    val currentModelId = activeModelInfo?.id
+    val currentSummary = remember(runs, currentModelId) {
+        currentModelId
+            ?.let { modelId -> benchmarkSummary(runs.filter { it.modelId == modelId }) }
+            ?: BenchmarkSummary.Empty
+    }
     val enabled = disabledReason == null
 
-    GlassSurface(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(
-                text = "Benchmarks",
-                style = MaterialTheme.typography.labelMedium,
-                color = PrismBlue,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = if (summary.count == 0) {
-                    "No runs recorded"
-                } else {
-                    "${summary.count} runs | avg ${formatOptionalTps(summary.avgTokensPerSecond)} | best ${formatOptionalTps(summary.bestTokensPerSecond)}"
+    DashboardCard {
+            SectionHeader(
+                title = "Benchmarks",
+                subtitle = "Local speed, reliability, and model comparisons",
+                action = {
+                    Box {
+                        ChatOverflowButton(
+                            enabled = runs.isNotEmpty() && !isGenerating && !status.isRunning,
+                            onClick = { exportMenuExpanded = true },
+                        )
+                        DropdownMenu(
+                            expanded = exportMenuExpanded,
+                            onDismissRequest = { exportMenuExpanded = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Export CSV") },
+                                enabled = runs.isNotEmpty() && !isGenerating && !status.isRunning,
+                                onClick = {
+                                    exportMenuExpanded = false
+                                    onExportCsv()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Export JSON") },
+                                enabled = runs.isNotEmpty() && !isGenerating && !status.isRunning,
+                                onClick = {
+                                    exportMenuExpanded = false
+                                    onExportJson()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Clear history", color = MaterialTheme.colorScheme.error) },
+                                enabled = runs.isNotEmpty() && !isGenerating && !status.isRunning,
+                                onClick = {
+                                    exportMenuExpanded = false
+                                    onClear()
+                                },
+                            )
+                        }
+                    }
                 },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            BenchmarkSummaryPanel(
+                currentSummary = currentSummary,
+                allSummary = allSummary,
+                currentEmptyText = if (currentModelId == null) "No model selected" else "No runs for this model",
             )
 
             if (status.isRunning) {
@@ -1445,6 +2899,7 @@ private fun BenchmarkCenter(
                     enabled = enabled,
                     onRunPreset = onRunPreset,
                     onRunThreadSweep = onRunThreadSweep,
+                    onRunNativeBenchmark = onRunNativeBenchmark,
                 )
                 BenchmarkTab.Compare -> BenchmarkCompareTab(
                     runs = runs,
@@ -1457,12 +2912,74 @@ private fun BenchmarkCenter(
                     readiness = readiness,
                     runs = runs,
                 )
-                BenchmarkTab.Export -> BenchmarkExportTab(
-                    hasRuns = runs.isNotEmpty(),
-                    isGenerating = isGenerating || status.isRunning,
-                    onExportCsv = onExportCsv,
-                    onExportJson = onExportJson,
-                    onClear = onClear,
+            }
+    }
+}
+
+@Composable
+private fun BenchmarkSummaryPanel(
+    currentSummary: BenchmarkSummary,
+    allSummary: BenchmarkSummary,
+    currentEmptyText: String,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        BenchmarkSummaryGroup(
+            title = "Current model",
+            summary = currentSummary,
+            emptyText = currentEmptyText,
+        )
+        BenchmarkSummaryGroup(
+            title = "All models",
+            summary = allSummary,
+            emptyText = "No runs recorded",
+        )
+    }
+}
+
+@Composable
+private fun BenchmarkSummaryGroup(
+    title: String,
+    summary: BenchmarkSummary,
+    emptyText: String,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = PrismGlass.copy(alpha = 0.34f),
+        contentColor = PrismText,
+        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.30f)),
+        shadowElevation = 0.dp,
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelMedium,
+                color = PrismSlate,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (summary.totalCount == 0) {
+                Text(
+                    text = emptyText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                MetricGrid(
+                    listOf(
+                        "Runs" to summary.totalCount.toString(),
+                        "Completed" to summary.completedCount.toString(),
+                        "Failed" to summary.failedCount.toString(),
+                        "Truncated" to summary.truncatedCount.toString(),
+                        "Avg completed" to formatOptionalTps(summary.avgCompletedTokensPerSecond),
+                        "Avg overall" to formatOptionalTps(summary.avgAllTokensPerSecond),
+                        "Best" to formatOptionalTps(summary.bestCompletedTokensPerSecond),
+                        "Avg first token" to formatOptionalMs(summary.avgPromptMs),
+                    )
                 )
             }
         }
@@ -1476,28 +2993,48 @@ private fun BenchmarkRunsTab(
     enabled: Boolean,
     onRunPreset: (String) -> Unit,
     onRunThreadSweep: () -> Unit,
+    onRunNativeBenchmark: () -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            text = "Presets",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+    val actions = listOf(
+        BenchmarkAction("Sweep 2/4/6/8", onRunThreadSweep),
+        BenchmarkAction("Native PP/TG", onRunNativeBenchmark),
+    ) + presets.map { preset ->
+        BenchmarkAction(preset.name) { onRunPreset(preset.id) }
+    }
+    var selectedActionIndex by remember(actions.size) { mutableIntStateOf(actions.indexOfFirst { it.label == "Python Coding" }.coerceAtLeast(0)) }
+    val selectedAction = actions.getOrNull(selectedActionIndex) ?: actions.first()
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        SectionHeader(
+            title = "Preset",
+            subtitle = "Choose a benchmark task, then run it.",
         )
-        Button(
-            modifier = Modifier.fillMaxWidth(),
-            enabled = enabled,
-            onClick = onRunThreadSweep,
-        ) {
-            Text("Run Thread Sweep 2/4/6/8", maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-        presets.forEach { preset ->
-            Button(
+        actions.chunked(2).forEach { rowActions ->
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                enabled = enabled,
-                onClick = { onRunPreset(preset.id) },
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text("Run ${preset.name}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                rowActions.forEach { action ->
+                    val actionIndex = actions.indexOf(action)
+                    BenchmarkPresetTile(
+                        modifier = Modifier.weight(1f),
+                        label = action.label,
+                        enabled = enabled,
+                        selected = actionIndex == selectedActionIndex,
+                        onClick = { selectedActionIndex = actionIndex },
+                    )
+                }
+                if (rowActions.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
             }
+        }
+        Button(
+            modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp),
+            enabled = enabled,
+            onClick = selectedAction.onClick,
+        ) {
+            Text("Run ${selectedAction.label}", maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         if (runs.isEmpty()) {
@@ -1513,19 +3050,69 @@ private fun BenchmarkRunsTab(
 }
 
 @Composable
+private fun BenchmarkPresetTile(
+    modifier: Modifier = Modifier,
+    label: String,
+    enabled: Boolean,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = modifier.heightIn(min = 42.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = if (selected) PrismBlue.copy(alpha = 0.10f) else PrismGlass.copy(alpha = 0.28f),
+        contentColor = if (selected) PrismBlue else PrismSlate,
+        border = BorderStroke(1.dp, if (selected) PrismBlue.copy(alpha = 0.34f) else PrismGlassBorder.copy(alpha = 0.36f)),
+        enabled = enabled,
+        onClick = onClick,
+    ) {
+        Box(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 9.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
 private fun BenchmarkCompareTab(
     runs: List<BenchmarkRun>,
     readiness: List<ModelReadiness>,
 ) {
-    val modelIds = (readiness.map { it.info.id } + runs.mapNotNull { it.modelId })
-        .distinct()
-    val byModel = modelIds
-        .map { modelId ->
-            val modelRuns = runs.filter { it.modelId == modelId }
-            val modelReadiness = readiness.firstOrNull { it.info.id == modelId }
-            Triple(modelId, benchmarkSummary(modelRuns), modelReadiness)
+    val runRows = runs
+        .groupBy { it.comparisonKey() }
+        .map { (_, modelRuns) ->
+            val representative = modelRuns.maxByOrNull { it.createdAt } ?: return@map null
+            val modelId = representative.modelId ?: "Unknown model"
+            val modelReadiness = readiness.firstOrNull { it.info.id == representative.modelId }
+            BenchmarkComparisonRow(
+                modelId = modelId,
+                run = representative,
+                summary = benchmarkSummary(modelRuns),
+                readiness = modelReadiness,
+            )
         }
-        .sortedByDescending { it.second.avgTokensPerSecond ?: it.third?.prediction?.maxTokensPerSecond ?: 0.0 }
+        .filterNotNull()
+    val modelsWithRuns = runRows.map { it.modelId }.toSet()
+    val readinessRows = readiness
+        .filter { it.info.id !in modelsWithRuns }
+        .map { modelReadiness ->
+            BenchmarkComparisonRow(
+                modelId = modelReadiness.info.id,
+                run = null,
+                summary = BenchmarkSummary.Empty,
+                readiness = modelReadiness,
+            )
+        }
+    val byModel = (runRows + readinessRows)
+        .sortedByDescending { it.summary.reliabilityScore ?: it.readiness?.prediction?.maxTokensPerSecond ?: 0.0 }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (byModel.isEmpty()) {
@@ -1535,15 +3122,18 @@ private fun BenchmarkCompareTab(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
-            byModel.take(6).forEach { (modelId, summary, modelReadiness) ->
-                val actual = summary.avgTokensPerSecond?.let { "${formatTokensPerSecond(it)} tok/s actual" } ?: "No actual yet"
+            byModel.take(8).forEach { row ->
+                val summary = row.summary
+                val modelReadiness = row.readiness
+                val actual = summary.avgCompletedTokensPerSecond?.let { "${formatTokensPerSecond(it)} tok/s completed" } ?: "No actual yet"
                 val predicted = modelReadiness?.prediction?.let { prediction ->
                     "predicted ${predictionRange(prediction)}"
                 } ?: "prediction pending"
+                val runtimeDetail = row.run?.settingsLabel() ?: modelReadiness?.fit?.quantization ?: "settings pending"
                 BenchmarkMetricRow(
-                    label = compactModelName(modelId),
+                    label = row.run?.let { "${polishedModelName(row.modelId)} • ${it.shortHashLabel()}" } ?: polishedModelName(row.modelId),
                     value = actual,
-                    detail = "$predicted | ${summary.count} runs | first ${formatOptionalMs(summary.avgPromptMs)}",
+                    detail = "$predicted • $runtimeDetail • ${summaryStatusLine(summary)} • first ${formatOptionalMs(summary.avgPromptMs)}",
                 )
             }
         }
@@ -1575,10 +3165,12 @@ private fun BenchmarkModelsTab(
         } else {
             models.forEach { modelId ->
                 val summary = benchmarkSummary(runs.filter { it.modelId == modelId })
+                val modelRuns = runs.filter { it.modelId == modelId }
+                val runVariants = modelRuns.map { it.comparisonKey() }.distinct().size
                 val activeSize = activeModelInfo?.takeIf { it.id == modelId }?.bytes
                 val modelReadiness = readiness.firstOrNull { it.info.id == modelId }
                 BenchmarkMetricRow(
-                    label = compactModelName(modelId),
+                    label = polishedModelName(modelId),
                     value = modelReadiness?.performance?.label ?: "Unknown",
                     detail = listOfNotNull(
                         activeSize?.let { formatBytes(it) } ?: modelReadiness?.info?.bytes?.let { formatBytes(it) },
@@ -1586,8 +3178,9 @@ private fun BenchmarkModelsTab(
                         modelReadiness?.performance?.averageTokensPerSecond?.let { "actual ${formatTokensPerSecond(it)} tok/s" },
                         modelReadiness?.fit?.requiredRamBytes?.let { "needs ${formatBytes(it)}" },
                         modelReadiness?.prediction?.let { "expected ${predictionRange(it)}" },
-                        "${summary.count} runs",
-                    ).joinToString(" | "),
+                        summaryStatusLine(summary),
+                        if (runVariants > 1) "$runVariants variants" else null,
+                    ).joinToString(" • "),
                 )
             }
         }
@@ -1629,15 +3222,86 @@ private fun BenchmarkExportTab(
 
 @Composable
 private fun BenchmarkRunRow(run: BenchmarkRun) {
-    BenchmarkMetricRow(
-        label = "${run.presetName ?: run.source.replaceFirstChar { it.uppercase() }} | ${formatChatTimestamp(run.createdAt)}",
-        value = "${formatTokensPerSecond(run.tokensPerSecond)} tok/s",
-        detail = "${compactModelName(run.modelId)} | ${run.generatedTokens} tok | first ${run.promptEvalMs} ms | ${run.terminalReason}",
-    )
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = Color.White,
+        contentColor = PrismText,
+        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.48f)),
+        shadowElevation = 0.dp,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = run.presetName ?: run.source.replaceFirstChar { it.titlecase(Locale.US) },
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = formatChatTimestamp(run.createdAt),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                }
+                Text(
+                    text = "${formatTokensPerSecond(run.tokensPerSecond)} tok/s",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = PrismBlue,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    softWrap = false,
+                )
+            }
+            Text(
+                text = polishedModelName(run.modelId),
+                style = MaterialTheme.typography.labelMedium,
+                color = PrismSlate,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "ctx ${run.contextLength} • batch ${run.batchSize} • threads ${run.threadCount}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                BenchmarkStatusChip(status = run.status())
+                Text(
+                    text = "${run.runtimeBackend} • ${run.generatedTokens}/${run.maxTokens} tok • first ${run.promptEvalMs} ms",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
 }
 
 @Composable
-private fun BenchmarkMetricRow(label: String, value: String, detail: String) {
+private fun BenchmarkMetricRow(
+    label: String,
+    value: String,
+    detail: String,
+    status: BenchmarkRunStatus? = null,
+) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(8.dp),
@@ -1659,11 +3323,18 @@ private fun BenchmarkMetricRow(label: String, value: String, detail: String) {
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                status?.let { runStatus ->
+                    BenchmarkStatusChip(status = runStatus)
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
                 Text(
                     text = value,
                     style = MaterialTheme.typography.bodySmall,
                     color = PrismBlue,
                     fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
             Text(
@@ -1674,6 +3345,24 @@ private fun BenchmarkMetricRow(label: String, value: String, detail: String) {
                 overflow = TextOverflow.Ellipsis,
             )
         }
+    }
+}
+
+@Composable
+private fun BenchmarkStatusChip(status: BenchmarkRunStatus) {
+    Surface(
+        shape = RoundedCornerShape(6.dp),
+        color = status.color.copy(alpha = 0.12f),
+        contentColor = status.color,
+        border = BorderStroke(1.dp, status.color.copy(alpha = 0.32f)),
+    ) {
+        Text(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            text = status.label,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+        )
     }
 }
 
@@ -1698,11 +3387,7 @@ private fun SettingSlider(
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.SemiBold,
             )
-            Text(
-                text = valueText,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            InfoBadge(text = valueText, color = PrismBlue)
         }
         Slider(
             value = value,
@@ -1725,65 +3410,284 @@ private fun MessageBubble(
     val bubbleColor = if (isUser) {
         UserBubble
     } else {
-        AssistantBubble
+        Color.White.copy(alpha = 0.76f)
     }
     val alignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
     val labelColor = if (isUser) PrismBlue else PrismViolet
+    val context = LocalContext.current
+    val copyLabel = if (isUser) "prompt" else "response"
 
     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = alignment) {
         Column(
             modifier = Modifier
-                .fillMaxWidth(0.86f)
-                .background(color = bubbleColor, shape = RoundedCornerShape(8.dp))
-                .padding(12.dp)
+                .fillMaxWidth(if (isUser) 0.78f else 0.94f)
+                .background(
+                    color = bubbleColor,
+                    shape = RoundedCornerShape(if (isUser) 28.dp else 32.dp),
+                )
+                .padding(if (isUser) 18.dp else 16.dp)
         ) {
             Row(
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                if (!isUser) {
+                    AssistantBadge()
+                }
                 Text(
                     text = label,
                     style = MaterialTheme.typography.labelMedium,
                     color = labelColor,
                     fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
                 )
+                if (!isUser) {
+                    PerformancePill(
+                        modifier = Modifier.weight(1f, fill = false),
+                        performance = performance,
+                        loading = showLoading,
+                    )
+                }
                 if (showLoading) {
                     InfinityLoadingIndicator(
                         modifier = Modifier.size(22.dp),
                         color = PrismViolet,
                     )
-                    performance?.let { stats ->
-                        Text(
-                            text = "${stats.generatedTokens} tok | ${formatTokensPerSecond(stats.tokensPerSecond)} tok/s",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                }
+                Spacer(modifier = Modifier.weight(1f))
+                if (!isUser) {
+                    TextButton(
+                        modifier = Modifier.widthIn(min = 56.dp),
+                        enabled = text.isNotBlank(),
+                        onClick = {
+                            copyTextToClipboard(context, label, text)
+                            Toast.makeText(context, "Copied $copyLabel", Toast.LENGTH_SHORT).show()
+                        },
+                    ) {
+                        Text("Copy", maxLines = 1, softWrap = false)
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(4.dp))
-            if (isUser) {
-                Text(text = text, style = MaterialTheme.typography.bodyMedium, color = PrismText)
-            } else {
-                MarkdownText(text = text, color = PrismText)
+            Spacer(modifier = Modifier.height(if (isUser) 10.dp else 12.dp))
+            SelectionContainer {
+                if (isUser) {
+                    Text(text = text, style = MaterialTheme.typography.bodyMedium, color = PrismText)
+                } else {
+                    MarkdownText(text = text, color = PrismText)
+                }
             }
         }
     }
 }
 
 @Composable
+private fun AssistantBadge() {
+    Surface(
+        modifier = Modifier.size(36.dp),
+        shape = RoundedCornerShape(18.dp),
+        color = PrismViolet.copy(alpha = 0.10f),
+        contentColor = PrismViolet,
+        border = BorderStroke(1.dp, PrismViolet.copy(alpha = 0.36f)),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text("*", color = PrismViolet, style = MaterialTheme.typography.titleMedium)
+        }
+    }
+}
+
+@Composable
+private fun PerformancePill(performance: GenerationPerformance?) {
+    PerformancePill(modifier = Modifier, performance = performance, loading = false)
+}
+
+@Composable
+private fun PerformancePill(
+    modifier: Modifier,
+    performance: GenerationPerformance?,
+    loading: Boolean,
+) {
+    Surface(
+        modifier = modifier.widthIn(max = 150.dp),
+        shape = RoundedCornerShape(999.dp),
+        color = Color.White.copy(alpha = 0.56f),
+        contentColor = PrismSlate,
+        border = BorderStroke(1.dp, PrismGlassBorder),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Canvas(modifier = Modifier.size(7.dp)) {
+                drawCircle(color = PrismGreen)
+            }
+            Text(
+                text = when {
+                    performance != null -> "${formatTokensPerSecond(performance.tokensPerSecond)} tok/s"
+                    loading -> "typing"
+                    else -> "Local LLM"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ToolEventCard(rawText: String) {
+    val event = remember(rawText) { AgentToolProtocol.parseToolEvent(rawText) }
+    val status = event?.optString("status")?.takeIf { it.isNotBlank() } ?: "done"
+    val tool = event?.optString("tool")?.takeIf { it.isNotBlank() } ?: "tool"
+    val summary = event?.optString("summary")?.takeIf { it.isNotBlank() } ?: rawText
+    val color = when (status) {
+        "done" -> PrismGreen
+        "failed" -> PrismRed
+        "pending" -> PrismAmber
+        "cancelled" -> MaterialTheme.colorScheme.onSurfaceVariant
+        else -> PrismBlue
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        color = Color.White,
+        contentColor = PrismText,
+        border = BorderStroke(1.dp, PrismGlassBorder),
+        shadowElevation = 0.dp,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "Tool",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = color,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    modifier = Modifier.weight(1f),
+                    text = tool,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = status,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = color,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.bodySmall,
+                color = PrismText,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AgentToolConfirmationDialog(
+    action: PendingAgentToolAction,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(action.title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = action.summary,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = PrismText,
+                )
+                if (action.changes.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        action.changes.forEach { change ->
+                            Text(
+                                text = change,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                if (action.riskNotes.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        action.riskNotes.forEach { note ->
+                            Text(
+                                text = note,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (action.destructive) PrismRed else PrismAmber,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+                }
+                Text(
+                    text = action.name,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = action.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = action.argumentsJson,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(action.confirmLabel)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(action.cancelLabel)
+            }
+        },
+    )
+}
+
+private fun copyTextToClipboard(context: android.content.Context, label: String, text: String) {
+    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+    clipboard.setPrimaryClip(android.content.ClipData.newPlainText(label, text))
+}
+
+@Composable
 private fun GlassSurface(
     modifier: Modifier = Modifier,
+    radius: Dp = 22.dp,
     content: @Composable () -> Unit,
 ) {
     Surface(
         modifier = modifier,
-        shape = RoundedCornerShape(18.dp),
+        shape = RoundedCornerShape(radius),
         color = PrismGlass,
         contentColor = PrismText,
         border = BorderStroke(1.dp, PrismGlassBorder),
-        tonalElevation = 1.dp,
-        shadowElevation = 0.dp,
+        tonalElevation = 2.dp,
+        shadowElevation = 2.dp,
         content = content,
     )
 }
@@ -1797,9 +3701,10 @@ private val PrismRed = Color(0xFFDC2626)
 private val PrismText = Color(0xFF0F172A)
 private val PrismSlate = Color(0xFF1E293B)
 private val PrismOnDark = Color(0xFFF8FAFC)
-private val PrismGlass = Color(0xEFFFFFFF)
-private val PrismGlassBorder = Color(0x6693C5FD)
-private val UserBubble = Color(0xFFE0F7FF)
+private val PrismCanvas = Color(0xFFF8FCFF)
+private val PrismGlass = Color(0xDFFFFFFF)
+private val PrismGlassBorder = Color(0x8FBFDBFE)
+private val UserBubble = Color(0xDDE0F7FF)
 private val AssistantBubble = Color(0xFFF4E8FF)
 
 private val LlmHostPrismaticColorScheme = lightColorScheme(
@@ -1827,16 +3732,20 @@ private val LlmHostPrismaticColorScheme = lightColorScheme(
     onError = Color.White,
 )
 
-private fun compactStatus(
+private fun topBarSubtitle(
     status: RuntimeStatus,
     modelName: String?,
     importStatus: String,
     importState: ImportState,
 ): String {
     return if (importState is ImportState.Running && importStatus.isNotBlank()) {
-        "${status.label()} | $importStatus"
+        importStatus
+    } else if (status == RuntimeStatus.LOADING_MODEL || status == RuntimeStatus.GENERATING || status == RuntimeStatus.ERROR) {
+        status.label()
+    } else if (!modelName.isNullOrBlank()) {
+        "${polishedModelName(modelName)} • Offline"
     } else {
-        "${status.label()} | ${compactModelName(modelName)}"
+        "Offline AI workspace"
     }
 }
 
@@ -1883,11 +3792,46 @@ internal fun compactModelName(modelId: String?): String {
         }
 }
 
+private fun polishedModelName(modelId: String?): String {
+    val compact = compactModelName(modelId)
+    if (compact == "No model selected") {
+        return compact
+    }
+    return compact
+        .split(Regex("\\s+"))
+        .filter { it.isNotBlank() }
+        .joinToString(" ") { token ->
+            when {
+                token.equals("it", ignoreCase = true) -> "IT"
+                token.equals("llm", ignoreCase = true) -> "LLM"
+                token.equals("gguf", ignoreCase = true) -> "GGUF"
+                token.equals("cpu", ignoreCase = true) -> "CPU"
+                token.equals("gpu", ignoreCase = true) -> "GPU"
+                token.matches(Regex("\\d+[a-zA-Z]?")) -> token.uppercase(Locale.US)
+                token.any { it.isDigit() } -> token.uppercase(Locale.US)
+                token.length <= 2 -> token.uppercase(Locale.US)
+                else -> token.replaceFirstChar { char ->
+                    if (char.isLowerCase()) char.titlecase(Locale.US) else char.toString()
+                }
+            }
+        }
+        .ifBlank { compact }
+}
+
+private fun polishedChatTitle(title: String): String =
+    title
+        .replace("Benchmark - ", "Benchmark: ")
+        .trim()
+        .ifBlank { ChatTitles.DEFAULT_TITLE }
+
 private fun snapTokens(value: Float): Int {
     val step = GenerationSettings.MAX_TOKEN_STEP
     val snapped = (value / step).roundToInt() * step
     return snapped.coerceIn(GenerationSettings.MIN_MAX_TOKENS, GenerationSettings.MAX_MAX_TOKENS)
 }
+
+private fun snapStep(value: Float, step: Int): Int =
+    ((value / step).roundToInt() * step)
 
 private fun formatTokensPerSecond(value: Double): String =
     String.format(Locale.US, "%.2f", value)
@@ -1900,16 +3844,21 @@ private fun formatOptionalMs(value: Long?): String =
 
 private fun benchmarkDisabledReason(
     serviceAvailable: Boolean,
+    performanceBuild: Boolean,
     currentModel: String?,
     isGenerating: Boolean,
     status: BenchmarkStatus,
 ): String? = when {
     !serviceAvailable -> "Benchmark unavailable while the service reconnects"
+    !performanceBuild -> "Switch Android Studio Build Variant to benchmark or profile before testing performance"
     currentModel == null -> "Select a model before running benchmarks"
     status.isRunning -> "Benchmark already running: ${status.presetName ?: "current run"}"
     isGenerating -> "Stop the current generation before running another benchmark"
     else -> null
 }
+
+private fun summaryStatusLine(summary: BenchmarkSummary): String =
+    "${summary.totalCount} runs / ${summary.completedCount} completed / ${summary.failedCount} failed"
 
 private fun predictionRange(prediction: PerformancePrediction): String =
     "${formatTokensPerSecond(prediction.minTokensPerSecond)}-${formatTokensPerSecond(prediction.maxTokensPerSecond)} tok/s"
@@ -1936,17 +3885,57 @@ private fun performanceColor(tier: ModelPerformanceTier): Color = when (tier) {
 
 private fun benchmarkSummary(runs: List<BenchmarkRun>): BenchmarkSummary {
     val completed = runs.filter { it.generatedTokens > 0 && it.decodeMs > 0L }
+    val allTokensPerSecond = runs.map { it.tokensPerSecond }
     return BenchmarkSummary(
-        count = runs.size,
-        avgTokensPerSecond = completed.takeIf { it.isNotEmpty() }?.map { it.tokensPerSecond }?.average(),
-        bestTokensPerSecond = completed.maxOfOrNull { it.tokensPerSecond },
+        totalCount = runs.size,
+        completedCount = completed.size,
+        cleanCount = runs.count { it.terminalReason == "EOF" },
+        truncatedCount = runs.count { it.terminalReason == "MAX_TOKENS" },
+        errorCount = runs.count { it.terminalReason == "ERROR" },
+        interruptedCount = runs.count { it.terminalReason.contains("INTERRUPTED", ignoreCase = true) },
+        avgCompletedTokensPerSecond = completed.takeIf { it.isNotEmpty() }?.map { it.tokensPerSecond }?.average(),
+        avgAllTokensPerSecond = allTokensPerSecond.takeIf { it.isNotEmpty() }?.average(),
+        bestCompletedTokensPerSecond = completed.maxOfOrNull { it.tokensPerSecond },
         avgPromptMs = completed.takeIf { it.isNotEmpty() }?.map { it.promptEvalMs }?.average()?.roundToInt()?.toLong(),
         avgTotalMs = completed.takeIf { it.isNotEmpty() }?.map { it.totalMs }?.average()?.roundToInt()?.toLong(),
     )
 }
 
+private fun BenchmarkRun.comparisonKey(): String =
+    listOf(
+        modelId.orEmpty(),
+        modelSha256Prefix.orEmpty(),
+        contextLength,
+        batchSize,
+        threadCount,
+        gpuLayers,
+        runtimeBackend,
+        presetId.orEmpty(),
+        source,
+    ).joinToString("|")
+
+private fun BenchmarkRun.shortHashLabel(): String =
+    modelSha256Prefix?.takeIf { it.isNotBlank() }?.let { "hash ${shortHash(it)}" } ?: "hash pending"
+
+private fun BenchmarkRun.status(): BenchmarkRunStatus = when {
+    terminalReason == "EOF" -> BenchmarkRunStatus.Clean
+    terminalReason == "MAX_TOKENS" -> BenchmarkRunStatus.Truncated
+    terminalReason == "ERROR" -> BenchmarkRunStatus.Error
+    terminalReason.contains("INTERRUPTED", ignoreCase = true) -> BenchmarkRunStatus.Interrupted
+    generatedTokens > 0 && decodeMs > 0L -> BenchmarkRunStatus.Partial
+    else -> BenchmarkRunStatus.Unknown
+}
+
+private fun BenchmarkRun.settingsLabel(): String =
+    "ctx $contextLength | batch $batchSize | th $threadCount | gpu $gpuLayers | $runtimeBackend"
+
 private fun GenerationPerformance.terminalSuffix(): String =
-    terminalReason?.let { " | $it" }.orEmpty()
+    terminalReason?.let { reason ->
+        " | " + when (reason) {
+            "MAX_TOKENS" -> "token limit"
+            else -> reason
+        }
+    }.orEmpty()
 
 private fun formatBytes(bytes: Long): String {
     val mb = bytes / (1024.0 * 1024.0)

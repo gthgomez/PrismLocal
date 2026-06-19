@@ -39,3 +39,7 @@ llm_host_prefs.xml
 *.pdb
 *.ilk
 *.exe
+
+# Per-run plans and test outputs
+commitPlan.json
+runs/

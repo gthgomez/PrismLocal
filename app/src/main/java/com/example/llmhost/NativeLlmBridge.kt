@@ -19,6 +19,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         private const val STATE_CANCELLED = 4
         private const val STATE_ERROR = 5
         private const val STATE_TOMBSTONED = 6
+        private const val STATE_MAX_TOKENS = 7
         private val bridgeInstanceCounter = AtomicInteger(0)
 
         init {
@@ -46,14 +47,51 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
     private external fun nativeDestroyEngine(handle: Long)
     private external fun nativeLoadModel(handle: Long, path: String): Boolean
+    private external fun nativeLoadModelWithSettings(
+        handle: Long,
+        path: String,
+        maxTokens: Int,
+        threadCount: Int,
+        contextLength: Int,
+        batchSize: Int,
+        temperature: Float,
+        topK: Int,
+        topP: Float,
+        repeatPenalty: Float,
+        gpuLayers: Int,
+    ): Boolean
     private external fun nativeUnloadModel(handle: Long)
+    private external fun nativeResetConversation(handle: Long)
     private external fun nativeStartGeneration(
         handle: Long,
         prompt: String,
         genId: Int,
         maxTokens: Int,
         threadCount: Int,
+        contextLength: Int,
+        batchSize: Int,
+        temperature: Float,
+        topK: Int,
+        topP: Float,
+        repeatPenalty: Float,
+        gpuLayers: Int,
+        continueFromContext: Boolean,
     ): Int
+    private external fun nativeRunBenchmark(
+        handle: Long,
+        maxTokens: Int,
+        threadCount: Int,
+        contextLength: Int,
+        batchSize: Int,
+        temperature: Float,
+        topK: Int,
+        topP: Float,
+        repeatPenalty: Float,
+        gpuLayers: Int,
+        promptTokens: Int,
+        generationTokens: Int,
+        repetitions: Int,
+    ): String
     private external fun nativeCancelGeneration(handle: Long, genId: Int)
     private external fun nativeDrainTokens(handle: Long, genId: Int, maxTokens: Int): IntArray
     private external fun nativeAckEof(handle: Long, genId: Int)
@@ -61,9 +99,10 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     private external fun nativeGetState(handle: Long, genId: Int): Int
     private external fun nativeSetMemoryPressure(handle: Long, level: Int)
 
-    suspend fun loadModel(path: String): Boolean = nativeMutex.withLock {
+    suspend fun loadModel(path: String, settings: GenerationSettings = GenerationSettings()): Boolean = nativeMutex.withLock {
         if (isDestroyed) return@withLock false
-        nativeLoadModel(nativeHandle, path)
+        val safeSettings = settings.clamped()
+        nativeLoadModelWithSettings(nativeHandle, path, safeSettings)
     }
 
     suspend fun unloadModel() {
@@ -72,6 +111,30 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 nativeUnloadModel(nativeHandle)
             }
         }
+    }
+
+    suspend fun resetConversation() {
+        nativeMutex.withLock {
+            if (!isDestroyed) {
+                nativeResetConversation(nativeHandle)
+            }
+        }
+    }
+
+    suspend fun runNativeBenchmark(
+        settings: GenerationSettings = GenerationSettings(),
+        promptTokens: Int = 512,
+        generationTokens: Int = 128,
+        repetitions: Int = 3,
+    ): String = nativeMutex.withLock {
+        if (isDestroyed) return@withLock "{\"error\":\"destroyed\"}"
+        nativeRunBenchmark(
+            nativeHandle,
+            settings.clamped(),
+            promptTokens,
+            generationTokens,
+            repetitions,
+        )
     }
 
     suspend fun setMemoryPressure(level: Int) {
@@ -92,7 +155,11 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         }
     }
 
-    fun generate(prompt: String, settings: GenerationSettings = GenerationSettings()): Flow<GenerationChunk> = callbackFlow {
+    fun generate(
+        prompt: String,
+        settings: GenerationSettings = GenerationSettings(),
+        continueFromContext: Boolean = false,
+    ): Flow<GenerationChunk> = callbackFlow {
         val genId = sessionCounter.getAndIncrement()
         val safeSettings = settings.clamped()
 
@@ -106,6 +173,14 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     genId,
                     safeSettings.maxTokens,
                     safeSettings.threadCount,
+                    safeSettings.contextLength,
+                    safeSettings.batchSize,
+                    safeSettings.temperature,
+                    safeSettings.topK,
+                    safeSettings.topP,
+                    safeSettings.repeatPenalty,
+                    safeSettings.gpuLayers,
+                    continueFromContext,
                 ) != -1
             }
         }
@@ -133,11 +208,12 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 val state = nativeMutex.withLock {
                     if (isDestroyed) STATE_TOMBSTONED else nativeGetState(nativeHandle, genId)
                 }
-                if (state == STATE_EOF || state == STATE_CANCELLED || state == STATE_ERROR) {
+                if (state == STATE_EOF || state == STATE_CANCELLED || state == STATE_ERROR || state == STATE_MAX_TOKENS) {
                     val reason = when (state) {
                         STATE_EOF -> "EOF"
                         STATE_CANCELLED -> "CANCELLED"
                         STATE_ERROR -> "ERROR"
+                        STATE_MAX_TOKENS -> "MAX_TOKENS"
                         else -> "UNKNOWN"
                     }
                     observedTerminal = true
@@ -187,6 +263,14 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     generationId,
                     settings.maxTokens,
                     settings.threadCount,
+                    settings.contextLength,
+                    settings.batchSize,
+                    settings.temperature,
+                    settings.topK,
+                    settings.topP,
+                    settings.repeatPenalty,
+                    settings.gpuLayers,
+                    false,
                 ) != -1
             }
         }
@@ -205,4 +289,42 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         nativeMutex.withLock {
             if (isDestroyed) STATE_TOMBSTONED else nativeGetState(nativeHandle, generationId)
         }
+
+    private fun nativeLoadModelWithSettings(handle: Long, path: String, settings: GenerationSettings): Boolean =
+        nativeLoadModelWithSettings(
+            handle,
+            path,
+            settings.maxTokens,
+            settings.threadCount,
+            settings.contextLength,
+            settings.batchSize,
+            settings.temperature,
+            settings.topK,
+            settings.topP,
+            settings.repeatPenalty,
+            settings.gpuLayers,
+        )
+
+    private fun nativeRunBenchmark(
+        handle: Long,
+        settings: GenerationSettings,
+        promptTokens: Int,
+        generationTokens: Int,
+        repetitions: Int,
+    ): String =
+        nativeRunBenchmark(
+            handle,
+            settings.maxTokens,
+            settings.threadCount,
+            settings.contextLength,
+            settings.batchSize,
+            settings.temperature,
+            settings.topK,
+            settings.topP,
+            settings.repeatPenalty,
+            settings.gpuLayers,
+            promptTokens,
+            generationTokens,
+            repetitions,
+        )
 }

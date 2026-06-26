@@ -20,6 +20,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -40,6 +41,9 @@ internal fun MarkdownText(
     modifier: Modifier = Modifier,
 ) {
     val blocks = remember(text) { markdownBlocks(text) }
+    SideEffect {
+        android.util.Log.d("MarkdownText", "recomposed text_length=${text.length}")
+    }
     Column(modifier = modifier) {
         blocks.forEach { block ->
             when (block.kind) {

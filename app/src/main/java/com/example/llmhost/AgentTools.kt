@@ -559,16 +559,26 @@ object AgentToolProtocol {
 
     fun instructionBlock(): String = cachedInstructionBlock
 
-    fun buildPrompt(userPrompt: String): String = buildString {
+    fun buildPrompt(userPrompt: String, historyContext: String = ""): String = buildString {
         appendLine(instructionBlock())
+        if (historyContext.isNotBlank()) {
+            appendLine()
+            appendLine("Recent conversation history:")
+            appendLine(historyContext)
+        }
         appendLine()
         appendLine("User request:")
         appendLine(userPrompt)
     }
 
-    fun buildToolResultPrompt(originalPrompt: String, result: AgentToolResult): String =
+    fun buildToolResultPrompt(originalPrompt: String, result: AgentToolResult, historyContext: String = ""): String =
         buildString {
             appendLine("You are Prism Local, an on-device Android assistant.")
+            if (historyContext.isNotBlank()) {
+                appendLine()
+                appendLine("Recent conversation history:")
+                appendLine(historyContext)
+            }
             appendLine()
             appendLine("Original user request:")
             appendLine(originalPrompt)

@@ -25,11 +25,11 @@ class StreamingTextState {
         mutableSnapshot.value = text
     }
 
-    fun append(chunk: GenerationChunk) {
+    fun append(chunk: GenerationChunk): String? {
         val publishText = synchronized(lock) {
             val currentGeneration = activeGenerationId
             if (currentGeneration != null && currentGeneration != chunk.generationId) {
-                return
+                return null
             }
             if (currentGeneration == null) {
                 activeGenerationId = chunk.generationId
@@ -49,6 +49,7 @@ class StreamingTextState {
         if (publishText != null) {
             mutableSnapshot.value = publishText
         }
+        return publishText
     }
 
     fun clear() {

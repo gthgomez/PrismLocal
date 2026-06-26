@@ -1,6 +1,7 @@
 package com.example.llmhost
 
 import androidx.annotation.VisibleForTesting
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -98,6 +99,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     private external fun nativeAckEof(handle: Long, genId: Int)
     private external fun nativeDecodeTokens(handle: Long, genId: Int, tokens: IntArray): String
     private external fun nativeGetState(handle: Long, genId: Int): Int
+    private external fun nativeDrainDecodeAndState(handle: Long, genId: Int, maxTokens: Int): NativeDrainResult
     private external fun nativeSetMemoryPressure(handle: Long, level: Int)
 
     suspend fun loadModel(path: String, settings: GenerationSettings = GenerationSettings()): Boolean = nativeMutex.withLock {
@@ -192,18 +194,19 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         }
 
         var observedTerminal = false
+        val jniTimingsUs = mutableListOf<Long>()
         try {
             while (isActive && !isDestroyed) {
                 val (tokens, text, state) = nativeMutex.withLock {
                     if (isDestroyed) {
-                        Triple(IntArray(0), "", STATE_TOMBSTONED)
+                        NativeDrainResult().apply { state = STATE_TOMBSTONED }
                     } else {
-                        val t = nativeDrainTokens(nativeHandle, genId, 128)
-                        val s = if (t.isNotEmpty()) nativeDecodeTokens(nativeHandle, genId, t) else ""
-                        val st = nativeGetState(nativeHandle, genId)
-                        Triple(t, s, st)
+                        val jniStart = SystemClock.elapsedRealtimeNanos()
+                        val result = nativeDrainDecodeAndState(nativeHandle, genId, 128)
+                        jniTimingsUs.add((SystemClock.elapsedRealtimeNanos() - jniStart) / 1000)
+                        result
                     }
-                }
+                }.let { Triple(it.tokens, it.text, it.state) }
 
                 if (tokens.isNotEmpty()) {
                     val normalizedText = Utf8TextPipeline.normalizeNativeText(text)
@@ -237,6 +240,14 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     }
                     nativeAckEof(nativeHandle, genId)
                 }
+            }
+            val timingCount = jniTimingsUs.size
+            if (timingCount > 0) {
+                val sorted = jniTimingsUs.sorted()
+                val p50 = sorted[timingCount / 2]
+                val p99 = sorted[(timingCount * 99 / 100).coerceAtMost(timingCount - 1)]
+                val max = sorted.last()
+                Log.d(TAG, "jni_timing genId=$genId drains=$timingCount p50_us=$p50 p99_us=$p99 max_us=$max")
             }
         }
         close()

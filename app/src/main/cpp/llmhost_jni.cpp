@@ -25,6 +25,27 @@ void ensureStringCache(JNIEnv* env) {
     });
 }
 
+jclass g_drain_result_class = nullptr;
+jmethodID g_drain_result_ctor = nullptr;
+jfieldID g_drain_result_tokens_field = nullptr;
+jfieldID g_drain_result_text_field = nullptr;
+jfieldID g_drain_result_state_field = nullptr;
+std::once_flag g_drain_result_cache_flag;
+
+void ensureDrainResultCache(JNIEnv* env) {
+    std::call_once(g_drain_result_cache_flag, [env]() {
+        jclass local_class = env->FindClass("com/example/llmhost/NativeDrainResult");
+        if (local_class != nullptr) {
+            g_drain_result_class = static_cast<jclass>(env->NewGlobalRef(local_class));
+            g_drain_result_ctor = env->GetMethodID(g_drain_result_class, "<init>", "()V");
+            g_drain_result_tokens_field = env->GetFieldID(g_drain_result_class, "tokens", "[I");
+            g_drain_result_text_field = env->GetFieldID(g_drain_result_class, "text", "Ljava/lang/String;");
+            g_drain_result_state_field = env->GetFieldID(g_drain_result_class, "state", "I");
+            env->DeleteLocalRef(local_class);
+        }
+    });
+}
+
 llmhost::Engine* toEngine(jlong handle) {
     return reinterpret_cast<llmhost::Engine*>(handle);
 }
@@ -338,4 +359,48 @@ Java_com_example_llmhost_NativeLlmBridge_nativeSetMemoryPressure(JNIEnv*, jobjec
         return;
     }
     engine->setMemoryPressure(level);
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_example_llmhost_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv* env, jobject, jlong handle, jint gen_id, jint max_tokens) {
+    auto* engine = toEngine(handle);
+
+    ensureDrainResultCache(env);
+
+    if (g_drain_result_class == nullptr || g_drain_result_ctor == nullptr) {
+        return nullptr;
+    }
+
+    jobject result = env->NewObject(g_drain_result_class, g_drain_result_ctor);
+    if (result == nullptr) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+
+    if (engine == nullptr) {
+        env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Tombstoned));
+        return result;
+    }
+
+    try {
+        auto drain_result = engine->drainDecodeAndState(gen_id, max_tokens);
+
+        jintArray tokens = toJintArray(env, drain_result.tokens);
+        if (tokens != nullptr) {
+            env->SetObjectField(result, g_drain_result_tokens_field, tokens);
+            env->DeleteLocalRef(tokens);
+        }
+
+        jstring text = toJavaString(env, drain_result.text);
+        if (text != nullptr) {
+            env->SetObjectField(result, g_drain_result_text_field, text);
+            env->DeleteLocalRef(text);
+        }
+
+        env->SetIntField(result, g_drain_result_state_field, drain_result.state);
+    } catch (const std::exception&) {
+        env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Error));
+    }
+
+    return result;
 }

@@ -125,11 +125,13 @@ class InferenceService : Service() {
     private var pendingAgentToolOriginalPrompt: String? = null
     private var pendingAgentToolDepth: Int = 0
     private var reloadPending = false
+    private var lastProfileCaptureTime = 0L
     private val _lastAgentTracePath = MutableStateFlow<String?>(null)
     val lastAgentTracePath: StateFlow<String?> = _lastAgentTracePath.asStateFlow()
     private val activeAgentSteps = mutableListOf<AgentStep>()
     private var activeAgentChainPrompt: String? = null
     private var activeAgentChainStartTime = 0L
+    private var activeAgentChainTokens = 0
     private val activeAgentToolHistory = mutableListOf<AgentToolCall>()
     private val benchmarkQueue = ArrayDeque<BenchmarkPreset>()
     private val _currentModel = MutableStateFlow<String?>(null)
@@ -725,6 +727,43 @@ class InferenceService : Service() {
             largeMemoryClassMb = activityManager.largeMemoryClass,
             appHeapMaxBytes = Runtime.getRuntime().maxMemory(),
         )
+    }
+
+    private fun getDeviceCapabilityProfileCached(maxAgeMs: Long = 30000L): DeviceCapabilityProfile {
+        val now = SystemClock.elapsedRealtime()
+        val cached = _deviceCapabilityProfile.value
+        return if (cached != null && now - lastProfileCaptureTime < maxAgeMs) {
+            cached
+        } else {
+            val fresh = captureDeviceCapabilityProfile()
+            _deviceCapabilityProfile.value = fresh
+            lastProfileCaptureTime = now
+            fresh
+        }
+    }
+
+    private fun getFormattedHistoryForAgent(excludeIds: Set<Long>): String {
+        val history = synchronized(transcriptLock) {
+            _transcript.value.filter { message ->
+                message.text.isNotBlank() && message.id !in excludeIds
+            }
+        }
+        if (history.isEmpty()) return ""
+        val selected = ArrayDeque<TranscriptMessage>()
+        var chars = 0
+        for (message in history.asReversed()) {
+            val formatted = message.asPromptLine()
+            if (chars + formatted.length > 4000) {
+                break
+            }
+            selected.addFirst(message)
+            chars += formatted.length
+        }
+        return buildString {
+            selected.forEach { message ->
+                appendLine(message.asPromptLine())
+            }
+        }
     }
 
     private fun buildModelReadiness(
@@ -1470,6 +1509,7 @@ class InferenceService : Service() {
                     activeAgentSteps.clear()
                     activeAgentChainPrompt = prompt
                     activeAgentChainStartTime = System.currentTimeMillis()
+                    activeAgentChainTokens = 0
                     activeAgentToolHistory.clear()
                     handleAgentToolCall(directToolCall, prompt, depth = 0)
                     return@withLock
@@ -1491,10 +1531,11 @@ class InferenceService : Service() {
                     activeAgentSteps.clear()
                     activeAgentChainPrompt = prompt
                     activeAgentChainStartTime = System.currentTimeMillis()
+                    activeAgentChainTokens = 0
                     activeAgentToolHistory.clear()
                 }
                 val enginePrompt = if (benchmarkPreset == null) {
-                    if (agentEnabled) AgentToolProtocol.buildPrompt(prompt) else buildPromptWithRecentContext(prompt)
+                    if (agentEnabled) AgentToolProtocol.buildPrompt(prompt, getFormattedHistoryForAgent(emptySet())) else buildPromptWithRecentContext(prompt)
                 } else {
                     prompt
                 }
@@ -1518,6 +1559,7 @@ class InferenceService : Service() {
                 val assistantMessageId = appendTranscriptMessage(TranscriptRole.ASSISTANT, "")
                 activeAssistantTranscriptId = assistantMessageId
                 streamState.beginGeneration()
+                val baselineMemoryUsed = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()
                 _isGenerating.value = true
                 _runtimeStatus.value = RuntimeStatus.GENERATING
                 startGenerationForeground()
@@ -1553,12 +1595,12 @@ class InferenceService : Service() {
                             if (uiChunk.isTerminal) {
                                 terminalReason = uiChunk.terminalReason
                             }
-                            streamState.append(uiChunk)
+                            val publishedText = streamState.append(uiChunk)
                             if (uiChunk.isTerminal || now - lastTranscriptUpdateAt >= 75L) {
                                 lastTranscriptUpdateAt = now
                                 updateTranscriptMessage(
                                     assistantMessageId,
-                                    streamState.snapshotText(),
+                                    publishedText ?: streamState.snapshotText(),
                                     persistImmediately = uiChunk.isTerminal,
                                 )
                             }
@@ -1630,9 +1672,11 @@ class InferenceService : Service() {
                                     terminalReason = finalReason,
                                 )
                                 if (agentEnabled) {
+                                    activeAgentChainTokens += generatedTokens
                                     finalizeAgentTrace(success = (finalReason == "EOF" || finalReason == "MAX_TOKENS"))
                                 }
                             } else if (finalReason == "ERROR" && agentEnabled) {
+                                activeAgentChainTokens += generatedTokens
                                 finalizeAgentTrace(success = false)
                             }
                             val completedPreset = activeBenchmarkPreset
@@ -1648,6 +1692,9 @@ class InferenceService : Service() {
                                 if (agentToolCall == null) finalOutput else reasoningPrefix,
                                 persistImmediately = true,
                             )
+                            val runtime = Runtime.getRuntime()
+                            val usedMem = runtime.totalMemory() - runtime.freeMemory()
+                            Log.d(TAG, "generation_mem used_kb=${usedMem/1024} max_kb=${runtime.maxMemory()/1024} baseline_kb=${baselineMemoryUsed/1024}")
                             _isGenerating.value = false
                             generationJob = null
                             activeAssistantTranscriptId = null
@@ -1738,12 +1785,12 @@ class InferenceService : Service() {
                             if (uiChunk.isTerminal) {
                                 terminalReason = uiChunk.terminalReason
                             }
-                            streamState.append(uiChunk)
+                            val publishedText = streamState.append(uiChunk)
                             if (uiChunk.isTerminal || now - lastTranscriptUpdateAt >= 75L) {
                                 lastTranscriptUpdateAt = now
                                 updateTranscriptMessage(
                                     assistantMessage.id,
-                                    streamState.snapshotText(),
+                                    publishedText ?: streamState.snapshotText(),
                                     persistImmediately = uiChunk.isTerminal,
                                 )
                             }
@@ -1876,7 +1923,7 @@ class InferenceService : Service() {
         }
 
         // Battery & Thermal Safety Gates
-        val profile = _deviceCapabilityProfile.value ?: captureDeviceCapabilityProfile()
+        val profile = getDeviceCapabilityProfileCached()
         val thermalStatus = profile.thermalStatus?.lowercase()
         val isHot = thermalStatus in setOf("severe", "critical", "emergency", "shutdown")
         if (isHot) {
@@ -2273,6 +2320,12 @@ class InferenceService : Service() {
         val startTime = activeAgentChainStartTime
         if (startTime == 0L) return
 
+        val chainDurationMs = System.currentTimeMillis() - startTime
+        val iterationCount = steps.size
+        val toolCallCount = activeAgentToolHistory.size
+        val totalTokens = activeAgentChainTokens
+        Log.i(TAG, "agent_chain_summary duration_ms=$chainDurationMs iterations=$iterationCount total_tokens=$totalTokens tool_calls=$toolCallCount")
+
         serviceScope.launch(Dispatchers.IO) {
             runCatching {
                 val trace = AgentTrace(
@@ -2339,7 +2392,7 @@ class InferenceService : Service() {
 
     private fun validateRuntimeSettingsPayload(settings: GenerationSettings): Pair<String, List<String>> {
         val warnings = mutableListOf<String>()
-        val profile = _deviceCapabilityProfile.value
+        val profile = getDeviceCapabilityProfileCached()
         if (settings.contextLength > GenerationSettings.DEFAULT_CONTEXT_LENGTH) {
             warnings += "Higher context increases RAM use and may reduce speed."
         }
@@ -2513,9 +2566,7 @@ class InferenceService : Service() {
     }
 
     private fun agentToolGetAppVersionInfo(call: AgentToolCall): AgentToolResult {
-        val profile = _deviceCapabilityProfile.value ?: captureDeviceCapabilityProfile().also {
-            _deviceCapabilityProfile.value = it
-        }
+        val profile = getDeviceCapabilityProfileCached()
         return toolSuccess(
             call,
             "Prism Local ${BuildConfig.VERSION_NAME} (${BuildConfig.BUILD_TYPE}) on Android ${profile.androidSdk}",
@@ -3376,7 +3427,7 @@ class InferenceService : Service() {
 
     private fun agentToolRunBenchmark(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Benchmark requires confirmation")
-        val profile = _deviceCapabilityProfile.value ?: captureDeviceCapabilityProfile()
+        val profile = getDeviceCapabilityProfileCached()
         if ((profile.batteryPercent ?: 100) < 10 && profile.isCharging != true) {
             return toolFailure(call, AgentToolErrorCode.BUSY, "Battery is too low for benchmark; plug in or run from the UI")
         }
@@ -3449,7 +3500,7 @@ class InferenceService : Service() {
                 val settings = _generationSettings.value.clamped()
                 
                 // Safety Verification Gate
-                val profile = _deviceCapabilityProfile.value ?: captureDeviceCapabilityProfile()
+                val profile = getDeviceCapabilityProfileCached()
                 val thermalStatus = profile.thermalStatus?.lowercase()
                 val isHot = thermalStatus in setOf("severe", "critical", "emergency", "shutdown")
                 val isBatteryLow = (profile.batteryPercent ?: 100) < 15 && profile.isCharging != true
@@ -3488,7 +3539,7 @@ class InferenceService : Service() {
                 var lastTranscriptUpdateAt = 0L
                 var terminalReason: String? = null
                 val budgetedResult = truncateToolResultForBudget(toolResult, originalPrompt, settings)
-                val enginePrompt = AgentToolProtocol.buildToolResultPrompt(originalPrompt, budgetedResult)
+                val enginePrompt = AgentToolProtocol.buildToolResultPrompt(originalPrompt, budgetedResult, getFormattedHistoryForAgent(setOf(assistantMessageId)))
 
                 generationJob = engine.generate(enginePrompt, settings, grammar = null)
                     .onEach { chunk ->
@@ -3504,12 +3555,12 @@ class InferenceService : Service() {
                                 activeGenerationTokens = generatedTokens
                             }
                             if (uiChunk.isTerminal) terminalReason = uiChunk.terminalReason
-                            streamState.append(uiChunk)
+                            val publishedText = streamState.append(uiChunk)
                             if (uiChunk.isTerminal || now - lastTranscriptUpdateAt >= 75L) {
                                 lastTranscriptUpdateAt = now
                                 updateTranscriptMessage(
                                     assistantMessageId,
-                                    streamState.snapshotText(),
+                                    publishedText ?: streamState.snapshotText(),
                                     persistImmediately = uiChunk.isTerminal,
                                 )
                             }
@@ -3547,6 +3598,7 @@ class InferenceService : Service() {
                             )
                             val finalOutput = streamState.snapshotText()
                             val nextToolCall = if (finalReason == "EOF") AgentToolProtocol.parseToolCall(finalOutput) else null
+                            activeAgentChainTokens += generatedTokens
                             if (nextToolCall == null) {
                                 finalizeAgentTrace(success = (finalReason == "EOF" || finalReason == "MAX_TOKENS"))
                             } else if (finalReason == "ERROR") {
@@ -4387,7 +4439,9 @@ class InferenceService : Service() {
                     ?.optString("summary")
                     ?.takeIf { it.isNotBlank() }
             } else null
-            _transcript.value = _transcript.value + TranscriptMessage(id, role, text, sum)
+            val mutable = _transcript.value.toMutableList()
+            mutable.add(TranscriptMessage(id, role, text, sum))
+            _transcript.value = mutable
             id
         }
         touchCurrentChat(_transcript.value, updateTitle = role == TranscriptRole.USER)

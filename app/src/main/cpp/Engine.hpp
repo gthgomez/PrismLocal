@@ -51,6 +51,12 @@ public:
     std::string decodeTokens(int generation_id, const std::vector<int32_t>& tokens);
     int getState(int generation_id) const;
     void setMemoryPressure(int level);
+    struct DrainResult {
+        std::vector<int32_t> tokens;
+        std::string text;
+        int state = 0;
+    };
+    DrainResult drainDecodeAndState(int generation_id, int max_tokens);
 
 private:
     struct Impl;

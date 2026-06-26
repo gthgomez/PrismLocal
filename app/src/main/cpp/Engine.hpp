@@ -29,6 +29,7 @@ struct GenerationConfig {
     float repeat_penalty = 1.10f;
     int gpu_layers = 0;
     bool continue_from_context = false;
+    std::string grammar = "";
 };
 
 class Engine {

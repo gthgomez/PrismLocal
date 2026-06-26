@@ -12,7 +12,7 @@ class StreamingTextState {
     val snapshot: StateFlow<String> = mutableSnapshot.asStateFlow()
     private var lastPublish = 0L
     private var activeGenerationId: Int? = null
-    private val throttleMs = 33L
+    private val throttleMs = 50L
 
     fun beginGeneration(expectedGenerationId: Int? = null, initialText: String = "") {
         val text = synchronized(lock) {

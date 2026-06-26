@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
@@ -85,8 +86,11 @@ class InferenceService : Service() {
         private const val MAX_CHAT_MESSAGES_BEFORE_CONTINUATION = 60
         private const val MAX_CHAT_CHARS_BEFORE_CONTINUATION = 24_000
         private const val MAX_PROMPT_CONTEXT_CHARS = 8_000
-        private const val MAX_AGENT_TOOL_ITERATIONS = 3
+        private const val KEY_AGENT_ENABLED = "agent_enabled"
+        private const val KEY_PENDING_AGENT_ACTION_PREFIX = "pending_agent_action_"
     }
+
+    private fun pendingAgentActionKey(chatId: String): String = "$KEY_PENDING_AGENT_ACTION_PREFIX$chatId"
 
     inner class LocalBinder : Binder() {
         fun getService(): InferenceService = this@InferenceService
@@ -120,6 +124,13 @@ class InferenceService : Service() {
     private var pendingAgentToolCall: AgentToolCall? = null
     private var pendingAgentToolOriginalPrompt: String? = null
     private var pendingAgentToolDepth: Int = 0
+    private var reloadPending = false
+    private val _lastAgentTracePath = MutableStateFlow<String?>(null)
+    val lastAgentTracePath: StateFlow<String?> = _lastAgentTracePath.asStateFlow()
+    private val activeAgentSteps = mutableListOf<AgentStep>()
+    private var activeAgentChainPrompt: String? = null
+    private var activeAgentChainStartTime = 0L
+    private val activeAgentToolHistory = mutableListOf<AgentToolCall>()
     private val benchmarkQueue = ArrayDeque<BenchmarkPreset>()
     private val _currentModel = MutableStateFlow<String?>(null)
     private val _activeModelInfo = MutableStateFlow<ModelStorageManager.ActiveModelInfo?>(null)
@@ -173,6 +184,7 @@ class InferenceService : Service() {
         modelStorageManager = ModelStorageManager(this)
         loadBenchmarkRuns()
         loadChats()
+        restorePendingAgentToolCall()
         loadGenerationSettings()
         refreshDeviceAndModelReadiness()
         observeHuggingFaceDownloadWork()
@@ -184,6 +196,7 @@ class InferenceService : Service() {
                 }
         }
         memoryGovernor.monitorMemory()
+            .distinctUntilChanged()
             .onEach { state ->
                 engine.setMemoryPressure(state.level)
                 if (state == MemoryState.CRITICAL) {
@@ -1075,12 +1088,14 @@ class InferenceService : Service() {
     private fun chatExportJson(session: ChatSession, messages: List<TranscriptMessage>): JSONObject {
         val array = JSONArray()
         messages.forEach { message ->
-            array.put(
-                JSONObject()
-                    .put("id", message.id)
-                    .put("role", message.role.name)
-                    .put("text", message.text),
-            )
+            val obj = JSONObject()
+                .put("id", message.id)
+                .put("role", message.role.name)
+                .put("text", message.text)
+            if (message.summary != null) {
+                obj.put("summary", message.summary)
+            }
+            array.put(obj)
         }
         return JSONObject()
             .put("schema", "prism-local-chat-v1")
@@ -1121,6 +1136,7 @@ class InferenceService : Service() {
         publishEvent: Boolean = false,
     ): String {
         persistTranscriptNow()
+        clearPendingAgentToolMemoryState()
         val session = newSession(title = title, messageCount = 0)
         synchronized(transcriptLock) {
             _chatSessions.value = (_chatSessions.value + session).sortedByDescending { it.updatedAt }
@@ -1154,6 +1170,7 @@ class InferenceService : Service() {
             return false
         }
         persistTranscriptNow()
+        clearPendingAgentToolMemoryState()
         synchronized(transcriptLock) {
             _currentChatId.value = chatId
             _transcript.value = readTranscriptFile(transcriptFile(chatId))
@@ -1166,6 +1183,7 @@ class InferenceService : Service() {
             .edit()
             .putString(KEY_ACTIVE_CHAT, chatId)
             .apply()
+        restorePendingAgentToolCall()
         resetNativeConversationAsync("chat switch")
         return true
     }
@@ -1196,6 +1214,7 @@ class InferenceService : Service() {
         val remaining = _chatSessions.value.filterNot { it.id == chatId }
         runCatching { transcriptFile(chatId).delete() }
             .onFailure { error -> Log.w(TAG, "failed to delete chat transcript", error) }
+        clearPendingAgentToolPrefs(chatId)
         if (remaining.isEmpty()) {
             _chatSessions.value = emptyList()
             createChat()
@@ -1226,6 +1245,7 @@ class InferenceService : Service() {
         }.onFailure { error ->
             Log.w(TAG, "failed to delete transcript", error)
         }
+        clearPendingAgentToolPrefs()
         persistChatIndex()
         resetNativeConversationAsync("clear transcript")
     }
@@ -1238,9 +1258,13 @@ class InferenceService : Service() {
         persistGenerationSettings(safeSettings)
         if (settingsRequireReload(previous, safeSettings)) {
             val modelId = _currentModel.value
-            if (modelId != null && !_isGenerating.value) {
-                publishUiEvent("Reloading model for context/backend settings")
-                serviceScope.launch { switchModel(modelId) }
+            if (modelId != null) {
+                if (!_isGenerating.value) {
+                    publishUiEvent("Reloading model for context/backend settings")
+                    serviceScope.launch { switchModel(modelId) }
+                } else {
+                    reloadPending = true
+                }
             }
         }
     }
@@ -1273,6 +1297,7 @@ class InferenceService : Service() {
             .putFloat(KEY_TOP_P, settings.topP)
             .putFloat(KEY_REPEAT_PENALTY, settings.repeatPenalty)
             .putInt(KEY_GPU_LAYERS, settings.gpuLayers)
+            .putBoolean(KEY_AGENT_ENABLED, settings.agentEnabled)
             .apply()
     }
 
@@ -1442,6 +1467,10 @@ class InferenceService : Service() {
                 if (directToolCall != null) {
                     ensureChatWithinLengthBudget()
                     appendTranscriptMessage(TranscriptRole.USER, prompt)
+                    activeAgentSteps.clear()
+                    activeAgentChainPrompt = prompt
+                    activeAgentChainStartTime = System.currentTimeMillis()
+                    activeAgentToolHistory.clear()
                     handleAgentToolCall(directToolCall, prompt, depth = 0)
                     return@withLock
                 }
@@ -1457,9 +1486,15 @@ class InferenceService : Service() {
                 if (benchmarkPreset == null && synchronized(transcriptLock) { _transcript.value.isEmpty() }) {
                     engine.resetConversation()
                 }
-                val agentEnabled = false
+                val agentEnabled = _generationSettings.value.agentEnabled
+                if (agentEnabled) {
+                    activeAgentSteps.clear()
+                    activeAgentChainPrompt = prompt
+                    activeAgentChainStartTime = System.currentTimeMillis()
+                    activeAgentToolHistory.clear()
+                }
                 val enginePrompt = if (benchmarkPreset == null) {
-                    buildPromptWithRecentContext(prompt)
+                    if (agentEnabled) AgentToolProtocol.buildPrompt(prompt) else buildPromptWithRecentContext(prompt)
                 } else {
                     prompt
                 }
@@ -1502,7 +1537,7 @@ class InferenceService : Service() {
                     "generateSafely start promptLength=${enginePrompt.length} model=${_currentModel.value} " +
                         "session=$session settings=$settings",
                 )
-                generationJob = engine.generate(enginePrompt, settings)
+                generationJob = engine.generate(enginePrompt, settings, grammar = if (agentEnabled) AgentToolProtocol.toolGrammar else null)
                     .onEach { chunk ->
                         if (session == generationSession) {
                             val uiChunk = Utf8TextPipeline.normalizeChunk(chunk)
@@ -1594,13 +1629,23 @@ class InferenceService : Service() {
                                     performance = finalPerformance,
                                     terminalReason = finalReason,
                                 )
+                                if (agentEnabled) {
+                                    finalizeAgentTrace(success = (finalReason == "EOF" || finalReason == "MAX_TOKENS"))
+                                }
+                            } else if (finalReason == "ERROR" && agentEnabled) {
+                                finalizeAgentTrace(success = false)
                             }
                             val completedPreset = activeBenchmarkPreset
                             clearActiveGenerationMetrics()
                             _benchmarkStatus.value = BenchmarkStatus()
+                            val reasoningPrefix = if (agentToolCall != null) {
+                                AgentToolProtocol.extractReasoningPrefix(finalOutput)
+                            } else {
+                                ""
+                            }
                             updateTranscriptMessage(
                                 assistantMessageId,
-                                if (agentToolCall == null) finalOutput else "",
+                                if (agentToolCall == null) finalOutput else reasoningPrefix,
                                 persistImmediately = true,
                             )
                             _isGenerating.value = false
@@ -1612,6 +1657,14 @@ class InferenceService : Service() {
                                 _runtimeStatus.value == RuntimeStatus.CANCELLING
                             ) {
                                 _runtimeStatus.value = RuntimeStatus.IDLE
+                            }
+                            if (reloadPending) {
+                                reloadPending = false
+                                val modelId = _currentModel.value
+                                if (modelId != null) {
+                                    publishUiEvent("Reloading model for context/backend settings")
+                                    serviceScope.launch { switchModel(modelId) }
+                                }
                             }
                             if (completedPreset?.suiteId != null && benchmarkQueue.isNotEmpty()) {
                                 serviceScope.launch { runNextQueuedBenchmark() }
@@ -1772,6 +1825,7 @@ class InferenceService : Service() {
         pendingAgentToolOriginalPrompt = null
         pendingAgentToolDepth = 0
         _pendingAgentToolAction.value = null
+        clearPendingAgentToolPrefs()
         appendTranscriptMessage(
             TranscriptRole.TOOL,
             AgentToolProtocol.toolEventJson(
@@ -1791,10 +1845,15 @@ class InferenceService : Service() {
         pendingAgentToolCall = null
         pendingAgentToolOriginalPrompt = null
         pendingAgentToolDepth = 0
+        clearPendingAgentToolPrefs()
         serviceScope.launch {
+            val stepStart = SystemClock.elapsedRealtime()
             val result = executeAgentTool(call, confirmed = true)
+            val latency = SystemClock.elapsedRealtime() - stepStart
+            recordAgentStep(call, result, latency)
             appendToolResult(result)
-            if (result.success && shouldContinueAfterTool(call) && depth + 1 < MAX_AGENT_TOOL_ITERATIONS) {
+            val maxIterations = _generationSettings.value.maxAgentIterations
+            if (result.success && shouldContinueAfterTool(call) && depth + 1 < maxIterations) {
                 startAgentFollowUpGeneration(originalPrompt, result, depth + 1)
             }
         }
@@ -1815,17 +1874,101 @@ class InferenceService : Service() {
             )
             return
         }
-        if (depth >= MAX_AGENT_TOOL_ITERATIONS) {
-            appendToolResult(
-                AgentToolResult(
-                    call = validatedCall,
-                    success = false,
-                    summary = "Tool loop stopped after $MAX_AGENT_TOOL_ITERATIONS steps",
-                    errorCode = AgentToolErrorCode.FAILED,
-                )
+
+        // Battery & Thermal Safety Gates
+        val profile = _deviceCapabilityProfile.value ?: captureDeviceCapabilityProfile()
+        val thermalStatus = profile.thermalStatus?.lowercase()
+        val isHot = thermalStatus in setOf("severe", "critical", "emergency", "shutdown")
+        if (isHot) {
+            val safetyResult = AgentToolResult(
+                call = validatedCall,
+                success = false,
+                summary = "Agent execution paused: Device is too hot (thermal state: $thermalStatus)",
+                errorCode = AgentToolErrorCode.BUSY
+            )
+            appendToolResult(safetyResult)
+            finalizeAgentTrace(success = false, abortReason = "Device thermal state is $thermalStatus")
+            appendTranscriptMessage(
+                TranscriptRole.ASSISTANT,
+                "⚠️ Agent execution paused: Device is too hot (thermal state: $thermalStatus). Stopping tool execution to protect device hardware."
             )
             return
         }
+        if ((profile.batteryPercent ?: 100) < 15 && profile.isCharging != true) {
+            val safetyResult = AgentToolResult(
+                call = validatedCall,
+                success = false,
+                summary = "Agent execution paused: Battery is low (${profile.batteryPercent}%)",
+                errorCode = AgentToolErrorCode.BUSY
+            )
+            appendToolResult(safetyResult)
+            finalizeAgentTrace(success = false, abortReason = "Battery is low (${profile.batteryPercent}%)")
+            appendTranscriptMessage(
+                TranscriptRole.ASSISTANT,
+                "⚠️ Agent execution paused: Battery level is low (${profile.batteryPercent}%). Stopping tool execution to preserve battery life."
+            )
+            return
+        }
+
+        // Loop / Repetition Guards
+        val maxIterations = _generationSettings.value.maxAgentIterations
+        if (depth >= maxIterations) {
+            val maxStepsResult = AgentToolResult(
+                call = validatedCall,
+                success = false,
+                summary = "Tool loop stopped after $maxIterations steps",
+                errorCode = AgentToolErrorCode.FAILED,
+            )
+            appendToolResult(maxStepsResult)
+            finalizeAgentTrace(success = false, abortReason = "Reached maximum tool depth of $maxIterations")
+            appendTranscriptMessage(
+                TranscriptRole.ASSISTANT,
+                "⚠️ Agent loop stopped: Reached the maximum execution depth limit of $maxIterations operations."
+            )
+            return
+        }
+
+        val isExactOrSimilarLoop = activeAgentToolHistory.any {
+            it.name == validatedCall.name && AgentToolProtocol.areArgumentsSimilar(it.arguments, validatedCall.arguments)
+        }
+        val isStatelessLoop = validatedCall.name in setOf("get_model_status", "get_storage_status", "get_app_version_info", "get_tool_capabilities") &&
+                activeAgentToolHistory.any { it.name == validatedCall.name }
+        
+        val cheapTools = setOf(
+            "get_model_status", "get_storage_status", "get_app_version_info", "get_tool_capabilities",
+            "search_chats", "list_installed_models", "list_curated_downloadable_models", "get_download_status",
+            "get_active_operation", "get_privacy_summary", "explain_runtime_settings", "diagnose_performance",
+            "recommend_runtime_settings", "get_model_card", "summarize_current_chat"
+        )
+        val historicalCount = activeAgentToolHistory.count { it.name == validatedCall.name }
+        val tooManyInvocations = if (validatedCall.name in cheapTools) {
+            historicalCount >= 3
+        } else {
+            historicalCount >= 2
+        }
+
+        if (isExactOrSimilarLoop || isStatelessLoop || tooManyInvocations) {
+            val reason = when {
+                isExactOrSimilarLoop -> "Repetitive or near-identical operation detected"
+                isStatelessLoop -> "Repetitive stateless query detected"
+                else -> "Tool ${validatedCall.name} requested too many times (${historicalCount + 1} times)"
+            }
+            val loopResult = AgentToolResult(
+                call = validatedCall,
+                success = false,
+                summary = "Agent loop aborted: $reason",
+                errorCode = AgentToolErrorCode.FAILED
+            )
+            appendToolResult(loopResult)
+            finalizeAgentTrace(success = false, abortReason = reason)
+            appendTranscriptMessage(
+                TranscriptRole.ASSISTANT,
+                "⚠️ Agent execution aborted: $reason. Stopping loop execution to protect device battery and CPU resources."
+            )
+            return
+        }
+        activeAgentToolHistory.add(validatedCall)
+
         appendTranscriptMessage(
             TranscriptRole.TOOL,
             AgentToolProtocol.toolEventJson(
@@ -1840,9 +1983,13 @@ class InferenceService : Service() {
         when (definition.risk) {
             AgentToolRisk.SAFE -> {
                 serviceScope.launch {
+                    val stepStart = SystemClock.elapsedRealtime()
                     val result = executeAgentTool(validatedCall, confirmed = false)
+                    val latency = SystemClock.elapsedRealtime() - stepStart
+                    recordAgentStep(validatedCall, result, latency)
                     appendToolResult(result)
-                    if (result.success && depth + 1 < MAX_AGENT_TOOL_ITERATIONS) {
+                    val maxIterations = _generationSettings.value.maxAgentIterations
+                    if (result.success && depth + 1 < maxIterations) {
                         startAgentFollowUpGeneration(originalPrompt, result, depth + 1)
                     }
                 }
@@ -1852,17 +1999,20 @@ class InferenceService : Service() {
                 pendingAgentToolCall = validatedCall
                 pendingAgentToolOriginalPrompt = originalPrompt
                 pendingAgentToolDepth = depth
+                persistPendingAgentToolCall(validatedCall, originalPrompt, depth)
                 _pendingAgentToolAction.value = buildAgentToolConfirmation(id, validatedCall, definition)
                 publishUiEvent("Confirm tool: ${validatedCall.name}")
             }
-            AgentToolRisk.RESTRICTED -> appendToolResult(
-                AgentToolResult(
+            AgentToolRisk.RESTRICTED -> {
+                val restrictedResult = AgentToolResult(
                     call = validatedCall,
                     success = false,
                     summary = "Restricted tool blocked: ${validatedCall.name}",
                     errorCode = AgentToolErrorCode.RESTRICTED_TOOL,
                 )
-            )
+                appendToolResult(restrictedResult)
+                recordAgentStep(validatedCall, restrictedResult, 0L)
+            }
         }
     }
 
@@ -2090,7 +2240,82 @@ class InferenceService : Service() {
             else -> AgentToolResult(call, success = false, summary = "Unknown tool: ${call.name}")
         }
 
-    private fun shouldContinueAfterTool(call: AgentToolCall): Boolean = false
+    private fun shouldContinueAfterTool(call: AgentToolCall): Boolean =
+        when (call.name) {
+            "set_runtime_settings",
+            "restore_previous_runtime_settings",
+            "rename_current_chat",
+            "clear_chat",
+            "delete_or_clear_chat",
+            "download_model",
+            "switch_model",
+            "cancel_active_job",
+            "cancel_active_operation" -> true
+            else -> false
+        }
+
+    private fun recordAgentStep(call: AgentToolCall, result: AgentToolResult, latencyMs: Long) {
+        val index = activeAgentSteps.size
+        activeAgentSteps.add(
+            AgentStep(
+                stepIndex = index,
+                toolName = call.name,
+                arguments = call.arguments.toString(),
+                resultSummary = result.summary,
+                latencyMs = latencyMs
+            )
+        )
+    }
+
+    private fun finalizeAgentTrace(success: Boolean, abortReason: String? = null) {
+        val prompt = activeAgentChainPrompt ?: return
+        val steps = activeAgentSteps.toList()
+        val startTime = activeAgentChainStartTime
+        if (startTime == 0L) return
+
+        serviceScope.launch(Dispatchers.IO) {
+            runCatching {
+                val trace = AgentTrace(
+                    timestamp = startTime,
+                    prompt = prompt,
+                    steps = steps,
+                    success = success,
+                    abortReason = abortReason
+                )
+                val json = JSONObject()
+                    .put("timestamp", trace.timestamp)
+                    .put("prompt", trace.prompt)
+                    .put("success", trace.success)
+                if (trace.abortReason != null) {
+                    json.put("abort_reason", trace.abortReason)
+                }
+                
+                val stepsArray = JSONArray()
+                trace.steps.forEach { step ->
+                    val stepJson = JSONObject()
+                        .put("stepIndex", step.stepIndex)
+                        .put("toolName", step.toolName)
+                        .put("arguments", step.arguments)
+                        .put("resultSummary", step.resultSummary)
+                        .put("latencyMs", step.latencyMs)
+                    stepsArray.put(stepJson)
+                }
+                json.put("steps", stepsArray)
+
+                val tracesDir = File(filesDir, "agent_traces")
+                if (!tracesDir.exists()) {
+                    tracesDir.mkdirs()
+                }
+                val file = File(tracesDir, "agent_trace_${trace.timestamp}.json")
+                file.writeText(json.toString(2))
+                _lastAgentTracePath.value = file.absolutePath
+                Log.d(TAG, "Agent trace saved: ${file.absolutePath}")
+            }.onFailure { error ->
+                Log.e(TAG, "Failed to serialize/save agent trace", error)
+            }
+        }
+        activeAgentChainStartTime = 0L
+    }
 
     private fun proposedRuntimeSettings(
         args: JSONObject,
@@ -2671,7 +2896,7 @@ class InferenceService : Service() {
             else -> chatExportMarkdown(session, messages)
         }
         val dir = File(filesDir, "agent_exports").apply { mkdirs() }
-        val safeName = session.title.replace(Regex("[^A-Za-z0-9._-]+"), "_").trim('_').ifBlank { "chat" }.take(48)
+        val safeName = AgentSanitizer.sanitizeFileName(session.title).take(48)
         val file = File(dir, "${safeName}_${System.currentTimeMillis()}.$extension")
         file.writeText(content)
         return AgentToolResult(
@@ -3222,6 +3447,28 @@ class InferenceService : Service() {
                 if (_currentModel.value == null) return@withLock
                 val session = ++generationSession
                 val settings = _generationSettings.value.clamped()
+                
+                // Safety Verification Gate
+                val profile = _deviceCapabilityProfile.value ?: captureDeviceCapabilityProfile()
+                val thermalStatus = profile.thermalStatus?.lowercase()
+                val isHot = thermalStatus in setOf("severe", "critical", "emergency", "shutdown")
+                val isBatteryLow = (profile.batteryPercent ?: 100) < 15 && profile.isCharging != true
+                val isAgentDisabled = !settings.agentEnabled
+
+                if (isHot || isBatteryLow || isAgentDisabled) {
+                    val reason = when {
+                        isAgentDisabled -> "Agentic tools toggled off"
+                        isHot -> "Device is too hot (thermal state: $thermalStatus)"
+                        else -> "Battery level is low (${profile.batteryPercent}%)"
+                    }
+                    finalizeAgentTrace(success = false, abortReason = "Follow-up aborted: $reason")
+                    appendTranscriptMessage(
+                        TranscriptRole.ASSISTANT,
+                        "⚠️ Agent follow-up aborted: $reason. Stopping execution to protect device resources."
+                    )
+                    return@withLock
+                }
+
                 _generationPerformance.value = null
                 val assistantMessageId = appendTranscriptMessage(TranscriptRole.ASSISTANT, "")
                 activeAssistantTranscriptId = assistantMessageId
@@ -3240,9 +3487,10 @@ class InferenceService : Service() {
                 var lastPerformancePublishAt = 0L
                 var lastTranscriptUpdateAt = 0L
                 var terminalReason: String? = null
-                val enginePrompt = AgentToolProtocol.buildToolResultPrompt(originalPrompt, toolResult)
+                val budgetedResult = truncateToolResultForBudget(toolResult, originalPrompt, settings)
+                val enginePrompt = AgentToolProtocol.buildToolResultPrompt(originalPrompt, budgetedResult)
 
-                generationJob = engine.generate(enginePrompt, settings)
+                generationJob = engine.generate(enginePrompt, settings, grammar = null)
                     .onEach { chunk ->
                         if (session == generationSession) {
                             val uiChunk = Utf8TextPipeline.normalizeChunk(chunk)
@@ -3299,10 +3547,20 @@ class InferenceService : Service() {
                             )
                             val finalOutput = streamState.snapshotText()
                             val nextToolCall = if (finalReason == "EOF") AgentToolProtocol.parseToolCall(finalOutput) else null
+                            if (nextToolCall == null) {
+                                finalizeAgentTrace(success = (finalReason == "EOF" || finalReason == "MAX_TOKENS"))
+                            } else if (finalReason == "ERROR") {
+                                finalizeAgentTrace(success = false)
+                            }
                             clearActiveGenerationMetrics()
+                            val reasoningPrefix = if (nextToolCall != null) {
+                                AgentToolProtocol.extractReasoningPrefix(finalOutput)
+                            } else {
+                                ""
+                            }
                             updateTranscriptMessage(
                                 assistantMessageId,
-                                if (nextToolCall == null) finalOutput else "",
+                                if (nextToolCall == null) finalOutput else reasoningPrefix,
                                 persistImmediately = true,
                             )
                             _isGenerating.value = false
@@ -3315,6 +3573,14 @@ class InferenceService : Service() {
                             ) {
                                 _runtimeStatus.value = RuntimeStatus.IDLE
                             }
+                            if (reloadPending) {
+                                reloadPending = false
+                                val modelId = _currentModel.value
+                                if (modelId != null) {
+                                    publishUiEvent("Reloading model for context/backend settings")
+                                    serviceScope.launch { switchModel(modelId) }
+                                }
+                            }
                             if (nextToolCall != null) {
                                 handleAgentToolCall(nextToolCall, originalPrompt, depth)
                             }
@@ -3324,6 +3590,143 @@ class InferenceService : Service() {
             }
         }
     }
+
+    private fun truncateToolResultForBudget(
+        result: AgentToolResult,
+        originalPrompt: String,
+        settings: GenerationSettings
+    ): AgentToolResult {
+        val transcriptHistoryChars = synchronized(transcriptLock) {
+            _transcript.value.sumOf { it.text.length }
+        }
+        val estimatedHistoryTokens = transcriptHistoryChars / 4.0
+        val systemPromptOverhead = AgentToolProtocol.instructionBlock().length
+        val fixedOverhead = originalPrompt.length + 200
+        val overheadTokens = (systemPromptOverhead + fixedOverhead) / 4.0
+        val remainingBudget = settings.contextLength - estimatedHistoryTokens - overheadTokens
+        val limit = (settings.contextLength * 0.45).coerceIn(800.0, 3000.0)
+        val maxResultTokens = kotlin.math.max(100.0, remainingBudget * 0.6).coerceAtMost(limit).toInt()
+        val maxResultChars = maxResultTokens * 4
+
+        val details = result.details
+        val serializedDetails = details.toString()
+        if (serializedDetails.length <= maxResultChars) {
+            return result
+        }
+
+        val name = result.call.name
+        val truncatedDetails = JSONObject()
+        var wasTruncated = false
+
+        val searchLimit = if (maxResultTokens > 1500) 6 else if (maxResultTokens > 800) 4 else 3
+        val searchSnippetLimit = if (maxResultTokens > 1500) 250 else if (maxResultTokens > 800) 180 else 120
+        val listLimit = if (maxResultTokens > 1500) 15 else if (maxResultTokens > 800) 10 else 5
+
+        when (name) {
+            "search_chats" -> {
+                val results = details.optJSONArray("results")
+                if (results != null) {
+                    val truncatedResults = JSONArray()
+                    val limitCount = minOf(results.length(), searchLimit)
+                    for (i in 0 until limitCount) {
+                        val item = results.optJSONObject(i)
+                        if (item != null) {
+                            val newItem = JSONObject()
+                                .put("chat_id", item.optString("chat_id"))
+                                .put("title", item.optString("title"))
+                            val snippet = item.optString("snippet")
+                            val truncatedSnippet = if (snippet.length > searchSnippetLimit) {
+                                snippet.substring(0, searchSnippetLimit) + " (Truncated for context size)"
+                            } else {
+                                snippet
+                            }
+                            newItem.put("snippet", truncatedSnippet)
+                            truncatedResults.put(newItem)
+                        }
+                    }
+                    truncatedDetails.put("results", truncatedResults)
+                    truncatedDetails.put("truncated", true)
+                    truncatedDetails.put("note", "Results truncated for context. Full data available in app if needed.")
+                    wasTruncated = true
+                }
+            }
+            "list_installed_models", "list_curated_downloadable_models" -> {
+                val models = details.optJSONArray("models")
+                if (models != null) {
+                    val truncatedModels = JSONArray()
+                    val limitCount = minOf(models.length(), listLimit)
+                    for (i in 0 until limitCount) {
+                        val item = models.optJSONObject(i)
+                        if (item != null) {
+                            val newItem = JSONObject()
+                                .put("model_id", item.optString("model_id"))
+                                .put("name", item.optString("name"))
+                                .put("size_bytes", item.optLong("size_bytes", 0L))
+                                .put("is_active", item.optBoolean("is_active", false))
+                                .put("readiness", item.optString("readiness"))
+                            truncatedModels.put(newItem)
+                        }
+                    }
+                    truncatedDetails.put("models", truncatedModels)
+                    truncatedDetails.put("count", details.optInt("count", models.length()))
+                    truncatedDetails.put("truncated", true)
+                    truncatedDetails.put("note", "Results truncated for context. Full data available in app if needed.")
+                    wasTruncated = true
+                }
+            }
+            "list_benchmark_runs" -> {
+                val runs = details.optJSONArray("runs")
+                if (runs != null) {
+                    val truncatedRuns = JSONArray()
+                    val limitCount = minOf(runs.length(), listLimit)
+                    for (i in 0 until limitCount) {
+                        val item = runs.optJSONObject(i)
+                        if (item != null) {
+                            val newItem = JSONObject()
+                                .put("preset_id", item.optString("preset_id"))
+                                .put("model_id", item.optString("model_id"))
+                                .put("tokens_per_second", item.optDouble("tokens_per_second", 0.0))
+                                .put("terminal_reason", item.optString("terminal_reason"))
+                                .put("completed_at", item.optLong("completed_at"))
+                            truncatedRuns.put(newItem)
+                        }
+                    }
+                    truncatedDetails.put("runs", truncatedRuns)
+                    truncatedDetails.put("total_runs", details.optInt("total_runs", runs.length()))
+                    truncatedDetails.put("truncated", true)
+                    truncatedDetails.put("note", "Results truncated for context. Full data available in app if needed.")
+                    wasTruncated = true
+                }
+            }
+        }
+
+        val finalDetails = if (wasTruncated) {
+            truncatedDetails
+        } else {
+            val fallback = JSONObject()
+            details.keys().forEach { key ->
+                val value = details.opt(key)
+                if (value is String && value.length > 150) {
+                    fallback.put(key, value.substring(0, 150) + " (Truncated for context size)")
+                } else if (value is JSONArray && value.length() > 5) {
+                    val truncatedArray = JSONArray()
+                    for (i in 0 until 5) {
+                        truncatedArray.put(value.opt(i))
+                    }
+                    fallback.put(key, truncatedArray)
+                } else {
+                    fallback.put(key, value)
+                }
+            }
+            fallback.put("truncated", true)
+            fallback.put("note", "Results truncated for context. Full data available in app if needed.")
+            fallback
+        }
+
+        return result.copy(details = finalDetails)
+    }
+
+
 
     private suspend fun startBenchmarkChat(name: String) {
         createChatInternal("Benchmark - $name", publishEvent = false)
@@ -3391,6 +3794,7 @@ class InferenceService : Service() {
             topP = prefs.getFloat(KEY_TOP_P, GenerationSettings.DEFAULT_TOP_P),
             repeatPenalty = prefs.getFloat(KEY_REPEAT_PENALTY, GenerationSettings.DEFAULT_REPEAT_PENALTY),
             gpuLayers = prefs.getInt(KEY_GPU_LAYERS, GenerationSettings.DEFAULT_GPU_LAYERS),
+            agentEnabled = prefs.getBoolean(KEY_AGENT_ENABLED, false),
         ).clamped()
     }
 
@@ -3645,7 +4049,7 @@ class InferenceService : Service() {
         }
 
     private fun transcriptFile(chatId: String): File =
-        File(chatDirectory(), "$chatId.json")
+        File(chatDirectory(), "${AgentSanitizer.sanitizeChatId(chatId)}.json")
 
     private fun legacyTranscriptFile(): File = File(filesDir, LEGACY_TRANSCRIPT_FILE_NAME)
 
@@ -3695,6 +4099,7 @@ class InferenceService : Service() {
             nextTranscriptId = (restored.maxOfOrNull { it.id } ?: 0L) + 1L
         }
         persistChatIndex()
+        cleanupStalePendingAgentActions(normalizedSessions.map { it.id }.toSet())
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             .edit()
             .putString(KEY_ACTIVE_CHAT, activeSession.id)
@@ -3750,6 +4155,119 @@ class InferenceService : Service() {
         }
     }
 
+    private fun clearPendingAgentToolMemoryState() {
+        pendingAgentToolCall = null
+        pendingAgentToolOriginalPrompt = null
+        pendingAgentToolDepth = 0
+        _pendingAgentToolAction.value = null
+    }
+
+    private fun restorePendingAgentToolCall() {
+        val currentChatId = _currentChatId.value
+        if (currentChatId.isNullOrBlank()) {
+            clearPendingAgentToolMemoryState()
+            return
+        }
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val key = pendingAgentActionKey(currentChatId)
+        val rawJson = prefs.getString(key, null)
+        if (rawJson == null) {
+            clearPendingAgentToolMemoryState()
+            return
+        }
+        try {
+            val json = JSONObject(rawJson)
+            val storedChatId = json.optString("chatId")
+            if (storedChatId == currentChatId) {
+                val toolName = json.optString("toolName")
+                val argumentsStr = json.optString("arguments")
+                val reason = json.optString("reason").takeIf { it.isNotBlank() }
+                val originalPrompt = json.optString("originalPrompt")
+                val depth = json.optInt("depth", 0)
+
+                val arguments = if (argumentsStr.isNotBlank()) JSONObject(argumentsStr) else JSONObject()
+                val call = AgentToolCall(toolName, arguments, reason)
+                val definition = AgentToolRegistry.find(toolName)
+
+                if (definition != null) {
+                    pendingAgentToolCall = call
+                    pendingAgentToolOriginalPrompt = originalPrompt
+                    pendingAgentToolDepth = depth
+                    val actionId = "agent_tool_${SystemClock.uptimeMillis()}"
+                    _pendingAgentToolAction.value = buildAgentToolConfirmation(actionId, call, definition)
+                    Log.d(TAG, "Restored pending agent tool call: $toolName for chat $currentChatId")
+                } else {
+                    Log.w(TAG, "Restored pending agent tool call failed: Unknown tool $toolName")
+                    clearPendingAgentToolPrefs(currentChatId)
+                }
+            } else {
+                Log.d(TAG, "Discarded stale pending agent tool call for chat $storedChatId (current: $currentChatId)")
+                clearPendingAgentToolPrefs(currentChatId)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore pending agent tool call", e)
+            clearPendingAgentToolPrefs(currentChatId)
+        }
+    }
+
+    private fun persistPendingAgentToolCall(call: AgentToolCall, originalPrompt: String, depth: Int) {
+        val currentChatId = _currentChatId.value ?: return
+        try {
+            val json = JSONObject()
+                .put("chatId", currentChatId)
+                .put("toolName", call.name)
+                .put("arguments", call.arguments.toString())
+                .put("reason", call.reason ?: "")
+                .put("originalPrompt", originalPrompt)
+                .put("depth", depth)
+
+            val key = pendingAgentActionKey(currentChatId)
+            val success = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putString(key, json.toString())
+                .commit()
+            if (success) {
+                Log.d(TAG, "Persisted pending agent tool call: ${call.name} for chat $currentChatId")
+            } else {
+                Log.w(TAG, "Failed to commit pending agent tool call: ${call.name} for chat $currentChatId")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to persist pending agent tool call", e)
+        }
+    }
+
+    private fun clearPendingAgentToolPrefs(chatId: String? = null) {
+        val targetChatId = chatId ?: _currentChatId.value
+        clearPendingAgentToolMemoryState()
+        if (!targetChatId.isNullOrBlank()) {
+            val key = pendingAgentActionKey(targetChatId)
+            val success = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .remove(key)
+                .commit()
+            if (success) {
+                Log.d(TAG, "Cleared pending agent tool SharedPreferences for chat $targetChatId")
+            } else {
+                Log.w(TAG, "Failed to commit clearing pending agent tool SharedPreferences for chat $targetChatId")
+            }
+        }
+    }
+
+    private fun cleanupStalePendingAgentActions(validChatIds: Set<String>) {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val keysToRemove = prefs.all.keys.filter { key ->
+            key.startsWith(KEY_PENDING_AGENT_ACTION_PREFIX) && key.substringAfter(KEY_PENDING_AGENT_ACTION_PREFIX) !in validChatIds
+        }
+        if (keysToRemove.isNotEmpty()) {
+            val editor = prefs.edit()
+            for (key in keysToRemove) {
+                editor.remove(key)
+            }
+            editor.apply()
+            Log.d(TAG, "Cleaned up ${keysToRemove.size} stale pending agent actions from SharedPreferences")
+        }
+    }
+
     private fun readTranscriptFile(file: File): List<TranscriptMessage> =
         runCatching {
             if (!file.isFile) {
@@ -3767,6 +4285,7 @@ class InferenceService : Service() {
                             id = item.getLong("id"),
                             role = role,
                             text = item.optString("text", ""),
+                            summary = item.optString("summary").takeIf { it.isNotBlank() },
                         )
                     )
                 }
@@ -3778,12 +4297,14 @@ class InferenceService : Service() {
     private fun writeTranscriptFile(file: File, messages: List<TranscriptMessage>) {
         val array = JSONArray()
         messages.forEach { message ->
-            array.put(
-                JSONObject()
-                    .put("id", message.id)
-                    .put("role", message.role.name)
-                    .put("text", message.text)
-            )
+            val obj = JSONObject()
+                .put("id", message.id)
+                .put("role", message.role.name)
+                .put("text", message.text)
+            if (message.summary != null) {
+                obj.put("summary", message.summary)
+            }
+            array.put(obj)
         }
         file.parentFile?.mkdirs()
         val temp = File(file.parentFile ?: filesDir, "${file.name}.tmp")
@@ -3852,11 +4373,7 @@ class InferenceService : Service() {
         when (role) {
             TranscriptRole.USER -> "User: $text"
             TranscriptRole.ASSISTANT -> "Assistant: $text"
-            TranscriptRole.TOOL -> AgentToolProtocol.parseToolEvent(text)
-                ?.optString("summary")
-                ?.takeIf { it.isNotBlank() }
-                ?.let { "Tool: $it" }
-                ?: "Tool: $text"
+            TranscriptRole.TOOL -> summary?.let { "Tool: $it" } ?: "Tool: $text"
         }
 
     private fun appendTranscriptMessage(role: TranscriptRole, text: String): Long {
@@ -3865,21 +4382,34 @@ class InferenceService : Service() {
         }
         val id = synchronized(transcriptLock) {
             val id = nextTranscriptId++
-            _transcript.value = _transcript.value + TranscriptMessage(id, role, text)
+            val sum = if (role == TranscriptRole.TOOL) {
+                AgentToolProtocol.parseToolEvent(text)
+                    ?.optString("summary")
+                    ?.takeIf { it.isNotBlank() }
+            } else null
+            _transcript.value = _transcript.value + TranscriptMessage(id, role, text, sum)
             id
         }
         touchCurrentChat(_transcript.value, updateTitle = role == TranscriptRole.USER)
-        persistTranscriptThrottled(force = true)
+        persistTranscriptThrottled(force = false)
         return id
     }
 
     private fun updateTranscriptMessage(id: Long, text: String, persistImmediately: Boolean = false) {
         synchronized(transcriptLock) {
-            _transcript.value = _transcript.value.map { message ->
-                if (message.id == id && message.text != text) {
-                    message.copy(text = text)
-                } else {
-                    message
+            val list = _transcript.value
+            val index = list.indexOfLast { it.id == id }
+            if (index >= 0) {
+                val message = list[index]
+                if (message.text != text) {
+                    val mutableList = list.toMutableList()
+                    val sum = if (message.role == TranscriptRole.TOOL) {
+                        AgentToolProtocol.parseToolEvent(text)
+                            ?.optString("summary")
+                            ?.takeIf { it.isNotBlank() }
+                    } else message.summary
+                    mutableList[index] = message.copy(text = text, summary = sum)
+                    _transcript.value = mutableList
                 }
             }
         }

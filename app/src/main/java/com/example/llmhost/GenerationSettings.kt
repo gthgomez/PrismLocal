@@ -10,6 +10,8 @@ data class GenerationSettings(
     val topP: Float = DEFAULT_TOP_P,
     val repeatPenalty: Float = DEFAULT_REPEAT_PENALTY,
     val gpuLayers: Int = DEFAULT_GPU_LAYERS,
+    val agentEnabled: Boolean = false,
+    val maxAgentIterations: Int = DEFAULT_MAX_AGENT_ITERATIONS,
 ) {
     fun clamped(): GenerationSettings =
         GenerationSettings(
@@ -24,6 +26,8 @@ data class GenerationSettings(
             topP = topP.coerceIn(MIN_TOP_P, MAX_TOP_P),
             repeatPenalty = repeatPenalty.coerceIn(MIN_REPEAT_PENALTY, MAX_REPEAT_PENALTY),
             gpuLayers = gpuLayers.coerceIn(MIN_GPU_LAYERS, MAX_GPU_LAYERS),
+            agentEnabled = agentEnabled,
+            maxAgentIterations = maxAgentIterations.coerceIn(MIN_MAX_AGENT_ITERATIONS, MAX_MAX_AGENT_ITERATIONS),
         )
 
     companion object {
@@ -65,6 +69,10 @@ data class GenerationSettings(
         const val MIN_GPU_LAYERS = 0
         const val DEFAULT_GPU_LAYERS = 0
         const val MAX_GPU_LAYERS = 99
+
+        const val MIN_MAX_AGENT_ITERATIONS = 1
+        const val DEFAULT_MAX_AGENT_ITERATIONS = 3
+        const val MAX_MAX_AGENT_ITERATIONS = 10
 
         private fun snapToStep(value: Int, step: Int): Int =
             ((value + step / 2) / step) * step

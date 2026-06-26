@@ -4,15 +4,15 @@ import java.nio.charset.StandardCharsets
 
 internal object Utf8TextPipeline {
     fun normalizeNativeText(text: String): String {
-        if (text.isEmpty()) {
+        if (text.isEmpty()) return text
+        // Fast path: check if filtering is even needed
+        if (text.all { it == '\t' || it == '\n' || it == '\r' || (!it.isISOControl() && it != '\u0000' && it != '\uFFFD') }) {
             return text
         }
-        val explicitUtf8 = String(text.toByteArray(StandardCharsets.UTF_8), StandardCharsets.UTF_8)
-        return buildString(explicitUtf8.length) {
-            explicitUtf8.forEach { char ->
+        return buildString(text.length) {
+            for (char in text) {
                 when {
-                    char == '\u0000' -> Unit
-                    char == '\uFFFD' -> Unit
+                    char == '\u0000' || char == '\uFFFD' -> Unit
                     char == '\t' || char == '\n' || char == '\r' -> append(char)
                     !char.isISOControl() -> append(char)
                 }

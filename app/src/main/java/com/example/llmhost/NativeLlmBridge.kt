@@ -76,6 +76,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         repeatPenalty: Float,
         gpuLayers: Int,
         continueFromContext: Boolean,
+        grammar: String?,
     ): Int
     private external fun nativeRunBenchmark(
         handle: Long,
@@ -159,9 +160,9 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         prompt: String,
         settings: GenerationSettings = GenerationSettings(),
         continueFromContext: Boolean = false,
+        grammar: String? = null,
     ): Flow<GenerationChunk> = callbackFlow {
         val genId = sessionCounter.getAndIncrement()
-        val safeSettings = settings.clamped()
 
         val startSuccess = nativeMutex.withLock {
             if (isDestroyed) {
@@ -171,16 +172,17 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     nativeHandle,
                     prompt,
                     genId,
-                    safeSettings.maxTokens,
-                    safeSettings.threadCount,
-                    safeSettings.contextLength,
-                    safeSettings.batchSize,
-                    safeSettings.temperature,
-                    safeSettings.topK,
-                    safeSettings.topP,
-                    safeSettings.repeatPenalty,
-                    safeSettings.gpuLayers,
+                    settings.maxTokens,
+                    settings.threadCount,
+                    settings.contextLength,
+                    settings.batchSize,
+                    settings.temperature,
+                    settings.topK,
+                    settings.topP,
+                    settings.repeatPenalty,
+                    settings.gpuLayers,
                     continueFromContext,
+                    grammar,
                 ) != -1
             }
         }
@@ -192,22 +194,24 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         var observedTerminal = false
         try {
             while (isActive && !isDestroyed) {
-                val tokens = nativeMutex.withLock {
-                    if (isDestroyed) IntArray(0) else nativeDrainTokens(nativeHandle, genId, 128)
-                }
-
-                if (tokens.isNotEmpty()) {
-                    val text = nativeMutex.withLock {
-                        if (isDestroyed) "" else nativeDecodeTokens(nativeHandle, genId, tokens)
-                    }.let(Utf8TextPipeline::normalizeNativeText)
-                    if (text.isNotEmpty() || tokens.isNotEmpty()) {
-                        trySend(GenerationChunk(text, tokens.size, genId, isTerminal = false))
+                val (tokens, text, state) = nativeMutex.withLock {
+                    if (isDestroyed) {
+                        Triple(IntArray(0), "", STATE_TOMBSTONED)
+                    } else {
+                        val t = nativeDrainTokens(nativeHandle, genId, 128)
+                        val s = if (t.isNotEmpty()) nativeDecodeTokens(nativeHandle, genId, t) else ""
+                        val st = nativeGetState(nativeHandle, genId)
+                        Triple(t, s, st)
                     }
                 }
 
-                val state = nativeMutex.withLock {
-                    if (isDestroyed) STATE_TOMBSTONED else nativeGetState(nativeHandle, genId)
+                if (tokens.isNotEmpty()) {
+                    val normalizedText = Utf8TextPipeline.normalizeNativeText(text)
+                    if (normalizedText.isNotEmpty() || tokens.isNotEmpty()) {
+                        trySend(GenerationChunk(normalizedText, tokens.size, genId, isTerminal = false))
+                    }
                 }
+
                 if (state == STATE_EOF || state == STATE_CANCELLED || state == STATE_ERROR || state == STATE_MAX_TOKENS) {
                     val reason = when (state) {
                         STATE_EOF -> "EOF"
@@ -271,6 +275,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     settings.repeatPenalty,
                     settings.gpuLayers,
                     false,
+                    null,
                 ) != -1
             }
         }

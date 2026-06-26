@@ -158,7 +158,7 @@ std::string formatPromptForGeneration(llama_model* model, const std::string& pro
 
     int32_t required = llama_chat_apply_template(tmpl, messages, 1, true, nullptr, 0);
     if (required > 0) {
-        std::string formatted(static_cast<size_t>(required), '\0');
+        std::string formatted(static_cast<size_t>(required) + 32, '\0');
         int32_t actual = llama_chat_apply_template(
             tmpl,
             messages,
@@ -236,8 +236,15 @@ struct ModelRuntime {
     const llama_vocab* vocab = nullptr;
     std::mutex decode_mu;
 
+    bool single_batch_initialized = false;
+    llama_batch single_batch;
+
     ~ModelRuntime() {
         std::lock_guard<std::mutex> lock(decode_mu);
+        if (single_batch_initialized) {
+            llama_batch_free(single_batch);
+            single_batch_initialized = false;
+        }
         if (ctx != nullptr) {
             llama_free(ctx);
             ctx = nullptr;
@@ -316,6 +323,19 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens) {
 int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t count, llama_pos start_pos) {
     if (count <= 0) {
         return 0;
+    }
+    if (count == 1) {
+        if (!runtime.single_batch_initialized) {
+            runtime.single_batch = llama_batch_init(1, 0, 1);
+            runtime.single_batch_initialized = true;
+        }
+        runtime.single_batch.n_tokens = 1;
+        runtime.single_batch.token[0] = tokens[0];
+        runtime.single_batch.pos[0] = start_pos;
+        runtime.single_batch.n_seq_id[0] = 1;
+        runtime.single_batch.seq_id[0][0] = kMainSequence;
+        runtime.single_batch.logits[0] = 1;
+        return llama_decode(runtime.ctx, runtime.single_batch);
     }
     llama_batch batch = llama_batch_init(count, 0, 1);
     batch.n_tokens = count;
@@ -494,34 +514,33 @@ struct Engine::Impl {
             return;
         }
 
-        const GenerationConfig config = sanitizeGenerationConfig(session->config, runtime->thread_count);
-        llama_set_n_threads(runtime->ctx, config.thread_count, config.thread_count);
+        llama_set_n_threads(runtime->ctx, session->config.thread_count, session->config.thread_count);
         LOGI("generation_config generation_id=%u max_tokens=%d threads=%d n_ctx=%d n_batch=%d temp=%.2f top_k=%d top_p=%.2f repeat=%.2f kv_pos=%d",
              session->generation_id,
-             config.max_tokens,
-             config.thread_count,
+             session->config.max_tokens,
+             session->config.thread_count,
              runtime->context_length,
              runtime->batch_size,
-             config.temperature,
-             config.top_k,
-             config.top_p,
-             config.repeat_penalty,
+             session->config.temperature,
+             session->config.top_k,
+             session->config.top_p,
+             session->config.repeat_penalty,
              static_cast<int>(runtime->current_position));
 
         llama_perf_context_reset(runtime->ctx);
-        if (config.continue_from_context) {
+        if (session->config.continue_from_context) {
             if (runtime->current_position <= 0) {
                 ctrl->error_code.store(427, std::memory_order_release);
                 LOGE("continue_failed_no_context generation_id=%u", session->generation_id);
                 finishSession(session, StreamState::Error);
                 return;
             }
-            if (!shiftRuntimeContextIfNeeded(*runtime, config.max_tokens + kContextHeadroom)) {
+            if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens + kContextHeadroom)) {
                 ctrl->error_code.store(426, std::memory_order_release);
                 LOGE("continue_context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
                      static_cast<int>(runtime->current_position),
-                     config.max_tokens);
+                     session->config.max_tokens);
                 finishSession(session, StreamState::Error);
                 return;
             }
@@ -568,11 +587,11 @@ struct Engine::Impl {
             }
 
             int32_t usable_prompt_tokens = actual_tokens;
-            const int max_prompt_tokens = runtime->context_length - config.max_tokens - kContextHeadroom;
+            const int max_prompt_tokens = runtime->context_length - session->config.max_tokens - kContextHeadroom;
             if (usable_prompt_tokens > max_prompt_tokens) {
                 if (max_prompt_tokens <= 0) {
                     ctrl->error_code.store(422, std::memory_order_release);
-                    LOGE("context_too_small n_ctx=%d max_tokens=%d", runtime->context_length, config.max_tokens);
+                    LOGE("context_too_small n_ctx=%d max_tokens=%d", runtime->context_length, session->config.max_tokens);
                     finishSession(session, StreamState::Error);
                     return;
                 }
@@ -584,12 +603,12 @@ struct Engine::Impl {
                      dropped,
                      usable_prompt_tokens);
             }
-            if (!shiftRuntimeContextIfNeeded(*runtime, usable_prompt_tokens + config.max_tokens + kContextHeadroom)) {
+            if (!shiftRuntimeContextIfNeeded(*runtime, usable_prompt_tokens + session->config.max_tokens + kContextHeadroom)) {
                 ctrl->error_code.store(426, std::memory_order_release);
                 LOGE("context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
                      static_cast<int>(runtime->current_position),
-                     usable_prompt_tokens + config.max_tokens);
+                     usable_prompt_tokens + session->config.max_tokens);
                 finishSession(session, StreamState::Error);
                 return;
             }
@@ -626,16 +645,24 @@ struct Engine::Impl {
             finishSession(session, StreamState::Error);
             return;
         }
-        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, config.repeat_penalty, 0.0f, 0.0f));
-        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(config.top_k));
-        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(config.top_p, 1));
-        llama_sampler_chain_add(sampler, llama_sampler_init_temp(config.temperature));
+        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, session->config.repeat_penalty, 0.0f, 0.0f));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(session->config.top_k));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(session->config.top_p, 1));
+        llama_sampler_chain_add(sampler, llama_sampler_init_temp(session->config.temperature));
+        if (!session->config.grammar.empty()) {
+            auto* grammar_sampler = llama_sampler_init_grammar(runtime->vocab, session->config.grammar.c_str(), "root");
+            if (grammar_sampler != nullptr) {
+                llama_sampler_chain_add(sampler, grammar_sampler);
+            } else {
+                LOGW("Failed to compile grammar. Proceeding unconstrained.");
+            }
+        }
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
         const auto generation_start = std::chrono::steady_clock::now();
         int generated_tokens = 0;
         bool stopped_by_eog = false;
-        for (int i = 0; i < config.max_tokens; i++) {
+        for (int i = 0; i < session->config.max_tokens; i++) {
             if (memory_pressure_level.load(std::memory_order_acquire) >= 3) {
                 session->cancel_requested.store(true, std::memory_order_release);
             }
@@ -696,7 +723,7 @@ struct Engine::Impl {
         llama_sampler_free(sampler);
         const StreamState final_state = session->cancel_requested.load(std::memory_order_acquire)
             ? StreamState::Cancelled
-            : (!stopped_by_eog && generated_tokens >= config.max_tokens ? StreamState::MaxTokens : StreamState::Eof);
+            : (!stopped_by_eog && generated_tokens >= session->config.max_tokens ? StreamState::MaxTokens : StreamState::Eof);
         finishSession(session, final_state);
     }
 

@@ -20,6 +20,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -38,8 +39,9 @@ internal fun MarkdownText(
     color: Color,
     modifier: Modifier = Modifier,
 ) {
+    val blocks = remember(text) { markdownBlocks(text) }
     Column(modifier = modifier) {
-        markdownBlocks(text).forEach { block ->
+        blocks.forEach { block ->
             when (block.kind) {
                 MarkdownBlockKind.Blank -> Spacer(modifier = Modifier.height(8.dp))
                 MarkdownBlockKind.Divider -> HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)

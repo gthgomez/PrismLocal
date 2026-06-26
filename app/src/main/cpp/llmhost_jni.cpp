@@ -6,8 +6,24 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <mutex>
 
 namespace {
+
+jclass g_string_class = nullptr;
+jmethodID g_string_ctor = nullptr;
+std::once_flag g_string_cache_flag;
+
+void ensureStringCache(JNIEnv* env) {
+    std::call_once(g_string_cache_flag, [env]() {
+        jclass local_class = env->FindClass("java/lang/String");
+        if (local_class != nullptr) {
+            g_string_class = static_cast<jclass>(env->NewGlobalRef(local_class));
+            g_string_ctor = env->GetMethodID(g_string_class, "<init>", "([BLjava/lang/String;)V");
+            env->DeleteLocalRef(local_class);
+        }
+    });
+}
 
 llmhost::Engine* toEngine(jlong handle) {
     return reinterpret_cast<llmhost::Engine*>(handle);
@@ -52,29 +68,15 @@ jstring toJavaString(JNIEnv* env, const std::string& value) {
         return env->NewStringUTF("");
     }
 
-    jclass string_class = env->FindClass("java/lang/String");
-    if (string_class == nullptr) {
-        if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-        }
+    ensureStringCache(env);
+
+    if (g_string_class == nullptr || g_string_ctor == nullptr) {
         env->DeleteLocalRef(charset);
         env->DeleteLocalRef(bytes);
         return env->NewStringUTF("");
     }
 
-    jmethodID ctor = env->GetMethodID(string_class, "<init>", "([BLjava/lang/String;)V");
-    if (ctor == nullptr) {
-        if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-        }
-        env->DeleteLocalRef(string_class);
-        env->DeleteLocalRef(charset);
-        env->DeleteLocalRef(bytes);
-        return env->NewStringUTF("");
-    }
-
-    auto result = static_cast<jstring>(env->NewObject(string_class, ctor, bytes, charset));
-    env->DeleteLocalRef(string_class);
+    auto result = static_cast<jstring>(env->NewObject(g_string_class, g_string_ctor, bytes, charset));
     env->DeleteLocalRef(charset);
     env->DeleteLocalRef(bytes);
     if (result == nullptr || env->ExceptionCheck()) {
@@ -212,7 +214,8 @@ Java_com_example_llmhost_NativeLlmBridge_nativeStartGeneration(
     jfloat top_p,
     jfloat repeat_penalty,
     jint gpu_layers,
-    jboolean continue_from_context) {
+    jboolean continue_from_context,
+    jstring grammar) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return -1;
@@ -229,6 +232,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeStartGeneration(
         config.repeat_penalty = repeat_penalty;
         config.gpu_layers = gpu_layers;
         config.continue_from_context = continue_from_context == JNI_TRUE;
+        config.grammar = toString(env, grammar);
         return engine->startGeneration(toString(env, prompt), gen_id, config);
     } catch (const std::exception&) {
         return -1;

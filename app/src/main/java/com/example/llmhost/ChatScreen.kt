@@ -3696,7 +3696,7 @@ private fun MessageBubble(
                 if (isUser) {
                     Text(text = text, style = MaterialTheme.typography.bodyMedium, color = PrismText)
                 } else {
-                    MarkdownText(text = text, color = PrismText)
+                    EnhancedMarkdownText(text = text)
                 }
             }
         }

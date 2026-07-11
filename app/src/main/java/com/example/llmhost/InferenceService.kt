@@ -146,8 +146,15 @@ class InferenceService : Service() {
     val voiceInputResult: StateFlow<String?> = _voiceInputResult.asStateFlow()
     private val _voiceState = MutableStateFlow(VoiceState())
     val voiceState: StateFlow<VoiceState> = _voiceState.asStateFlow()
+    // Phase 7a — Background agent state (public for UI observation)
+    val backgroundAgentState: StateFlow<BackgroundAgentState> get() = if (::backgroundAgentManager.isInitialized) backgroundAgentManager.state else MutableStateFlow(BackgroundAgentState()).asStateFlow()
     // Phase 5 — Data connectors
     private lateinit var dataConnectorTools: DataConnectorTools
+    // Phase 3 — Grokipedia Knowledge Pack
+    private lateinit var grokipediaClient: GrokipediaClient
+    private lateinit var knowledgePackManager: KnowledgePackManager
+    // Phase 7a — Background Agent Execution
+    private lateinit var backgroundAgentManager: BackgroundAgentManager
     private var webSearchUsedThisSession = false
     private val benchmarkQueue = ArrayDeque<BenchmarkPreset>()
     // In-memory chat search index: chat_id -> (title + first N chars of concatenated messages).
@@ -232,6 +239,16 @@ class InferenceService : Service() {
         )
         // Phase 5 — Data connector tools
         dataConnectorTools = DataConnectorTools(this)
+        // Phase 3 — Grokipedia Knowledge Pack
+        grokipediaClient = GrokipediaClient()
+        knowledgePackManager = KnowledgePackManager(
+            grokipediaClient = grokipediaClient,
+            vectorStore = vectorStore,
+            ragManager = ragManager,
+            chunker = DocumentChunker,
+        )
+        // Phase 7a — Background Agent Execution
+        backgroundAgentManager = BackgroundAgentManager(this)
         loadBenchmarkRuns()
         loadChats()
         restorePendingAgentToolCall()
@@ -2086,6 +2103,10 @@ class InferenceService : Service() {
             "voice_input", "speak_output", "stop_speaking",
             // Phase 5 Data connectors (read-only)
             "search_contacts", "get_calendar_events", "list_sms_threads",
+            // Phase 3 Knowledge Pack (read-only)
+            "search_knowledge", "fetch_grokipedia_article", "list_knowledge_packs",
+            // Phase 7a Background
+            "check_background_tasks",
         )
         val historicalCount = activeAgentToolHistory.count { it.name == validatedCall.name }
         val tooManyInvocations = if (validatedCall.name in cheapTools) {
@@ -2420,6 +2441,15 @@ class InferenceService : Service() {
             "search_contacts" -> agentToolSearchContacts(call)
             "get_calendar_events" -> agentToolGetCalendarEvents(call)
             "list_sms_threads" -> agentToolListSmsThreads(call)
+            // Phase 3 Knowledge Pack
+            "search_knowledge" -> agentToolSearchKnowledge(call)
+            "fetch_grokipedia_article" -> agentToolFetchGrokipediaArticle(call)
+            "list_knowledge_packs" -> agentToolListKnowledgePacks(call)
+            "download_knowledge_pack" -> agentToolDownloadKnowledgePack(call, confirmed)
+            // Phase 7a Background agent
+            "run_in_background" -> agentToolRunInBackground(call, confirmed)
+            "check_background_tasks" -> agentToolCheckBackgroundTasks(call)
+            "cancel_background_task" -> agentToolCancelBackgroundTask(call, confirmed)
             else -> AgentToolResult(call, success = false, summary = "Unknown tool: ${call.name}")
         }
 
@@ -2442,7 +2472,12 @@ class InferenceService : Service() {
             // Phase 4 Voice I/O
             "voice_input",
             "speak_output",
-            "stop_speaking" -> true
+            "stop_speaking",
+            // Phase 3 Knowledge Pack
+            "download_knowledge_pack",
+            // Phase 7a Background
+            "run_in_background",
+            "check_background_tasks" -> true
             else -> false
         }
 
@@ -4049,6 +4084,100 @@ class InferenceService : Service() {
         } catch (e: SecurityException) {
             toolFailure(call, AgentToolErrorCode.FAILED, "SMS access denied: ${e.message}")
         }
+    }
+
+    // ---- Phase 3 Knowledge Pack tool handlers ----
+
+    private suspend fun agentToolSearchKnowledge(call: AgentToolCall): AgentToolResult {
+        val query = call.arguments.optString("query").trim().take(300)
+        val topK = call.arguments.optInt("top_k", 5).coerceIn(1, 10)
+        if (query.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Search query is required")
+        val results = knowledgePackManager.search(query, topK = topK)
+        val resultsArray = JSONArray()
+        results.forEach { (chunk, score) ->
+            val slug = chunk.documentId.removePrefix("grokipedia:").substringAfter(":").substringBefore(":")
+            resultsArray.put(JSONObject()
+                .put("title", chunk.documentId)
+                .put("text", chunk.text.take(500))
+                .put("score", String.format(java.util.Locale.US, "%.3f", score).toDouble())
+                .put("slug", slug))
+        }
+        return toolSuccess(call, "Found ${results.size} relevant knowledge chunks",
+            JSONObject().put("results", resultsArray).put("source", "grokipedia").put("untrusted_data", true).put("knowledge_base", "local"))
+    }
+
+    private suspend fun agentToolFetchGrokipediaArticle(call: AgentToolCall): AgentToolResult {
+        val slug = call.arguments.optString("slug").trim().take(200)
+        if (slug.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Article slug is required")
+        val chunks = runCatching { knowledgePackManager.fetchAndIndex(slug) }.getOrDefault(-1)
+        if (chunks <= 0) return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "Could not fetch article '$slug' from Grokipedia.")
+        val article = runCatching { grokipediaClient.fetchArticle(slug) }.getOrNull()
+        return toolSuccess(call, "Indexed '$slug' ($chunks chunks)",
+            JSONObject().put("indexed", true).put("slug", slug).put("chunks", chunks).put("title", article?.title ?: slug).put("source", "grokipedia"))
+    }
+
+    private suspend fun agentToolListKnowledgePacks(call: AgentToolCall): AgentToolResult {
+        val packs = knowledgePackManager.listAvailablePacks()
+        val packsArray = JSONArray()
+        packs.forEach { pack ->
+            packsArray.put(JSONObject()
+                .put("id", pack.id).put("name", pack.name).put("description", pack.description)
+                .put("downloaded", pack.downloadStatus == KnowledgePackStatus.INDEXED)
+                .put("chunks", pack.totalChunks).put("article_count", pack.topicSlugs.size).put("status", pack.downloadStatus.name))
+        }
+        val totalDownloaded = packs.count { it.downloadStatus == KnowledgePackStatus.INDEXED }
+        return toolSuccess(call, "$totalDownloaded/${packs.size} knowledge packs downloaded",
+            JSONObject().put("packs", packsArray).put("source", "grokipedia").put("total_packs", packs.size))
+    }
+
+    private suspend fun agentToolDownloadKnowledgePack(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+        if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Download requires confirmation")
+        val packId = call.arguments.optString("pack_id").trim().take(100)
+        if (packId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Knowledge pack ID is required")
+        val pack = KnowledgePackManager.CURATED_PACKS.firstOrNull { it.id == packId }
+            ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "Unknown knowledge pack: $packId")
+        val chunks = knowledgePackManager.downloadPack(packId)
+        if (chunks <= 0) return toolFailure(call, AgentToolErrorCode.FAILED, "Failed to download pack '$packId'")
+        return toolSuccess(call, "Downloaded '$packId' ($chunks chunks)",
+            JSONObject().put("downloaded", true).put("pack_id", packId).put("pack_name", pack.name).put("chunks", chunks).put("articles", pack.topicSlugs.size).put("source", "grokipedia"))
+    }
+
+    // ---- Phase 7a Background agent tool handlers ----
+
+    private suspend fun agentToolRunInBackground(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+        if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Background task requires confirmation")
+        val prompt = call.arguments.optString("prompt").trim()
+        if (prompt.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Prompt is required")
+        val task = backgroundAgentManager.enqueue(prompt)
+            ?: return toolFailure(call, AgentToolErrorCode.BUSY, "Background task queue is full (max 5)")
+        backgroundAgentManager.startBackgroundMode()
+        return toolSuccess(call, "Queued background task ${task.id}: ${prompt.take(80)}",
+            JSONObject().put("task_id", task.id).put("prompt_preview", prompt.take(80)).put("queue_position", backgroundAgentManager.state.value.queuedTasks.size).put("max_queue_size", 5))
+    }
+
+    private suspend fun agentToolCheckBackgroundTasks(call: AgentToolCall): AgentToolResult {
+        val state = backgroundAgentManager.state.value
+        val tasksJson = JSONObject().apply {
+            put("is_background_mode", state.isBackgroundMode)
+            put("battery_ok", state.batteryOk)
+            put("thermal_ok", state.thermalOk)
+        }
+        val queuedArray = JSONArray()
+        state.queuedTasks.forEach { task -> queuedArray.put(JSONObject().put("id", task.id).put("prompt_preview", task.prompt.take(80)).put("created_at", task.createdAt)) }
+        tasksJson.put("queued_tasks", queuedArray)
+        val completedArray = JSONArray()
+        state.completedTasks.forEach { task -> completedArray.put(JSONObject().put("id", task.id).put("status", task.status.name).put("result_summary", (task.resultSummary ?: "").take(80))) }
+        tasksJson.put("completed_tasks", completedArray)
+        return toolSuccess(call, "${state.queuedTasks.size} queued, ${state.completedTasks.size} completed", tasksJson)
+    }
+
+    private suspend fun agentToolCancelBackgroundTask(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+        if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Task cancellation requires confirmation")
+        val taskId = call.arguments.optString("task_id").trim()
+        if (taskId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "task_id is required")
+        val cancelled = backgroundAgentManager.cancelTask(taskId)
+        return if (cancelled) toolSuccess(call, "Cancelled background task $taskId")
+        else toolFailure(call, AgentToolErrorCode.NOT_FOUND, "No background task found with id: $taskId")
     }
 
     // ---- RAG context injection ----

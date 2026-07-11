@@ -55,6 +55,17 @@ object ToolCapabilityMapping {
         "search_documents" to setOf(Capability.FILE_READ),
         "list_documents" to setOf(Capability.FILE_READ),
         "delete_document" to setOf(Capability.FILE_WRITE),
+
+        // Phase 3 Knowledge Pack
+        "search_knowledge" to setOf(Capability.FILE_READ),
+        "fetch_grokipedia_article" to setOf(Capability.NETWORK_SEARCH),
+        "list_knowledge_packs" to setOf(Capability.SYSTEM_INFO),
+        "download_knowledge_pack" to setOf(Capability.NETWORK_SEARCH),
+
+        // Phase 7a Background agent
+        "run_in_background" to setOf(Capability.CHAT_MANAGE),
+        "check_background_tasks" to setOf(Capability.SYSTEM_INFO),
+        "cancel_background_task" to setOf(Capability.CHAT_MANAGE),
     )
 
     fun capabilitiesFor(toolName: String): Set<Capability> = map[toolName] ?: emptySet()

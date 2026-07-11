@@ -537,6 +537,63 @@ object AgentToolRegistry {
             argumentSchema = """{"type":"object","properties":{"limit":{"type":"integer","description":"Max threads (1-20, default 10)"}},"required":[]}""",
             intRanges = mapOf("limit" to AgentToolIntRange(1, 20)),
         ),
+
+        // Phase 3 — Grokipedia Knowledge Pack
+        AgentToolDefinition(
+            name = "search_knowledge",
+            description = "Search the local Grokipedia knowledge base for factual information. Returns relevant article chunks with scores. Use this for fact-checking and general knowledge questions.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"top_k":{"type":"integer","description":"Max results (1-10, default 5)"}},"required":["query"]}""",
+            requiredArguments = setOf("query"),
+            intRanges = mapOf("top_k" to AgentToolIntRange(1, 10)),
+            maxStringLengths = mapOf("query" to 300),
+        ),
+        AgentToolDefinition(
+            name = "fetch_grokipedia_article",
+            description = "Fetch a specific Grokipedia article by slug and index it for future searches.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{"slug":{"type":"string","description":"Article slug (e.g. 'artificial-intelligence')"}},"required":["slug"]}""",
+            requiredArguments = setOf("slug"),
+            maxStringLengths = mapOf("slug" to 200),
+        ),
+        AgentToolDefinition(
+            name = "list_knowledge_packs",
+            description = "List available curated knowledge packs that can be downloaded for offline use.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{}}""",
+        ),
+        AgentToolDefinition(
+            name = "download_knowledge_pack",
+            description = "Download and index a curated knowledge pack from Grokipedia for offline search. Requires network access.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"type":"object","properties":{"pack_id":{"type":"string","description":"Knowledge pack ID"}},"required":["pack_id"]}""",
+            requiredArguments = setOf("pack_id"),
+            maxStringLengths = mapOf("pack_id" to 100),
+        ),
+
+        // Phase 7a — Background Agent Execution
+        AgentToolDefinition(
+            name = "run_in_background",
+            description = "Queue a task to continue running in the background after you close the app or lock the screen.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"type":"object","properties":{"prompt":{"type":"string","description":"What to work on in the background"}},"required":["prompt"]}""",
+            requiredArguments = setOf("prompt"),
+            maxStringLengths = mapOf("prompt" to 2000),
+        ),
+        AgentToolDefinition(
+            name = "check_background_tasks",
+            description = "Check the status of queued and completed background tasks.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{}}""",
+        ),
+        AgentToolDefinition(
+            name = "cancel_background_task",
+            description = "Cancel a queued background task by ID.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]}""",
+            requiredArguments = setOf("task_id"),
+            maxStringLengths = mapOf("task_id" to 50),
+        ),
     )
 
     fun find(name: String): AgentToolDefinition? =

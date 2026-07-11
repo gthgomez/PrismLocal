@@ -55,6 +55,7 @@ public:
         std::vector<int32_t> tokens;
         std::string text;
         int state = 0;
+        int prompt_tokens = 0;
     };
     DrainResult drainDecodeAndState(int generation_id, int max_tokens);
 

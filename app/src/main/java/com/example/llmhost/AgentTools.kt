@@ -93,6 +93,7 @@ data class AgentTrace(
 
 object AgentToolRegistry {
     private const val MAX_REASON_LENGTH = 220
+    const val MAX_AGENT_CHAIN_TOKENS = 8000
 
     val definitions: List<AgentToolDefinition> = listOf(
         AgentToolDefinition(
@@ -334,6 +335,16 @@ object AgentToolRegistry {
             returnContract = """{"deprecated":true}""",
         ),
         AgentToolDefinition(
+            name = "web_search",
+            description = "Search the web using a fixed DuckDuckGo endpoint. Returns titles, snippets, and source URLs. No API key needed. All results are untrusted open-web data.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"query":"search terms","max_results":5}""",
+            requiredArguments = setOf("query"),
+            intRanges = mapOf("max_results" to AgentToolIntRange(1, 10)),
+            maxStringLengths = mapOf("query" to 200),
+            returnContract = """{"query":"string","results":[{"title":"string","snippet":"string","url":"string"}],"untrusted_data":true}""",
+        ),
+        AgentToolDefinition(
             name = "list_curated_downloadable_models",
             description = "List app-approved Hugging Face GGUF downloads. Does not access arbitrary URLs.",
             risk = AgentToolRisk.SAFE,
@@ -404,6 +415,44 @@ object AgentToolRegistry {
             risk = AgentToolRisk.SAFE,
             argumentSchema = "{}",
             returnContract = """{"started":true}""",
+        ),
+        AgentToolDefinition(
+            name = "remember_fact",
+            description = "Store a durable fact about the user for future conversations. Use sparingly for genuinely useful information.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"fact":"string","category":"PERSONAL|PREFERENCE|PROJECT|RELATIONSHIP|KNOWLEDGE|GENERAL"}""",
+            requiredArguments = setOf("fact"),
+            maxStringLengths = mapOf("fact" to 300, "category" to 20),
+            allowedValues = mapOf("category" to setOf("personal", "preference", "project", "relationship", "knowledge", "general")),
+            returnContract = """{"stored":true,"fact_id":"string","category":"string"}""",
+        ),
+        AgentToolDefinition(
+            name = "recall_facts",
+            description = "Search the assistant's memory for relevant facts about the user.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"query":"search terms","max_results":5}""",
+            requiredArguments = setOf("query"),
+            maxStringLengths = mapOf("query" to 200, "category" to 20),
+            intRanges = mapOf("max_results" to AgentToolIntRange(1, 10)),
+            returnContract = """{"matches":[{"fact":"string","category":"string","score":0.85}],"untrusted_data":true}""",
+        ),
+        AgentToolDefinition(
+            name = "forget_fact",
+            description = "Remove a stored fact from the assistant's memory. Requires user confirmation.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"fact_id":"string"}""",
+            requiredArguments = setOf("fact_id"),
+            maxStringLengths = mapOf("fact_id" to 20),
+            returnContract = """{"deleted":true,"fact_id":"string"}""",
+        ),
+        AgentToolDefinition(
+            name = "list_memories",
+            description = "List all stored memories the assistant has about the user, grouped by category.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"category":"all|personal|preference|project|relationship|knowledge|general","limit":30}""",
+            intRanges = mapOf("limit" to AgentToolIntRange(5, 100)),
+            allowedValues = mapOf("category" to setOf("all", "personal", "preference", "project", "relationship", "knowledge", "general")),
+            returnContract = """{"total":0,"by_category":{},"memories":[],"untrusted_data":true}""",
         ),
     )
 
@@ -492,6 +541,8 @@ object AgentToolRegistry {
         )
 
     private fun restrictedReason(call: AgentToolCall): String? {
+        // web_search is sandboxed: uses a single hardcoded DuckDuckGo endpoint, no arbitrary URLs
+        if (call.name == "web_search") return null
         val text = buildString {
             append(call.name)
             call.reason?.let { append(' ').append(it) }

@@ -6,9 +6,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -341,9 +344,11 @@ fun ChatScreen(
 
                         Spacer(modifier = Modifier.height(22.dp))
 
-                        val activeAssistantMessageId = transcript
-                            .lastOrNull { it.role == TranscriptRole.ASSISTANT }
-                            ?.id
+                        val activeAssistantMessageId by remember(transcript.size, isGenerating) {
+                            derivedStateOf {
+                                transcript.lastOrNull { it.role == TranscriptRole.ASSISTANT }?.id
+                            }
+                        }
                         val modelActionsEnabled = service != null &&
                             !isGenerating &&
                             runtimeStatus != RuntimeStatus.LOADING_MODEL &&
@@ -439,7 +444,11 @@ fun ChatScreen(
                             },
                         )
 
-                        if (controlsVisible) {
+                        AnimatedVisibility(
+                            visible = controlsVisible,
+                            enter = fadeIn(),
+                            exit = fadeOut(),
+                        ) {
                             ModalBottomSheet(
                                 onDismissRequest = { controlsVisible = false },
                                 sheetState = controlSheetState,
@@ -490,7 +499,11 @@ fun ChatScreen(
                                 )
                             }
                         }
-                        if (chatsVisible) {
+                        AnimatedVisibility(
+                            visible = chatsVisible,
+                            enter = fadeIn(),
+                            exit = fadeOut(),
+                        ) {
                             ModalBottomSheet(
                                 onDismissRequest = { chatsVisible = false },
                                 sheetState = chatSheetState,
@@ -2628,6 +2641,27 @@ private fun RuntimeControls(
                 enabled = enabled,
             )
         }
+        AnimatedVisibility(visible = settings.agentEnabled) {
+            Column {
+                SettingSlider(
+                    label = "Agent iterations",
+                    valueText = settings.maxAgentIterations.toString(),
+                    value = settings.maxAgentIterations.toFloat(),
+                    valueRange = GenerationSettings.MIN_MAX_AGENT_ITERATIONS.toFloat()..GenerationSettings.MAX_MAX_AGENT_ITERATIONS.toFloat(),
+                    steps = GenerationSettings.MAX_MAX_AGENT_ITERATIONS - GenerationSettings.MIN_MAX_AGENT_ITERATIONS - 1,
+                    enabled = enabled,
+                    onValueChange = { value ->
+                        onSettingsChange(settings.copy(maxAgentIterations = value.roundToInt()))
+                    },
+                )
+                Text(
+                    text = "Max tool-call chain depth before auto-stop. Lower = safer, higher = more autonomous.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
+                )
+            }
+        }
         Surface(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(10.dp),
@@ -3421,6 +3455,133 @@ private fun SettingSlider(
             steps = steps,
             enabled = enabled,
         )
+    }
+}
+
+// ---- Memory Browser ----
+
+@Composable
+private fun MemoryBrowser(
+    memories: List<MemoryFact>,
+    onDelete: (String) -> Unit,
+    onRefresh: () -> Unit,
+) {
+    var searchQuery by remember { mutableStateOf("") }
+    val filteredMemories by remember {
+        derivedStateOf {
+            if (searchQuery.isBlank()) memories
+            else memories.filter { it.fact.contains(searchQuery, ignoreCase = true) }
+        }
+    }
+
+    DashboardCard {
+        SectionHeader(
+            title = "Memory",
+            subtitle = "${memories.size} facts stored",
+        )
+
+        OutlinedTextField(
+            value = searchQuery,
+            onValueChange = { searchQuery = it },
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("Search memories...") },
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodySmall,
+        )
+
+        if (filteredMemories.isEmpty()) {
+            Text(
+                text = "No memories stored yet. Memories are extracted from conversations automatically.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+        } else {
+            LazyColumn(
+                modifier = Modifier.heightIn(max = 300.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(filteredMemories, key = { it.id }) { memory ->
+                    MemoryFactRow(
+                        fact = memory,
+                        onDelete = { onDelete(memory.id) },
+                    )
+                }
+            }
+        }
+
+        TextButton(
+            onClick = onRefresh,
+            modifier = Modifier.align(Alignment.CenterHorizontally),
+        ) {
+            Text("Refresh")
+        }
+    }
+}
+
+@Composable
+private fun MemoryFactRow(
+    fact: MemoryFact,
+    onDelete: () -> Unit,
+) {
+    val categoryColor = when (fact.category) {
+        MemoryCategory.PERSONAL -> PrismBlue
+        MemoryCategory.PREFERENCE -> PrismViolet
+        MemoryCategory.PROJECT -> PrismGreen
+        MemoryCategory.RELATIONSHIP -> PrismAmber
+        MemoryCategory.KNOWLEDGE -> PrismCyan
+        MemoryCategory.GENERAL -> PrismSlate
+    }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = categoryColor.copy(alpha = 0.12f),
+                    contentColor = categoryColor,
+                ) {
+                    Text(
+                        text = fact.category.name,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                }
+                InfoBadge(
+                    text = "${(fact.confidence * 100).roundToInt()}%",
+                    color = when {
+                        fact.confidence >= 0.7f -> PrismGreen
+                        fact.confidence >= 0.4f -> PrismAmber
+                        else -> PrismSlate
+                    },
+                )
+            }
+            Text(
+                text = fact.fact,
+                style = MaterialTheme.typography.bodySmall,
+                color = PrismText,
+            )
+        }
+        TextButton(
+            onClick = onDelete,
+            contentPadding = PaddingValues(0.dp),
+            modifier = Modifier.width(32.dp).height(32.dp),
+        ) {
+            Text(
+                text = "✕",
+                color = PrismRed.copy(alpha = 0.7f),
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+            )
+        }
     }
 }
 

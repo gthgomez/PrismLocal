@@ -6,4 +6,5 @@ data class GenerationChunk(
     val generationId: Int,
     val isTerminal: Boolean,
     val terminalReason: String = "NONE",
+    val promptTokens: Int = 0,
 )

@@ -646,14 +646,14 @@ class ModelStorageManager(private val context: Context) {
     private fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            val buffer = ByteArray(64 * 1024)
             while (true) {
                 val read = input.read(buffer)
                 if (read == -1) break
                 digest.update(buffer, 0, read)
             }
         }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+        return digest.digest().toHex()
     }
 
     private fun hasUsableSpaceFor(bytes: Long): Boolean {
@@ -752,4 +752,16 @@ class ModelStorageManager(private val context: Context) {
         const val MAX_MODEL_BYTES = 32L * 1024L * 1024L * 1024L
         const val MIN_FREE_SPACE_AFTER_IMPORT = 512L * 1024L * 1024L
     }
+}
+
+private val HEX_CHARS = "0123456789abcdef".toCharArray()
+
+private fun ByteArray.toHex(): String {
+    val result = CharArray(size * 2)
+    for (i in indices) {
+        val b = this[i].toInt() and 0xFF
+        result[i * 2] = HEX_CHARS[b ushr 4]
+        result[i * 2 + 1] = HEX_CHARS[b and 0x0F]
+    }
+    return String(result)
 }

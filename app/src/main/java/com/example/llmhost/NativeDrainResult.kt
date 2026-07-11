@@ -8,4 +8,5 @@ class NativeDrainResult {
     @JvmField var tokens: IntArray = IntArray(0)
     @JvmField var text: String = ""
     @JvmField var state: Int = 0
+    @JvmField var promptTokens: Int = 0
 }

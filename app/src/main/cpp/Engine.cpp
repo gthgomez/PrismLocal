@@ -29,13 +29,13 @@ namespace {
 constexpr uint32_t kTokenCapacity = 1024;
 constexpr int kMinGeneratedTokens = 1;
 constexpr int kDefaultGeneratedTokens = 128;
-constexpr int kMaxGeneratedTokens = 512;
+constexpr int kMaxGeneratedTokens = 1024;
 constexpr int kMinThreadCount = 1;
 constexpr int kDefaultThreadCount = 6;
 constexpr int kMaxThreadCount = 8;
 constexpr int kMinContextLength = 512;
 constexpr int kDefaultContextLength = 2048;
-constexpr int kMaxContextLength = 8192;
+constexpr int kMaxContextLength = 16384;
 constexpr int kMinBatchSize = 128;
 constexpr int kDefaultBatchSize = 512;
 constexpr int kMaxBatchSize = 2048;
@@ -101,13 +101,17 @@ void clearRing(ControlBlock* ctrl) {
 
 bool writeToken(ControlBlock* ctrl, int32_t* tokens, int32_t token, const std::atomic<bool>& cancel_requested) {
     const uint32_t cap = ctrl->capacity.load(std::memory_order_acquire);
+    int overflow_spins = 0;
     while (!cancel_requested.load(std::memory_order_acquire)) {
         const uint32_t h = ctrl->head.load(std::memory_order_relaxed);
         const uint32_t t = ctrl->tail.load(std::memory_order_acquire);
         const uint32_t next = (h + 1) % cap;
         if (next == t) {
             ctrl->overflow.store(1, std::memory_order_release);
-            std::this_thread::yield();
+            // Exponential backoff from 100us to 1ms to avoid CPU spin
+            const int backoff_us = std::min(1000, 100 * (1 << std::min(overflow_spins, 4)));
+            std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+            overflow_spins++;
             continue;
         }
         tokens[h] = token;
@@ -243,6 +247,10 @@ struct ModelRuntime {
     llama_sampler* cached_sampler = nullptr;
     GenerationConfig cached_config;
 
+    llama_sampler* cached_grammar_sampler = nullptr;
+    std::string cached_grammar_string;
+    std::vector<llama_token> active_tokens;
+
     ~ModelRuntime() {
         std::lock_guard<std::mutex> lock(decode_mu);
         if (single_batch_initialized) {
@@ -252,6 +260,10 @@ struct ModelRuntime {
         if (cached_sampler != nullptr) {
             llama_sampler_free(cached_sampler);
             cached_sampler = nullptr;
+        }
+        if (cached_grammar_sampler != nullptr) {
+            llama_sampler_free(cached_grammar_sampler);
+            cached_grammar_sampler = nullptr;
         }
         if (ctx != nullptr) {
             llama_free(ctx);
@@ -271,6 +283,7 @@ struct GenerationSession {
     std::atomic<bool> cancel_requested{false};
     std::atomic<bool> eof_acknowledged{false};
     std::shared_ptr<ModelRuntime> runtime;
+    std::atomic<int> prompt_tokens{0};
 
     ~GenerationSession() {
         if (worker.joinable()) {
@@ -295,6 +308,7 @@ void resetRuntimeContext(ModelRuntime& runtime, bool clear_data) {
         llama_memory_clear(llama_get_memory(runtime.ctx), clear_data);
     }
     runtime.current_position = 0;
+    runtime.active_tokens.clear();
 }
 
 bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens) {
@@ -311,9 +325,22 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens) {
         return required_tokens < limit;
     }
 
-    const llama_pos keep_prefix = std::min<llama_pos>(512, runtime.current_position / 4);
-    const llama_pos discard = std::max<llama_pos>(1, (runtime.current_position - keep_prefix) / 4);
-    const float util_before_pct = static_cast<float>(runtime.current_position) / static_cast<float>(runtime.context_length) * 100.0f;
+    const float util_pct = static_cast<float>(runtime.current_position) / static_cast<float>(runtime.context_length);
+    llama_pos keep_prefix;
+    if (util_pct < 0.40f) {
+        // Low utilization: keep most history — plenty of room
+        keep_prefix = std::max<llama_pos>(256, runtime.current_position * 3 / 4);
+    } else if (util_pct < 0.70f) {
+        // Moderate utilization: keep half of history
+        keep_prefix = std::max<llama_pos>(256, runtime.current_position / 2);
+    } else if (util_pct < 0.85f) {
+        // High utilization: keep a third
+        keep_prefix = std::max<llama_pos>(128, runtime.current_position / 3);
+    } else {
+        // Very tight: keep a sixth
+        keep_prefix = std::max<llama_pos>(64, runtime.current_position / 6);
+    }
+    const llama_pos discard = std::max<llama_pos>(16, (runtime.current_position - keep_prefix) / 3);
     llama_memory_t memory = llama_get_memory(runtime.ctx);
     const bool removed = llama_memory_seq_rm(memory, kMainSequence, keep_prefix, keep_prefix + discard);
     if (!removed) {
@@ -323,13 +350,18 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens) {
     }
     llama_memory_seq_add(memory, kMainSequence, keep_prefix + discard, runtime.current_position, -discard);
     runtime.current_position -= discard;
+    if (static_cast<size_t>(keep_prefix) < runtime.active_tokens.size()) {
+        auto erase_start = runtime.active_tokens.begin() + keep_prefix;
+        auto erase_end = std::min(runtime.active_tokens.end(), erase_start + discard);
+        runtime.active_tokens.erase(erase_start, erase_end);
+    }
     const float util_after_pct = static_cast<float>(runtime.current_position) / static_cast<float>(runtime.context_length) * 100.0f;
     LOGI("context_shift keep=%d discard=%d current_position=%d required=%d utilization_before_pct=%.1f%% utilization_after_pct=%.1f%%",
          static_cast<int>(keep_prefix),
          static_cast<int>(discard),
          static_cast<int>(runtime.current_position),
          required_tokens,
-         util_before_pct,
+         util_pct * 100.0f,
          util_after_pct);
     return runtime.current_position + required_tokens < limit;
 }
@@ -402,6 +434,8 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     ctx_params.n_ubatch = config.batch_size;
     ctx_params.n_threads = config.thread_count;
     ctx_params.n_threads_batch = ctx_params.n_threads;
+    ctx_params.type_k = GGML_TYPE_Q8_0;  // quantize KV cache keys to 8-bit, ~2-4x memory reduction
+    ctx_params.type_v = GGML_TYPE_Q8_0;  // quantize KV cache values to 8-bit, ~2-4x memory reduction
     ctx_params.no_perf = false;
 
     llama_context* ctx = llama_init_from_model(model, ctx_params);
@@ -625,12 +659,35 @@ struct Engine::Impl {
                      dropped,
                      usable_prompt_tokens);
             }
-            if (!shiftRuntimeContextIfNeeded(*runtime, usable_prompt_tokens + session->config.max_tokens + kContextHeadroom)) {
+            session->prompt_tokens.store(usable_prompt_tokens, std::memory_order_relaxed);
+            size_t common_prefix = 0;
+            while (common_prefix < static_cast<size_t>(usable_prompt_tokens) &&
+                   common_prefix < runtime->active_tokens.size() &&
+                   prompt_tokens[common_prefix] == runtime->active_tokens[common_prefix]) {
+                common_prefix++;
+            }
+
+            if (common_prefix > 0) {
+                if (common_prefix < static_cast<size_t>(runtime->current_position)) {
+                    llama_memory_t memory = llama_get_memory(runtime->ctx);
+                    llama_memory_seq_rm(memory, kMainSequence, static_cast<llama_pos>(common_prefix), -1);
+                }
+                runtime->current_position = static_cast<llama_pos>(common_prefix);
+                runtime->active_tokens.resize(common_prefix);
+                LOGI("prefix_cache_hit common_prefix=%zu", common_prefix);
+            } else {
+                resetRuntimeContext(*runtime, false);
+                LOGI("prefix_cache_miss; fully cleared kv");
+            }
+
+            const int32_t tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
+
+            if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens + kContextHeadroom)) {
                 ctrl->error_code.store(426, std::memory_order_release);
                 LOGE("context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
                      static_cast<int>(runtime->current_position),
-                     usable_prompt_tokens + session->config.max_tokens);
+                     tokens_to_decode + session->config.max_tokens);
                 finishSession(session, StreamState::Error);
                 return;
             }
@@ -640,19 +697,24 @@ struct Engine::Impl {
                 return;
             }
 
-            const llama_pos prompt_start = runtime->current_position;
-            const int decode_result = decodeTokensAt(*runtime, prompt_tokens.data(), usable_prompt_tokens, prompt_start);
-            if (decode_result != 0) {
-                ctrl->error_code.store(static_cast<uint32_t>(5000 + std::abs(decode_result)), std::memory_order_release);
-                LOGE("prompt_eval_failed rc=%d", decode_result);
-                finishSession(session, StreamState::Error);
-                return;
+            if (tokens_to_decode > 0) {
+                const llama_pos prompt_start = runtime->current_position;
+                const int decode_result = decodeTokensAt(*runtime, prompt_tokens.data() + common_prefix, tokens_to_decode, prompt_start);
+                if (decode_result != 0) {
+                    ctrl->error_code.store(static_cast<uint32_t>(5000 + std::abs(decode_result)), std::memory_order_release);
+                    LOGE("prompt_eval_failed rc=%d", decode_result);
+                    finishSession(session, StreamState::Error);
+                    return;
+                }
+                runtime->current_position += tokens_to_decode;
+                runtime->active_tokens.insert(runtime->active_tokens.end(), prompt_tokens.begin() + common_prefix, prompt_tokens.begin() + usable_prompt_tokens);
             }
-            runtime->current_position += usable_prompt_tokens;
-            LOGI("prompt_eval_done generation_id=%u prompt_tokens=%d kv_pos=%d",
+            LOGI("prompt_eval_done generation_id=%u prompt_tokens=%d kv_pos=%d cached_tokens=%zu decoded_tokens=%d",
                  session->generation_id,
                  usable_prompt_tokens,
-                 static_cast<int>(runtime->current_position));
+                 static_cast<int>(runtime->current_position),
+                 common_prefix,
+                 tokens_to_decode);
             const float kv_usage_pct = static_cast<float>(runtime->current_position) / static_cast<float>(runtime->context_length) * 100.0f;
             LOGI("context_utilization generation_id=%u kv_pos=%d context_length=%d kv_usage_pct=%.1f%%",
                  session->generation_id,
@@ -668,15 +730,23 @@ struct Engine::Impl {
         }
 
         llama_sampler* sampler = nullptr;
-        if (runtime->cached_sampler != nullptr &&
+        const bool non_grammar_matches =
+            runtime->cached_sampler != nullptr &&
             runtime->cached_config.temperature == session->config.temperature &&
             runtime->cached_config.top_k == session->config.top_k &&
             runtime->cached_config.top_p == session->config.top_p &&
-            runtime->cached_config.repeat_penalty == session->config.repeat_penalty &&
-            runtime->cached_config.grammar == session->config.grammar) {
+            runtime->cached_config.repeat_penalty == session->config.repeat_penalty;
+        const bool grammar_matches =
+            !session->config.grammar.empty() &&
+            runtime->cached_grammar_sampler != nullptr &&
+            runtime->cached_grammar_string == session->config.grammar;
+
+        if (non_grammar_matches && (grammar_matches || session->config.grammar.empty())) {
+            // Full cache hit: non-grammar params and grammar both unchanged
             sampler = runtime->cached_sampler;
             llama_sampler_reset(sampler);
         } else {
+            // Rebuild chain (cheap), but reuse cached grammar (expensive) when possible
             if (runtime->cached_sampler != nullptr) {
                 llama_sampler_free(runtime->cached_sampler);
                 runtime->cached_sampler = nullptr;
@@ -692,19 +762,32 @@ struct Engine::Impl {
             llama_sampler_chain_add(sampler, llama_sampler_init_top_p(session->config.top_p, 1));
             llama_sampler_chain_add(sampler, llama_sampler_init_temp(session->config.temperature));
             if (!session->config.grammar.empty()) {
-                const auto grammar_start = std::chrono::steady_clock::now();
-                auto* grammar_sampler = llama_sampler_init_grammar(runtime->vocab, session->config.grammar.c_str(), "root");
-                const auto grammar_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - grammar_start).count();
-                LOGI("grammar_compile_time_us=%lld", static_cast<long long>(grammar_elapsed));
-                if (grammar_sampler != nullptr) {
-                    llama_sampler_chain_add(sampler, grammar_sampler);
+                if (grammar_matches) {
+                    // Reuse cached grammar — avoids expensive recompilation
+                    llama_sampler_reset(runtime->cached_grammar_sampler);
+                    llama_sampler_chain_add(sampler, runtime->cached_grammar_sampler);
                 } else {
-                    LOGW("Failed to compile grammar. Proceeding unconstrained.");
+                    // Compile new grammar
+                    if (runtime->cached_grammar_sampler != nullptr) {
+                        llama_sampler_free(runtime->cached_grammar_sampler);
+                        runtime->cached_grammar_sampler = nullptr;
+                    }
+                    const auto grammar_start = std::chrono::steady_clock::now();
+                    auto* grammar_sampler = llama_sampler_init_grammar(runtime->vocab, session->config.grammar.c_str(), "root");
+                    const auto grammar_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - grammar_start).count();
+                    LOGI("grammar_compile_time_us=%lld", static_cast<long long>(grammar_elapsed));
+                    if (grammar_sampler != nullptr) {
+                        runtime->cached_grammar_sampler = grammar_sampler;
+                        runtime->cached_grammar_string = session->config.grammar;
+                        llama_sampler_chain_add(sampler, grammar_sampler);
+                    } else {
+                        LOGW("Failed to compile grammar. Proceeding unconstrained.");
+                    }
                 }
             }
             llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-            
+
             runtime->cached_sampler = sampler;
             runtime->cached_config = session->config;
         }
@@ -739,6 +822,7 @@ struct Engine::Impl {
 
             if (writeToken(ctrl, buffers.tokens, static_cast<int32_t>(token), session->cancel_requested)) {
                 generated_tokens++;
+                runtime->active_tokens.push_back(token);
             }
             if (session->cancel_requested.load(std::memory_order_acquire)) {
                 finishSession(session, StreamState::Cancelled);
@@ -1161,6 +1245,14 @@ Engine::DrainResult Engine::drainDecodeAndState(int generation_id, int max_token
         result.text = decodeTokens(generation_id, result.tokens);
     }
     result.state = getState(generation_id);
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        if (impl_->active_session && impl_->active_session->generation_id == static_cast<uint32_t>(generation_id)) {
+            result.prompt_tokens = impl_->active_session->prompt_tokens.load(std::memory_order_relaxed);
+        }
+    }
+
     return result;
 }
 

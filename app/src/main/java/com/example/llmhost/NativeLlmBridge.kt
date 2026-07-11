@@ -21,6 +21,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         private const val STATE_ERROR = 5
         private const val STATE_TOMBSTONED = 6
         private const val STATE_MAX_TOKENS = 7
+        private val EMPTY_INT_ARRAY = IntArray(0)
         private val bridgeInstanceCounter = AtomicInteger(0)
 
         init {
@@ -39,7 +40,14 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         private external fun nativeCreateEngine(debugHooksEnabled: Boolean): Long
     }
 
-    private val nativeMutex = Mutex()
+    // modelMutex serializes model lifecycle: load, unload, reset, destroy.
+    // The drain/decode path does NOT acquire this lock — C++ handles its own
+    // thread safety via atomics and internal mutexes.
+    private val modelMutex = Mutex()
+    // genMutex serializes generation start/cancel/ack to prevent concurrent
+    // generations from racing on session state. The hot drain loop is NOT
+    // serialized — it reads atomics lock-free.
+    private val genMutex = Mutex()
     private val sessionCounter = AtomicInteger(1)
 
     @Volatile
@@ -99,17 +107,17 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     private external fun nativeAckEof(handle: Long, genId: Int)
     private external fun nativeDecodeTokens(handle: Long, genId: Int, tokens: IntArray): String
     private external fun nativeGetState(handle: Long, genId: Int): Int
-    private external fun nativeDrainDecodeAndState(handle: Long, genId: Int, maxTokens: Int): NativeDrainResult
+    private external fun nativeDrainDecodeAndState(handle: Long, genId: Int, maxTokens: Int, outResult: NativeDrainResult)
     private external fun nativeSetMemoryPressure(handle: Long, level: Int)
 
-    suspend fun loadModel(path: String, settings: GenerationSettings = GenerationSettings()): Boolean = nativeMutex.withLock {
+    suspend fun loadModel(path: String, settings: GenerationSettings = GenerationSettings()): Boolean = modelMutex.withLock {
         if (isDestroyed) return@withLock false
         val safeSettings = settings.clamped()
         nativeLoadModelWithSettings(nativeHandle, path, safeSettings)
     }
 
     suspend fun unloadModel() {
-        nativeMutex.withLock {
+        modelMutex.withLock {
             if (!isDestroyed) {
                 nativeUnloadModel(nativeHandle)
             }
@@ -117,7 +125,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     }
 
     suspend fun resetConversation() {
-        nativeMutex.withLock {
+        modelMutex.withLock {
             if (!isDestroyed) {
                 nativeResetConversation(nativeHandle)
             }
@@ -129,7 +137,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         promptTokens: Int = 512,
         generationTokens: Int = 128,
         repetitions: Int = 3,
-    ): String = nativeMutex.withLock {
+    ): String = modelMutex.withLock {
         if (isDestroyed) return@withLock "{\"error\":\"destroyed\"}"
         nativeRunBenchmark(
             nativeHandle,
@@ -141,15 +149,15 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     }
 
     suspend fun setMemoryPressure(level: Int) {
-        nativeMutex.withLock {
-            if (!isDestroyed) {
-                nativeSetMemoryPressure(nativeHandle, level)
-            }
+        // Lock-free: C++ only writes an atomic (memory_pressure_level.store).
+        // The volatile isDestroyed check + C++ nullptr guard make this safe without a mutex.
+        if (!isDestroyed) {
+            nativeSetMemoryPressure(nativeHandle, level)
         }
     }
 
     suspend fun destroySafely() {
-        nativeMutex.withLock {
+        modelMutex.withLock {
             if (isDestroyed) return@withLock
             isDestroyed = true
             nativeDestroyEngine(nativeHandle)
@@ -166,7 +174,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     ): Flow<GenerationChunk> = callbackFlow {
         val genId = sessionCounter.getAndIncrement()
 
-        val startSuccess = nativeMutex.withLock {
+        val startSuccess = genMutex.withLock {
             if (isDestroyed) {
                 false
             } else {
@@ -195,23 +203,36 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
         var observedTerminal = false
         val jniTimingsUs = mutableListOf<Long>()
+        val reusableResult = NativeDrainResult()
+        var pollDelay = 2L
         try {
             while (isActive && !isDestroyed) {
-                val (tokens, text, state) = nativeMutex.withLock {
-                    if (isDestroyed) {
-                        NativeDrainResult().apply { state = STATE_TOMBSTONED }
-                    } else {
-                        val jniStart = SystemClock.elapsedRealtimeNanos()
-                        val result = nativeDrainDecodeAndState(nativeHandle, genId, 128)
-                        jniTimingsUs.add((SystemClock.elapsedRealtimeNanos() - jniStart) / 1000)
-                        result
-                    }
-                }.let { Triple(it.tokens, it.text, it.state) }
+                // Lock-free drain: C++ handles thread safety via atomics on the
+                // ControlBlock and internal decode_mu. Skipping the Kotlin mutex here
+                // eliminates contention with setMemoryPressure and model operations.
+                val jniStart = SystemClock.elapsedRealtimeNanos()
+                if (isDestroyed) {
+                    reusableResult.tokens = EMPTY_INT_ARRAY
+                    reusableResult.text = ""
+                    reusableResult.state = STATE_TOMBSTONED
+                } else {
+                    reusableResult.tokens = EMPTY_INT_ARRAY
+                    reusableResult.text = ""
+                    reusableResult.state = 0
+                    nativeDrainDecodeAndState(nativeHandle, genId, 128, reusableResult)
+                }
+                jniTimingsUs.add((SystemClock.elapsedRealtimeNanos() - jniStart) / 1000)
+
+                val tokens = reusableResult.tokens
+                val text = reusableResult.text
+                val state = reusableResult.state
+                val promptTokens = reusableResult.promptTokens
 
                 if (tokens.isNotEmpty()) {
+                    pollDelay = 2L // reset backoff on active token receipt
                     val normalizedText = Utf8TextPipeline.normalizeNativeText(text)
                     if (normalizedText.isNotEmpty() || tokens.isNotEmpty()) {
-                        trySend(GenerationChunk(normalizedText, tokens.size, genId, isTerminal = false))
+                        trySend(GenerationChunk(normalizedText, tokens.size, genId, isTerminal = false, promptTokens = promptTokens))
                     }
                 }
 
@@ -224,16 +245,17 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                         else -> "UNKNOWN"
                     }
                     observedTerminal = true
-                    trySend(GenerationChunk("", 0, genId, isTerminal = true, terminalReason = reason))
+                    trySend(GenerationChunk("", 0, genId, isTerminal = true, terminalReason = reason, promptTokens = promptTokens))
                     break
                 }
 
                 if (tokens.isEmpty()) {
-                    delay(5)
+                    delay(pollDelay)
+                    pollDelay = (pollDelay * 2).coerceAtMost(64L) // backoff up to 64ms
                 }
             }
         } finally {
-            nativeMutex.withLock {
+            genMutex.withLock {
                 if (!isDestroyed) {
                     if (!observedTerminal) {
                         nativeCancelGeneration(nativeHandle, genId)
@@ -255,19 +277,19 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
     @VisibleForTesting
     suspend fun debugDrainTokensForTesting(generationId: Int, maxTokens: Int): IntArray =
-        nativeMutex.withLock {
+        modelMutex.withLock {
             if (isDestroyed) IntArray(0) else nativeDrainTokens(nativeHandle, generationId, maxTokens)
         }
 
     @VisibleForTesting
     suspend fun debugDecodeTokensForTesting(generationId: Int, tokens: IntArray): String =
-        nativeMutex.withLock {
+        modelMutex.withLock {
             if (isDestroyed) "" else nativeDecodeTokens(nativeHandle, generationId, tokens)
         }.let(Utf8TextPipeline::normalizeNativeText)
 
     @VisibleForTesting
     suspend fun debugStartGenerationForTesting(prompt: String, generationId: Int): Boolean =
-        nativeMutex.withLock {
+        modelMutex.withLock {
             if (isDestroyed) {
                 false
             } else {
@@ -293,7 +315,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
     @VisibleForTesting
     suspend fun debugCancelGenerationForTesting(generationId: Int) {
-        nativeMutex.withLock {
+        modelMutex.withLock {
             if (!isDestroyed) {
                 nativeCancelGeneration(nativeHandle, generationId)
             }
@@ -302,7 +324,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
     @VisibleForTesting
     suspend fun debugStateForTesting(generationId: Int): Int =
-        nativeMutex.withLock {
+        modelMutex.withLock {
             if (isDestroyed) STATE_TOMBSTONED else nativeGetState(nativeHandle, generationId)
         }
 

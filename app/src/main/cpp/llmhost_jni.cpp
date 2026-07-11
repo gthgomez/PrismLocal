@@ -12,6 +12,7 @@ namespace {
 
 jclass g_string_class = nullptr;
 jmethodID g_string_ctor = nullptr;
+jstring g_utf8_charset = nullptr;
 std::once_flag g_string_cache_flag;
 
 void ensureStringCache(JNIEnv* env) {
@@ -22,6 +23,11 @@ void ensureStringCache(JNIEnv* env) {
             g_string_ctor = env->GetMethodID(g_string_class, "<init>", "([BLjava/lang/String;)V");
             env->DeleteLocalRef(local_class);
         }
+        jstring local_utf8 = env->NewStringUTF("UTF-8");
+        if (local_utf8 != nullptr) {
+            g_utf8_charset = static_cast<jstring>(env->NewGlobalRef(local_utf8));
+            env->DeleteLocalRef(local_utf8);
+        }
     });
 }
 
@@ -30,8 +36,9 @@ jmethodID g_drain_result_ctor = nullptr;
 jfieldID g_drain_result_tokens_field = nullptr;
 jfieldID g_drain_result_text_field = nullptr;
 jfieldID g_drain_result_state_field = nullptr;
+jfieldID g_drain_result_prompt_tokens_field = nullptr;
 std::once_flag g_drain_result_cache_flag;
-
+ 
 void ensureDrainResultCache(JNIEnv* env) {
     std::call_once(g_drain_result_cache_flag, [env]() {
         jclass local_class = env->FindClass("com/example/llmhost/NativeDrainResult");
@@ -41,6 +48,7 @@ void ensureDrainResultCache(JNIEnv* env) {
             g_drain_result_tokens_field = env->GetFieldID(g_drain_result_class, "tokens", "[I");
             g_drain_result_text_field = env->GetFieldID(g_drain_result_class, "text", "Ljava/lang/String;");
             g_drain_result_state_field = env->GetFieldID(g_drain_result_class, "state", "I");
+            g_drain_result_prompt_tokens_field = env->GetFieldID(g_drain_result_class, "promptTokens", "I");
             env->DeleteLocalRef(local_class);
         }
     });
@@ -68,6 +76,21 @@ jstring toJavaString(JNIEnv* env, const std::string& value) {
         return env != nullptr ? env->NewStringUTF("") : nullptr;
     }
 
+    // Fast path: if the string is pure ASCII (chars 0x00-0x7F), use NewStringUTF directly.
+    // This avoids the byte[] + String(byte[],charset) constructor path which allocates
+    // 3+ JNI local references and a Java byte array per call.
+    bool is_ascii = true;
+    for (const char c : value) {
+        if (static_cast<unsigned char>(c) > 0x7F) {
+            is_ascii = false;
+            break;
+        }
+    }
+    if (is_ascii) {
+        return env->NewStringUTF(value.c_str());
+    }
+
+    // Full path for non-ASCII text (uses String(byte[], charset) for correct UTF-8)
     jbyteArray bytes = env->NewByteArray(static_cast<jsize>(value.size()));
     if (bytes == nullptr) {
         return env->NewStringUTF("");
@@ -83,22 +106,14 @@ jstring toJavaString(JNIEnv* env, const std::string& value) {
         return env->NewStringUTF("");
     }
 
-    jstring charset = env->NewStringUTF("UTF-8");
-    if (charset == nullptr) {
-        env->DeleteLocalRef(bytes);
-        return env->NewStringUTF("");
-    }
-
     ensureStringCache(env);
 
-    if (g_string_class == nullptr || g_string_ctor == nullptr) {
-        env->DeleteLocalRef(charset);
+    if (g_string_class == nullptr || g_string_ctor == nullptr || g_utf8_charset == nullptr) {
         env->DeleteLocalRef(bytes);
         return env->NewStringUTF("");
     }
 
-    auto result = static_cast<jstring>(env->NewObject(g_string_class, g_string_ctor, bytes, charset));
-    env->DeleteLocalRef(charset);
+    auto result = static_cast<jstring>(env->NewObject(g_string_class, g_string_ctor, bytes, g_utf8_charset));
     env->DeleteLocalRef(bytes);
     if (result == nullptr || env->ExceptionCheck()) {
         if (env->ExceptionCheck()) {
@@ -361,46 +376,41 @@ Java_com_example_llmhost_NativeLlmBridge_nativeSetMemoryPressure(JNIEnv*, jobjec
     engine->setMemoryPressure(level);
 }
 
-extern "C" JNIEXPORT jobject JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv* env, jobject, jlong handle, jint gen_id, jint max_tokens) {
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_llmhost_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv* env, jobject, jlong handle, jint gen_id, jint max_tokens, jobject result) {
     auto* engine = toEngine(handle);
 
     ensureDrainResultCache(env);
 
-    if (g_drain_result_class == nullptr || g_drain_result_ctor == nullptr) {
-        return nullptr;
-    }
-
-    jobject result = env->NewObject(g_drain_result_class, g_drain_result_ctor);
-    if (result == nullptr) {
-        env->ExceptionClear();
-        return nullptr;
+    if (g_drain_result_class == nullptr || g_drain_result_ctor == nullptr || result == nullptr) {
+        return;
     }
 
     if (engine == nullptr) {
         env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Tombstoned));
-        return result;
+        return;
     }
 
     try {
         auto drain_result = engine->drainDecodeAndState(gen_id, max_tokens);
 
-        jintArray tokens = toJintArray(env, drain_result.tokens);
-        if (tokens != nullptr) {
-            env->SetObjectField(result, g_drain_result_tokens_field, tokens);
-            env->DeleteLocalRef(tokens);
-        }
+        if (!drain_result.tokens.empty()) {
+            jintArray tokens = toJintArray(env, drain_result.tokens);
+            if (tokens != nullptr) {
+                env->SetObjectField(result, g_drain_result_tokens_field, tokens);
+                env->DeleteLocalRef(tokens);
+            }
 
-        jstring text = toJavaString(env, drain_result.text);
-        if (text != nullptr) {
-            env->SetObjectField(result, g_drain_result_text_field, text);
-            env->DeleteLocalRef(text);
+            jstring text = toJavaString(env, drain_result.text);
+            if (text != nullptr) {
+                env->SetObjectField(result, g_drain_result_text_field, text);
+                env->DeleteLocalRef(text);
+            }
         }
 
         env->SetIntField(result, g_drain_result_state_field, drain_result.state);
+        env->SetIntField(result, g_drain_result_prompt_tokens_field, drain_result.prompt_tokens);
     } catch (const std::exception&) {
         env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Error));
     }
-
-    return result;
 }

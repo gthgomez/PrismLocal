@@ -31,7 +31,13 @@ class MemoryGovernor(private val context: Context) {
                 else -> MemoryState.NORMAL
             }
             emit(state)
-            delay(pollIntervalMs)
+            val adaptiveDelay = when (state) {
+                MemoryState.CRITICAL -> 1000L
+                MemoryState.PRESSURE -> 2000L
+                MemoryState.WATCH -> 2000L
+                MemoryState.NORMAL -> 5000L
+            }
+            delay(adaptiveDelay)
         }
     }
 }

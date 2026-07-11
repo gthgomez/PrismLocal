@@ -50,24 +50,24 @@ internal fun MarkdownText(
                 MarkdownBlockKind.Blank -> Spacer(modifier = Modifier.height(8.dp))
                 MarkdownBlockKind.Divider -> HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 MarkdownBlockKind.Heading -> Text(
-                    text = parseInlineMarkdown(block.text),
+                    text = block.text,
                     color = color,
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
                 MarkdownBlockKind.Quote -> Text(
-                    text = parseInlineMarkdown(block.text),
+                    text = block.text,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodyMedium,
                     fontStyle = FontStyle.Italic,
                 )
                 MarkdownBlockKind.Text -> Text(
-                    text = parseInlineMarkdown(block.text),
+                    text = block.text,
                     color = color,
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 MarkdownBlockKind.Code -> CodeBlock(
-                    code = block.text,
+                    code = block.text.text,
                     language = block.language,
                     color = color,
                 )
@@ -87,7 +87,7 @@ internal enum class MarkdownBlockKind {
 
 internal data class MarkdownBlock(
     val kind: MarkdownBlockKind,
-    val text: String,
+    val text: AnnotatedString,
     val language: String? = null,
 )
 
@@ -112,20 +112,20 @@ internal fun markdownBlocks(text: String): List<MarkdownBlock> {
             }
             blocks += MarkdownBlock(
                 kind = MarkdownBlockKind.Code,
-                text = codeLines.joinToString("\n").trimEnd(),
+                text = AnnotatedString(codeLines.joinToString("\n").trimEnd()),
                 language = language,
             )
         } else {
             blocks += when {
-                trimmed.isBlank() -> MarkdownBlock(MarkdownBlockKind.Blank, "")
-                trimmed == "---" || trimmed == "***" -> MarkdownBlock(MarkdownBlockKind.Divider, "")
-                trimmed.startsWith("### ") -> MarkdownBlock(MarkdownBlockKind.Heading, trimmed.removePrefix("### ").trim())
-                trimmed.startsWith("## ") -> MarkdownBlock(MarkdownBlockKind.Heading, trimmed.removePrefix("## ").trim())
-                trimmed.startsWith("# ") -> MarkdownBlock(MarkdownBlockKind.Heading, trimmed.removePrefix("# ").trim())
-                trimmed.startsWith("> ") -> MarkdownBlock(MarkdownBlockKind.Quote, trimmed.removePrefix("> ").trim())
-                trimmed.startsWith("- ") -> MarkdownBlock(MarkdownBlockKind.Text, "• ${trimmed.removePrefix("- ").trim()}")
-                trimmed.startsWith("* ") -> MarkdownBlock(MarkdownBlockKind.Text, "• ${trimmed.removePrefix("* ").trim()}")
-                else -> MarkdownBlock(MarkdownBlockKind.Text, line)
+                trimmed.isBlank() -> MarkdownBlock(MarkdownBlockKind.Blank, AnnotatedString(""))
+                trimmed == "---" || trimmed == "***" -> MarkdownBlock(MarkdownBlockKind.Divider, AnnotatedString(""))
+                trimmed.startsWith("### ") -> MarkdownBlock(MarkdownBlockKind.Heading, parseInlineMarkdown(trimmed.removePrefix("### ").trim()))
+                trimmed.startsWith("## ") -> MarkdownBlock(MarkdownBlockKind.Heading, parseInlineMarkdown(trimmed.removePrefix("## ").trim()))
+                trimmed.startsWith("# ") -> MarkdownBlock(MarkdownBlockKind.Heading, parseInlineMarkdown(trimmed.removePrefix("# ").trim()))
+                trimmed.startsWith("> ") -> MarkdownBlock(MarkdownBlockKind.Quote, parseInlineMarkdown(trimmed.removePrefix("> ").trim()))
+                trimmed.startsWith("- ") -> MarkdownBlock(MarkdownBlockKind.Text, parseInlineMarkdown("• ${trimmed.removePrefix("- ").trim()}"))
+                trimmed.startsWith("* ") -> MarkdownBlock(MarkdownBlockKind.Text, parseInlineMarkdown("• ${trimmed.removePrefix("* ").trim()}"))
+                else -> MarkdownBlock(MarkdownBlockKind.Text, parseInlineMarkdown(line))
             }
             index += 1
         }
@@ -187,7 +187,7 @@ private fun CodeBlock(
 internal fun markdownPlainLinesForTesting(text: String): List<String> =
     markdownBlocks(text)
         .filter { it.kind != MarkdownBlockKind.Blank && it.kind != MarkdownBlockKind.Divider }
-        .map { parseInlineMarkdown(it.text).text }
+        .map { it.text.text }
 
 private fun parseInlineMarkdown(text: String): AnnotatedString =
     buildAnnotatedString {

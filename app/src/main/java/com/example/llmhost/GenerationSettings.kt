@@ -32,8 +32,8 @@ data class GenerationSettings(
 
     companion object {
         const val MIN_MAX_TOKENS = 1
-        const val DEFAULT_MAX_TOKENS = 128
-        const val MAX_MAX_TOKENS = 512
+        const val DEFAULT_MAX_TOKENS = 256
+        const val MAX_MAX_TOKENS = 1024
         const val MAX_TOKEN_STEP = 32
 
         const val MIN_THREAD_COUNT = 1
@@ -42,7 +42,7 @@ data class GenerationSettings(
 
         const val MIN_CONTEXT_LENGTH = 512
         const val DEFAULT_CONTEXT_LENGTH = 2048
-        const val MAX_CONTEXT_LENGTH = 8192
+        const val MAX_CONTEXT_LENGTH = 16384
         const val CONTEXT_LENGTH_STEP = 512
 
         const val MIN_BATCH_SIZE = 128
@@ -71,8 +71,8 @@ data class GenerationSettings(
         const val MAX_GPU_LAYERS = 99
 
         const val MIN_MAX_AGENT_ITERATIONS = 1
-        const val DEFAULT_MAX_AGENT_ITERATIONS = 3
-        const val MAX_MAX_AGENT_ITERATIONS = 10
+        const val DEFAULT_MAX_AGENT_ITERATIONS = 5
+        const val MAX_MAX_AGENT_ITERATIONS = 12
 
         private fun snapToStep(value: Int, step: Int): Int =
             ((value + step / 2) / step) * step

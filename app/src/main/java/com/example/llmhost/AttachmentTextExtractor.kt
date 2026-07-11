@@ -214,7 +214,7 @@ object AttachmentTextExtractor {
     }
 
     private fun decodeQuotedPrintable(text: String): ByteArray {
-        val out = ArrayList<Byte>(text.length)
+        val out = java.io.ByteArrayOutputStream(text.length)
         var i = 0
         while (i < text.length) {
             val c = text[i]
@@ -229,15 +229,16 @@ object AttachmentTextExtractor {
                     i += 2
                     continue
                 }
-                val hex = "$a$b"
-                val value = hex.toIntOrNull(16)
-                if (value != null) {
-                    out += value.toByte()
+                val digit1 = Character.digit(a, 16)
+                val digit2 = Character.digit(b, 16)
+                if (digit1 != -1 && digit2 != -1) {
+                    val value = (digit1 shl 4) or digit2
+                    out.write(value)
                     i += 3
                     continue
                 }
             }
-            out += c.code.toByte()
+            out.write(c.code)
             i++
         }
         return out.toByteArray()

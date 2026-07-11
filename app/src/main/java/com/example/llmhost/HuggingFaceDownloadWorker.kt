@@ -252,7 +252,7 @@ class HuggingFaceDownloadWorker(
             var copied = existing
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
             var lastProgressAt = 0L
-            FileOutputStream(target, append).buffered().use { output ->
+            FileOutputStream(target, append).use { output ->
                 connection.inputStream.use { input ->
                     while (true) {
                         val read = input.read(buffer)
@@ -315,7 +315,7 @@ class HuggingFaceDownloadWorker(
 
     private suspend fun sha256(file: File, onProgress: suspend (Long) -> Unit): String {
         val digest = MessageDigest.getInstance("SHA-256")
-        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        val buffer = ByteArray(64 * 1024)
         var total = 0L
         var lastProgressAt = 0L
         file.inputStream().use { input ->
@@ -332,7 +332,7 @@ class HuggingFaceDownloadWorker(
                 }
             }
         }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+        return digest.digest().toHex()
     }
 
     private fun parseContentRangeTotal(value: String?): Long? =
@@ -404,4 +404,16 @@ fun enqueueHuggingFaceDownload(context: Context, entryId: String) {
         ExistingWorkPolicy.REPLACE,
         HuggingFaceDownloadWork.request(entryId),
     )
+}
+
+private val HEX_CHARS = "0123456789abcdef".toCharArray()
+
+private fun ByteArray.toHex(): String {
+    val result = CharArray(size * 2)
+    for (i in indices) {
+        val b = this[i].toInt() and 0xFF
+        result[i * 2] = HEX_CHARS[b ushr 4]
+        result[i * 2 + 1] = HEX_CHARS[b and 0x0F]
+    }
+    return String(result)
 }

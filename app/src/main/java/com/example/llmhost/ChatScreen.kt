@@ -120,8 +120,10 @@ fun ChatScreen(
         var snackbarMessage by remember { mutableStateOf<String?>(null) }
         var controlsVisible by remember { mutableStateOf(false) }
         var chatsVisible by remember { mutableStateOf(false) }
+        var memoriesVisible by remember { mutableStateOf(false) }
         val controlSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val chatSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        val memoriesSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
         LaunchedEffect(uiMessage) {
             val message = uiMessage ?: return@LaunchedEffect
@@ -181,6 +183,9 @@ fun ChatScreen(
                         )
                         val pendingAgentToolAction by (service?.pendingAgentToolAction ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = null
+                        )
+                        val memories by (service?.memories ?: emptyFlow()).collectAsStateWithLifecycle(
+                            initialValue = emptyList()
                         )
                         var prompt by remember { mutableStateOf("") }
                         var attachments by remember { mutableStateOf<List<PromptAttachment>>(emptyList()) }
@@ -340,6 +345,7 @@ fun ChatScreen(
                             collapsed = headerCollapsed,
                             onOpenChats = { chatsVisible = true },
                             onOpenControls = { controlsVisible = true },
+                            onOpenMemories = { memoriesVisible = true },
                         )
 
                         Spacer(modifier = Modifier.height(22.dp))
@@ -531,6 +537,25 @@ fun ChatScreen(
                                 )
                             }
                         }
+                        AnimatedVisibility(
+                            visible = memoriesVisible,
+                            enter = fadeIn(),
+                            exit = fadeOut(),
+                        ) {
+                            ModalBottomSheet(
+                                onDismissRequest = { memoriesVisible = false },
+                                sheetState = memoriesSheetState,
+                                containerColor = Color.White,
+                                contentColor = PrismText,
+                                dragHandle = { SheetDragHandle() },
+                            ) {
+                                MemoryBrowser(
+                                    memories = memories,
+                                    onDelete = { id -> service?.deleteMemory(id) },
+                                    onRefresh = { service?.refreshMemories() },
+                                )
+                            }
+                        }
                         pendingAgentToolAction?.let { action ->
                             AgentToolConfirmationDialog(
                                 action = action,
@@ -601,6 +626,7 @@ private fun ChatTopBar(
     collapsed: Boolean,
     onOpenChats: () -> Unit,
     onOpenControls: () -> Unit,
+    onOpenMemories: () -> Unit,
 ) {
     GlassSurface(modifier = Modifier.fillMaxWidth(), radius = 32.dp) {
         BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp)) {
@@ -629,6 +655,7 @@ private fun ChatTopBar(
                         overflow = TextOverflow.Ellipsis,
                     )
                     TopBarIconAction(label = "Chats", onClick = onOpenChats)
+                    TopBarIconAction(label = "Memory", onClick = onOpenMemories)
                     TopBarIconAction(label = "Settings", onClick = onOpenControls)
                 }
             } else if (compact) {
@@ -660,6 +687,12 @@ private fun ChatTopBar(
                         )
                         TopBarAction(
                             modifier = Modifier.weight(1f),
+                            label = "Memory",
+                            compact = true,
+                            onClick = onOpenMemories,
+                        )
+                        TopBarAction(
+                            modifier = Modifier.weight(1f),
                             label = "Settings",
                             compact = true,
                             onClick = onOpenControls,
@@ -682,6 +715,7 @@ private fun ChatTopBar(
                         importState = importState,
                     )
                     TopBarAction(label = "Chats", onClick = onOpenChats)
+                    TopBarAction(label = "Memory", onClick = onOpenMemories)
                     TopBarAction(label = "Settings", onClick = onOpenControls)
                 }
             }

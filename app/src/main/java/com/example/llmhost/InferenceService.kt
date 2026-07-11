@@ -135,6 +135,8 @@ class InferenceService : Service() {
     private var activeAgentChainTokens = 0
     private val activeAgentToolHistory = mutableListOf<AgentToolCall>()
     private lateinit var memoryStore: SqlMemoryStore
+    private val _memories = MutableStateFlow<List<MemoryFact>>(emptyList())
+    val memories: StateFlow<List<MemoryFact>> = _memories.asStateFlow()
     private var webSearchUsedThisSession = false
     private val benchmarkQueue = ArrayDeque<BenchmarkPreset>()
     // In-memory chat search index: chat_id -> (title + first N chars of concatenated messages).
@@ -191,6 +193,7 @@ class InferenceService : Service() {
         memoryGovernor = MemoryGovernor(this)
         modelStorageManager = ModelStorageManager(this)
         memoryStore = SqlMemoryStore(this)
+        refreshMemoriesList()
         loadBenchmarkRuns()
         loadChats()
         restorePendingAgentToolCall()
@@ -3705,6 +3708,7 @@ class InferenceService : Service() {
         if (existing.isNotEmpty() && existing.first().score > 0.75f) {
             // Update the existing fact instead of creating a duplicate
             val updated = memoryStore.update(existing.first().fact.id, factText, existing.first().fact.confidence)
+            if (updated) refreshMemoriesList()
             return if (updated) {
                 toolSuccess(call, "Updated existing memory: ${factText.take(80)}",
                     JSONObject().put("stored", true).put("fact_id", existing.first().fact.id).put("category", category.name).put("merged", true))
@@ -3714,6 +3718,7 @@ class InferenceService : Service() {
         }
         val fact = MemoryFact(fact = factText, category = category, confidence = 0.6f, sourceChatId = _currentChatId.value)
         val stored = memoryStore.insert(fact)
+        refreshMemoriesList()
         return toolSuccess(call, "Stored: ${factText.take(80)}",
             JSONObject().put("stored", true).put("fact_id", stored.id).put("category", category.name))
     }
@@ -3739,6 +3744,7 @@ class InferenceService : Service() {
         val factId = call.arguments.optString("fact_id").trim().take(20)
         if (factId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "fact_id is required")
         val deleted = memoryStore.delete(factId)
+        if (deleted) refreshMemoriesList()
         return if (deleted) {
             toolSuccess(call, "Memory deleted", JSONObject().put("deleted", true).put("fact_id", factId))
         } else {
@@ -3776,6 +3782,21 @@ class InferenceService : Service() {
                 .put("by_category", JSONObject(byCategory))
                 .put("memories", memoriesArray)
                 .put("untrusted_data", true))
+    }
+
+    private fun refreshMemoriesList() {
+        runCatching { _memories.value = memoryStore.getAllActive() }
+    }
+
+    /** Public API for the memory browser UI. Deletes a single memory fact by id and refreshes the observable list. */
+    fun deleteMemory(id: String) {
+        memoryStore.delete(id)
+        refreshMemoriesList()
+    }
+
+    /** Public API for the memory browser UI. Reloads the observable memory list from the store. */
+    fun refreshMemories() {
+        refreshMemoriesList()
     }
 
     private fun startAgentFollowUpGeneration(

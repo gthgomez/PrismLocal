@@ -1235,6 +1235,67 @@ std::string Engine::decodeTokens(int generation_id, const std::vector<int32_t>& 
     return text;
 }
 
+std::vector<float> Engine::encode(const std::string& text) {
+    if (!impl_) return {};
+    std::shared_ptr<ModelRuntime> runtime;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        runtime = impl_->active_runtime;
+    }
+    if (!runtime || runtime->mock_model || runtime->ctx == nullptr || runtime->vocab == nullptr) {
+        return {};
+    }
+
+    std::lock_guard<std::mutex> decode_lock(runtime->decode_mu);
+
+    // Tokenize the text
+    const bool add_special = true;
+    const int32_t token_count = -llama_tokenize(
+        runtime->vocab,
+        text.c_str(),
+        static_cast<int32_t>(text.size()),
+        nullptr, 0,
+        add_special, true);
+    if (token_count <= 0) return {};
+
+    std::vector<llama_token> tokens(static_cast<size_t>(token_count));
+    const int32_t actual = llama_tokenize(
+        runtime->vocab,
+        text.c_str(),
+        static_cast<int32_t>(text.size()),
+        tokens.data(), token_count,
+        add_special, true);
+    if (actual < 0) return {};
+
+    // Enable embeddings mode
+    llama_set_embeddings(runtime->ctx, true);
+
+    // Build batch and encode
+    llama_batch batch = llama_batch_get_one(tokens.data(), actual);
+    const int32_t rc = llama_encode(runtime->ctx, batch);
+    if (rc != 0) {
+        llama_set_embeddings(runtime->ctx, false);
+        return {};
+    }
+
+    // Retrieve embeddings
+    const int32_t n_embd = llama_model_n_embd(runtime->model);
+    float* embeddings = llama_get_embeddings(runtime->ctx);
+    if (embeddings == nullptr) {
+        llama_set_embeddings(runtime->ctx, false);
+        return {};
+    }
+
+    // Copy first token's embedding
+    std::vector<float> result(n_embd);
+    std::copy(embeddings, embeddings + n_embd, result.begin());
+
+    // Restore non-embeddings mode
+    llama_set_embeddings(runtime->ctx, false);
+
+    return result;
+}
+
 Engine::DrainResult Engine::drainDecodeAndState(int generation_id, int max_tokens) {
     DrainResult result;
     if (!impl_) {

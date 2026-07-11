@@ -109,6 +109,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     private external fun nativeGetState(handle: Long, genId: Int): Int
     private external fun nativeDrainDecodeAndState(handle: Long, genId: Int, maxTokens: Int, outResult: NativeDrainResult)
     private external fun nativeSetMemoryPressure(handle: Long, level: Int)
+    private external fun nativeEncode(handle: Long, text: String): FloatArray
 
     suspend fun loadModel(path: String, settings: GenerationSettings = GenerationSettings()): Boolean = modelMutex.withLock {
         if (isDestroyed) return@withLock false
@@ -154,6 +155,18 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         if (!isDestroyed) {
             nativeSetMemoryPressure(nativeHandle, level)
         }
+    }
+
+    /**
+     * Encode [text] into a float embedding vector using the loaded model.
+     * Returns empty FloatArray on failure (no model loaded, encode error, etc.).
+     * Thread-safe via modelMutex.
+     */
+    suspend fun encode(text: String): FloatArray = modelMutex.withLock {
+        if (isDestroyed) return@withLock floatArrayOf()
+        val h = nativeHandle
+        if (h == 0L) return@withLock floatArrayOf()
+        nativeEncode(h, text)
     }
 
     suspend fun destroySafely() {

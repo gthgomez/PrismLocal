@@ -73,6 +73,7 @@ data class AgentToolValidationResult(
     val valid: Boolean,
     val errorCode: AgentToolErrorCode = AgentToolErrorCode.OK,
     val message: String = "",
+    val requiredCapabilities: Set<Capability> = emptySet(),
 )
 
 data class AgentStep(
@@ -454,6 +455,88 @@ object AgentToolRegistry {
             allowedValues = mapOf("category" to setOf("all", "personal", "preference", "project", "relationship", "knowledge", "general")),
             returnContract = """{"total":0,"by_category":{},"memories":[],"untrusted_data":true}""",
         ),
+
+        // Phase 2 — RAG document tools
+        AgentToolDefinition(
+            name = "ingest_document",
+            description = "Ingest a text document into the RAG knowledge base. Splits text into chunks, embeds each chunk, and stores for semantic search.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"type":"object","properties":{"document_id":{"type":"string","description":"Unique identifier for this document"},"title":{"type":"string","description":"Human-readable title"},"text":{"type":"string","description":"Full document text (max 100000 chars)"}},"required":["document_id","text"]}""",
+            requiredArguments = setOf("document_id", "text"),
+            maxStringLengths = mapOf("document_id" to 120, "title" to 200, "text" to 100_000),
+            returnContract = """{"stored":true,"chunk_count":5,"document_id":"string"}""",
+        ),
+        AgentToolDefinition(
+            name = "search_documents",
+            description = "Search ingested RAG documents for content relevant to a query. Returns top-K matching text chunks with relevance scores.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{"query":{"type":"string","description":"Natural language search query"},"top_k":{"type":"integer","description":"Max results (1-20, default 5)"}},"required":["query"]}""",
+            requiredArguments = setOf("query"),
+            intRanges = mapOf("top_k" to AgentToolIntRange(1, 20)),
+            maxStringLengths = mapOf("query" to 500),
+            returnContract = """{"results":[{"document_id":"string","chunk_index":0,"text":"chunk","score":0.85}],"untrusted_data":true}""",
+        ),
+        AgentToolDefinition(
+            name = "list_documents",
+            description = "List all documents currently stored in the RAG knowledge base.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{}}""",
+            returnContract = """{"count":0,"documents":[{"document_id":"string","chunk_count":5}]}""",
+        ),
+        AgentToolDefinition(
+            name = "delete_document",
+            description = "Remove a document and all its chunks from the RAG knowledge base.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"type":"object","properties":{"document_id":{"type":"string"}},"required":["document_id"]}""",
+            requiredArguments = setOf("document_id"),
+            maxStringLengths = mapOf("document_id" to 120),
+            returnContract = """{"deleted":true,"document_id":"string","chunks_removed":0}""",
+        ),
+
+        // Phase 4 — Voice I/O tools
+        AgentToolDefinition(
+            name = "voice_input",
+            description = "Listen for voice input from the user's microphone. Returns transcribed text using on-device speech recognition.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{"timeout_seconds":{"type":"integer","description":"Max listening duration in seconds (3-30, default 10)"}},"required":[]}""",
+            intRanges = mapOf("timeout_seconds" to AgentToolIntRange(3, 30)),
+        ),
+        AgentToolDefinition(
+            name = "speak_output",
+            description = "Speak text aloud using the device's text-to-speech engine.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{"text":{"type":"string","description":"Text to speak aloud (max 1000 chars)"}},"required":["text"]}""",
+            maxStringLengths = mapOf("text" to 1000),
+        ),
+        AgentToolDefinition(
+            name = "stop_speaking",
+            description = "Stop any currently playing text-to-speech output.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{}}""",
+        ),
+
+        // Phase 5 — Data connectors (CONFIRM-gated read-only access)
+        AgentToolDefinition(
+            name = "search_contacts",
+            description = "Search the user's contacts by name. Requires user confirmation. Results are read-only.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"type":"object","properties":{"query":{"type":"string","description":"Name search query (max 100 chars)"}},"required":["query"]}""",
+            maxStringLengths = mapOf("query" to 100),
+        ),
+        AgentToolDefinition(
+            name = "get_calendar_events",
+            description = "Get upcoming calendar events. Requires user confirmation. Results are read-only.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"type":"object","properties":{"days":{"type":"integer","description":"Days to look ahead (1-30, default 7)"}},"required":[]}""",
+            intRanges = mapOf("days" to AgentToolIntRange(1, 30)),
+        ),
+        AgentToolDefinition(
+            name = "list_sms_threads",
+            description = "List recent SMS conversation threads (metadata only). Requires user confirmation.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"type":"object","properties":{"limit":{"type":"integer","description":"Max threads (1-20, default 10)"}},"required":[]}""",
+            intRanges = mapOf("limit" to AgentToolIntRange(1, 20)),
+        ),
     )
 
     fun find(name: String): AgentToolDefinition? =
@@ -480,7 +563,7 @@ object AgentToolRegistry {
     fun validate(call: AgentToolCall): AgentToolValidationResult {
         val reason = call.reason?.take(MAX_REASON_LENGTH)
         val normalized = canonicalize(call).copy(reason = reason)
-        val restricted = restrictedReason(normalized)
+        val restricted = capabilityCheck(normalized)
         if (restricted != null) {
             return AgentToolValidationResult(
                 call = normalized,
@@ -540,29 +623,23 @@ object AgentToolRegistry {
             message = message,
         )
 
-    private fun restrictedReason(call: AgentToolCall): String? {
-        // web_search is sandboxed: uses a single hardcoded DuckDuckGo endpoint, no arbitrary URLs
-        if (call.name == "web_search") return null
-        val text = buildString {
-            append(call.name)
-            call.reason?.let { append(' ').append(it) }
-            append(' ').append(call.arguments.toString())
-        }.lowercase()
-        if (text.contains("..") || text.contains("/") || text.contains("\\")) {
-            return "Directory traversal or path injection characters are restricted."
-        }
-        val blocked = listOf(
-            listOf("shell", "terminal", "cmd", "powershell", "bash", "exec") to "Shell/terminal execution is outside Prism Local.",
-            listOf("contacts", "sms", "call_log", "call logs") to "Contacts, SMS, and call logs are outside Prism Local.",
-            listOf("clipboard", "location", "camera", "microphone", "photos") to "Device sensors, clipboard, location, camera, microphone, and photos are outside Prism Local.",
-            listOf("secret", "token", "cookie", "credential", "password", "keystore") to "Secrets, tokens, cookies, credentials, and signing material are restricted.",
-            listOf("apk", "install_app", "install apk") to "APK installation is restricted.",
-            listOf("http://", "https://", "url", "arbitrary_url") to "Arbitrary URLs are restricted; downloads must use curated catalog IDs.",
-            listOf("bypass", "skip confirmation", "without confirmation") to "Confirmation bypass is restricted.",
-            listOf("delete audit", "hide log", "suppress log") to "Audit/log hiding is restricted.",
-        )
-        return blocked.firstOrNull { (needles, _) -> needles.any { it in text } }?.second
+    /**
+     * Validate tool capabilities against the registry.
+     * Replaces restrictedReason() — capabilities are statically assigned, not parsed from model reason.
+     */
+    private fun capabilityCheck(call: AgentToolCall): String? {
+        val check = ToolCapabilityMapping.check(call.name, CapabilityRegistryHolder.registry)
+        return if (!check.granted) check.reason else null
     }
+}
+
+/**
+ * Holds the global CapabilityRegistry and SecurityAuditLog instances.
+ * Initialized by InferenceService.onCreate().
+ */
+object CapabilityRegistryHolder {
+    val registry: CapabilityRegistry = CapabilityRegistry()
+    val auditLog: SecurityAuditLog = SecurityAuditLog()
 }
 
 object AgentToolProtocol {

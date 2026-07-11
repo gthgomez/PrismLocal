@@ -137,6 +137,17 @@ class InferenceService : Service() {
     private lateinit var memoryStore: SqlMemoryStore
     private val _memories = MutableStateFlow<List<MemoryFact>>(emptyList())
     val memories: StateFlow<List<MemoryFact>> = _memories.asStateFlow()
+    // Phase 2 — RAG
+    private lateinit var vectorStore: VectorStore
+    private lateinit var ragManager: RagManager
+    // Phase 4 — Voice I/O
+    private lateinit var voiceIoManager: VoiceIoManager
+    private val _voiceInputResult = MutableStateFlow<String?>(null)
+    val voiceInputResult: StateFlow<String?> = _voiceInputResult.asStateFlow()
+    private val _voiceState = MutableStateFlow(VoiceState())
+    val voiceState: StateFlow<VoiceState> = _voiceState.asStateFlow()
+    // Phase 5 — Data connectors
+    private lateinit var dataConnectorTools: DataConnectorTools
     private var webSearchUsedThisSession = false
     private val benchmarkQueue = ArrayDeque<BenchmarkPreset>()
     // In-memory chat search index: chat_id -> (title + first N chars of concatenated messages).
@@ -194,6 +205,33 @@ class InferenceService : Service() {
         modelStorageManager = ModelStorageManager(this)
         memoryStore = SqlMemoryStore(this)
         refreshMemoriesList()
+        // Phase 2 — RAG vector store + manager
+        vectorStore = VectorStore(this)
+        ragManager = RagManager(vectorStore, DocumentChunker) { text ->
+            engine.encode(text)
+        }
+        // Phase 4 — Voice I/O manager
+        voiceIoManager = VoiceIoManager(this).also { mgr ->
+            mgr.onSpeechResult = { text ->
+                _voiceInputResult.value = text
+                _voiceState.value = _voiceState.value.copy(isListening = false, partialTranscript = null)
+                publishUiEvent("Voice input captured")
+            }
+            mgr.onSpeechError = { error ->
+                _voiceInputResult.value = null
+                _voiceState.value = _voiceState.value.copy(isListening = false)
+                publishUiEvent("Voice input error: $error")
+            }
+            mgr.onSpeechPartialResult = { partial ->
+                _voiceState.value = _voiceState.value.copy(partialTranscript = partial)
+            }
+        }
+        _voiceState.value = VoiceState(
+            sttAvailable = voiceIoManager.isSttAvailable(),
+            ttsAvailable = voiceIoManager.isTtsAvailable(),
+        )
+        // Phase 5 — Data connector tools
+        dataConnectorTools = DataConnectorTools(this)
         loadBenchmarkRuns()
         loadChats()
         restorePendingAgentToolCall()
@@ -2041,7 +2079,13 @@ class InferenceService : Service() {
             "get_model_status", "get_storage_status", "get_app_version_info", "get_tool_capabilities",
             "search_chats", "list_installed_models", "list_curated_downloadable_models", "get_download_status",
             "get_active_operation", "get_privacy_summary", "explain_runtime_settings", "diagnose_performance",
-            "recommend_runtime_settings", "get_model_card", "summarize_current_chat", "web_search", "recall_facts", "list_memories"
+            "recommend_runtime_settings", "get_model_card", "summarize_current_chat", "web_search", "recall_facts", "list_memories",
+            // Phase 2 RAG
+            "search_documents", "list_documents",
+            // Phase 4 Voice
+            "voice_input", "speak_output", "stop_speaking",
+            // Phase 5 Data connectors (read-only)
+            "search_contacts", "get_calendar_events", "list_sms_threads",
         )
         val historicalCount = activeAgentToolHistory.count { it.name == validatedCall.name }
         val tooManyInvocations = if (validatedCall.name in cheapTools) {
@@ -2363,6 +2407,19 @@ class InferenceService : Service() {
             "download_model" -> agentToolDownloadModel(call, confirmed)
             "switch_model" -> agentToolSwitchModel(call, confirmed)
             "continue_generation" -> agentToolContinueGeneration(call, confirmed)
+            // Phase 2 RAG
+            "ingest_document" -> agentToolIngestDocument(call)
+            "search_documents" -> agentToolSearchDocuments(call)
+            "list_documents" -> agentToolListDocuments(call)
+            "delete_document" -> agentToolDeleteDocument(call)
+            // Phase 4 Voice I/O
+            "voice_input" -> agentToolVoiceInput(call)
+            "speak_output" -> agentToolSpeakOutput(call)
+            "stop_speaking" -> agentToolStopSpeaking(call)
+            // Phase 5 Data connectors
+            "search_contacts" -> agentToolSearchContacts(call)
+            "get_calendar_events" -> agentToolGetCalendarEvents(call)
+            "list_sms_threads" -> agentToolListSmsThreads(call)
             else -> AgentToolResult(call, success = false, summary = "Unknown tool: ${call.name}")
         }
 
@@ -2378,7 +2435,14 @@ class InferenceService : Service() {
             "cancel_active_job",
             "cancel_active_operation",
             "remember_fact",
-            "forget_fact" -> true
+            "forget_fact",
+            // Phase 2 RAG
+            "ingest_document",
+            "delete_document",
+            // Phase 4 Voice I/O
+            "voice_input",
+            "speak_output",
+            "stop_speaking" -> true
             else -> false
         }
 
@@ -3799,6 +3863,204 @@ class InferenceService : Service() {
         refreshMemoriesList()
     }
 
+    // ---- Phase 2 RAG tool handlers ----
+
+    private suspend fun agentToolIngestDocument(call: AgentToolCall): AgentToolResult {
+        val documentId = call.arguments.optString("document_id").trim().take(120)
+        val title = call.arguments.optString("title", documentId).trim().take(200)
+        val text = call.arguments.optString("text").trim()
+        if (documentId.isBlank() || text.isBlank()) {
+            return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "document_id and text are required")
+        }
+        val chunkCount = runCatching {
+            ragManager.ingestDocument(documentId, title, text)
+        }.getOrDefault(0)
+        return toolSuccess(call, "Ingested $chunkCount chunks from '$title'",
+            JSONObject().put("stored", true).put("chunk_count", chunkCount).put("document_id", documentId))
+    }
+
+    private suspend fun agentToolSearchDocuments(call: AgentToolCall): AgentToolResult {
+        val query = call.arguments.optString("query").trim().take(500)
+        val topK = call.arguments.optInt("top_k", 5).coerceIn(1, 20)
+        if (query.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Query is required")
+        val results = runCatching { ragManager.query(query, topK = topK) }.getOrDefault(emptyList())
+        val resultsArray = JSONArray()
+        results.forEach { (chunk, score) ->
+            resultsArray.put(JSONObject()
+                .put("document_id", chunk.documentId)
+                .put("chunk_index", chunk.chunkIndex)
+                .put("text", chunk.text.take(500))
+                .put("score", String.format(Locale.US, "%.3f", score).toDouble()))
+        }
+        return toolSuccess(call, "Found ${results.size} relevant chunks",
+            JSONObject().put("results", resultsArray).put("untrusted_data", true))
+    }
+
+    private suspend fun agentToolListDocuments(call: AgentToolCall): AgentToolResult {
+        val allChunks = runCatching { vectorStore.getAllChunks() }.getOrDefault(emptyList())
+        val docMap = mutableMapOf<String, Int>()
+        allChunks.forEach { chunk -> docMap[chunk.documentId] = (docMap[chunk.documentId] ?: 0) + 1 }
+        val docsArray = JSONArray()
+        docMap.forEach { (docId, count) ->
+            docsArray.put(JSONObject().put("document_id", docId).put("chunk_count", count))
+        }
+        return toolSuccess(call, "${docMap.size} documents in knowledge base",
+            JSONObject().put("count", docMap.size).put("documents", docsArray))
+    }
+
+    private suspend fun agentToolDeleteDocument(call: AgentToolCall): AgentToolResult {
+        val documentId = call.arguments.optString("document_id").trim().take(120)
+        if (documentId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "document_id is required")
+        val removed = runCatching { ragManager.deleteDocument(documentId) }.getOrDefault(0)
+        return toolSuccess(call, "Deleted document '$documentId' ($removed chunks removed)",
+            JSONObject().put("deleted", true).put("document_id", documentId).put("chunks_removed", removed))
+    }
+
+    // ---- Phase 4 Voice I/O tool handlers ----
+
+    private suspend fun agentToolVoiceInput(call: AgentToolCall): AgentToolResult {
+        val timeoutSeconds = call.arguments.optInt("timeout_seconds", 10).coerceIn(3, 30)
+        if (!voiceIoManager.isSttAvailable()) {
+            return toolFailure(call, AgentToolErrorCode.FAILED,
+                "On-device speech recognition not available. Install a speech recognition language pack.")
+        }
+        _voiceInputResult.value = null
+        _voiceState.value = _voiceState.value.copy(isListening = true)
+        if (!voiceIoManager.startListening()) {
+            _voiceState.value = _voiceState.value.copy(isListening = false)
+            return toolFailure(call, AgentToolErrorCode.FAILED, "Failed to start speech recognition.")
+        }
+        val deadline = System.currentTimeMillis() + (timeoutSeconds * 1000L)
+        var result: String? = null
+        while (System.currentTimeMillis() < deadline && result == null) {
+            result = _voiceInputResult.value
+            if (result == null) kotlinx.coroutines.delay(200)
+        }
+        voiceIoManager.stopListening()
+        _voiceState.value = _voiceState.value.copy(isListening = false, partialTranscript = null)
+        val finalResult = _voiceInputResult.value
+        _voiceInputResult.value = null
+        return if (finalResult != null) {
+            toolSuccess(call, "Voice captured: ${finalResult.take(120)}",
+                JSONObject().put("transcript", finalResult))
+        } else {
+            toolFailure(call, AgentToolErrorCode.FAILED,
+                "No speech detected within $timeoutSeconds seconds.")
+        }
+    }
+
+    private suspend fun agentToolSpeakOutput(call: AgentToolCall): AgentToolResult {
+        val text = call.arguments.optString("text").take(1000)
+        if (text.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Text to speak is empty")
+        if (!voiceIoManager.isTtsAvailable()) {
+            voiceIoManager.initTts()
+            kotlinx.coroutines.delay(300)
+        }
+        if (!voiceIoManager.isTtsAvailable()) {
+            return toolFailure(call, AgentToolErrorCode.FAILED, "TTS engine not available.")
+        }
+        voiceIoManager.speak(text)
+        _voiceState.value = _voiceState.value.copy(isSpeaking = true)
+        return toolSuccess(call, "Speaking: ${text.take(80)}", JSONObject().put("text_length", text.length))
+    }
+
+    private suspend fun agentToolStopSpeaking(call: AgentToolCall): AgentToolResult {
+        voiceIoManager.stopSpeaking()
+        _voiceState.value = _voiceState.value.copy(isSpeaking = false)
+        return toolSuccess(call, "Speech output stopped")
+    }
+
+    // ---- Phase 5 Data Connector tool handlers ----
+
+    private suspend fun agentToolSearchContacts(call: AgentToolCall): AgentToolResult {
+        val query = call.arguments.optString("query").trim().take(100)
+        if (query.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Search query is empty")
+        if (!dataConnectorTools.hasPermission(android.Manifest.permission.READ_CONTACTS)) {
+            return toolFailure(call, AgentToolErrorCode.FAILED,
+                "READ_CONTACTS permission not granted. Grant it in Settings > Apps > Prism Local > Permissions.")
+        }
+        return try {
+            val results = dataConnectorTools.searchContacts(query)
+            val jsonResults = JSONArray()
+            results.forEach { contact ->
+                jsonResults.put(JSONObject()
+                    .put("name", contact.name)
+                    .put("has_phone", contact.hasPhone)
+                    .put("has_email", contact.hasEmail)
+                    .put("lookup_key", contact.lookupKey))
+            }
+            toolSuccess(call, "${jsonResults.length()} contact(s) matching \"$query\"",
+                JSONObject().put("query", query).put("untrusted_data", true)
+                    .put("result_count", jsonResults.length()).put("results", jsonResults))
+        } catch (e: SecurityException) {
+            toolFailure(call, AgentToolErrorCode.FAILED, "Contacts access denied: ${e.message}")
+        }
+    }
+
+    private suspend fun agentToolGetCalendarEvents(call: AgentToolCall): AgentToolResult {
+        if (!dataConnectorTools.hasPermission(android.Manifest.permission.READ_CALENDAR)) {
+            return toolFailure(call, AgentToolErrorCode.FAILED,
+                "READ_CALENDAR permission not granted. Grant it in Settings > Apps > Prism Local > Permissions.")
+        }
+        val days = call.arguments.optInt("days", 7).coerceIn(1, 30)
+        val now = System.currentTimeMillis()
+        val end = now + days * 24L * 60L * 60L * 1000L
+        return try {
+            val events = dataConnectorTools.getCalendarEvents(startMillis = now, endMillis = end)
+            val jsonResults = JSONArray()
+            events.forEach { event ->
+                jsonResults.put(JSONObject()
+                    .put("title", event.title)
+                    .put("start", DataConnectorTools.formatDate(event.startMillis))
+                    .put("start_millis", event.startMillis)
+                    .put("end", DataConnectorTools.formatDate(event.endMillis))
+                    .put("end_millis", event.endMillis)
+                    .put("is_all_day", event.isAllDay)
+                    .put("location", event.location ?: JSONObject.NULL))
+            }
+            toolSuccess(call, "${jsonResults.length()} event(s) in next $days day(s)",
+                JSONObject().put("days", days).put("untrusted_data", true)
+                    .put("result_count", jsonResults.length()).put("results", jsonResults))
+        } catch (e: SecurityException) {
+            toolFailure(call, AgentToolErrorCode.FAILED, "Calendar access denied: ${e.message}")
+        }
+    }
+
+    private suspend fun agentToolListSmsThreads(call: AgentToolCall): AgentToolResult {
+        if (!dataConnectorTools.hasPermission(android.Manifest.permission.READ_SMS)) {
+            return toolFailure(call, AgentToolErrorCode.FAILED,
+                "READ_SMS permission not granted. Grant it in Settings > Apps > Prism Local > Permissions.")
+        }
+        val limit = call.arguments.optInt("limit", 10).coerceIn(1, 20)
+        return try {
+            val threads = dataConnectorTools.listSmsThreads(limit)
+            val jsonResults = JSONArray()
+            threads.forEach { thread ->
+                jsonResults.put(JSONObject()
+                    .put("address", thread.address)
+                    .put("snippet", thread.snippet)
+                    .put("message_count", thread.messageCount)
+                    .put("date", DataConnectorTools.formatDate(thread.dateMillis))
+                    .put("date_millis", thread.dateMillis))
+            }
+            toolSuccess(call, "${jsonResults.length()} SMS thread(s)",
+                JSONObject().put("untrusted_data", true)
+                    .put("result_count", jsonResults.length()).put("results", jsonResults))
+        } catch (e: SecurityException) {
+            toolFailure(call, AgentToolErrorCode.FAILED, "SMS access denied: ${e.message}")
+        }
+    }
+
+    // ---- RAG context injection ----
+
+    private suspend fun buildRagContextForPrompt(userPrompt: String): String {
+        if (userPrompt.isBlank()) return ""
+        return runCatching {
+            val chunks = ragManager.query(userPrompt, topK = 3)
+            if (chunks.isEmpty()) "" else ragManager.buildRagContext(chunks, maxChars = 2000)
+        }.getOrDefault("")
+    }
+
     private fun startAgentFollowUpGeneration(
         originalPrompt: String,
         toolResult: AgentToolResult,
@@ -4981,6 +5243,7 @@ class InferenceService : Service() {
             }
         }
         serviceScope.cancel()
+        if (::voiceIoManager.isInitialized) voiceIoManager.shutdown()
         super.onDestroy()
     }
 

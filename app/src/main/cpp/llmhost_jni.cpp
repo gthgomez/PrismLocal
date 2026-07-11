@@ -358,6 +358,27 @@ Java_com_example_llmhost_NativeLlmBridge_nativeDecodeTokens(JNIEnv* env, jobject
     }
 }
 
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_example_llmhost_NativeLlmBridge_nativeEncode(JNIEnv* env, jobject, jlong handle, jstring text) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) {
+        return env->NewFloatArray(0);
+    }
+    try {
+        const std::string utf8 = toString(env, text);
+        const std::vector<float> embedding = engine->encode(utf8);
+        if (embedding.empty()) {
+            return env->NewFloatArray(0);
+        }
+        jfloatArray result = env->NewFloatArray(static_cast<jsize>(embedding.size()));
+        if (result == nullptr) return env->NewFloatArray(0);
+        env->SetFloatArrayRegion(result, 0, static_cast<jsize>(embedding.size()), embedding.data());
+        return result;
+    } catch (const std::exception&) {
+        return env->NewFloatArray(0);
+    }
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_example_llmhost_NativeLlmBridge_nativeGetState(JNIEnv*, jobject, jlong handle, jint gen_id) {
     auto* engine = toEngine(handle);

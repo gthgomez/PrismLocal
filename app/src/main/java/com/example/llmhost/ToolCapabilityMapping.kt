@@ -1,0 +1,65 @@
+package com.example.llmhost
+
+/**
+ * Declares which capabilities each tool requires.
+ * This is the central security policy — tools cannot execute without their declared capabilities.
+ *
+ * Replaces: restrictedReason() keyword matching in AgentTools.kt
+ */
+object ToolCapabilityMapping {
+
+    private val map: Map<String, Set<Capability>> = mapOf(
+        // Chat tools
+        "summarize_current_chat" to setOf(Capability.CHAT_READ),
+        "search_chats" to setOf(Capability.CHAT_READ),
+        "rename_chat" to setOf(Capability.CHAT_MANAGE),
+        "delete_chat" to setOf(Capability.CHAT_MANAGE),
+        "create_chat" to setOf(Capability.CHAT_MANAGE),
+        "clear_current_chat" to setOf(Capability.CHAT_MANAGE),
+        "export_chat" to setOf(Capability.FILE_WRITE),
+
+        // Model tools
+        "switch_model" to setOf(Capability.MODEL_SWITCH),
+        "list_installed_models" to setOf(Capability.SYSTEM_INFO),
+        "list_curated_downloadable_models" to setOf(Capability.SYSTEM_INFO),
+        "download_model" to setOf(Capability.MODEL_DOWNLOAD),
+        "delete_model" to setOf(Capability.MODEL_DELETE),
+        "get_model_card" to setOf(Capability.SYSTEM_INFO),
+        "import_model" to setOf(Capability.MODEL_IMPORT),
+
+        // Generation tools
+        "recommend_runtime_settings" to setOf(Capability.GENERATION_CONFIGURE),
+        "configure_generation" to setOf(Capability.GENERATION_CONFIGURE),
+        "run_benchmark" to setOf(Capability.BENCHMARK_RUN),
+        "list_benchmark_runs" to setOf(Capability.SYSTEM_INFO),
+
+        // Memory tools
+        "remember_fact" to setOf(Capability.MEMORY_WRITE),
+        "recall_facts" to setOf(Capability.MEMORY_READ),
+        "forget_fact" to setOf(Capability.MEMORY_WRITE),
+        "list_memories" to setOf(Capability.MEMORY_READ),
+
+        // Network tools
+        "web_search" to setOf(Capability.NETWORK_SEARCH),
+
+        // Future tools (voice, data connectors) — declared here for forward compat
+        "voice_input" to setOf(Capability.VOICE_INPUT),
+        "speak_output" to setOf(Capability.VOICE_OUTPUT),
+        "stop_speaking" to setOf(Capability.VOICE_OUTPUT),
+        "search_contacts" to setOf(Capability.CONTACTS_READ),
+        "get_calendar_events" to setOf(Capability.CALENDAR_READ),
+        "list_sms_threads" to setOf(Capability.SMS_READ),
+
+        // RAG tools (Phase 2)
+        "ingest_document" to setOf(Capability.FILE_READ),
+        "search_documents" to setOf(Capability.FILE_READ),
+        "list_documents" to setOf(Capability.FILE_READ),
+        "delete_document" to setOf(Capability.FILE_WRITE),
+    )
+
+    fun capabilitiesFor(toolName: String): Set<Capability> = map[toolName] ?: emptySet()
+
+    /** Check if a tool's capabilities are all granted */
+    fun check(toolName: String, registry: CapabilityRegistry): CapabilityCheck =
+        registry.check(capabilitiesFor(toolName))
+}

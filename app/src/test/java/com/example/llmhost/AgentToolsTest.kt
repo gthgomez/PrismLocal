@@ -15,10 +15,26 @@ class AgentToolsTest {
     }
 
     @Test
-    fun restrictedToolRequestIsBlockedBeforeUnknownHandling() {
+    fun unknownToolsRejectedBeforeArgumentValidation() {
+        // "run_shell_command" is not in the tool registry → UNKNOWN_TOOL.
+        // (Capability check passes for unknown tools since they map to no capabilities.)
         val result = AgentToolRegistry.validate(
             AgentToolCall(
                 name = "run_shell_command",
+            )
+        )
+
+        assertFalse(result.valid)
+        assertEquals(AgentToolErrorCode.UNKNOWN_TOOL, result.errorCode)
+    }
+
+    @Test
+    fun restrictedCapabilityToolsAreBlocked() {
+        // "export_chat" requires FILE_WRITE → RESTRICTED, not auto-granted
+        val result = AgentToolRegistry.validate(
+            AgentToolCall(
+                name = "export_chat",
+                arguments = org.json.JSONObject().put("format", "markdown"),
             )
         )
 
@@ -46,11 +62,12 @@ class AgentToolsTest {
     }
 
     @Test
-    fun restrictedToolBlockCheckOnArguments() {
+    fun capabilityCheckBlocksRestrictedToolsByNameNotArguments() {
+        // "download_model" requires MODEL_DOWNLOAD → RESTRICTED capability, not auto-granted.
+        // Capability check uses tool name only — arguments are not inspected for security.
         val call = AgentToolCall(
-            name = "rename_current_chat",
-            arguments = org.json.JSONObject().put("title", "My secret powershell token"),
-            reason = "test reason"
+            name = "download_model",
+            arguments = org.json.JSONObject().put("entry_id", "test-entry"),
         )
         val result = AgentToolRegistry.validate(call)
         assertFalse(result.valid)

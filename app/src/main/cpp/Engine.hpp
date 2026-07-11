@@ -59,6 +59,9 @@ public:
     };
     DrainResult drainDecodeAndState(int generation_id, int max_tokens);
 
+    // Encode text and return float embeddings. Returns empty vector on failure.
+    std::vector<float> encode(const std::string& text);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

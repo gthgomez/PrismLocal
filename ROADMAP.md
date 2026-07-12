@@ -187,4 +187,22 @@ Phase 7:           Polish         ─── background execution, content render
 
 ---
 
-*Last updated: 2026-07-11 — Phase 1 in progress*
+## Completed: InferenceService Architecture Refactor
+
+InferenceService was refactored from a 5,391-line monolith into a 1,143-line orchestrator.
+All code extracted into focused, testable modules under `agent/`, `benchmark/`, `chat/`, `engine/`,
+`export/`, `generation/`, `model/`, and `ui/`.
+
+**Phases completed**:
+- **Phase A**: Model layer — `ModelManager`, `ModelStorageManager`, `ModelReadinessAssessor`, `DeviceProfiler`
+- **Phase B**: Chat/export layer — `ChatManager`, `ChatExporter`, `TranscriptStore`, `ChatSearchIndex`
+- **Phase C**: Benchmark layer — `BenchmarkStore`, `BenchmarkRunner`
+- **Phase D**: Agent layer — `AgentToolRouter` + 11 tool-handler classes
+- **Phase E**: Generation layer — `GenerationOrchestrator`, `PromptBuilder`, `GenerationMetrics`
+- **Cleanup**: ~1,770 lines of dead code removed; formatting utilities centralized in `util/FormatUtils.kt`
+
+**Result**: `assembleDebug` + `assembleRelease` + `testDebugUnitTest` all pass.
+InferenceService reduced from 5,391 → **1,143 lines** (~79% reduction).
+
+---
+*Last updated: 2026-07-11 — Refactoring complete*

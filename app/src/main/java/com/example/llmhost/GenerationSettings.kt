@@ -77,4 +77,16 @@ data class GenerationSettings(
         private fun snapToStep(value: Int, step: Int): Int =
             ((value + step / 2) / step) * step
     }
+
+    fun toAgentJson(): org.json.JSONObject =
+        org.json.JSONObject()
+            .put("max_tokens", maxTokens)
+            .put("threads", threadCount)
+            .put("context_length", contextLength)
+            .put("batch_size", batchSize)
+            .put("temperature", temperature.toDouble())
+            .put("top_k", topK)
+            .put("top_p", topP.toDouble())
+            .put("repeat_penalty", repeatPenalty.toDouble())
+            .put("gpu_layers", gpuLayers)
 }

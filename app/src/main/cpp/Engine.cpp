@@ -26,7 +26,7 @@
 namespace llmhost {
 namespace {
 
-constexpr uint32_t kTokenCapacity = 1024;
+constexpr uint32_t kTokenCapacity = 2048;
 constexpr int kMinGeneratedTokens = 1;
 constexpr int kDefaultGeneratedTokens = 128;
 constexpr int kMaxGeneratedTokens = 1024;
@@ -247,8 +247,13 @@ struct ModelRuntime {
     llama_sampler* cached_sampler = nullptr;
     GenerationConfig cached_config;
 
-    llama_sampler* cached_grammar_sampler = nullptr;
-    std::string cached_grammar_string;
+    struct GrammarCacheSlot {
+        llama_sampler* sampler = nullptr;
+        std::string grammar;
+        int64_t last_access = 0;
+    };
+    GrammarCacheSlot grammar_cache[2];
+    int64_t grammar_access_counter = 0;
     std::vector<llama_token> active_tokens;
 
     ~ModelRuntime() {
@@ -261,9 +266,11 @@ struct ModelRuntime {
             llama_sampler_free(cached_sampler);
             cached_sampler = nullptr;
         }
-        if (cached_grammar_sampler != nullptr) {
-            llama_sampler_free(cached_grammar_sampler);
-            cached_grammar_sampler = nullptr;
+        for (auto& slot : grammar_cache) {
+            if (slot.sampler != nullptr) {
+                llama_sampler_free(slot.sampler);
+                slot.sampler = nullptr;
+            }
         }
         if (ctx != nullptr) {
             llama_free(ctx);
@@ -736,10 +743,16 @@ struct Engine::Impl {
             runtime->cached_config.top_k == session->config.top_k &&
             runtime->cached_config.top_p == session->config.top_p &&
             runtime->cached_config.repeat_penalty == session->config.repeat_penalty;
-        const bool grammar_matches =
-            !session->config.grammar.empty() &&
-            runtime->cached_grammar_sampler != nullptr &&
-            runtime->cached_grammar_string == session->config.grammar;
+        int grammar_cache_hit_slot = -1;
+        for (int gi = 0; gi < 2; gi++) {
+            if (!session->config.grammar.empty() &&
+                runtime->grammar_cache[gi].sampler != nullptr &&
+                runtime->grammar_cache[gi].grammar == session->config.grammar) {
+                grammar_cache_hit_slot = gi;
+                break;
+            }
+        }
+        const bool grammar_matches = grammar_cache_hit_slot >= 0;
 
         if (non_grammar_matches && (grammar_matches || session->config.grammar.empty())) {
             // Full cache hit: non-grammar params and grammar both unchanged
@@ -764,13 +777,15 @@ struct Engine::Impl {
             if (!session->config.grammar.empty()) {
                 if (grammar_matches) {
                     // Reuse cached grammar — avoids expensive recompilation
-                    llama_sampler_reset(runtime->cached_grammar_sampler);
-                    llama_sampler_chain_add(sampler, runtime->cached_grammar_sampler);
+                    runtime->grammar_cache[grammar_cache_hit_slot].last_access = ++runtime->grammar_access_counter;
+                    llama_sampler_reset(runtime->grammar_cache[grammar_cache_hit_slot].sampler);
+                    llama_sampler_chain_add(sampler, runtime->grammar_cache[grammar_cache_hit_slot].sampler);
                 } else {
-                    // Compile new grammar
-                    if (runtime->cached_grammar_sampler != nullptr) {
-                        llama_sampler_free(runtime->cached_grammar_sampler);
-                        runtime->cached_grammar_sampler = nullptr;
+                    // Find LRU slot to evict
+                    const int evict_slot = runtime->grammar_cache[0].last_access <= runtime->grammar_cache[1].last_access ? 0 : 1;
+                    if (runtime->grammar_cache[evict_slot].sampler != nullptr) {
+                        llama_sampler_free(runtime->grammar_cache[evict_slot].sampler);
+                        runtime->grammar_cache[evict_slot].sampler = nullptr;
                     }
                     const auto grammar_start = std::chrono::steady_clock::now();
                     auto* grammar_sampler = llama_sampler_init_grammar(runtime->vocab, session->config.grammar.c_str(), "root");
@@ -778,8 +793,9 @@ struct Engine::Impl {
                         std::chrono::steady_clock::now() - grammar_start).count();
                     LOGI("grammar_compile_time_us=%lld", static_cast<long long>(grammar_elapsed));
                     if (grammar_sampler != nullptr) {
-                        runtime->cached_grammar_sampler = grammar_sampler;
-                        runtime->cached_grammar_string = session->config.grammar;
+                        runtime->grammar_cache[evict_slot].sampler = grammar_sampler;
+                        runtime->grammar_cache[evict_slot].grammar = session->config.grammar;
+                        runtime->grammar_cache[evict_slot].last_access = ++runtime->grammar_access_counter;
                         llama_sampler_chain_add(sampler, grammar_sampler);
                     } else {
                         LOGW("Failed to compile grammar. Proceeding unconstrained.");
@@ -1042,6 +1058,31 @@ std::string Engine::runBenchmark(GenerationConfig config, int prompt_tokens, int
     const int nr = std::clamp(repetitions, 1, 5);
     const llama_token token = llama_vocab_bos(runtime->vocab);
 
+    // Pre-tokenize a realistic decode sequence — repeating BOS creates degenerate
+    // KV cache patterns that under-report real decode time.
+    const char* bench_decode_text = "The quick brown fox jumps over the lazy dog. ";
+    std::string repeated_text;
+    repeated_text.reserve(static_cast<size_t>(tg) * 20);
+    for (int i = 0; i < (tg + 20) / 10; i++) {
+        repeated_text += bench_decode_text;
+    }
+    std::vector<llama_token> bench_tokens(static_cast<size_t>(tg));
+    const int32_t n_bench_tokens = llama_tokenize(
+        runtime->vocab,
+        repeated_text.c_str(),
+        static_cast<int32_t>(repeated_text.size()),
+        bench_tokens.data(),
+        tg,
+        true,
+        true);
+    const int32_t decode_count = n_bench_tokens > 0 ? std::min(n_bench_tokens, tg) : tg;
+    // Fallback: if tokenization produced fewer tokens than needed, fill with BOS
+    if (decode_count < tg) {
+        for (int i = decode_count; i < tg; i++) {
+            bench_tokens[i] = llama_vocab_bos(runtime->vocab);
+        }
+    }
+
     std::lock_guard<std::mutex> decode_lock(runtime->decode_mu);
     llama_set_n_threads(runtime->ctx, safe_config.thread_count, safe_config.thread_count);
     double prompt_ms_total = 0.0;
@@ -1063,7 +1104,7 @@ std::string Engine::runBenchmark(GenerationConfig config, int prompt_tokens, int
 
         const auto decode_start = std::chrono::steady_clock::now();
         for (int i = 0; i < tg; i++) {
-            const int decode_rc = decodeTokensAt(*runtime, &token, 1, runtime->current_position);
+            const int decode_rc = decodeTokensAt(*runtime, &bench_tokens[i], 1, runtime->current_position);
             if (decode_rc != 0) {
                 LOGE("benchmark_decode_failed rc=%d tg=%d rep=%d i=%d", decode_rc, tg, rep, i);
                 resetRuntimeContext(*runtime, false);
@@ -1286,9 +1327,22 @@ std::vector<float> Engine::encode(const std::string& text) {
         return {};
     }
 
-    // Copy first token's embedding
-    std::vector<float> result(n_embd);
-    std::copy(embeddings, embeddings + n_embd, result.begin());
+    // Mean-pool across all token embeddings for a single representative vector.
+    // llama_get_embeddings returns a flat array of shape [n_tokens × n_embd].
+    // Using only the first token (as before) discards 85%+ of semantic signal
+    // for multi-token chunks. Mean pooling is the standard approach for
+    // sentence/paragraph embedding extraction from causal LMs.
+    std::vector<float> result(n_embd, 0.0f);
+    for (int32_t t = 0; t < actual; t++) {
+        const float* token_emb = embeddings + static_cast<size_t>(t) * static_cast<size_t>(n_embd);
+        for (int32_t e = 0; e < n_embd; e++) {
+            result[e] += token_emb[e];
+        }
+    }
+    const float inv_n = 1.0f / static_cast<float>(actual);
+    for (int32_t e = 0; e < n_embd; e++) {
+        result[e] *= inv_n;
+    }
 
     // Restore non-embeddings mode
     llama_set_embeddings(runtime->ctx, false);

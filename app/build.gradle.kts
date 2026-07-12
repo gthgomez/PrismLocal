@@ -108,7 +108,7 @@ android {
             }
         }
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
             isDebuggable = false
             isJniDebuggable = false
             if (releaseSigningReady) {

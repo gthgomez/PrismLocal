@@ -2,11 +2,18 @@
 
 #include "Engine.hpp"
 
+#include <android/log.h>
+
+#include <algorithm>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <mutex>
+
+#define LOG_TAG "LlmHostJni"
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
 
@@ -32,27 +39,47 @@ void ensureStringCache(JNIEnv* env) {
 }
 
 jclass g_drain_result_class = nullptr;
-jmethodID g_drain_result_ctor = nullptr;
-jfieldID g_drain_result_tokens_field = nullptr;
-jfieldID g_drain_result_text_field = nullptr;
+jfieldID g_tokens_buffer_field = nullptr;
+jfieldID g_tokens_count_field = nullptr;
+jfieldID g_text_buffer_field = nullptr;
+jfieldID g_text_count_field = nullptr;
+jfieldID g_text_overflow_field = nullptr;
 jfieldID g_drain_result_state_field = nullptr;
 jfieldID g_drain_result_prompt_tokens_field = nullptr;
 std::once_flag g_drain_result_cache_flag;
- 
+
+bool drainResultFieldsReady() {
+    return g_drain_result_class != nullptr
+        && g_tokens_buffer_field != nullptr
+        && g_tokens_count_field != nullptr
+        && g_text_buffer_field != nullptr
+        && g_text_count_field != nullptr
+        && g_text_overflow_field != nullptr
+        && g_drain_result_state_field != nullptr
+        && g_drain_result_prompt_tokens_field != nullptr;
+}
+
 void ensureDrainResultCache(JNIEnv* env) {
     std::call_once(g_drain_result_cache_flag, [env]() {
-        jclass local_class = env->FindClass("com/example/llmhost/NativeDrainResult");
+        jclass local_class = env->FindClass("com/prismai/llmhost/NativeDrainResult");
         if (local_class != nullptr) {
             g_drain_result_class = static_cast<jclass>(env->NewGlobalRef(local_class));
-            g_drain_result_ctor = env->GetMethodID(g_drain_result_class, "<init>", "()V");
-            g_drain_result_tokens_field = env->GetFieldID(g_drain_result_class, "tokens", "[I");
-            g_drain_result_text_field = env->GetFieldID(g_drain_result_class, "text", "Ljava/lang/String;");
+            g_tokens_buffer_field = env->GetFieldID(g_drain_result_class, "tokensBuffer", "[I");
+            g_tokens_count_field = env->GetFieldID(g_drain_result_class, "tokensCount", "I");
+            g_text_buffer_field = env->GetFieldID(g_drain_result_class, "textBuffer", "[B");
+            g_text_count_field = env->GetFieldID(g_drain_result_class, "textCount", "I");
+            g_text_overflow_field = env->GetFieldID(g_drain_result_class, "textOverflow", "Ljava/lang/String;");
             g_drain_result_state_field = env->GetFieldID(g_drain_result_class, "state", "I");
             g_drain_result_prompt_tokens_field = env->GetFieldID(g_drain_result_class, "promptTokens", "I");
             env->DeleteLocalRef(local_class);
+            if (!drainResultFieldsReady()) {
+                LOGE("ensureDrainResultCache: incomplete field IDs (Kotlin/native layout mismatch)");
+            }
         }
     });
 }
+
+
 
 llmhost::Engine* toEngine(jlong handle) {
     return reinterpret_cast<llmhost::Engine*>(handle);
@@ -403,7 +430,15 @@ Java_com_example_llmhost_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv* env, 
 
     ensureDrainResultCache(env);
 
-    if (g_drain_result_class == nullptr || g_drain_result_ctor == nullptr || result == nullptr) {
+    if (result == nullptr) {
+        return;
+    }
+
+    if (!drainResultFieldsReady()) {
+        jclass ex = env->FindClass("java/lang/NoSuchFieldError");
+        if (ex != nullptr) {
+            env->ThrowNew(ex, "NativeDrainResult field ID mismatch (Kotlin/native layout out of sync)");
+        }
         return;
     }
 
@@ -415,18 +450,65 @@ Java_com_example_llmhost_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv* env, 
     try {
         auto drain_result = engine->drainDecodeAndState(gen_id, max_tokens);
 
+        // --- Tokens: copy into pre-allocated IntArray ---
         if (!drain_result.tokens.empty()) {
-            jintArray tokens = toJintArray(env, drain_result.tokens);
-            if (tokens != nullptr) {
-                env->SetObjectField(result, g_drain_result_tokens_field, tokens);
-                env->DeleteLocalRef(tokens);
-            }
+            jintArray buf = static_cast<jintArray>(
+                env->GetObjectField(result, g_tokens_buffer_field));
+            if (buf == nullptr) {
+                env->SetIntField(result, g_tokens_count_field, 0);
+            } else {
+                const jsize buf_len = env->GetArrayLength(buf);
+                const jsize count = static_cast<jsize>(drain_result.tokens.size());
 
-            jstring text = toJavaString(env, drain_result.text);
-            if (text != nullptr) {
-                env->SetObjectField(result, g_drain_result_text_field, text);
-                env->DeleteLocalRef(text);
+                if (count > buf_len) {
+                    // Should never happen if buffer matches kTokenCapacity, but fail safe.
+                    LOGW("drain_tokens_overflow count=%d buf=%d; clamping", static_cast<int>(count), static_cast<int>(buf_len));
+                }
+                const jsize copy = std::min(count, buf_len);
+                env->SetIntArrayRegion(buf, 0, copy, drain_result.tokens.data());
+                env->SetIntField(result, g_tokens_count_field, copy);
+                env->DeleteLocalRef(buf);
             }
+        } else {
+            env->SetIntField(result, g_tokens_count_field, 0);
+        }
+
+        // --- Text: copy raw UTF-8 bytes into pre-allocated ByteArray ---
+        //     Overflow fallback: if text exceeds buffer, allocate jstring into textOverflow.
+        if (!drain_result.text.empty()) {
+            const jsize text_len = static_cast<jsize>(drain_result.text.size());
+            jbyteArray buf = static_cast<jbyteArray>(
+                env->GetObjectField(result, g_text_buffer_field));
+            if (buf == nullptr) {
+                env->SetIntField(result, g_text_count_field, 0);
+                jstring overflow = toJavaString(env, drain_result.text);
+                if (overflow != nullptr) {
+                    env->SetObjectField(result, g_text_overflow_field, overflow);
+                    env->DeleteLocalRef(overflow);
+                }
+            } else {
+                const jsize buf_len = env->GetArrayLength(buf);
+
+                if (text_len <= buf_len) {
+                    // Fast path: zero-alloc copy into pre-allocated buffer
+                    env->SetByteArrayRegion(buf, 0, text_len,
+                        reinterpret_cast<const jbyte*>(drain_result.text.data()));
+                    env->SetIntField(result, g_text_count_field, text_len);
+                } else {
+                    // Overflow path: fall back to dynamic jstring allocation
+                    LOGW("drain_text_overflow text_len=%d buf=%d; using jstring fallback",
+                         static_cast<int>(text_len), static_cast<int>(buf_len));
+                    env->SetIntField(result, g_text_count_field, 0);
+                    jstring overflow = toJavaString(env, drain_result.text);
+                    if (overflow != nullptr) {
+                        env->SetObjectField(result, g_text_overflow_field, overflow);
+                        env->DeleteLocalRef(overflow);
+                    }
+                }
+                env->DeleteLocalRef(buf);
+            }
+        } else {
+            env->SetIntField(result, g_text_count_field, 0);
         }
 
         env->SetIntField(result, g_drain_result_state_field, drain_result.state);

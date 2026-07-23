@@ -1,4 +1,4 @@
-# CLAUDE.md - LLMHostAndroid Router
+# CLAUDE.md - Prism Local Router
 
 Project-local routing only. Root `C:\Workspace\ENGINEERING.md` and
 `C:\Workspace\CLAUDE.md` for general protocols. Refer to root `AGENTS.md` for Gemini-specific overrides.
@@ -16,7 +16,7 @@ Project-local routing only. Root `C:\Workspace\ENGINEERING.md` and
 
 ## Repo Snapshot
 
-- Android app repo at `C:\Workspace\Project_Android\LLMHostAndroid`.
+- Android app repo at `C:\Workspace\Project_Android\PrismLocal`.
 - App id and namespace: `com.example.llmhost`.
 - Manifest label: `Prism Local`.
 - Stack: Kotlin, Compose Material3, foreground `InferenceService`, JNI C++ bridge, vendored `llama.cpp`, GGUF model storage.

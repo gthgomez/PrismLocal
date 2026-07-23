@@ -18,8 +18,13 @@ $env:LLMHOST_RELEASE_STORE_FILE='C:\path\to\release.jks'
 $env:LLMHOST_RELEASE_STORE_PASSWORD='...'
 $env:LLMHOST_RELEASE_KEY_ALIAS='llmhost'
 $env:LLMHOST_RELEASE_KEY_PASSWORD='...'
-C:\Workspace\Project_Android\gradlew.bat --no-daemon -p C:\Workspace\artifacts\llm-host-apk-20260505 assembleRelease
+cd C:\Workspace\Project_Android\PrismLocal
+.\gradlew.bat --no-daemon assembleRelease
 ```
+
+User-level `~/.gradle/gradle.properties` may define the same keys. After the
+folder rename, `LLMHOST_RELEASE_STORE_FILE` must use `PrismLocal`, not the
+legacy `LLMHostAndroid` path.
 
 CI should provide the same values through secret storage and materialize the
 keystore outside the repository checkout.

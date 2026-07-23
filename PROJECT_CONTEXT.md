@@ -2,9 +2,9 @@
 
 ## What This Is
 
-`LLMHostAndroid` is an Android app for local GGUF inference. The current
+`LLMHostAndroid` (PrismLocal) is an Android app for local GGUF inference. The current
 manifest presents the app as `Prism Local`, with package/application id
-`com.example.llmhost`. It is a Kotlin/Compose app with a foreground inference
+`com.prismai.llmhost`. It is a Kotlin/Compose app with a foreground inference
 service, app-owned model storage, and a JNI bridge to a C++ `llama.cpp` engine.
 
 This document is source-backed routing context for agents. It does not replace
@@ -32,12 +32,13 @@ that AGP 9.x owns this path and double-declaration can break the build.
 - `ChatScreen.kt` is the central Compose UI. It collects service `StateFlow`s for
   model state, chat sessions, transcripts, runtime settings, downloads,
   benchmarks, device capability, and pending agent-tool confirmations.
-- `InferenceService.kt` owns app runtime state: native engine lifecycle, model
-  import/switching, generation jobs, foreground notification, memory pressure,
-  transcripts, chat index, benchmark history, Hugging Face downloads, and agent
-  tool dispatch.
+- `InferenceService.kt` is a thin coordinator/foreground service manager (reduced from 5,391 to 1,044 lines). It initializes and binds the modular subsystems:
+  - `com.example.llmhost.generation.GenerationOrchestrator` — Coordinates generation flows, token collection, and metrics.
+  - `com.example.llmhost.chat.ChatManager` — Governs transcript files, chat CRUD, and full-text search indexing.
+  - `com.example.llmhost.model.ModelManager` / `ModelStorageManager` — Oversees GGUF loading, profiling, and memory assessment.
+  - `com.example.llmhost.agent.AgentToolRouter` — Dispatches execution of the 11 modular agent tools.
 - `NativeLlmBridge.kt` loads `libllmhost`, serializes JNI calls with a mutex, and
-  exposes streaming generation as `Flow<GenerationChunk>`.
+  exposes streaming generation as `Flow<GenerationChunk>` using a pre-allocated carrier buffer.
 - `app/src/main/cpp/CMakeLists.txt` builds `libllmhost.so` from
   `llmhost_jni.cpp` and `Engine.cpp`, links static `llama`/`ggml`, disables most
   llama.cpp tools/tests/server outputs, and sets 16 KB page-size linker flags.
@@ -79,9 +80,14 @@ CMake source list. Treat it as inactive unless CMake is changed.
 
 ## Commands
 
+**Cwd:** always `PrismLocal/` (this repo). The workspace composite root
+`Project_Android/` has no `:app` module; agents that run Gradle from the parent
+folder will fail with `project 'app' not found`.
+
 Trusted commands from this repo:
 
 ```powershell
+cd C:\Workspace\Project_Android\PrismLocal
 .\gradlew.bat --no-daemon :app:testDebugUnitTest
 .\gradlew.bat --no-daemon assembleDebug
 .\gradlew.bat --no-daemon assembleDebugAndroidTest
@@ -90,9 +96,19 @@ Trusted commands from this repo:
 .\gradlew.bat --no-daemon assembleRelease
 ```
 
+From composite root only (uses this project’s wrapper + `-p`):
+
+```powershell
+.\PrismLocal\gradlew.bat -p PrismLocal --no-daemon :app:assembleDebug
+```
+
 Use `connectedDebugAndroidTest` only when an emulator/device is available. The
 current checkout has a local smoke GGUF asset under `app/src/androidTest/assets`,
 but `.gitignore` excludes that path, so a clean checkout may need asset staging.
+
+Release signing properties (`LLMHOST_RELEASE_*`) live in user-level
+`~/.gradle/gradle.properties` or the environment. Store path must point at
+`PrismLocal/release/…` after the LLMHostAndroid → PrismLocal rename.
 
 Packaging/release checks, when relevant:
 
@@ -124,7 +140,7 @@ Dated evidence docs:
 - `app/src/main/cpp/LLAMA_CPP_VERSION.md` records the vendored llama.cpp
   snapshot commit `bbeb89d76c41bc250f16e4a6fefcc9b530d6e3f3`.
 
-Fresh build/test/log evidence is required before claiming the current dirty tree
+Fresh build/test/log evidence is required before claiming the current tree
 passes.
 
 ## Signing
@@ -156,25 +172,19 @@ an older artifact path; adapt commands to this repo path before use.
 
 ## Current Limitations And Gaps
 
-- The repo is dirty with existing in-progress changes. This context was written from current
-  source inspection and dated evidence, but no Gradle build/test was run in this
-  docs pass.
-- `RUNTIME_LIMITS.md` contains useful runtime notes, but it still says context
-  length is fixed at 512. Current source has `GenerationSettings` and native
-  clamping for configurable context length from 512 to 8192. Source wins until
-  that runbook is refreshed.
-- The local smoke GGUF asset exists in this checkout but is ignored by git.
-  Device tests may need asset setup on another machine.
-- `SIGNING.md` has valid signing input names but an old artifact-path example.
-- No `README.md`, `QA_CHECKLIST.md`, `.github` instructions, or `TOOLS.md` exist
-  in this repo at the time this file was created.
-- OpenCL/Adreno support is experimental and depends on external include/library
-  configuration; CPU/KleidiAI paths are the normal documented path.
-- Production readiness, Play Store readiness, and current release signing status
-  are unverified here.
+- Build compilation (`assembleDebug`) and unit tests (`:app:testDebugUnitTest`) are verified and passing.
+- `RUNTIME_LIMITS.md` is updated to document the configurable context length (512 to 16,384), prompt batch sizes, max generated tokens (up to 1,024), and agent iterations (up to 12).
+- The local JNI layer is performance-hardened with zero heap allocations on the polling fast path, and cancel latency has been optimized via C++ intra-batch cancellation checks in `decodeTokensAt`.
+- The local smoke GGUF asset exists in this checkout but is ignored by git. Device tests may need asset setup on another machine.
+- `README.md` and `QA_CHECKLIST.md` are present in the repository.
+- OpenCL/Adreno support is experimental and depends on external include/library configuration; CPU/KleidiAI paths are the normal documented path.
+- Production readiness, Play Store readiness, and current release signing status are unverified here.
 
 ## Docs Fitness
 
 A cold-start agent should be able to answer what the app is, where source lives,
 which commands are trusted, what paths are risky, which evidence is dated, what
 is unverified, and what done means by reading `AGENTS.md` plus this file.
+
+---
+*Last updated: 2026-07-19 — Decomposed refactoring & JNI performance updates mapped*

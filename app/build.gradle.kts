@@ -47,12 +47,12 @@ val openClCmakeArgs = buildList {
 }
 
 android {
-    namespace = "com.example.llmhost"
+    namespace = "com.prismai.llmhost"
     compileSdk = 36
     ndkVersion = "27.1.12297006"
 
     defaultConfig {
-        applicationId = "com.example.llmhost"
+        applicationId = "com.prismai.llmhost"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

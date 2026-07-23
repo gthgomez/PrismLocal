@@ -373,11 +373,17 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens) {
     return runtime.current_position + required_tokens < limit;
 }
 
-int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t count, llama_pos start_pos) {
+// Returns:
+//   0        = success
+//   negative = llama_decode error
+//   -999     = cancelled between batch chunks (prompt eval only)
+int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t count,
+                   llama_pos start_pos, const std::atomic<bool>* cancel_flag = nullptr) {
     if (count <= 0) {
         return 0;
     }
     if (count == 1) {
+        // Single-token fast path — no cancellation check needed (5-30ms)
         if (!runtime.single_batch_initialized) {
             runtime.single_batch = llama_batch_init(1, 0, 1);
             runtime.single_batch_initialized = true;
@@ -393,6 +399,11 @@ int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t cou
     const int batch_size = runtime.batch_size;
     llama_batch batch = llama_batch_init(std::min(count, batch_size), 0, 1);
     for (int32_t offset = 0; offset < count; offset += batch_size) {
+        // Check cancellation between batch chunks
+        if (cancel_flag != nullptr && cancel_flag->load(std::memory_order_acquire)) {
+            llama_batch_free(batch);
+            return -999;
+        }
         int32_t chunk = std::min(batch_size, count - offset);
         batch.n_tokens = chunk;
         for (int32_t i = 0; i < chunk; i++) {
@@ -706,8 +717,15 @@ struct Engine::Impl {
 
             if (tokens_to_decode > 0) {
                 const llama_pos prompt_start = runtime->current_position;
-                const int decode_result = decodeTokensAt(*runtime, prompt_tokens.data() + common_prefix, tokens_to_decode, prompt_start);
+                const int decode_result = decodeTokensAt(*runtime, prompt_tokens.data() + common_prefix,
+                    tokens_to_decode, prompt_start, &session->cancel_requested);
                 if (decode_result != 0) {
+                    if (decode_result == -999) {
+                        LOGI("prompt_eval_cancelled generation_id=%u",
+                             session->generation_id);
+                        finishSession(session, StreamState::Cancelled);
+                        return;
+                    }
                     ctrl->error_code.store(static_cast<uint32_t>(5000 + std::abs(decode_result)), std::memory_order_release);
                     LOGE("prompt_eval_failed rc=%d", decode_result);
                     finishSession(session, StreamState::Error);
@@ -812,6 +830,7 @@ struct Engine::Impl {
         int generated_tokens = 0;
         bool stopped_by_eog = false;
         std::vector<long long> decode_times_us;
+        decode_times_us.reserve(static_cast<size_t>(session->config.max_tokens));
         for (int i = 0; i < session->config.max_tokens; i++) {
             if (memory_pressure_level.load(std::memory_order_acquire) >= 3) {
                 session->cancel_requested.store(true, std::memory_order_release);

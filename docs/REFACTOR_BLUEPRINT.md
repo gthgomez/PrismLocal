@@ -1,8 +1,8 @@
 # Refactor Blueprint — InferenceService Split & Future-Proofing
 
-> **Status**: Proposal  
-> **Last updated**: 2026-07-11  
-> **Target**: Split `InferenceService.kt` (5,391 lines, 16+ concerns) into ~25 focused classes across 10 domain packages, while preserving the existing public API for zero-impact migration and enabling independent development of roadmap capabilities.
+> **Status**: Completed & Reference-Only  
+> **Last updated**: 2026-07-19  
+> **Target**: Historical blueprint and execution record for the InferenceService refactoring, splitting the 5,391-line monolith into focused domain packages.
 
 ---
 

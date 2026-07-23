@@ -42,4 +42,7 @@ llm_host_prefs.xml
 
 # Per-run plans and test outputs
 commitPlan.json
+walkthrough.md
+*.png
 runs/
+

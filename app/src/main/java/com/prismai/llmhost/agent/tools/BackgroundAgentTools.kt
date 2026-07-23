@@ -1,8 +1,12 @@
 package com.prismai.llmhost.agent.tools
+import com.prismai.llmhost.*
+import com.prismai.llmhost.bridge.*
+import com.prismai.llmhost.service.*
+import com.prismai.llmhost.storage.*
+import com.prismai.llmhost.tools.*
+import com.prismai.llmhost.ui.*
+import com.prismai.llmhost.model.*
 
-import com.prismai.llmhost.AgentToolCall
-import com.prismai.llmhost.AgentToolErrorCode
-import com.prismai.llmhost.AgentToolResult
 import com.prismai.llmhost.BackgroundAgentManager
 import org.json.JSONArray
 import org.json.JSONObject

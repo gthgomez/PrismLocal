@@ -1,4 +1,11 @@
 package com.prismai.llmhost.chat
+import com.prismai.llmhost.*
+import com.prismai.llmhost.bridge.*
+import com.prismai.llmhost.service.*
+import com.prismai.llmhost.storage.*
+import com.prismai.llmhost.tools.*
+import com.prismai.llmhost.ui.*
+import com.prismai.llmhost.model.*
 
 import android.content.Context
 import android.os.SystemClock
@@ -338,7 +345,7 @@ class ChatManager(
         synchronized(lock) {
             id = nextTranscriptId++
             sum = if (role == TranscriptRole.TOOL) {
-                com.prismai.llmhost.AgentToolProtocol.parseToolEvent(text)
+                AgentToolProtocol.parseToolEvent(text)
                     ?.optString("summary")
                     ?.takeIf { it.isNotBlank() }
             } else null
@@ -363,7 +370,7 @@ class ChatManager(
                 if (message.text != text) {
                     val mutableList = list.toMutableList()
                     val sum = if (message.role == TranscriptRole.TOOL) {
-                        com.prismai.llmhost.AgentToolProtocol.parseToolEvent(text)
+                        AgentToolProtocol.parseToolEvent(text)
                             ?.optString("summary")
                             ?.takeIf { it.isNotBlank() }
                     } else message.summary

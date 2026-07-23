@@ -1,15 +1,18 @@
 package com.prismai.llmhost.agent
+import com.prismai.llmhost.*
+import com.prismai.llmhost.bridge.*
+import com.prismai.llmhost.service.*
+import com.prismai.llmhost.storage.*
+import com.prismai.llmhost.tools.*
+import com.prismai.llmhost.ui.*
+import com.prismai.llmhost.model.*
 
 import android.content.SharedPreferences
 import android.os.SystemClock
 import android.util.Log
-import com.prismai.llmhost.AgentToolCall
-import com.prismai.llmhost.AgentToolDefinition
 import com.prismai.llmhost.ChatSession
 import com.prismai.llmhost.DeviceCapabilityProfile
 import com.prismai.llmhost.GenerationSettings
-import com.prismai.llmhost.HuggingFaceModelCatalog
-import com.prismai.llmhost.PendingAgentToolAction
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.util.FormatUtils
 import org.json.JSONObject
@@ -226,7 +229,7 @@ class AgentToolConfirmation(
 
                 val arguments = if (argumentsStr.isNotBlank()) JSONObject(argumentsStr) else JSONObject()
                 val call = AgentToolCall(toolName, arguments, reason)
-                val definition = com.prismai.llmhost.AgentToolRegistry.find(toolName)
+                val definition = AgentToolRegistry.find(toolName)
 
                 if (definition != null) {
                     pendingCall = call

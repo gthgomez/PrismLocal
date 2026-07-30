@@ -114,7 +114,7 @@ class ModelReadinessAssessor(
                 isLargeModelClass && availableAfterUnloadBytes < ModelLoadLimits.LARGE_MODEL_AVAILABLE_RISKY ->
                     ModelFitRating.RISKY
                 requiredRamBytes <= safeBudget && !lowMemory -> ModelFitRating.SAFE
-                requiredRamBytes <= riskyBudget -> ModelFitRating.RISKY
+                requiredRamBytes <= riskyBudget || modelBytes <= (availableAfterUnloadBytes * 0.90).toLong() -> ModelFitRating.RISKY
                 else -> ModelFitRating.TOO_LARGE
             }
         }
@@ -147,8 +147,14 @@ class ModelReadinessAssessor(
             ?.average()
         val score = actualAverage ?: ((prediction.minTokensPerSecond + prediction.maxTokensPerSecond) / 2.0)
         val tier = when {
+            actualAverage != null -> when {
+                actualAverage < 0.5 -> ModelPerformanceTier.NOT_RECOMMENDED
+                actualAverage < 2.0 -> ModelPerformanceTier.VERY_SLOW
+                actualAverage < 6.0 -> ModelPerformanceTier.USABLE
+                else -> ModelPerformanceTier.RECOMMENDED
+            }
             fit.rating == ModelFitRating.TOO_LARGE -> ModelPerformanceTier.NOT_RECOMMENDED
-            actualAverage == null && prediction.sampleCount == 0 -> ModelPerformanceTier.UNKNOWN
+            prediction.sampleCount == 0 -> ModelPerformanceTier.UNKNOWN
             score < 0.5 -> ModelPerformanceTier.NOT_RECOMMENDED
             score < 2.0 -> ModelPerformanceTier.VERY_SLOW
             score < 6.0 -> ModelPerformanceTier.USABLE
@@ -175,7 +181,13 @@ class ModelReadinessAssessor(
         info: ModelStorageManager.ActiveModelInfo,
         profile: DeviceCapabilityProfile,
     ): ModelFitEstimate {
-        val availableAfterCurrentUnload = profile.availableRamBytes + (uiState._activeModelInfo.value?.bytes ?: 0L)
+        val currentModelId = uiState.currentModel.value
+        val activeBytes = uiState._activeModelInfo.value?.bytes
+            ?: currentModelId?.takeIf { it.isNotBlank() }?.let { modelStorageManager.activeModelInfo(it)?.bytes }
+            ?: 0L
+        val availableAfterCurrentUnload = profile.availableRamBytes + activeBytes
+        val lmkThresholdBytes = (profile.availableRamBytes / 8L).coerceAtLeast(256L * 1024L * 1024L)
+        val usableRamBytes = maxOf(0L, availableAfterCurrentUnload - lmkThresholdBytes)
         val settings = uiState._generationSettings.value.clamped()
         val quantization = ggufFileTypeHint(info.validation.metadata?.fileType)
             ?: quantizationHint(info.fileName)
@@ -186,34 +198,49 @@ class ModelReadinessAssessor(
         )
         val declaredContext = info.validation.metadata?.contextLength ?: GenerationSettings.DEFAULT_CONTEXT_LENGTH
         val activeContext = minOf(settings.contextLength, declaredContext.coerceAtLeast(GenerationSettings.MIN_CONTEXT_LENGTH))
-        val contextEstimate = (MODEL_CONTEXT_ESTIMATE_BYTES *
-            (activeContext.toDouble() / GenerationSettings.DEFAULT_CONTEXT_LENGTH.toDouble()))
-            .toLong()
-            .coerceAtLeast(MODEL_CONTEXT_ESTIMATE_BYTES / 4L)
+        val kvCacheEstimateBytes = activeContext.toLong() * 256L * 1024L
         val requiredRam = info.bytes +
             runtimeOverhead +
-            contextEstimate +
+            kvCacheEstimateBytes +
             (settings.threadCount * MODEL_THREAD_SCRATCH_BYTES)
-        val rating = rateModelFit(
+        val staticRating = rateModelFit(
             modelBytes = info.bytes,
             requiredRamBytes = requiredRam,
-            availableAfterUnloadBytes = availableAfterCurrentUnload,
+            availableAfterUnloadBytes = usableRamBytes,
             lowMemory = profile.lowMemory,
         )
-        val reason = when (rating) {
-            ModelFitRating.SAFE -> "Recommended"
-            ModelFitRating.RISKY -> if (profile.lowMemory) "May be slow; device reports low memory" else "May be slow; limited RAM headroom"
-            ModelFitRating.TOO_LARGE -> "Likely too large for current RAM headroom"
+
+        // Empirical performance override: check past benchmark runs
+        val exactRuns = uiState._benchmarkRuns.value.filter {
+            it.modelId == info.id && it.generatedTokens > 0 && it.decodeMs > 0L
         }
+        val actualAverage = exactRuns.takeIf { it.isNotEmpty() }
+            ?.map { it.tokensPerSecond }
+            ?.average()
+        val hasProvenSuccess = actualAverage != null && actualAverage >= 1.0
+
+        val finalRating = if (hasProvenSuccess && info.bytes <= ModelLoadLimits.HARD_CAP_BYTES) {
+            if (profile.lowMemory || actualAverage!! < 2.0) ModelFitRating.RISKY else ModelFitRating.SAFE
+        } else {
+            staticRating
+        }
+
+        val reason = when {
+            hasProvenSuccess -> "Proven usable on your device (avg ${FormatUtils.formatAgentTps(actualAverage!!)} tok/s across ${exactRuns.size} run${if (exactRuns.size > 1) "s" else ""})"
+            finalRating == ModelFitRating.SAFE -> "Recommended"
+            finalRating == ModelFitRating.RISKY -> if (profile.lowMemory) "May be slow; device reports low memory" else "May be slow; limited RAM headroom"
+            else -> "Likely too large for current LMK-safe RAM headroom"
+        }
+
         return ModelFitEstimate(
             modelId = info.id,
             fileName = info.fileName,
             modelBytes = info.bytes,
             quantization = quantization,
             requiredRamBytes = requiredRam,
-            availableRamAfterUnloadBytes = availableAfterCurrentUnload,
+            availableRamAfterUnloadBytes = usableRamBytes,
             storageFreeBytes = profile.storageFreeBytes,
-            rating = rating,
+            rating = finalRating,
             reason = reason,
         )
     }

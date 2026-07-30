@@ -8,6 +8,7 @@ import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
 import android.content.Intent
+import android.net.Uri
 import com.prismai.llmhost.ui.theme.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.ui.components.*
@@ -16,7 +17,11 @@ import com.prismai.llmhost.ui.memory.*
 import com.prismai.llmhost.ui.chat.*
 import com.prismai.llmhost.ui.benchmark.*
 import com.prismai.llmhost.ui.controlplane.*
+import com.prismai.llmhost.ui.rag.*
+import com.prismai.llmhost.ui.voice.*
 import android.widget.Toast
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.RepeatMode
@@ -90,6 +95,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
@@ -103,6 +109,10 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -131,14 +141,17 @@ fun ChatScreen(
     onImportPickerFinished: () -> Unit,
     onSwitchModel: (String) -> Unit,
 ) {
-    MaterialTheme(colorScheme = LlmHostPrismaticColorScheme) {
+    PrismLocalTheme {
         var snackbarMessage by remember { mutableStateOf<String?>(null) }
         var controlsVisible by remember { mutableStateOf(false) }
         var chatsVisible by remember { mutableStateOf(false) }
         var memoriesVisible by remember { mutableStateOf(false) }
+        var ragBrowserVisible by remember { mutableStateOf(false) }
         val controlSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val chatSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val memoriesSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        val ragSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        val scope = rememberCoroutineScope()
 
         LaunchedEffect(uiMessage) {
             val message = uiMessage ?: return@LaunchedEffect
@@ -151,7 +164,7 @@ fun ChatScreen(
         }
 
         Box(modifier = Modifier.fillMaxSize()) {
-            Surface(modifier = Modifier.fillMaxSize(), color = PrismCanvas) {
+            Surface(modifier = Modifier.fillMaxSize(), color = prismCanvasColor()) {
                 PrismBackdrop(modifier = Modifier.fillMaxSize())
                 BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                     val minChatHeight = maxHeight * 0.70f
@@ -199,8 +212,17 @@ fun ChatScreen(
                         val pendingAgentToolAction by (service?.pendingAgentToolAction ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = null
                         )
+                        val thermalGovernorState by (service?.thermalGovernorState ?: emptyFlow()).collectAsStateWithLifecycle(
+                            initialValue = com.prismai.llmhost.util.ThermalGovernorState()
+                        )
                         val memories by (service?.memories ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
+                        )
+                        val vectorChunks by (service?.vectorChunks ?: emptyFlow()).collectAsStateWithLifecycle(
+                            initialValue = emptyList()
+                        )
+                        val voiceState by (service?.voiceState ?: emptyFlow()).collectAsStateWithLifecycle(
+                            initialValue = com.prismai.llmhost.tools.VoiceState()
                         )
                         var prompt by remember { mutableStateOf("") }
                         var attachments by remember { mutableStateOf<List<PromptAttachment>>(emptyList()) }
@@ -213,6 +235,25 @@ fun ChatScreen(
                             derivedStateOf {
                                 transcript.isEmpty() ||
                                     listState.layoutInfo.visibleItemsInfo.any { item -> item.index == bottomAnchorIndex }
+                            }
+                        }
+                        // stickToBottom: pin while streaming. Detach only on user-driven scroll away
+                        // from bottom; content growth alone must not clear the flag (would fight follow).
+                        var stickToBottom by remember { mutableStateOf(true) }
+                        var suppressStickDetach by remember { mutableStateOf(false) }
+                        LaunchedEffect(listState, transcript.size) {
+                            snapshotFlow {
+                                val bottomIndex = if (transcript.isEmpty()) 0 else transcript.size
+                                val atBottom = transcript.isEmpty() ||
+                                    listState.layoutInfo.visibleItemsInfo.any { item ->
+                                        item.index == bottomIndex
+                                    }
+                                listState.isScrollInProgress to atBottom
+                            }.collect { (scrolling, atBottom) ->
+                                when {
+                                    atBottom -> stickToBottom = true
+                                    scrolling && !suppressStickDetach -> stickToBottom = false
+                                }
                             }
                         }
                         val headerCollapsed by remember(transcript.size) {
@@ -231,6 +272,12 @@ fun ChatScreen(
                             }
                             service?.importModel(uri)
                         }
+                        val linkLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                            onImportPickerFinished()
+                            if (uri != null) {
+                                service?.linkExternalModel(uri)
+                            }
+                        }
                         val attachmentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
                             onImportPickerFinished()
                             if (uris.isEmpty()) {
@@ -238,16 +285,25 @@ fun ChatScreen(
                             }
                             val importedModels = mutableListOf<String>()
                             val attached = mutableListOf<PromptAttachment>()
+                            val ggufUris = mutableListOf<Uri>()
                             uris.forEach { uri ->
                                 runCatching {
                                     context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }
                                 val name = AttachmentTextExtractor.displayName(context, uri)
                                 if (name.endsWith(".gguf", ignoreCase = true)) {
-                                    service?.importModel(uri)
+                                    ggufUris += uri
                                     importedModels += name
                                 } else {
                                     attached += AttachmentTextExtractor.fromUri(context, uri)
+                                }
+                            }
+                            if (ggufUris.isNotEmpty()) {
+                                scope.launch {
+                                    val targetUri = ggufUris.firstOrNull()
+                                    if (targetUri != null) {
+                                        service?.importModel(targetUri)
+                                    }
                                 }
                             }
                             if (attached.isNotEmpty()) {
@@ -336,6 +392,8 @@ fun ChatScreen(
                             service?.panelRequests?.collect { panel ->
                                 when (panel) {
                                     "chats" -> chatsVisible = true
+                                    "rag", "documents", "knowledge" -> ragBrowserVisible = true
+                                    "memories" -> memoriesVisible = true
                                     "model_manager",
                                     "benchmarks",
                                     "settings" -> controlsVisible = true
@@ -343,10 +401,24 @@ fun ChatScreen(
                             }
                         }
 
-                        LaunchedEffect(transcript.size, isGenerating) {
-                            if (transcript.isNotEmpty()) {
-                                if (!isGenerating || transcript.size <= 2 || isAtBottomAnchor) {
-                                    listState.animateScrollToItem(bottomAnchorIndex)
+                        val activeAssistantTextLength = remember(transcript) {
+                            transcript.lastOrNull { it.role == TranscriptRole.ASSISTANT }?.text?.length ?: 0
+                        }
+                        val generatedTokenCount = generationPerformance?.generatedTokens ?: 0
+
+                        LaunchedEffect(
+                            transcript.size,
+                            isGenerating,
+                            generatedTokenCount,
+                            activeAssistantTextLength,
+                            stickToBottom,
+                        ) {
+                            if (transcript.isNotEmpty() && stickToBottom) {
+                                suppressStickDetach = true
+                                try {
+                                    listState.scrollToItem(bottomAnchorIndex)
+                                } finally {
+                                    suppressStickDetach = false
                                 }
                             }
                         }
@@ -358,9 +430,12 @@ fun ChatScreen(
                             importStatus = importStatus,
                             importState = importState,
                             collapsed = headerCollapsed,
+                            thermalGovernorState = thermalGovernorState,
+                            generationPerformance = generationPerformance,
                             onOpenChats = { chatsVisible = true },
                             onOpenControls = { controlsVisible = true },
                             onOpenMemories = { memoriesVisible = true },
+                            onOpenRag = { ragBrowserVisible = true },
                         )
 
                         Spacer(modifier = Modifier.height(22.dp))
@@ -432,6 +507,60 @@ fun ChatScreen(
 
                         Spacer(modifier = Modifier.height(10.dp))
 
+                        VoiceOverlay(
+                            voiceState = voiceState,
+                            onStopListening = { service?.stopVoiceInput() },
+                        )
+
+                        AnimatedVisibility(
+                            visible = !isAtBottomAnchor && transcript.isNotEmpty(),
+                            enter = fadeIn(),
+                            exit = fadeOut(),
+                            modifier = Modifier
+                                .align(Alignment.CenterHorizontally)
+                                .padding(bottom = 6.dp),
+                        ) {
+                            val fabDescription = if (isGenerating) {
+                                "Jump to latest generation"
+                            } else {
+                                "Scroll to bottom"
+                            }
+                            Surface(
+                                modifier = Modifier.semantics {
+                                    contentDescription = fabDescription
+                                    role = Role.Button
+                                },
+                                onClick = {
+                                    stickToBottom = true
+                                    scope.launch {
+                                        suppressStickDetach = true
+                                        try {
+                                            listState.animateScrollToItem(bottomAnchorIndex)
+                                        } finally {
+                                            suppressStickDetach = false
+                                        }
+                                    }
+                                },
+                                shape = RoundedCornerShape(999.dp),
+                                color = PrismBlue,
+                                contentColor = Color.White,
+                                shadowElevation = 4.dp,
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Text(
+                                        text = if (isGenerating) "↓ Generating..." else "↓ Scroll to bottom",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                    )
+                                }
+                            }
+                        }
+
                         PromptComposer(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -463,6 +592,8 @@ fun ChatScreen(
                                     service?.generateSafely(text)
                                 }
                             },
+                            onVoiceClick = { service?.startVoiceInput() },
+                            voiceState = voiceState,
                         )
 
                         AnimatedVisibility(
@@ -473,8 +604,8 @@ fun ChatScreen(
                             ModalBottomSheet(
                                 onDismissRequest = { controlsVisible = false },
                                 sheetState = controlSheetState,
-                                containerColor = Color.White,
-                                contentColor = PrismText,
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                contentColor = MaterialTheme.colorScheme.onSurface,
                             ) {
                                 ControlPlaneSheet(
                                     models = models,
@@ -496,12 +627,20 @@ fun ChatScreen(
                                     isGenerating = isGenerating,
                                     serviceAvailable = service != null,
                                     onSwitchModel = onSwitchModel,
+                                    onDeleteModel = { modelId -> scope.launch { service?.deleteModel(modelId) } },
                                     onImportModel = {
                                         onImportPickerStarted()
                                         importLauncher.launch(arrayOf("*/*"))
                                     },
+                                    onLinkModel = {
+                                        onImportPickerStarted()
+                                        linkLauncher.launch(arrayOf("*/*"))
+                                    },
                                     onCancelImport = { service?.cancelImport() },
                                     onDownloadModel = { entryId -> service?.downloadHuggingFaceModel(entryId) },
+                                    onDownloadCustomHfModel = { repo, file -> service?.downloadCustomHuggingFaceModel(repo, file) },
+                                    storageBreakdown = service?.storageBreakdown(),
+                                    onClearCache = { service?.clearCacheAndTempFiles() },
                                     onSettingsChange = { settings -> service?.updateGenerationSettings(settings) },
                                     onRunBenchmark = { presetId -> service?.runBenchmarkPreset(presetId) },
                                     onRunThreadSweep = { service?.runThreadSweepBenchmark() },
@@ -528,8 +667,8 @@ fun ChatScreen(
                             ModalBottomSheet(
                                 onDismissRequest = { chatsVisible = false },
                                 sheetState = chatSheetState,
-                                containerColor = Color.White,
-                                contentColor = PrismText,
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                contentColor = MaterialTheme.colorScheme.onSurface,
                                 dragHandle = { SheetDragHandle() },
                             ) {
                                 ChatListSheet(
@@ -560,14 +699,40 @@ fun ChatScreen(
                             ModalBottomSheet(
                                 onDismissRequest = { memoriesVisible = false },
                                 sheetState = memoriesSheetState,
-                                containerColor = Color.White,
-                                contentColor = PrismText,
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                contentColor = MaterialTheme.colorScheme.onSurface,
                                 dragHandle = { SheetDragHandle() },
                             ) {
                                 MemoryBrowser(
                                     memories = memories,
                                     onDelete = { id -> service?.deleteMemory(id) },
                                     onRefresh = { service?.refreshMemories() },
+                                    onAddMemory = { fact, category -> service?.addMemory(fact, category) },
+                                )
+                            }
+                        }
+                        AnimatedVisibility(
+                            visible = ragBrowserVisible,
+                            enter = fadeIn(),
+                            exit = fadeOut(),
+                        ) {
+                            ModalBottomSheet(
+                                onDismissRequest = { ragBrowserVisible = false },
+                                sheetState = ragSheetState,
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                contentColor = MaterialTheme.colorScheme.onSurface,
+                                dragHandle = { SheetDragHandle() },
+                            ) {
+                                DocumentBrowser(
+                                    chunks = vectorChunks,
+                                    onIngestDocument = { id, title, text ->
+                                        scope.launch { service?.ingestDocument(id, title, text) }
+                                    },
+                                    onDeleteDocument = { id -> service?.deleteDocument(id) },
+                                    onQueryVectorStore = { query ->
+                                        service?.queryVectorStore(query) ?: emptyList()
+                                    },
+                                    onRefresh = { service?.refreshVectorStore() },
                                 )
                             }
                         }

@@ -51,12 +51,13 @@ import com.prismai.llmhost.BenchmarkPreset
 import com.prismai.llmhost.BenchmarkStatus
 import com.prismai.llmhost.DeviceCapabilityProfile
 import com.prismai.llmhost.ModelReadiness
+import com.prismai.llmhost.benchmark.BenchmarkRunAnalytics
+import com.prismai.llmhost.model.ModelTierHints
 import com.prismai.llmhost.ui.components.*
 import com.prismai.llmhost.ui.theme.*
 import com.prismai.llmhost.ui.chat.ChatOverflowButton
 import com.prismai.llmhost.ui.*
 import java.util.Locale
-import kotlin.math.roundToInt
 
 private enum class BenchmarkTab(val label: String) {
     Runs("Runs"),
@@ -64,21 +65,24 @@ private enum class BenchmarkTab(val label: String) {
     Models("Models"),
 }
 
+/** UI-facing summary; averages exclude ERROR / QUALITY_ABORT / INTERRUPTED / CANCELLED (B6). */
 private data class BenchmarkSummary(
     val totalCount: Int,
     val completedCount: Int,
     val cleanCount: Int,
     val truncatedCount: Int,
     val errorCount: Int,
+    val qualityAbortCount: Int,
     val interruptedCount: Int,
+    val cancelledCount: Int,
+    /** Successful-run average only (EOF / MAX_TOKENS with tokens + decodeMs). */
     val avgCompletedTokensPerSecond: Double?,
-    val avgAllTokensPerSecond: Double?,
     val bestCompletedTokensPerSecond: Double?,
     val avgPromptMs: Long?,
     val avgTotalMs: Long?,
 ) {
     val failedCount: Int
-        get() = errorCount + interruptedCount
+        get() = errorCount + interruptedCount + qualityAbortCount + cancelledCount
 
     val reliabilityScore: Double?
         get() = avgCompletedTokensPerSecond?.let { average ->
@@ -96,13 +100,30 @@ private data class BenchmarkSummary(
             cleanCount = 0,
             truncatedCount = 0,
             errorCount = 0,
+            qualityAbortCount = 0,
             interruptedCount = 0,
+            cancelledCount = 0,
             avgCompletedTokensPerSecond = null,
-            avgAllTokensPerSecond = null,
             bestCompletedTokensPerSecond = null,
             avgPromptMs = null,
             avgTotalMs = null,
         )
+
+        fun fromAnalytics(s: BenchmarkRunAnalytics.Summary): BenchmarkSummary =
+            BenchmarkSummary(
+                totalCount = s.totalCount,
+                completedCount = s.completedCount,
+                cleanCount = s.cleanCount,
+                truncatedCount = s.truncatedCount,
+                errorCount = s.errorCount,
+                qualityAbortCount = s.qualityAbortCount,
+                interruptedCount = s.interruptedCount,
+                cancelledCount = s.cancelledCount,
+                avgCompletedTokensPerSecond = s.avgCompletedTokensPerSecond,
+                bestCompletedTokensPerSecond = s.bestCompletedTokensPerSecond,
+                avgPromptMs = s.avgPromptMs,
+                avgTotalMs = s.avgTotalMs,
+            )
     }
 }
 
@@ -115,6 +136,7 @@ private data class BenchmarkComparisonRow(
 
 private data class BenchmarkAction(
     val label: String,
+    val presetId: String? = null,
     val onClick: () -> Unit,
 )
 
@@ -124,6 +146,7 @@ private enum class BenchmarkRunStatus(
 ) {
     Clean("Clean", PrismGreen),
     Truncated("Truncated", PrismAmber),
+    QualityAbort("Quality", PrismAmber),
     Error("Error", PrismRed),
     Interrupted("Interrupted", PrismAmber),
     Partial("Partial", PrismBlue),
@@ -247,6 +270,7 @@ internal fun BenchmarkCenter(
             BenchmarkTab.Runs -> BenchmarkRunsTab(
                 runs = runs,
                 presets = presets,
+                currentModelId = currentModelId,
                 enabled = enabled,
                 onRunPreset = onRunPreset,
                 onRunThreadSweep = onRunThreadSweep,
@@ -325,12 +349,18 @@ private fun BenchmarkSummaryGroup(
                         "Runs" to summary.totalCount.toString(),
                         "Completed" to summary.completedCount.toString(),
                         "Failed" to summary.failedCount.toString(),
+                        "Quality abort" to summary.qualityAbortCount.toString(),
                         "Truncated" to summary.truncatedCount.toString(),
-                        "Avg completed" to formatOptionalTps(summary.avgCompletedTokensPerSecond),
-                        "Avg overall" to formatOptionalTps(summary.avgAllTokensPerSecond),
+                        "Avg successful" to formatOptionalTps(summary.avgCompletedTokensPerSecond),
                         "Best" to formatOptionalTps(summary.bestCompletedTokensPerSecond),
                         "Avg first token" to formatOptionalMs(summary.avgPromptMs),
                     )
+                )
+                Text(
+                    text = "Averages exclude ERROR, QUALITY_ABORT, CANCELLED, and interrupted runs.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
                 )
             }
         }
@@ -341,19 +371,38 @@ private fun BenchmarkSummaryGroup(
 private fun BenchmarkRunsTab(
     runs: List<BenchmarkRun>,
     presets: List<BenchmarkPreset>,
+    currentModelId: String?,
     enabled: Boolean,
     onRunPreset: (String) -> Unit,
     onRunThreadSweep: () -> Unit,
     onRunNativeBenchmark: () -> Unit,
 ) {
     val actions = listOf(
-        BenchmarkAction("Sweep 2/4/6/8", onRunThreadSweep),
-        BenchmarkAction("Native PP/TG", onRunNativeBenchmark),
+        BenchmarkAction("Sweep 2/4/6/8", onClick = onRunThreadSweep),
+        BenchmarkAction("Native PP/TG", onClick = onRunNativeBenchmark),
     ) + presets.map { preset ->
-        BenchmarkAction(preset.name) { onRunPreset(preset.id) }
+        BenchmarkAction(preset.name, presetId = preset.id) { onRunPreset(preset.id) }
     }
-    var selectedActionIndex by remember(actions.size) { mutableIntStateOf(actions.indexOfFirst { it.label == "Python Coding" }.coerceAtLeast(0)) }
+    var selectedActionIndex by remember(actions.size) {
+        mutableIntStateOf(actions.indexOfFirst { it.label == "Python Coding" }.coerceAtLeast(0))
+    }
+    var successfulOnly by remember { mutableStateOf(false) }
     val selectedAction = actions.getOrNull(selectedActionIndex) ?: actions.first()
+    val codingWarning = remember(selectedAction.presetId, currentModelId) {
+        if (selectedAction.presetId == "coding") {
+            ModelTierHints.codingBenchmarkWarning(currentModelId)
+        } else {
+            null
+        }
+    }
+    val visibleRuns = remember(runs, successfulOnly) {
+        val filtered = if (successfulOnly) {
+            runs.filter { BenchmarkRunAnalytics.isSuccessfulForAverages(it) }
+        } else {
+            runs
+        }
+        filtered.take(8)
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         SectionHeader(
@@ -380,6 +429,16 @@ private fun BenchmarkRunsTab(
                 }
             }
         }
+        codingWarning?.let { warning ->
+            Text(
+                text = warning,
+                style = MaterialTheme.typography.bodySmall,
+                color = PrismAmber,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
         Button(
             modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp),
             enabled = enabled,
@@ -388,14 +447,35 @@ private fun BenchmarkRunsTab(
             Text("Run ${selectedAction.label}", maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        if (runs.isEmpty()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
             Text(
-                text = "Run a preset or send a chat prompt to collect local performance data.",
+                text = "Recent runs",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            TextButton(onClick = { successfulOnly = !successfulOnly }) {
+                Text(
+                    text = if (successfulOnly) "Successful only" else "All runs",
+                    maxLines = 1,
+                )
+            }
+        }
+        if (visibleRuns.isEmpty()) {
+            Text(
+                text = if (runs.isEmpty()) {
+                    "Run a preset or send a chat prompt to collect local performance data."
+                } else {
+                    "No successful runs yet (ERROR / quality abort filtered out)."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
-            runs.take(5).forEach { run -> BenchmarkRunRow(run) }
+            visibleRuns.forEach { run -> BenchmarkRunRow(run) }
         }
     }
 }
@@ -543,9 +623,9 @@ private fun BenchmarkRunRow(run: BenchmarkRun) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
-        color = Color.White,
-        contentColor = PrismText,
-        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.48f)),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
         shadowElevation = 0.dp,
     ) {
         Column(
@@ -584,13 +664,13 @@ private fun BenchmarkRunRow(run: BenchmarkRun) {
             Text(
                 text = polishedModelName(run.modelId),
                 style = MaterialTheme.typography.labelMedium,
-                color = PrismSlate,
+                color = MaterialTheme.colorScheme.onSurface,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                text = "ctx ${run.contextLength} • batch ${run.batchSize} • threads ${run.threadCount}",
+                text = "ctx ${run.contextLength} • batch ${run.batchSize} • threads ${run.threadCount} • temp ${String.format(Locale.US, "%.2f", run.temperature)}",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -609,6 +689,19 @@ private fun BenchmarkRunRow(run: BenchmarkRun) {
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+            run.terminalDetail?.takeIf { it.isNotBlank() }?.let { detail ->
+                Text(
+                    text = detail,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = when (run.status()) {
+                        BenchmarkRunStatus.Error -> PrismRed
+                        BenchmarkRunStatus.QualityAbort -> PrismAmber
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }
@@ -623,9 +716,9 @@ private fun BenchmarkMetricRow(
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(8.dp),
-        color = Color.White,
-        contentColor = PrismText,
-        border = BorderStroke(1.dp, PrismGlassBorder),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
         shadowElevation = 0.dp,
     ) {
         Column(
@@ -700,25 +793,10 @@ internal fun benchmarkDisabledReason(
 }
 
 private fun summaryStatusLine(summary: BenchmarkSummary): String =
-    "${summary.totalCount} runs / ${summary.completedCount} completed / ${summary.failedCount} failed"
+    "${summary.totalCount} runs / ${summary.completedCount} ok / ${summary.failedCount} failed"
 
-private fun benchmarkSummary(runs: List<BenchmarkRun>): BenchmarkSummary {
-    val completed = runs.filter { it.generatedTokens > 0 && it.decodeMs > 0L }
-    val allTokensPerSecond = runs.map { it.tokensPerSecond }
-    return BenchmarkSummary(
-        totalCount = runs.size,
-        completedCount = completed.size,
-        cleanCount = runs.count { it.terminalReason == "EOF" },
-        truncatedCount = runs.count { it.terminalReason == "MAX_TOKENS" },
-        errorCount = runs.count { it.terminalReason == "ERROR" },
-        interruptedCount = runs.count { it.terminalReason.contains("INTERRUPTED", ignoreCase = true) },
-        avgCompletedTokensPerSecond = completed.takeIf { it.isNotEmpty() }?.map { it.tokensPerSecond }?.average(),
-        avgAllTokensPerSecond = allTokensPerSecond.takeIf { it.isNotEmpty() }?.average(),
-        bestCompletedTokensPerSecond = completed.maxOfOrNull { it.tokensPerSecond },
-        avgPromptMs = completed.takeIf { it.isNotEmpty() }?.map { it.promptEvalMs }?.average()?.roundToInt()?.toLong(),
-        avgTotalMs = completed.takeIf { it.isNotEmpty() }?.map { it.totalMs }?.average()?.roundToInt()?.toLong(),
-    )
-}
+private fun benchmarkSummary(runs: List<BenchmarkRun>): BenchmarkSummary =
+    BenchmarkSummary.fromAnalytics(BenchmarkRunAnalytics.summarize(runs))
 
 private fun BenchmarkRun.comparisonKey(): String =
     listOf(
@@ -736,14 +814,16 @@ private fun BenchmarkRun.comparisonKey(): String =
 private fun BenchmarkRun.shortHashLabel(): String =
     modelSha256Prefix?.takeIf { it.isNotBlank() }?.let { "hash ${shortHash(it)}" } ?: "hash pending"
 
-private fun BenchmarkRun.status(): BenchmarkRunStatus = when {
-    terminalReason == "EOF" -> BenchmarkRunStatus.Clean
-    terminalReason == "MAX_TOKENS" -> BenchmarkRunStatus.Truncated
-    terminalReason == "ERROR" -> BenchmarkRunStatus.Error
-    terminalReason.contains("INTERRUPTED", ignoreCase = true) -> BenchmarkRunStatus.Interrupted
-    generatedTokens > 0 && decodeMs > 0L -> BenchmarkRunStatus.Partial
-    else -> BenchmarkRunStatus.Unknown
-}
+private fun BenchmarkRun.status(): BenchmarkRunStatus =
+    when (BenchmarkRunAnalytics.statusOf(this)) {
+        BenchmarkRunAnalytics.RunStatus.Clean -> BenchmarkRunStatus.Clean
+        BenchmarkRunAnalytics.RunStatus.Truncated -> BenchmarkRunStatus.Truncated
+        BenchmarkRunAnalytics.RunStatus.QualityAbort -> BenchmarkRunStatus.QualityAbort
+        BenchmarkRunAnalytics.RunStatus.Error -> BenchmarkRunStatus.Error
+        BenchmarkRunAnalytics.RunStatus.Interrupted -> BenchmarkRunStatus.Interrupted
+        BenchmarkRunAnalytics.RunStatus.Partial -> BenchmarkRunStatus.Partial
+        BenchmarkRunAnalytics.RunStatus.Unknown -> BenchmarkRunStatus.Unknown
+    }
 
 private fun BenchmarkRun.settingsLabel(): String =
     "ctx $contextLength | batch $batchSize | th $threadCount | gpu $gpuLayers | $runtimeBackend"

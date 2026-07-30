@@ -73,10 +73,9 @@ internal fun MarkdownText(
                     color = color,
                     style = MaterialTheme.typography.bodyMedium,
                 )
-                MarkdownBlockKind.Code -> CodeBlock(
+                MarkdownBlockKind.Code -> com.prismai.llmhost.ui.CodeBlock(
                     code = block.text.text,
                     language = block.language,
-                    color = color,
                 )
             }
         }

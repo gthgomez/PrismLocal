@@ -193,4 +193,20 @@ class ModelTools(
             summary = "Runtime settings explained for current ctx ${settings.contextLength}, threads ${settings.threadCount}, tokens ${settings.maxTokens}",
             details = JSONObject().put("settings", settings.toAgentJson()).put("explanations", explanations))
     }
+
+    suspend fun deleteModel(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+        if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Model delete requires confirmation")
+        val modelId = call.arguments.optString("model_id").trim()
+        if (modelId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Missing model_id parameter")
+        val activeModel = modelStorageManager.activeModelInfo(modelId)
+            ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "Model not found: $modelId")
+        val deleted = modelManager.deleteModel(modelId)
+        return if (deleted) {
+            onRefreshReadiness()
+            toolSuccess(call, "Deleted model $modelId",
+                JSONObject().put("model_id", modelId).put("bytes_freed", activeModel.bytes))
+        } else {
+            toolFailure(call, AgentToolErrorCode.FAILED, "Failed to delete model $modelId")
+        }
+    }
 }

@@ -98,6 +98,7 @@ class ModelStorageManager(private val context: Context) {
     }
 
     fun listInstalledModels(): List<String> {
+        cleanOrphanedDownloads()
         val dir = modelsDir
         if (!dir.exists()) return emptyList()
         val models = dir.listFiles()
@@ -218,6 +219,7 @@ class ModelStorageManager(private val context: Context) {
                 validation = validation,
             )
             writeManifestAtomically(modelRoot, manifest)
+            pruneInactiveVersions(modelRoot, versionId)
 
             val resolved = resolveActiveModel(modelId)
             if (resolved is ModelResolveResult.Success) {
@@ -252,11 +254,114 @@ class ModelStorageManager(private val context: Context) {
         }
     }
 
+    fun deleteModel(modelId: String): Boolean {
+        val modelRoot = File(modelsDir, modelId)
+        if (!modelRoot.exists()) return false
+        val deleted = runCatching { modelRoot.deleteRecursively() }.getOrDefault(false)
+        Log.d(TAG, "deleteModel modelId=$modelId deleted=$deleted")
+        return deleted
+    }
+
+    private fun pruneInactiveVersions(modelRoot: File, activeVersionId: String) {
+        val versionsDir = File(modelRoot, "versions")
+        if (!versionsDir.exists()) return
+        versionsDir.listFiles()?.forEach { versionDir ->
+            if (versionDir.isDirectory && versionDir.name != activeVersionId) {
+                runCatching {
+                    versionDir.deleteRecursively()
+                    Log.d(TAG, "pruned inactive model version dir=${versionDir.absolutePath}")
+                }
+            }
+        }
+    }
+
     fun resolveActiveModel(modelId: String, verifyHash: Boolean = true): ModelResolveResult =
         parseManifest(File(modelsDir, modelId), verifyHash = verifyHash)
 
     fun activeModelInfo(modelId: String): ActiveModelInfo? =
         (resolveActiveModel(modelId, verifyHash = false) as? ModelResolveResult.Success)?.model
+
+    fun linkExternalModelUri(uri: Uri): ImportResult {
+        val displayName = displayNameFor(uri)
+        val modelId = modelIdFrom(displayName)
+        val versionId = newVersionId()
+        val now = Instant.now().toString()
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val size = sizeFor(uri).coerceAtLeast(0L)
+        val validation = ModelValidation(
+            format = "GGUF",
+            ggufVersion = 3,
+            status = "saf_linked",
+            validatedAt = now,
+        )
+        val modelRoot = File(modelsDir, modelId)
+        val targetVersionDir = File(modelRoot, "versions/$versionId").also { it.mkdirs() }
+        val dummyFile = File(targetVersionDir, MODEL_FILE).also {
+            if (!it.exists()) runCatching { it.writeText(uri.toString()) }
+        }
+        val manifest = mergedManifest(
+            modelRoot = modelRoot,
+            modelId = modelId,
+            versionId = versionId,
+            versionFile = "versions/$versionId/$MODEL_FILE",
+            displayName = displayName,
+            sha256 = "linked_saf_uri",
+            bytes = size,
+            importedAt = now,
+            validation = validation,
+        )
+        writeManifestAtomically(modelRoot, manifest)
+        val resolved = resolveActiveModel(modelId, verifyHash = false)
+        return if (resolved is ModelResolveResult.Success) {
+            ImportResult.Success(resolved.model)
+        } else {
+            ImportResult.Failure(ModelStorageError(ModelStorageError.Code.OPEN_FAILED, "Failed to link SAF model"))
+        }
+    }
+
+    data class StorageBreakdown(
+        val installedModelsBytes: Long,
+        val downloadsCacheBytes: Long,
+        val freeStorageBytes: Long,
+        val totalStorageBytes: Long,
+    )
+
+    fun getStorageBreakdown(): StorageBreakdown {
+        val installedBytes = listInstalledModelInfos().sumOf { it.bytes }
+        val downloadsDir = File(context.filesDir, "hf-downloads")
+        val cacheBytes = if (downloadsDir.exists()) downloadsDir.walkTopDown().filter { it.isFile }.sumOf { it.length() } else 0L
+        val stat = StatFs(modelsDir.absolutePath)
+        val freeBytes = stat.availableBytes
+        val totalBytes = stat.totalBytes
+        return StorageBreakdown(
+            installedModelsBytes = installedBytes,
+            downloadsCacheBytes = cacheBytes,
+            freeStorageBytes = freeBytes,
+            totalStorageBytes = totalBytes,
+        )
+    }
+
+    fun clearCacheAndTempFiles(): Long {
+        var freed = 0L
+        runCatching {
+            val downloadsDir = File(context.filesDir, "hf-downloads")
+            if (downloadsDir.exists()) {
+                downloadsDir.listFiles()?.forEach { file ->
+                    freed += file.length()
+                    file.delete()
+                }
+            }
+            val stagingDir = File(modelsDir, IMPORT_STAGING_DIR)
+            if (stagingDir.exists()) {
+                freed += stagingDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                stagingDir.deleteRecursively()
+            }
+        }
+        Log.d(TAG, "clearCacheAndTempFiles freed=$freed bytes")
+        return freed
+    }
 
     private fun parseManifest(modelRoot: File, verifyHash: Boolean): ModelResolveResult {
         val modelId = modelRoot.name
@@ -431,6 +536,22 @@ class ModelStorageManager(private val context: Context) {
                 onProgress(ImportProgress(copied, total))
                 if (copied > MAX_MODEL_BYTES) {
                     throw IOException("Model exceeds maximum size $MAX_MODEL_BYTES")
+                }
+                if (copied % (10L * 1024L * 1024L) < DEFAULT_BUFFER_SIZE && !hasUsableSpaceFor(0L)) {
+                    throw IOException("Insufficient storage space during import")
+                }
+            }
+        }
+    }
+
+    fun cleanOrphanedDownloads(maxAgeMs: Long = 24 * 3600 * 1000L) {
+        runCatching {
+            val downloadsDir = File(context.filesDir, "hf-downloads")
+            if (!downloadsDir.exists()) return
+            val now = System.currentTimeMillis()
+            downloadsDir.listFiles()?.forEach { file ->
+                if (file.name.endsWith(".part") && (now - file.lastModified() > maxAgeMs)) {
+                    file.delete()
                 }
             }
         }

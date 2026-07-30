@@ -36,6 +36,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -98,9 +99,6 @@ class InferenceService : Service() {
         private const val CHAT_DIR_NAME = "chats"
         private const val TRANSCRIPT_PERSIST_THROTTLE_MS = 1000L
         private const val MAX_BENCHMARK_RUNS = 250
-        private const val MAX_CHAT_MESSAGES_BEFORE_CONTINUATION = 60
-        private const val MAX_CHAT_CHARS_BEFORE_CONTINUATION = 24_000
-        private const val MAX_PROMPT_CONTEXT_CHARS = 8_000
         private const val KEY_AGENT_ENABLED = "agent_enabled"
         private const val KEY_PENDING_AGENT_ACTION_PREFIX = "pending_agent_action_"
     }
@@ -232,6 +230,8 @@ class InferenceService : Service() {
     // ── Public StateFlow/SharedFlow exposures — delegated to extracted classes ──
     val lastAgentTracePath: StateFlow<String?> get() = uiState.lastAgentTracePath
     val memories: StateFlow<List<MemoryFact>> get() = uiState.memories
+    val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunk>> get() = uiState.vectorChunks
+    val thermalGovernorState: StateFlow<com.prismai.llmhost.util.ThermalGovernorState> get() = uiState.thermalGovernorState
     val voiceInputResult: StateFlow<String?> get() = uiState.voiceInputResult
     val voiceState: StateFlow<VoiceState> get() = uiState.voiceState
     val currentModel: StateFlow<String?> get() = uiState.currentModel
@@ -295,6 +295,9 @@ class InferenceService : Service() {
                 _voiceInputResult.value = text
                 _voiceState.value = _voiceState.value.copy(isListening = false, partialTranscript = null)
                 publishUiEvent("Voice input captured")
+                if (_generationSettings.value.autoSendVoice && text.isNotBlank()) {
+                    generateSafely(text)
+                }
             }
             mgr.onSpeechError = { error ->
                 _voiceInputResult.value = null
@@ -320,7 +323,15 @@ class InferenceService : Service() {
             chunker = DocumentChunker,
         )
         // Phase 7a — Background Agent Execution
-        backgroundAgentManager = BackgroundAgentManager(this)
+        backgroundAgentManager = BackgroundAgentManager(
+            context = this,
+            executeTask = { bgTask ->
+                generateSafelyAndAwait(prompt = bgTask.prompt, preserveBenchmarkQueue = true)
+            },
+            cancelNativeGeneration = {
+                cancelGenerationAndJoin("background task cancelled")
+            },
+        )
 
         // ── Phase C: generation & agent core ────────────────────────────
         generationMetrics = GenerationMetrics(uiState)
@@ -364,8 +375,8 @@ class InferenceService : Service() {
             getActiveSession = { generationSession },
             incrementSession = { ++generationSession },
             onSaveTranscript = { persistTranscriptNow() },
-            onRecordBenchmarkRun = { prompt, output, perf, reason ->
-                benchmarkStore.record(prompt, output, perf, reason)
+            onRecordBenchmarkRun = { prompt, output, perf, reason, detail ->
+                benchmarkStore.record(prompt, output, perf, reason, detail)
             },
             onDeferredReload = { modelId -> switchModel(modelId) },
             getReloadPending = { reloadPending },
@@ -540,6 +551,28 @@ class InferenceService : Service() {
         modelDownloadManager.downloadHuggingFaceModel(entryId)
     }
 
+    fun storageBreakdown(): ModelStorageManager.StorageBreakdown = modelStorageManager.getStorageBreakdown()
+
+    fun clearCacheAndTempFiles(): Long {
+        val freed = modelStorageManager.clearCacheAndTempFiles()
+        publishUiEvent("Cleared ${FormatUtils.formatBytesForMessage(freed)} of cache and temp files")
+        return freed
+    }
+
+    fun downloadCustomHuggingFaceModel(repoId: String, fileName: String) {
+        modelDownloadManager.downloadCustomHuggingFaceModel(repoId, fileName)
+    }
+
+    fun linkExternalModel(uri: Uri) {
+        val result = modelStorageManager.linkExternalModelUri(uri)
+        if (result is ModelStorageManager.ImportResult.Success) {
+            refreshDeviceAndModelReadiness()
+            publishUiEvent("Linked external GGUF ${result.model.id}")
+        } else if (result is ModelStorageManager.ImportResult.Failure) {
+            publishUiEvent("Failed to link GGUF: ${result.error.userMessage}")
+        }
+    }
+
     fun cancelImport() {
         importJob?.cancel()
         importJob = null
@@ -560,6 +593,14 @@ class InferenceService : Service() {
             Log.d(TAG, "switchModel requested modelId=$modelId")
             cancelAndJoinGenerationLocked("model switch")
             modelManager.switchModel(modelId)
+        }
+    }
+
+    suspend fun deleteModel(modelId: String): Boolean {
+        return operationMutex.withLock {
+            Log.d(TAG, "deleteModel requested modelId=$modelId")
+            cancelAndJoinGenerationLocked("model delete")
+            modelManager.deleteModel(modelId)
         }
     }
 
@@ -699,13 +740,56 @@ class InferenceService : Service() {
         preserveBenchmarkQueue: Boolean = false,
     ) {
         serviceScope.launch {
-            operationMutex.withLock {
-                cancelAndJoinGenerationLocked(
-                    reason = "new generation",
-                    clearQueuedBenchmarks = !preserveBenchmarkQueue,
-                )
-                generationOrchestrator.generate(prompt, benchmarkPreset)
-            }
+            generateSafelyAndAwait(prompt, benchmarkPreset, preserveBenchmarkQueue)
+        }
+    }
+
+    suspend fun generateSafelyAndAwait(
+        prompt: String,
+        benchmarkPreset: BenchmarkPreset? = null,
+        preserveBenchmarkQueue: Boolean = false,
+    ): String {
+        var activeJob: Job? = null
+        operationMutex.withLock {
+            cancelAndJoinGenerationLocked(
+                reason = "new generation",
+                clearQueuedBenchmarks = !preserveBenchmarkQueue,
+            )
+            generationOrchestrator.generate(prompt, benchmarkPreset)
+            activeJob = generationJob
+        }
+        activeJob?.join()
+        awaitGenerationSessionIdle()
+        return streamState.snapshotText().takeIf { it.isNotBlank() } ?: "Background task completed"
+    }
+
+    private suspend fun awaitGenerationSessionIdle(
+        pollMs: Long = 20L,
+        maxWaitMs: Long = 30 * 60 * 1000L,
+    ) {
+        com.prismai.llmhost.generation.GenerationSessionWait.awaitSessionIdle(
+            isGenerating = {
+                _isGenerating.value ||
+                (::agentTrace.isInitialized && agentTrace.activeAgentChainStartTime != 0L) ||
+                _pendingAgentToolAction.value != null
+            },
+            getJob = { generationJob },
+            pollMs = pollMs,
+            maxWaitMs = maxWaitMs,
+            elapsedTimeMs = { android.os.SystemClock.elapsedRealtime() },
+            onTimeout = { Log.w(TAG, "awaitGenerationSessionIdle timed out") },
+        )
+    }
+
+    suspend fun cancelGenerationAndJoin(reason: String = "user cancellation") {
+        operationMutex.withLock {
+            cancelAndJoinGenerationLocked(reason)
+        }
+    }
+
+    fun cancelGenerationSafely() {
+        serviceScope.launch {
+            cancelGenerationAndJoin("user cancellation")
         }
     }
 
@@ -805,6 +889,7 @@ class InferenceService : Service() {
             "list_curated_downloadable_models" -> modelTools.listCuratedDownloadableModels(call)
             "get_download_status" -> modelTools.getDownloadStatus(call)
             "download_model" -> modelTools.downloadModel(call, confirmed)
+            "delete_model" -> modelTools.deleteModel(call, confirmed)
             "recommend_runtime_settings" -> modelTools.recommendRuntimeSettings(call)
             "explain_runtime_settings" -> modelTools.explainRuntimeSettings(call)
             // ── Runtime tools ────────────────────────────────────────────────
@@ -901,6 +986,67 @@ class InferenceService : Service() {
     /** Public API for the memory browser UI. Reloads the observable memory list from the store. */
     fun refreshMemories() {
         refreshMemoriesList()
+    }
+
+    /** Public API for the memory browser UI. Adds a manual memory fact and refreshes the observable list. */
+    fun addMemory(fact: String, category: MemoryCategory = MemoryCategory.GENERAL, confidence: Float = 0.85f) {
+        memoryStore.insert(
+            MemoryFact(
+                fact = fact,
+                category = category,
+                confidence = confidence,
+            )
+        )
+        refreshMemoriesList()
+    }
+
+    /** Public API for the document browser UI. Ingests a text document into local SQLite VectorStore. */
+    suspend fun ingestDocument(id: String, title: String, text: String): Int {
+        val count = ragManager.ingestDocument(id, title, text)
+        refreshVectorChunksList()
+        return count
+    }
+
+    /** Public API for the document browser UI. Deletes all chunks for a document id. */
+    fun deleteDocument(id: String): Int {
+        val count = ragManager.deleteDocument(id)
+        refreshVectorChunksList()
+        return count
+    }
+
+    /** Public API for the document browser UI. Performs vector cosine similarity search. */
+    suspend fun queryVectorStore(query: String, topK: Int = 5): List<Pair<com.prismai.llmhost.storage.VectorChunk, Float>> {
+        return ragManager.query(query, topK = topK)
+    }
+
+    /** Public API to force refresh vector store chunks StateFlow. */
+    fun refreshVectorStore() {
+        refreshVectorChunksList()
+    }
+
+    /** Public API for voice input & TTS */
+    fun startVoiceInput(): Boolean {
+        return voiceIoManager.startListening().also { success ->
+            if (success) {
+                _voiceState.value = _voiceState.value.copy(isListening = true, partialTranscript = null)
+            }
+        }
+    }
+
+    fun stopVoiceInput() {
+        voiceIoManager.stopListening()
+        _voiceState.value = _voiceState.value.copy(isListening = false, partialTranscript = null)
+    }
+
+    fun speakText(text: String): Boolean = voiceIoManager.speak(text)
+
+    fun stopSpeaking() {
+        voiceIoManager.stopSpeaking()
+        _voiceState.value = _voiceState.value.copy(isSpeaking = false)
+    }
+
+    private fun refreshVectorChunksList() {
+        runCatching { uiState._vectorChunks.value = vectorStore.getAllChunks() }
     }
 
     private fun startAgentFollowUpGeneration(

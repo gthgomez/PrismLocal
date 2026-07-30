@@ -382,13 +382,19 @@ class ChatManager(
         touchCurrentChat(uiState._transcript.value, updateTitle = false)
     }
 
-    // ── Persist transcript to disk (sync, for CRUD operations) ───────────
+    // ── Persist transcript to disk (thread-safe under ioMutex) ─────────────
 
-    /** Called by InferenceService's [persistTranscriptNow] wrapper (which runs async on IO). */
-    fun persistTranscript(chatId: String, messages: List<TranscriptMessage>) {
-        val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == chatId }?.title
-        searchIndex.update(chatId, messages, sessionTitle)
-        transcriptStore.writeTranscriptFile(transcriptStore.transcriptFile(chatId), messages)
+    /** Persists transcript messages for [chatId] under [ioMutex] to avoid disk races. */
+    suspend fun persistTranscript(chatId: String, messages: List<TranscriptMessage>) {
+        ioMutex.withLock {
+            runCatching {
+                val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == chatId }?.title
+                searchIndex.update(chatId, messages, sessionTitle)
+                transcriptStore.writeTranscriptFile(transcriptStore.transcriptFile(chatId), messages)
+            }.onFailure { error ->
+                Log.w(TAG, "failed to persist transcript for $chatId", error)
+            }
+        }
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
@@ -396,16 +402,8 @@ class ChatManager(
     private fun persistTranscriptNow() {
         val chatId = uiState._currentChatId.value ?: return
         val messages = uiState._transcript.value
-        val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == chatId }?.title
         scope.launch(Dispatchers.IO) {
-            ioMutex.withLock {
-                runCatching {
-                    searchIndex.update(chatId, messages, sessionTitle)
-                    transcriptStore.writeTranscriptFile(transcriptStore.transcriptFile(chatId), messages)
-                }.onFailure { error ->
-                    Log.w(TAG, "failed to persist transcript", error)
-                }
-            }
+            persistTranscript(chatId, messages)
         }
     }
 }

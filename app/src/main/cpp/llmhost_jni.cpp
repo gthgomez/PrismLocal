@@ -46,6 +46,9 @@ jfieldID g_text_count_field = nullptr;
 jfieldID g_text_overflow_field = nullptr;
 jfieldID g_drain_result_state_field = nullptr;
 jfieldID g_drain_result_prompt_tokens_field = nullptr;
+jfieldID g_drain_result_ttft_ms_field = nullptr;
+jfieldID g_drain_result_tokens_per_sec_field = nullptr;
+jfieldID g_drain_result_active_threads_field = nullptr;
 std::once_flag g_drain_result_cache_flag;
 
 bool drainResultFieldsReady() {
@@ -56,12 +59,18 @@ bool drainResultFieldsReady() {
         && g_text_count_field != nullptr
         && g_text_overflow_field != nullptr
         && g_drain_result_state_field != nullptr
-        && g_drain_result_prompt_tokens_field != nullptr;
+        && g_drain_result_prompt_tokens_field != nullptr
+        && g_drain_result_ttft_ms_field != nullptr
+        && g_drain_result_tokens_per_sec_field != nullptr
+        && g_drain_result_active_threads_field != nullptr;
 }
 
 void ensureDrainResultCache(JNIEnv* env) {
     std::call_once(g_drain_result_cache_flag, [env]() {
-        jclass local_class = env->FindClass("com/prismai/llmhost/NativeDrainResult");
+        jclass local_class = env->FindClass("com/prismai/llmhost/bridge/NativeDrainResult");
+        if (local_class == nullptr) {
+            local_class = env->FindClass("com/prismai/llmhost/NativeDrainResult");
+        }
         if (local_class != nullptr) {
             g_drain_result_class = static_cast<jclass>(env->NewGlobalRef(local_class));
             g_tokens_buffer_field = env->GetFieldID(g_drain_result_class, "tokensBuffer", "[I");
@@ -71,6 +80,9 @@ void ensureDrainResultCache(JNIEnv* env) {
             g_text_overflow_field = env->GetFieldID(g_drain_result_class, "textOverflow", "Ljava/lang/String;");
             g_drain_result_state_field = env->GetFieldID(g_drain_result_class, "state", "I");
             g_drain_result_prompt_tokens_field = env->GetFieldID(g_drain_result_class, "promptTokens", "I");
+            g_drain_result_ttft_ms_field = env->GetFieldID(g_drain_result_class, "ttftMs", "J");
+            g_drain_result_tokens_per_sec_field = env->GetFieldID(g_drain_result_class, "tokensPerSec", "F");
+            g_drain_result_active_threads_field = env->GetFieldID(g_drain_result_class, "activeThreads", "I");
             env->DeleteLocalRef(local_class);
             if (!drainResultFieldsReady()) {
                 LOGE("ensureDrainResultCache: incomplete field IDs (Kotlin/native layout mismatch)");
@@ -180,7 +192,7 @@ std::vector<int32_t> fromJintArray(JNIEnv* env, jintArray values) {
 } // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeCreateEngine(JNIEnv*, jclass, jboolean debug_hooks_enabled) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeCreateEngine(JNIEnv*, jclass, jboolean debug_hooks_enabled) {
     try {
         auto engine = std::make_unique<llmhost::Engine>(debug_hooks_enabled == JNI_TRUE);
         return reinterpret_cast<jlong>(engine.release());
@@ -190,12 +202,12 @@ Java_com_example_llmhost_NativeLlmBridge_nativeCreateEngine(JNIEnv*, jclass, jbo
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeDestroyEngine(JNIEnv*, jobject, jlong handle) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDestroyEngine(JNIEnv*, jobject, jlong handle) {
     delete toEngine(handle);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeLoadModel(JNIEnv* env, jobject, jlong handle, jstring path) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeLoadModel(JNIEnv* env, jobject, jlong handle, jstring path) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return JNI_FALSE;
@@ -208,7 +220,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeLoadModel(JNIEnv* env, jobject, j
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeLoadModelWithSettings(
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeLoadModelWithSettings(
     JNIEnv* env,
     jobject,
     jlong handle,
@@ -221,7 +233,10 @@ Java_com_example_llmhost_NativeLlmBridge_nativeLoadModelWithSettings(
     jint top_k,
     jfloat top_p,
     jfloat repeat_penalty,
-    jint gpu_layers) {
+    jint gpu_layers,
+    jstring kv_cache_type_k,
+    jstring kv_cache_type_v,
+    jboolean enable_flash_attn) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return JNI_FALSE;
@@ -237,6 +252,13 @@ Java_com_example_llmhost_NativeLlmBridge_nativeLoadModelWithSettings(
         config.top_p = top_p;
         config.repeat_penalty = repeat_penalty;
         config.gpu_layers = gpu_layers;
+        if (kv_cache_type_k != nullptr) {
+            config.kv_cache_type_k = toString(env, kv_cache_type_k);
+        }
+        if (kv_cache_type_v != nullptr) {
+            config.kv_cache_type_v = toString(env, kv_cache_type_v);
+        }
+        config.enable_flash_attn = (enable_flash_attn == JNI_TRUE);
         return engine->loadModel(toString(env, path), config) ? JNI_TRUE : JNI_FALSE;
     } catch (const std::exception&) {
         return JNI_FALSE;
@@ -244,7 +266,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeLoadModelWithSettings(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeUnloadModel(JNIEnv*, jobject, jlong handle) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeUnloadModel(JNIEnv*, jobject, jlong handle) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return;
@@ -253,7 +275,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeUnloadModel(JNIEnv*, jobject, jlo
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeResetConversation(JNIEnv*, jobject, jlong handle) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeResetConversation(JNIEnv*, jobject, jlong handle) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return;
@@ -262,7 +284,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeResetConversation(JNIEnv*, jobjec
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeStartGeneration(
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeStartGeneration(
     JNIEnv* env,
     jobject,
     jlong handle,
@@ -303,7 +325,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeStartGeneration(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeRunBenchmark(
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeRunBenchmark(
     JNIEnv* env,
     jobject,
     jlong handle,
@@ -341,7 +363,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeRunBenchmark(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeCancelGeneration(JNIEnv*, jobject, jlong handle, jint gen_id) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeCancelGeneration(JNIEnv*, jobject, jlong handle, jint gen_id) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return;
@@ -350,7 +372,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeCancelGeneration(JNIEnv*, jobject
 }
 
 extern "C" JNIEXPORT jintArray JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeDrainTokens(JNIEnv* env, jobject, jlong handle, jint gen_id, jint max_tokens) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainTokens(JNIEnv* env, jobject, jlong handle, jint gen_id, jint max_tokens) {
     auto* engine = toEngine(handle);
     if (engine == nullptr || max_tokens <= 0) {
         return env->NewIntArray(0);
@@ -363,7 +385,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeDrainTokens(JNIEnv* env, jobject,
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeAckEof(JNIEnv*, jobject, jlong handle, jint gen_id) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeAckEof(JNIEnv*, jobject, jlong handle, jint gen_id) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return;
@@ -372,7 +394,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeAckEof(JNIEnv*, jobject, jlong ha
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeDecodeTokens(JNIEnv* env, jobject, jlong handle, jint gen_id, jintArray tokens) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDecodeTokens(JNIEnv* env, jobject, jlong handle, jint gen_id, jintArray tokens) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return env->NewStringUTF("");
@@ -386,7 +408,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeDecodeTokens(JNIEnv* env, jobject
 }
 
 extern "C" JNIEXPORT jfloatArray JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeEncode(JNIEnv* env, jobject, jlong handle, jstring text) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeEncode(JNIEnv* env, jobject, jlong handle, jstring text) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return env->NewFloatArray(0);
@@ -407,7 +429,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeEncode(JNIEnv* env, jobject, jlon
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeGetState(JNIEnv*, jobject, jlong handle, jint gen_id) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeGetState(JNIEnv*, jobject, jlong handle, jint gen_id) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return static_cast<jint>(llmhost::StreamState::Tombstoned);
@@ -416,7 +438,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeGetState(JNIEnv*, jobject, jlong 
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeSetMemoryPressure(JNIEnv*, jobject, jlong handle, jint level) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeSetMemoryPressure(JNIEnv*, jobject, jlong handle, jint level) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return;
@@ -425,7 +447,7 @@ Java_com_example_llmhost_NativeLlmBridge_nativeSetMemoryPressure(JNIEnv*, jobjec
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_llmhost_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv* env, jobject, jlong handle, jint gen_id, jint max_tokens, jobject result) {
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv* env, jobject, jlong handle, jint gen_id, jint max_tokens, jobject result) {
     auto* engine = toEngine(handle);
 
     ensureDrainResultCache(env);
@@ -513,7 +535,139 @@ Java_com_example_llmhost_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv* env, 
 
         env->SetIntField(result, g_drain_result_state_field, drain_result.state);
         env->SetIntField(result, g_drain_result_prompt_tokens_field, drain_result.prompt_tokens);
+        env->SetLongField(result, g_drain_result_ttft_ms_field, static_cast<jlong>(drain_result.ttft_ms));
+        env->SetFloatField(result, g_drain_result_tokens_per_sec_field, static_cast<jfloat>(drain_result.tokens_per_sec));
+        env->SetIntField(result, g_drain_result_active_threads_field, static_cast<jint>(drain_result.active_threads));
     } catch (const std::exception&) {
         env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Error));
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeSetThreadCount(JNIEnv*, jobject, jlong handle, jint thread_count) {
+    auto* engine = toEngine(handle);
+    if (engine != nullptr) {
+        engine->setThreadCount(thread_count);
+    }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeLoadVisionProjector(JNIEnv*, jobject, jlong, jstring) {
+    return JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeProcessImage(JNIEnv*, jobject, jlong, jobject, jint, jint) {
+    return JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeGetBackendName(JNIEnv* env, jobject, jlong handle) {
+    auto* engine = toEngine(handle);
+    std::string backend = engine != nullptr ? engine->get_backend_name() : "CPU";
+    return env->NewStringUTF(backend.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeGetGpuLayersOffloaded(JNIEnv*, jobject, jlong handle) {
+    auto* engine = toEngine(handle);
+    return engine != nullptr ? engine->get_gpu_layers() : 0;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeIsKleidiAiEnabled(JNIEnv*, jobject, jlong handle) {
+    auto* engine = toEngine(handle);
+    return (engine != nullptr && engine->is_kleidiai_enabled()) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeIsVulkanEnabled(JNIEnv*, jobject, jlong handle) {
+    auto* engine = toEngine(handle);
+    return (engine != nullptr && engine->is_vulkan_enabled()) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeLoadDraftModel(JNIEnv* env, jobject, jlong handle, jstring path, jint draft_gpu_layers) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr || path == nullptr) {
+        return JNI_FALSE;
+    }
+    std::string path_str = toString(env, path);
+    return engine->loadDraftModel(path_str, draft_gpu_layers) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeUnloadDraftModel(JNIEnv*, jobject, jlong handle) {
+    auto* engine = toEngine(handle);
+    if (engine != nullptr) {
+        engine->unloadDraftModel();
+    }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeIsSpeculativeActive(JNIEnv*, jobject, jlong handle) {
+    auto* engine = toEngine(handle);
+    return (engine != nullptr && engine->is_speculative_active()) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeGetSpeculativeAcceptanceRate(JNIEnv*, jobject, jlong handle) {
+    auto* engine = toEngine(handle);
+    return engine != nullptr ? static_cast<jfloat>(engine->get_speculative_acceptance_rate()) : 0.0f;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeApplyLoraAdapters(
+        JNIEnv* env,
+        jobject,
+        jlong handle,
+        jobjectArray paths,
+        jfloatArray scales) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) {
+        return JNI_FALSE;
+    }
+    if (paths == nullptr || scales == nullptr) {
+        engine->clearLoraAdapters();
+        return JNI_TRUE;
+    }
+
+    jsize path_len = env->GetArrayLength(paths);
+    jsize scale_len = env->GetArrayLength(scales);
+    jsize count = path_len < scale_len ? path_len : scale_len;
+
+    jfloat* scale_elements = env->GetFloatArrayElements(scales, nullptr);
+    if (scale_elements == nullptr) {
+        return JNI_FALSE;
+    }
+
+    std::vector<llmhost::LoraAdapterSpec> specs;
+    specs.reserve(count);
+
+    for (jsize i = 0; i < count; ++i) {
+        auto path_jstr = static_cast<jstring>(env->GetObjectArrayElement(paths, i));
+        if (path_jstr == nullptr) continue;
+
+        const char* path_chars = env->GetStringUTFChars(path_jstr, nullptr);
+        if (path_chars != nullptr) {
+            llmhost::LoraAdapterSpec spec;
+            spec.path = std::string(path_chars);
+            spec.scale = static_cast<float>(scale_elements[i]);
+            specs.push_back(std::move(spec));
+            env->ReleaseStringUTFChars(path_jstr, path_chars);
+        }
+        env->DeleteLocalRef(path_jstr);
+    }
+
+    env->ReleaseFloatArrayElements(scales, scale_elements, JNI_ABORT);
+
+    return engine->applyLoraAdapters(specs) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeClearLoraAdapters(JNIEnv*, jobject, jlong handle) {
+    auto* engine = toEngine(handle);
+    if (engine != nullptr) {
+        engine->clearLoraAdapters();
     }
 }

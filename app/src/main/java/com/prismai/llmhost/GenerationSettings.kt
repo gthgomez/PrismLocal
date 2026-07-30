@@ -17,8 +17,19 @@ data class GenerationSettings(
     val topP: Float = DEFAULT_TOP_P,
     val repeatPenalty: Float = DEFAULT_REPEAT_PENALTY,
     val gpuLayers: Int = DEFAULT_GPU_LAYERS,
+    val useVulkan: Boolean = true,
     val agentEnabled: Boolean = false,
     val maxAgentIterations: Int = DEFAULT_MAX_AGENT_ITERATIONS,
+    val autoSendVoice: Boolean = false,
+    val autoReadResponse: Boolean = false,
+    val useSpeculative: Boolean = false,
+    val draftModelPath: String = "",
+    val nDraft: Int = 5,
+    val draftGpuLayers: Int = 0,
+    val kvCacheTypeK: String = "q8_0",
+    val kvCacheTypeV: String = "q8_0",
+    val enableFlashAttn: Boolean = true,
+    val loraAdapters: List<Pair<String, Float>> = emptyList(),
 ) {
     fun clamped(): GenerationSettings =
         GenerationSettings(
@@ -33,8 +44,19 @@ data class GenerationSettings(
             topP = topP.coerceIn(MIN_TOP_P, MAX_TOP_P),
             repeatPenalty = repeatPenalty.coerceIn(MIN_REPEAT_PENALTY, MAX_REPEAT_PENALTY),
             gpuLayers = gpuLayers.coerceIn(MIN_GPU_LAYERS, MAX_GPU_LAYERS),
+            useVulkan = useVulkan,
             agentEnabled = agentEnabled,
             maxAgentIterations = maxAgentIterations.coerceIn(MIN_MAX_AGENT_ITERATIONS, MAX_MAX_AGENT_ITERATIONS),
+            autoSendVoice = autoSendVoice,
+            autoReadResponse = autoReadResponse,
+            useSpeculative = useSpeculative,
+            draftModelPath = draftModelPath,
+            nDraft = nDraft.coerceIn(2, 8),
+            draftGpuLayers = draftGpuLayers.coerceIn(0, 99),
+            kvCacheTypeK = if (kvCacheTypeK in listOf("f16", "q8_0", "q4_0")) kvCacheTypeK else "q8_0",
+            kvCacheTypeV = if (kvCacheTypeV in listOf("f16", "q8_0", "q4_0")) kvCacheTypeV else "q8_0",
+            enableFlashAttn = enableFlashAttn,
+            loraAdapters = loraAdapters,
         )
 
     companion object {
@@ -44,7 +66,7 @@ data class GenerationSettings(
         const val MAX_TOKEN_STEP = 32
 
         const val MIN_THREAD_COUNT = 1
-        const val DEFAULT_THREAD_COUNT = 6
+        const val DEFAULT_THREAD_COUNT = 4
         const val MAX_THREAD_COUNT = 8
 
         const val MIN_CONTEXT_LENGTH = 512
@@ -74,7 +96,7 @@ data class GenerationSettings(
         const val MAX_REPEAT_PENALTY = 1.50f
 
         const val MIN_GPU_LAYERS = 0
-        const val DEFAULT_GPU_LAYERS = 0
+        const val DEFAULT_GPU_LAYERS = 99
         const val MAX_GPU_LAYERS = 99
 
         const val MIN_MAX_AGENT_ITERATIONS = 1
@@ -96,4 +118,5 @@ data class GenerationSettings(
             .put("top_p", topP.toDouble())
             .put("repeat_penalty", repeatPenalty.toDouble())
             .put("gpu_layers", gpuLayers)
+            .put("use_vulkan", useVulkan)
 }

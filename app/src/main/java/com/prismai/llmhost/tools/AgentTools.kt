@@ -408,6 +408,15 @@ object AgentToolRegistry {
             returnContract = """{"entry_id":"curated id","network_required":true}""",
         ),
         AgentToolDefinition(
+            name = "delete_model",
+            description = "Delete an installed GGUF model from local storage. Requires user confirmation.",
+            risk = AgentToolRisk.CONFIRM,
+            argumentSchema = """{"model_id":"installed model id"}""",
+            requiredArguments = setOf("model_id"),
+            maxStringLengths = mapOf("model_id" to 120),
+            returnContract = """{"model_id":"string","bytes_freed":12345}""",
+        ),
+        AgentToolDefinition(
             name = "export_chat",
             description = "Export the active chat transcript to a file. Requires user confirmation.",
             risk = AgentToolRisk.CONFIRM,
@@ -507,6 +516,34 @@ object AgentToolRegistry {
             requiredArguments = setOf("document_id"),
             maxStringLengths = mapOf("document_id" to 120),
             returnContract = """{"deleted":true,"document_id":"string","chunks_removed":0}""",
+        ),
+
+        // Phase 5 — Workspace file system tools
+        AgentToolDefinition(
+            name = "list_workspace_files",
+            description = "List files and subdirectories inside the safe app workspace directory.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{"path":{"type":"string","description":"Relative directory path inside workspace (default empty for root)"}},"required":[]}""",
+            maxStringLengths = mapOf("path" to 200),
+            returnContract = """{"path":"/","count":0,"items":[{"name":"file.txt","relative_path":"file.txt","is_directory":false,"size_bytes":128}]}""",
+        ),
+        AgentToolDefinition(
+            name = "read_workspace_file",
+            description = "Read the text contents of a workspace file up to 16,000 characters. Path traversal outside workspace is blocked.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{"path":{"type":"string","description":"Relative path to workspace file"}},"required":["path"]}""",
+            requiredArguments = setOf("path"),
+            maxStringLengths = mapOf("path" to 300),
+            returnContract = """{"path":"file.txt","content":"text","is_truncated":false,"file_size_bytes":128,"untrusted_data":true}""",
+        ),
+        AgentToolDefinition(
+            name = "search_workspace_files",
+            description = "Search text files in the workspace for lines matching a keyword or phrase.",
+            risk = AgentToolRisk.SAFE,
+            argumentSchema = """{"type":"object","properties":{"query":{"type":"string","description":"Search term or keyword"}},"required":["query"]}""",
+            requiredArguments = setOf("query"),
+            maxStringLengths = mapOf("query" to 200),
+            returnContract = """{"query":"term","file_count":0,"results":[{"path":"file.txt","matches":["1: match line"]}]}""",
         ),
 
         // Phase 4 — Voice I/O tools
@@ -730,12 +767,12 @@ object AgentToolProtocol {
     val toolGrammar = """
         root   ::= tool | prose
         tool   ::= "{" whitespace "\"tool_call\"" whitespace ":" whitespace "{" whitespace "\"name\"" whitespace ":" whitespace string whitespace "," whitespace "\"arguments\"" whitespace ":" whitespace object whitespace "," whitespace "\"reason\"" whitespace ":" whitespace string whitespace "}" whitespace "}"
-        prose  ::= [^{] [^\0]*
+        prose  ::= [^] +
 
         object ::= "{" whitespace (string whitespace ":" whitespace value (whitespace "," whitespace string whitespace ":" whitespace value)*)? whitespace "}"
         array  ::= "[" whitespace (value (whitespace "," whitespace value)*)? whitespace "]"
         value  ::= string | number | object | array | "true" | "false" | "null"
-        string ::= "\"" ([^"\\"] | "\\" [\"\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])* "\""
+        string ::= "\"" ([^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])* "\""
         number ::= "-"? ([0-9] | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
         whitespace ::= [ \t\n\r]*
     """.trimIndent()
@@ -848,13 +885,33 @@ object AgentToolProtocol {
             if (end != null) {
                 val candidate = text.substring(start, end + 1)
                 val json = runCatching { JSONObject(candidate) }.getOrNull()
-                if (json != null && (json.has(TOOL_SENTINEL) || json.has("name"))) {
-                    return json to start..end
+                if (json != null) {
+                    val isExplicitToolCall = json.has(TOOL_SENTINEL)
+                    val isGenericNameObj = json.has("name")
+                    val insideCodeBlock = isInsideCodeBlock(text, start)
+                    if (isExplicitToolCall || (isGenericNameObj && !insideCodeBlock)) {
+                        return json to start..end
+                    }
                 }
             }
             index = start + 1
         }
         return null
+    }
+
+    private fun isInsideCodeBlock(text: String, targetIndex: Int): Boolean {
+        var count = 0
+        var pos = 0
+        while (pos < targetIndex) {
+            val idx = text.indexOf("```", pos)
+            if (idx in 0 until targetIndex) {
+                count++
+                pos = idx + 3
+            } else {
+                break
+            }
+        }
+        return (count % 2) == 1
     }
 
     private fun findMatchingBraceEnd(text: String, start: Int): Int? {
@@ -895,12 +952,7 @@ object AgentToolProtocol {
         for (key in keysA) {
             val valA = a.opt(key)?.toString()?.trim() ?: ""
             val valB = b.opt(key)?.toString()?.trim() ?: ""
-            if (valA != valB) {
-                if (valA.length > 3 && valB.length > 3) {
-                    if (valA.contains(valB, ignoreCase = true) || valB.contains(valA, ignoreCase = true)) {
-                        return true
-                    }
-                }
+            if (!valA.equals(valB, ignoreCase = true)) {
                 return false
             }
         }

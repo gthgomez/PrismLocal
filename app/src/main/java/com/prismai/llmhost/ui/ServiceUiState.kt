@@ -68,6 +68,9 @@ class ServiceUiState {
     internal val _generationPerformance = MutableStateFlow<GenerationPerformance?>(null)
     val generationPerformance: StateFlow<GenerationPerformance?> = _generationPerformance.asStateFlow()
 
+    internal val _thermalGovernorState = MutableStateFlow(com.prismai.llmhost.util.ThermalGovernorState())
+    val thermalGovernorState: StateFlow<com.prismai.llmhost.util.ThermalGovernorState> = _thermalGovernorState.asStateFlow()
+
     // ── Benchmark ──────────────────────────────────────────────────────
 
     internal val _benchmarkRuns = MutableStateFlow<List<BenchmarkRun>>(emptyList())
@@ -99,6 +102,11 @@ class ServiceUiState {
 
     internal val _memories = MutableStateFlow<List<MemoryFact>>(emptyList())
     val memories: StateFlow<List<MemoryFact>> = _memories.asStateFlow()
+
+    // ── RAG / Vector Store ─────────────────────────────────────────────
+
+    internal val _vectorChunks = MutableStateFlow<List<com.prismai.llmhost.storage.VectorChunk>>(emptyList())
+    val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunk>> = _vectorChunks.asStateFlow()
 
     // ── Voice ──────────────────────────────────────────────────────────
 

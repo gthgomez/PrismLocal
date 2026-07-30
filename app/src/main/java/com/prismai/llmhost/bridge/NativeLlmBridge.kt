@@ -74,6 +74,9 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         topP: Float,
         repeatPenalty: Float,
         gpuLayers: Int,
+        kvCacheTypeK: String,
+        kvCacheTypeV: String,
+        enableFlashAttn: Boolean,
     ): Boolean
     private external fun nativeUnloadModel(handle: Long)
     private external fun nativeResetConversation(handle: Long)
@@ -115,7 +118,72 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     private external fun nativeGetState(handle: Long, genId: Int): Int
     private external fun nativeDrainDecodeAndState(handle: Long, genId: Int, maxTokens: Int, outResult: NativeDrainResult)
     private external fun nativeSetMemoryPressure(handle: Long, level: Int)
+    private external fun nativeSetThreadCount(handle: Long, threadCount: Int)
     private external fun nativeEncode(handle: Long, text: String): FloatArray
+    private external fun nativeLoadVisionProjector(handle: Long, path: String): Boolean
+    private external fun nativeApplyLoraAdapters(handle: Long, paths: Array<String>, scales: FloatArray): Boolean
+    private external fun nativeClearLoraAdapters(handle: Long)
+    private external fun nativeProcessImage(handle: Long, buffer: java.nio.ByteBuffer, width: Int, height: Int): Boolean
+    private external fun nativeGetBackendName(handle: Long): String
+    private external fun nativeGetGpuLayersOffloaded(handle: Long): Int
+    private external fun nativeIsKleidiAiEnabled(handle: Long): Boolean
+    private external fun nativeIsVulkanEnabled(handle: Long): Boolean
+    private external fun nativeLoadDraftModel(handle: Long, path: String, draftGpuLayers: Int): Boolean
+    private external fun nativeUnloadDraftModel(handle: Long)
+    private external fun nativeIsSpeculativeActive(handle: Long): Boolean
+    private external fun nativeGetSpeculativeAcceptanceRate(handle: Long): Float
+
+    suspend fun loadDraftModel(draftPath: String, draftGpuLayers: Int = 0): Boolean = modelMutex.withLock {
+        if (isDestroyed) return@withLock false
+        nativeLoadDraftModel(nativeHandle, draftPath, draftGpuLayers)
+    }
+
+    suspend fun unloadDraftModel() = modelMutex.withLock {
+        if (!isDestroyed) {
+            nativeUnloadDraftModel(nativeHandle)
+        }
+    }
+
+    suspend fun isSpeculativeActive(): Boolean = modelMutex.withLock {
+        if (isDestroyed) false else nativeIsSpeculativeActive(nativeHandle)
+    }
+
+    suspend fun getSpeculativeAcceptanceRate(): Float = modelMutex.withLock {
+        if (isDestroyed) 0.0f else nativeGetSpeculativeAcceptanceRate(nativeHandle)
+    }
+
+    suspend fun isVulkanEnabled(): Boolean = modelMutex.withLock {
+        if (isDestroyed) return@withLock false
+        nativeIsVulkanEnabled(nativeHandle)
+    }
+
+    suspend fun loadVisionProjector(path: String): Boolean = modelMutex.withLock {
+        if (isDestroyed) return@withLock false
+        nativeLoadVisionProjector(nativeHandle, path)
+    }
+
+    suspend fun processImage(buffer: java.nio.ByteBuffer, width: Int, height: Int): Boolean = modelMutex.withLock {
+        if (isDestroyed) return@withLock false
+        nativeProcessImage(nativeHandle, buffer, width, height)
+    }
+
+    suspend fun getBackendName(): String = modelMutex.withLock {
+        if (isDestroyed) "CPU" else nativeGetBackendName(nativeHandle)
+    }
+
+    suspend fun getGpuLayersOffloaded(): Int = modelMutex.withLock {
+        if (isDestroyed) 0 else nativeGetGpuLayersOffloaded(nativeHandle)
+    }
+
+    suspend fun isKleidiAiEnabled(): Boolean = modelMutex.withLock {
+        if (isDestroyed) false else nativeIsKleidiAiEnabled(nativeHandle)
+    }
+
+    suspend fun setThreadCount(threadCount: Int) {
+        if (!isDestroyed) {
+            nativeSetThreadCount(nativeHandle, threadCount)
+        }
+    }
 
     suspend fun loadModel(path: String, settings: GenerationSettings = GenerationSettings()): Boolean = modelMutex.withLock {
         if (isDestroyed) return@withLock false
@@ -173,6 +241,29 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         val h = nativeHandle
         if (h == 0L) return@withLock floatArrayOf()
         nativeEncode(h, text)
+    }
+
+    suspend fun applyLoraAdapters(adapters: List<Pair<String, Float>>): Boolean = modelMutex.withLock {
+        if (isDestroyed || nativeHandle == 0L) return@withLock false
+        val paths = adapters.map { it.first }.toTypedArray()
+        val scales = adapters.map { it.second }.toFloatArray()
+        nativeApplyLoraAdapters(nativeHandle, paths, scales)
+    }
+
+    suspend fun clearLoraAdapters() {
+        modelMutex.withLock {
+            if (!isDestroyed && nativeHandle != 0L) {
+                nativeClearLoraAdapters(nativeHandle)
+            }
+        }
+    }
+
+    suspend fun cancelGeneration(genId: Int = 0) {
+        genMutex.withLock {
+            if (!isDestroyed && nativeHandle != 0L) {
+                nativeCancelGeneration(nativeHandle, genId)
+            }
+        }
     }
 
     suspend fun destroySafely() {
@@ -267,7 +358,18 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
                     val normalizedText = Utf8TextPipeline.normalizeNativeText(text)
                     if (normalizedText.isNotEmpty() || tokenCount > 0) {
-                        trySend(GenerationChunk(normalizedText, tokenCount, genId, isTerminal = false, promptTokens = promptTokens))
+                        trySend(
+                            GenerationChunk(
+                                text = normalizedText,
+                                tokenCount = tokenCount,
+                                generationId = genId,
+                                isTerminal = false,
+                                promptTokens = promptTokens,
+                                ttftMs = reusableResult.ttftMs,
+                                tokensPerSec = reusableResult.tokensPerSec,
+                                activeThreads = reusableResult.activeThreads,
+                            )
+                        )
                     }
                 }
 
@@ -280,7 +382,19 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                         else -> "UNKNOWN"
                     }
                     observedTerminal = true
-                    trySend(GenerationChunk("", 0, genId, isTerminal = true, terminalReason = reason, promptTokens = promptTokens))
+                    trySend(
+                        GenerationChunk(
+                            text = "",
+                            tokenCount = 0,
+                            generationId = genId,
+                            isTerminal = true,
+                            terminalReason = reason,
+                            promptTokens = promptTokens,
+                            ttftMs = reusableResult.ttftMs,
+                            tokensPerSec = reusableResult.tokensPerSec,
+                            activeThreads = reusableResult.activeThreads,
+                        )
+                    )
                     break
                 }
 
@@ -376,6 +490,9 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
             settings.topP,
             settings.repeatPenalty,
             settings.gpuLayers,
+            settings.kvCacheTypeK,
+            settings.kvCacheTypeV,
+            settings.enableFlashAttn,
         )
 
     private fun nativeRunBenchmark(

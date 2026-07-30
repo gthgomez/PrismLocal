@@ -80,6 +80,7 @@ class HuggingFaceDownloadWorker(
         setDownloadProgress(entry, ModelDownloadState.Running.Stage.QUEUED, 0L, entry.expectedBytes, "Waiting for network")
 
         val downloadsDir = File(appContext.filesDir, "hf-downloads").also { it.mkdirs() }
+        cleanupStalePartialFiles(downloadsDir)
         val partialFile = File(downloadsDir, "${entry.id}.part")
 
         return try {
@@ -120,12 +121,15 @@ class HuggingFaceDownloadWorker(
                 }
             }
             when (importResult) {
-                is ModelStorageManager.ImportResult.Failure -> Result.failure(
-                    workDataOf(
-                        HuggingFaceDownloadWork.KEY_ENTRY_NAME to entry.name,
-                        HuggingFaceDownloadWork.KEY_MESSAGE to importResult.error.userMessage,
+                is ModelStorageManager.ImportResult.Failure -> {
+                    partialFile.delete()
+                    Result.failure(
+                        workDataOf(
+                            HuggingFaceDownloadWork.KEY_ENTRY_NAME to entry.name,
+                            HuggingFaceDownloadWork.KEY_MESSAGE to importResult.error.userMessage,
+                        )
                     )
-                )
+                }
                 is ModelStorageManager.ImportResult.Success -> {
                     partialFile.delete()
                     Result.success(
@@ -142,9 +146,7 @@ class HuggingFaceDownloadWorker(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            if (partialFile.length() == 0L) {
-                partialFile.delete()
-            }
+            partialFile.delete()
             Result.failure(
                 workDataOf(
                     HuggingFaceDownloadWork.KEY_ENTRY_ID to entry.id,
@@ -244,6 +246,7 @@ class HuggingFaceDownloadWorker(
             if (code == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE) {
                 if (expectedSize != null && existing == expectedSize) return
                 target.delete()
+                if (existing == 0L) throw IllegalStateException("HTTP 416: Invalid range requested for empty file")
                 return downloadResumable(entry, target, expectedSize)
             }
             if (code !in 200..299) {
@@ -408,9 +411,20 @@ class HuggingFaceDownloadWorker(
 fun enqueueHuggingFaceDownload(context: Context, entryId: String) {
     WorkManager.getInstance(context).enqueueUniqueWork(
         HuggingFaceDownloadWork.UNIQUE_WORK_NAME,
-        ExistingWorkPolicy.REPLACE,
+        ExistingWorkPolicy.KEEP,
         HuggingFaceDownloadWork.request(entryId),
     )
+}
+
+private fun cleanupStalePartialFiles(downloadsDir: File, maxAgeMs: Long = 24 * 3600 * 1000L) {
+    runCatching {
+        val now = System.currentTimeMillis()
+        downloadsDir.listFiles()?.forEach { file ->
+            if (file.name.endsWith(".part") && (now - file.lastModified() > maxAgeMs)) {
+                file.delete()
+            }
+        }
+    }
 }
 
 private val HEX_CHARS = "0123456789abcdef".toCharArray()

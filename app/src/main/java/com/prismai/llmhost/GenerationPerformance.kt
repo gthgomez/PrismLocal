@@ -16,6 +16,8 @@ data class GenerationPerformance(
     val tokensPerSecond: Double,
     val settings: GenerationSettings,
     val terminalReason: String? = null,
+    val ttftMs: Long = 0L,
+    val activeThreads: Int = 0,
 ) {
     val isComplete: Boolean = terminalReason != null
     // TODO: wire up promptTokens from native prompt_eval_done log line

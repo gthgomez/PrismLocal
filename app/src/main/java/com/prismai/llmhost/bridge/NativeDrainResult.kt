@@ -30,6 +30,10 @@ class NativeDrainResult {
     @JvmField var state: Int = 0
     @JvmField var promptTokens: Int = 0
 
+    @JvmField var ttftMs: Long = 0L
+    @JvmField var tokensPerSec: Float = 0.0f
+    @JvmField var activeThreads: Int = 0
+
     companion object {
         // Matches kTokenCapacity (2048) in Engine.cpp.
         // Drain call passes maxTokens=128, but this buffer must accommodate

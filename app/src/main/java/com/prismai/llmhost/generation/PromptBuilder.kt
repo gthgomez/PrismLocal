@@ -19,11 +19,11 @@ import java.util.ArrayDeque
  * Pure formatting logic — no Android lifecycle or coroutine dependencies.
  */
 class PromptBuilder(
-    private val memoryStore: SqlMemoryStore,
-    private val ragManager: RagManager,
+    private val memoryStore: MemoryStore,
+    private val ragManager: RagManager? = null,
 ) {
     companion object {
-        private const val MAX_PROMPT_CONTEXT_CHARS = 8_000
+        private const val DEFAULT_TOKEN_BUDGET = 3_072
     }
 
     // ── Memory context ──────────────────────────────────────────────────
@@ -37,9 +37,10 @@ class PromptBuilder(
 
     suspend fun buildRagContext(userPrompt: String): String {
         if (userPrompt.isBlank()) return ""
+        val rag = ragManager ?: return ""
         return runCatching {
-            val chunks = ragManager.query(userPrompt, topK = 3)
-            if (chunks.isEmpty()) "" else ragManager.buildRagContext(chunks, maxChars = 2000)
+            val chunks = rag.query(userPrompt, topK = 3)
+            if (chunks.isEmpty()) "" else rag.buildRagContext(chunks, maxChars = 2000)
         }.getOrDefault("")
     }
 
@@ -49,6 +50,7 @@ class PromptBuilder(
         newPrompt: String,
         transcript: List<TranscriptMessage>,
         activeAssistantTranscriptId: Long?,
+        tokenBudget: Int = DEFAULT_TOKEN_BUDGET,
     ): String {
         val memoryContext = buildMemoryContext(newPrompt)
         val history = transcript.filter { message ->
@@ -58,14 +60,16 @@ class PromptBuilder(
             return newPrompt
         }
         val selected = ArrayDeque<TranscriptMessage>()
-        var chars = newPrompt.length + memoryContext.length
+        var estimatedTokens = (newPrompt.length + memoryContext.length) / 4
         for (message in history.asReversed()) {
             val formatted = message.asPromptLine()
-            if (chars + formatted.length > MAX_PROMPT_CONTEXT_CHARS && selected.isNotEmpty()) {
+            val tokens = (formatted.length / 4) + 1
+            if (estimatedTokens + tokens <= tokenBudget || selected.isEmpty()) {
+                selected.addFirst(message)
+                estimatedTokens += tokens
+            } else {
                 break
             }
-            selected.addFirst(message)
-            chars += formatted.length
         }
         return buildString {
             appendLine("You are Assistant in a local Android chat. Use the recent conversation for context.")

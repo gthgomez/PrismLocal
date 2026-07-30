@@ -36,4 +36,6 @@ data class BenchmarkRun(
     val availableMemoryMb: Long?,
     val modelLoadMs: Long?,
     val terminalReason: String,
+    /** Short diagnostic for ERROR / QUALITY_ABORT / interrupt; null for clean EOF. */
+    val terminalDetail: String? = null,
 )

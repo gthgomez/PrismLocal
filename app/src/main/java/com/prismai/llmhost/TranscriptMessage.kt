@@ -18,4 +18,5 @@ data class TranscriptMessage(
     val role: TranscriptRole,
     val text: String,
     val summary: String? = null,
+    val regenerationHistory: List<String> = emptyList(),
 )

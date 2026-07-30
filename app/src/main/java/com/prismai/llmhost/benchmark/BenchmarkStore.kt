@@ -33,6 +33,59 @@ class BenchmarkStore(
         private const val MAX_BENCHMARK_RUNS = 250
         private const val TAG = "BenchmarkStore"
 
+        /** Export JSON schema id; bump when column/field set changes. */
+        const val JSON_SCHEMA = "prism-local-benchmarks-v4"
+
+        /** Shared CSV header contract — used by [csv] and unit tests. */
+        val CSV_COLUMNS: List<String> = listOf(
+            "created_at_ms", "model_id", "source", "preset_id", "preset_name",
+            "prompt_chars", "output_chars", "prompt_eval_ms", "decode_ms", "total_ms",
+            "generated_tokens", "tokens_per_second", "max_tokens", "thread_count",
+            "context_length", "batch_size", "temperature", "top_k", "top_p",
+            "repeat_penalty", "gpu_layers", "runtime_backend", "model_bytes",
+            "model_sha256_prefix", "available_memory_mb", "model_load_ms", "terminal_reason",
+            "terminal_detail",
+        )
+
+        fun csvHeader(): String = CSV_COLUMNS.joinToString(",")
+
+        /**
+         * Pure JSON → [BenchmarkRun] parse for load path and unit tests.
+         * Missing `terminal_detail` yields null (legacy v3 rows).
+         */
+        fun parseRun(item: JSONObject, index: Int = 0): BenchmarkRun =
+            BenchmarkRun(
+                id = item.optString("id", "bench_${item.optLong("created_at_ms", 0L)}_$index"),
+                createdAt = item.optLong("created_at_ms", 0L),
+                modelId = item.optString("model_id").takeIf { it.isNotBlank() },
+                source = item.optString("source", "chat"),
+                presetId = item.optString("preset_id").takeIf { it.isNotBlank() },
+                presetName = item.optString("preset_name").takeIf { it.isNotBlank() },
+                promptChars = item.optInt("prompt_chars", 0),
+                outputChars = item.optInt("output_chars", 0),
+                promptEvalMs = item.optLong("prompt_eval_ms", 0L),
+                decodeMs = item.optLong("decode_ms", 0L),
+                totalMs = item.optLong("total_ms", 0L),
+                generatedTokens = item.optInt("generated_tokens", 0),
+                tokensPerSecond = item.optDouble("tokens_per_second", 0.0),
+                maxTokens = item.optInt("max_tokens", GenerationSettings.DEFAULT_MAX_TOKENS),
+                threadCount = item.optInt("thread_count", GenerationSettings.DEFAULT_THREAD_COUNT),
+                contextLength = item.optInt("context_length", GenerationSettings.DEFAULT_CONTEXT_LENGTH),
+                batchSize = item.optInt("batch_size", GenerationSettings.DEFAULT_BATCH_SIZE),
+                temperature = item.optDouble("temperature", GenerationSettings.DEFAULT_TEMPERATURE.toDouble()).toFloat(),
+                topK = item.optInt("top_k", GenerationSettings.DEFAULT_TOP_K),
+                topP = item.optDouble("top_p", GenerationSettings.DEFAULT_TOP_P.toDouble()).toFloat(),
+                repeatPenalty = item.optDouble("repeat_penalty", GenerationSettings.DEFAULT_REPEAT_PENALTY.toDouble()).toFloat(),
+                gpuLayers = item.optInt("gpu_layers", GenerationSettings.DEFAULT_GPU_LAYERS),
+                runtimeBackend = item.optString("runtime_backend", "unknown"),
+                modelBytes = item.optLongOrNull("model_bytes"),
+                modelSha256Prefix = item.optString("model_sha256_prefix").takeIf { it.isNotBlank() },
+                availableMemoryMb = item.optLongOrNull("available_memory_mb"),
+                modelLoadMs = item.optLongOrNull("model_load_ms"),
+                terminalReason = item.optString("terminal_reason", "UNKNOWN"),
+                terminalDetail = item.optString("terminal_detail").takeIf { it.isNotBlank() },
+            )
+
         private fun csvCell(value: String): String {
             val escaped = value.replace("\"", "\"\"")
             return if (escaped.any { it == ',' || it == '"' || it == '\n' || it == '\r' }) {
@@ -58,6 +111,7 @@ class BenchmarkStore(
                 .put("model_bytes", modelBytes).put("model_sha256_prefix", modelSha256Prefix)
                 .put("available_memory_mb", availableMemoryMb).put("model_load_ms", modelLoadMs)
                 .put("terminal_reason", terminalReason)
+                .put("terminal_detail", terminalDetail ?: JSONObject.NULL)
 
         private fun JSONObject.optLongOrNull(name: String): Long? =
             if (has(name) && !isNull(name)) optLong(name) else null
@@ -74,7 +128,13 @@ class BenchmarkStore(
 
     // ── Recording ───────────────────────────────────────────────────────
 
-    fun record(prompt: String, output: String, performance: GenerationPerformance, terminalReason: String) {
+    fun record(
+        prompt: String,
+        output: String,
+        performance: GenerationPerformance,
+        terminalReason: String,
+        terminalDetail: String? = null,
+    ) {
         val now = System.currentTimeMillis()
         val preset = metrics.activeBenchmarkPreset
         val activeModel = uiState.activeModelInfo.value
@@ -100,6 +160,7 @@ class BenchmarkStore(
             modelBytes = activeModel?.bytes, modelSha256Prefix = activeModel?.sha256?.take(12),
             availableMemoryMb = memory.availableMb, modelLoadMs = loadMs,
             terminalReason = terminalReason,
+            terminalDetail = terminalDetail?.takeIf { it.isNotBlank() }?.take(400),
         )
         uiState._benchmarkRuns.value = (uiState.benchmarkRuns.value + run)
             .sortedByDescending { it.createdAt }.take(MAX_BENCHMARK_RUNS)
@@ -137,6 +198,7 @@ class BenchmarkStore(
                 ?.takeIf { it.modelId == uiState.currentModel.value && it.state in setOf("loaded", "current") }
                 ?.loadMs,
             terminalReason = "NATIVE_PP_TG",
+            terminalDetail = null,
         )
         uiState._benchmarkRuns.value = (uiState.benchmarkRuns.value + run)
             .sortedByDescending { it.createdAt }.take(MAX_BENCHMARK_RUNS)
@@ -144,6 +206,11 @@ class BenchmarkStore(
         onRefreshReadiness()
     }
 
+    /**
+     * Record a benchmark interrupted by service cancel/session bump.
+     * UI stop ("user cancel" / "user cancellation") stores [terminalDetail] = `user_stop`
+     * so analytics align with in-flow CANCELLED + user_stop taxonomy.
+     */
     fun recordInterrupted(reason: String, streamSnapshot: String) {
         if (metrics.activeBenchmarkPreset == null) return
         val prompt = metrics.activePrompt ?: return
@@ -156,7 +223,17 @@ class BenchmarkStore(
             settings = settings, terminalReason = terminalReason,
             promptTokens = metrics.activePromptTokens,
         )
-        record(prompt, streamSnapshot, performance, terminalReason)
+        val detail = if (isUserCancelReason(reason)) {
+            "user_stop"
+        } else {
+            "interrupted:$reason"
+        }
+        record(prompt, streamSnapshot, performance, terminalReason, terminalDetail = detail)
+    }
+
+    private fun isUserCancelReason(reason: String): Boolean {
+        val lower = reason.lowercase(Locale.US)
+        return lower.contains("user cancel") || lower == "user cancellation"
     }
 
     // ── Persistence ─────────────────────────────────────────────────────
@@ -168,37 +245,7 @@ class BenchmarkStore(
             val array = JSONArray(file.readText())
             buildList {
                 for (index in 0 until array.length()) {
-                    val item = array.getJSONObject(index)
-                    add(BenchmarkRun(
-                        id = item.optString("id", "bench_${item.optLong("created_at_ms", 0L)}_$index"),
-                        createdAt = item.optLong("created_at_ms", 0L),
-                        modelId = item.optString("model_id").takeIf { it.isNotBlank() },
-                        source = item.optString("source", "chat"),
-                        presetId = item.optString("preset_id").takeIf { it.isNotBlank() },
-                        presetName = item.optString("preset_name").takeIf { it.isNotBlank() },
-                        promptChars = item.optInt("prompt_chars", 0),
-                        outputChars = item.optInt("output_chars", 0),
-                        promptEvalMs = item.optLong("prompt_eval_ms", 0L),
-                        decodeMs = item.optLong("decode_ms", 0L),
-                        totalMs = item.optLong("total_ms", 0L),
-                        generatedTokens = item.optInt("generated_tokens", 0),
-                        tokensPerSecond = item.optDouble("tokens_per_second", 0.0),
-                        maxTokens = item.optInt("max_tokens", GenerationSettings.DEFAULT_MAX_TOKENS),
-                        threadCount = item.optInt("thread_count", GenerationSettings.DEFAULT_THREAD_COUNT),
-                        contextLength = item.optInt("context_length", GenerationSettings.DEFAULT_CONTEXT_LENGTH),
-                        batchSize = item.optInt("batch_size", GenerationSettings.DEFAULT_BATCH_SIZE),
-                        temperature = item.optDouble("temperature", GenerationSettings.DEFAULT_TEMPERATURE.toDouble()).toFloat(),
-                        topK = item.optInt("top_k", GenerationSettings.DEFAULT_TOP_K),
-                        topP = item.optDouble("top_p", GenerationSettings.DEFAULT_TOP_P.toDouble()).toFloat(),
-                        repeatPenalty = item.optDouble("repeat_penalty", GenerationSettings.DEFAULT_REPEAT_PENALTY.toDouble()).toFloat(),
-                        gpuLayers = item.optInt("gpu_layers", GenerationSettings.DEFAULT_GPU_LAYERS),
-                        runtimeBackend = item.optString("runtime_backend", "unknown"),
-                        modelBytes = item.optLongOrNull("model_bytes"),
-                        modelSha256Prefix = item.optString("model_sha256_prefix").takeIf { it.isNotBlank() },
-                        availableMemoryMb = item.optLongOrNull("available_memory_mb"),
-                        modelLoadMs = item.optLongOrNull("model_load_ms"),
-                        terminalReason = item.optString("terminal_reason", "UNKNOWN"),
-                    ))
+                    add(parseRun(array.getJSONObject(index), index))
                 }
             }.sortedByDescending { it.createdAt }.take(MAX_BENCHMARK_RUNS)
         }.onFailure { error -> Log.w(TAG, "failed to load benchmark runs", error) }
@@ -220,14 +267,7 @@ class BenchmarkStore(
     // ── Export ──────────────────────────────────────────────────────────
 
     fun csv(): String {
-        val header = listOf(
-            "created_at_ms", "model_id", "source", "preset_id", "preset_name",
-            "prompt_chars", "output_chars", "prompt_eval_ms", "decode_ms", "total_ms",
-            "generated_tokens", "tokens_per_second", "max_tokens", "thread_count",
-            "context_length", "batch_size", "temperature", "top_k", "top_p",
-            "repeat_penalty", "gpu_layers", "runtime_backend", "model_bytes",
-            "model_sha256_prefix", "available_memory_mb", "model_load_ms", "terminal_reason",
-        ).joinToString(",")
+        val header = csvHeader()
         val rows = uiState.benchmarkRuns.value.sortedBy { it.createdAt }
             .joinToString("\n") { run ->
                 listOf(
@@ -247,6 +287,7 @@ class BenchmarkStore(
                     run.modelBytes?.toString().orEmpty(), csvCell(run.modelSha256Prefix.orEmpty()),
                     run.availableMemoryMb?.toString().orEmpty(), run.modelLoadMs?.toString().orEmpty(),
                     csvCell(run.terminalReason),
+                    csvCell(run.terminalDetail.orEmpty()),
                 ).joinToString(",")
             }
         return if (rows.isBlank()) "$header\n" else "$header\n$rows\n"
@@ -257,7 +298,7 @@ class BenchmarkStore(
         uiState.benchmarkRuns.value.sortedBy { it.createdAt }
             .forEach { run -> array.put(run.toJson()) }
         return JSONObject()
-            .put("schema", "prism-local-benchmarks-v3")
+            .put("schema", JSON_SCHEMA)
             .put("exported_at_ms", System.currentTimeMillis())
             .put("runs", array).toString(2)
     }

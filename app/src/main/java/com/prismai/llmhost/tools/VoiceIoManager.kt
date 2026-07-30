@@ -45,6 +45,7 @@ class VoiceIoManager(private val context: Context) {
     var onSpeechResult: ((String) -> Unit)? = null
     var onSpeechError: ((String) -> Unit)? = null
     var onSpeechPartialResult: ((String) -> Unit)? = null
+    var onRmsDbChanged: ((Float) -> Unit)? = null
     var onTtsDone: (() -> Unit)? = null
 
     /** Initialize TTS engine. Returns true if initialization succeeded or is pending. */
@@ -89,7 +90,7 @@ class VoiceIoManager(private val context: Context) {
             }
 
             override fun onRmsChanged(rmsdB: Float) {
-                // Not used
+                mainHandler.post { onRmsDbChanged?.invoke(rmsdB) }
             }
 
             override fun onBufferReceived(buffer: ByteArray?) {
@@ -205,6 +206,18 @@ class VoiceIoManager(private val context: Context) {
         return true
     }
 
+    /** Queue text for speech output without flushing existing queued utterances. */
+    fun speakQueueAdd(text: String): Boolean {
+        val engine = tts
+        if (!ttsInitialized || engine == null) {
+            Log.w(TAG, "TTS not initialized")
+            return false
+        }
+
+        val result = engine.speak(text, TextToSpeech.QUEUE_ADD, null, "${TTS_UTTERANCE_ID}_${System.currentTimeMillis()}")
+        return result == TextToSpeech.SUCCESS
+    }
+
     /** Stop any active speech output */
     fun stopSpeaking() {
         tts?.stop()
@@ -240,4 +253,5 @@ data class VoiceState(
     val sttAvailable: Boolean = false,
     val ttsAvailable: Boolean = false,
     val partialTranscript: String? = null,
+    val rmsDb: Float = 0f,
 )

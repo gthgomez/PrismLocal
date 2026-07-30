@@ -48,7 +48,9 @@ class BenchmarkRunner(
             eventBus.publish("Stop the current generation before running a benchmark")
             return
         }
-        orchestrator.generate(prompt = preset.prompt, benchmarkPreset = preset)
+        scope.launch {
+            orchestrator.generate(prompt = preset.prompt, benchmarkPreset = preset)
+        }
     }
 
     fun runThreadSweep() {
@@ -94,7 +96,9 @@ class BenchmarkRunner(
 
     fun runNextQueued() {
         val next = queue.pollFirst() ?: return
-        orchestrator.generate(prompt = next.prompt, benchmarkPreset = next)
+        scope.launch {
+            orchestrator.generate(prompt = next.prompt, benchmarkPreset = next)
+        }
     }
 
     fun cancelGeneration() {

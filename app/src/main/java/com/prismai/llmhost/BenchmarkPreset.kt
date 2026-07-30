@@ -13,8 +13,28 @@ data class BenchmarkPreset(
     val prompt: String,
     val threadCountOverride: Int? = null,
     val maxTokensOverride: Int? = null,
+    val temperatureOverride: Float? = null,
+    val topPOverride: Float? = null,
+    val topKOverride: Int? = null,
+    val repeatPenaltyOverride: Float? = null,
+    /** When true, mid-stream QualityGuard may stop degenerate output (slice B3). */
+    val enableQualityGuard: Boolean = false,
     val suiteId: String? = null,
-)
+) {
+    /**
+     * Applies non-null preset overrides on top of [base] for a single generation.
+     * Does not mutate persisted user settings — call sites must keep the result local.
+     */
+    fun applySettingsOverrides(base: GenerationSettings): GenerationSettings =
+        base.copy(
+            maxTokens = maxTokensOverride ?: base.maxTokens,
+            threadCount = threadCountOverride ?: base.threadCount,
+            temperature = temperatureOverride ?: base.temperature,
+            topP = topPOverride ?: base.topP,
+            topK = topKOverride ?: base.topK,
+            repeatPenalty = repeatPenaltyOverride ?: base.repeatPenalty,
+        ).clamped()
+}
 
 data class BenchmarkStatus(
     val isRunning: Boolean = false,
@@ -27,6 +47,13 @@ object BenchmarkPresets {
     private const val THREAD_SWEEP_PROMPT =
         "Benchmark thread scaling. Reply with one concise paragraph about local LLM performance on Android."
 
+    /** Coding preset token cap (plan B1: 256–384 band). */
+    const val CODING_MAX_TOKENS = 320
+    const val CODING_TEMPERATURE = 0.25f
+    const val CODING_TOP_P = 0.90f
+    const val CODING_TOP_K = 40
+    const val CODING_REPEAT_PENALTY = 1.18f
+
     val defaults: List<BenchmarkPreset> = listOf(
         BenchmarkPreset(
             id = "short_answer",
@@ -37,6 +64,12 @@ object BenchmarkPresets {
             id = "coding",
             name = "Python Coding",
             prompt = "Write a small Python function that returns the median value from a list of int values, include type hints, and explain the edge cases.",
+            maxTokensOverride = CODING_MAX_TOKENS,
+            temperatureOverride = CODING_TEMPERATURE,
+            topPOverride = CODING_TOP_P,
+            topKOverride = CODING_TOP_K,
+            repeatPenaltyOverride = CODING_REPEAT_PENALTY,
+            enableQualityGuard = true,
         ),
         BenchmarkPreset(
             id = "json",

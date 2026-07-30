@@ -43,7 +43,30 @@ class ModelManager(
 
     fun listModels(): List<String> = modelStorageManager.listInstalledModels()
 
-    suspend fun switchModel(modelId: String): Boolean {
+    suspend fun deleteModel(modelId: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        Log.d(TAG, "deleteModel requested modelId=$modelId")
+        if (uiState._currentModel.value == modelId) {
+            engine.unloadModel()
+            uiState.streamState.clear()
+            uiState._currentModel.value = null
+            uiState._activeModelInfo.value = null
+            uiState._runtimeStatus.value = RuntimeStatus.IDLE
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_ACTIVE_MODEL)
+                .apply()
+        }
+        val deleted = modelStorageManager.deleteModel(modelId)
+        if (deleted) {
+            eventBus.publish("Deleted model $modelId")
+            onRefreshReadiness()
+        } else {
+            eventBus.publish("Failed to delete model $modelId")
+        }
+        deleted
+    }
+
+    suspend fun switchModel(modelId: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         Log.d(TAG, "switchModel requested modelId=$modelId")
         uiState._runtimeStatus.value = RuntimeStatus.LOADING_MODEL
         val loadStartedAt = SystemClock.elapsedRealtime()
@@ -58,7 +81,7 @@ class ModelManager(
             message = "Loading model",
         )
 
-        return when (val resolved = modelStorageManager.resolveActiveModel(modelId, verifyHash = false)) {
+        when (val resolved = modelStorageManager.resolveActiveModel(modelId, verifyHash = false)) {
             is ModelStorageManager.ModelResolveResult.Failure -> {
                 if (uiState._currentModel.value == modelId) {
                     engine.unloadModel()
@@ -95,7 +118,7 @@ class ModelManager(
                         lowMemory = memory.lowMemory,
                         message = "Model already loaded",
                     )
-                    return true
+                    return@withContext true
                 }
                 val loadRejection = nativeLoadRejection(activeModel)
                 if (loadRejection != null) {
@@ -111,7 +134,7 @@ class ModelManager(
                         message = loadRejection.message,
                     )
                     eventBus.publish(loadRejection.message)
-                    return false
+                    return@withContext false
                 }
                 Log.d(TAG, "unloadModel before switch modelId=$modelId current=${uiState._currentModel.value}")
                 engine.unloadModel()
@@ -121,6 +144,9 @@ class ModelManager(
                 Log.d(TAG, "switchModel path=${activeModel.file.absolutePath} result=$loaded")
                 if (loaded) {
                     val memory = deviceProfiler.deviceMemorySnapshot()
+                    val backendName = engine.getBackendName()
+                    val gpuLayersOffloaded = engine.getGpuLayersOffloaded()
+                    val isKleidiAiEnabled = engine.isKleidiAiEnabled()
                     uiState._currentModel.value = modelId
                     uiState._activeModelInfo.value = activeModel
                     chatManager.touchCurrentChat(uiState._transcript.value, updateTitle = false)
@@ -132,7 +158,10 @@ class ModelManager(
                         modelBytes = activeModel.bytes,
                         availableMemoryMb = memory.availableMb,
                         lowMemory = memory.lowMemory,
-                        message = "Model loaded",
+                        message = "Model loaded ($backendName)",
+                        gpuLayersOffloaded = gpuLayersOffloaded,
+                        backendName = backendName,
+                        isKleidiAiEnabled = isKleidiAiEnabled,
                     )
                     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                         .edit()
@@ -170,7 +199,7 @@ class ModelManager(
             ModelLoadLimits.HARD_CAP_BYTES,
             (availableAfterCurrentUnload - reserve).coerceAtLeast(0L),
         )
-        val allowed = fit.rating != ModelFitRating.TOO_LARGE && model.bytes <= budget
+        val allowed = (fit.rating != ModelFitRating.TOO_LARGE || fit.reason.startsWith("Proven usable") || model.bytes <= (availableAfterCurrentUnload * 0.90).toLong()) && model.bytes <= ModelLoadLimits.HARD_CAP_BYTES
         if (!allowed) {
             Log.w(
                 TAG,

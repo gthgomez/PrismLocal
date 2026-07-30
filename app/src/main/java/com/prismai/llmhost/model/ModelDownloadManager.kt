@@ -60,6 +60,15 @@ class ModelDownloadManager(
         enqueueHuggingFaceDownload(context, entry.id)
     }
 
+    fun downloadCustomHuggingFaceModel(repoId: String, fileName: String) {
+        if (repoId.isBlank() || fileName.isBlank()) {
+            eventBus.publish("Repository ID and filename are required")
+            return
+        }
+        val entry = HuggingFaceModelCatalog.createCustomEntry(repoId, fileName)
+        downloadHuggingFaceModel(entry.id)
+    }
+
     fun observeDownloadWork() {
         downloadObserverJob?.cancel()
         downloadObserverJob = WorkManager.getInstance(context)

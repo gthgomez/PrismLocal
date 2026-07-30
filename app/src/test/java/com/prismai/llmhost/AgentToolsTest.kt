@@ -122,10 +122,10 @@ class AgentToolsTest {
         // Exact and whitespace normalized match
         assertTrue(AgentToolProtocol.areArgumentsSimilar(json1, json2))
 
-        // Semantic substring match
+        // Substring / version variations should be recognized as NOT similar
         val json3 = org.json.JSONObject().put("query", "llama 3")
         val json4 = org.json.JSONObject().put("query", "llama 3.1")
-        assertTrue(AgentToolProtocol.areArgumentsSimilar(json3, json4))
+        assertFalse(AgentToolProtocol.areArgumentsSimilar(json3, json4))
 
         // Different query terms should be rejected
         val json5 = org.json.JSONObject().put("query", "alpaca")

@@ -206,6 +206,28 @@ internal fun RuntimeControls(
                 },
             )
             SettingSlider(
+                label = "Top K",
+                valueText = settings.topK.toString(),
+                value = settings.topK.toFloat(),
+                valueRange = GenerationSettings.MIN_TOP_K.toFloat()..GenerationSettings.MAX_TOP_K.toFloat(),
+                steps = GenerationSettings.MAX_TOP_K - GenerationSettings.MIN_TOP_K - 1,
+                enabled = enabled,
+                onValueChange = { value ->
+                    onSettingsChange(settings.copy(topK = value.roundToInt()))
+                },
+            )
+            SettingSlider(
+                label = "Repeat penalty",
+                valueText = String.format(Locale.US, "%.2f", settings.repeatPenalty),
+                value = settings.repeatPenalty,
+                valueRange = GenerationSettings.MIN_REPEAT_PENALTY..GenerationSettings.MAX_REPEAT_PENALTY,
+                steps = 49,
+                enabled = enabled,
+                onValueChange = { value ->
+                    onSettingsChange(settings.copy(repeatPenalty = value))
+                },
+            )
+            SettingSlider(
                 label = "GPU layers",
                 valueText = settings.gpuLayers.toString(),
                 value = settings.gpuLayers.toFloat(),
@@ -215,6 +237,12 @@ internal fun RuntimeControls(
                 onValueChange = { value ->
                     onSettingsChange(settings.copy(gpuLayers = value.roundToInt()))
                 },
+            )
+            Text(
+                text = "Offloaded GPU layer count. Applies on next model load.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
             )
         }
         performance?.let { stats ->

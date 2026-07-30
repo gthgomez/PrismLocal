@@ -7,6 +7,7 @@ import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -37,15 +38,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 // ---------------------------------------------------------------------------
-// Table color tokens
+// Table rendering helper
 // ---------------------------------------------------------------------------
-private val TableBorderColor = Color(0xFF334155)     // PrismSlate-ish
-private val TableHeaderBg   = Color(0xFF1E293B)      // dark slate background for header
-private val TableHeaderText = Color(0xFFF8FAFC)      // white-ish
-private val TableRowEvenBg  = Color(0xFFF8FAFC)      // very light (matches PrismCanvas)
-private val TableRowOddBg   = Color(0xFFF1F5F9)      // slightly darker
-private val TableCellText   = Color(0xFF0F172A)      // PrismText
-private val TableContainerBg = Color(0xDFFFFFFF)     // PrismGlass
 
 // ---------------------------------------------------------------------------
 // ParsedTable data class
@@ -203,7 +197,7 @@ fun MarkdownTable(
         Text(
             text = markdown,
             style = MaterialTheme.typography.bodyMedium,
-            color = TableCellText,
+            color = MaterialTheme.colorScheme.onSurface,
         )
         return
     }
@@ -211,8 +205,9 @@ fun MarkdownTable(
     Surface(
         modifier = modifier.padding(vertical = 6.dp),
         shape = RoundedCornerShape(8.dp),
-        color = TableContainerBg,
-        contentColor = TableCellText,
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
         tonalElevation = 0.dp,
         shadowElevation = 0.dp,
     ) {
@@ -252,11 +247,20 @@ private fun TableRow(
     rowIndex: Int,
 ) {
     val rowBg = if (isHeader) {
-        TableHeaderBg
+        MaterialTheme.colorScheme.primaryContainer
     } else {
-        if (rowIndex % 2 == 0) TableRowEvenBg else TableRowOddBg
+        if (rowIndex % 2 == 0) {
+            MaterialTheme.colorScheme.surface
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+        }
     }
-    val textColor = if (isHeader) TableHeaderText else TableCellText
+    val textColor = if (isHeader) {
+        MaterialTheme.colorScheme.onPrimaryContainer
+    } else {
+        MaterialTheme.colorScheme.onSurface
+    }
+    val borderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
 
     Row(
         modifier = Modifier
@@ -277,7 +281,7 @@ private fun TableRow(
                         if (!isLast) {
                             Modifier.border(
                                 width = 0.5.dp,
-                                color = TableBorderColor.copy(alpha = 0.20f),
+                                color = borderColor,
                             )
                         } else {
                             Modifier

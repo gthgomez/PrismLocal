@@ -38,12 +38,17 @@ class GenerationMetrics(private val uiState: ServiceUiState) {
         settings: GenerationSettings,
         terminalReason: String?,
         promptTokens: Int = 0,
+        ttftMs: Long = 0L,
+        activeThreads: Int = 0,
+        ndkTps: Float = 0.0f,
     ): GenerationPerformance {
         val firstTokenOrNow = firstTokenAt ?: now
-        val promptEvalMs = (firstTokenOrNow - startedAt).coerceAtLeast(0L)
+        val promptEvalMs = if (ttftMs > 0L) ttftMs else (firstTokenOrNow - startedAt).coerceAtLeast(0L)
         val decodeMs = (now - firstTokenOrNow).coerceAtLeast(0L)
         val totalMs = (now - startedAt).coerceAtLeast(0L)
-        val tokensPerSecond = if (decodeMs > 0L && generatedTokens > 0) {
+        val tokensPerSecond = if (ndkTps > 0.0f) {
+            ndkTps.toDouble()
+        } else if (decodeMs > 0L && generatedTokens > 0) {
             generatedTokens * 1000.0 / decodeMs
         } else {
             0.0
@@ -57,6 +62,8 @@ class GenerationMetrics(private val uiState: ServiceUiState) {
             tokensPerSecond = tokensPerSecond,
             settings = settings,
             terminalReason = terminalReason,
+            ttftMs = promptEvalMs,
+            activeThreads = activeThreads,
         )
         uiState._generationPerformance.value = performance
         return performance

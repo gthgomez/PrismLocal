@@ -27,6 +27,13 @@ class EngineConfigStore(private val prefs: SharedPreferences) {
         repeatPenalty = prefs.getFloat(KEY_REPEAT_PENALTY, GenerationSettings.DEFAULT_REPEAT_PENALTY),
         gpuLayers = prefs.getInt(KEY_GPU_LAYERS, GenerationSettings.DEFAULT_GPU_LAYERS),
         agentEnabled = prefs.getBoolean(KEY_AGENT_ENABLED, false),
+        useSpeculative = prefs.getBoolean(KEY_USE_SPECULATIVE, false),
+        draftModelPath = prefs.getString(KEY_DRAFT_MODEL_PATH, "") ?: "",
+        nDraft = prefs.getInt(KEY_N_DRAFT, 5),
+        draftGpuLayers = prefs.getInt(KEY_DRAFT_GPU_LAYERS, 0),
+        kvCacheTypeK = prefs.getString(KEY_KV_CACHE_TYPE_K, "q8_0") ?: "q8_0",
+        kvCacheTypeV = prefs.getString(KEY_KV_CACHE_TYPE_V, "q8_0") ?: "q8_0",
+        enableFlashAttn = prefs.getBoolean(KEY_ENABLE_FLASH_ATTN, true),
     ).clamped()
 
     fun save(settings: GenerationSettings) {
@@ -41,6 +48,13 @@ class EngineConfigStore(private val prefs: SharedPreferences) {
             .putFloat(KEY_REPEAT_PENALTY, settings.repeatPenalty)
             .putInt(KEY_GPU_LAYERS, settings.gpuLayers)
             .putBoolean(KEY_AGENT_ENABLED, settings.agentEnabled)
+            .putBoolean(KEY_USE_SPECULATIVE, settings.useSpeculative)
+            .putString(KEY_DRAFT_MODEL_PATH, settings.draftModelPath)
+            .putInt(KEY_N_DRAFT, settings.nDraft)
+            .putInt(KEY_DRAFT_GPU_LAYERS, settings.draftGpuLayers)
+            .putString(KEY_KV_CACHE_TYPE_K, settings.kvCacheTypeK)
+            .putString(KEY_KV_CACHE_TYPE_V, settings.kvCacheTypeV)
+            .putBoolean(KEY_ENABLE_FLASH_ATTN, settings.enableFlashAttn)
             .apply()
     }
 
@@ -55,10 +69,24 @@ class EngineConfigStore(private val prefs: SharedPreferences) {
         const val KEY_REPEAT_PENALTY = "repeat_penalty"
         const val KEY_GPU_LAYERS = "gpu_layers"
         const val KEY_AGENT_ENABLED = "agent_enabled"
+        const val KEY_USE_SPECULATIVE = "use_speculative"
+        const val KEY_DRAFT_MODEL_PATH = "draft_model_path"
+        const val KEY_N_DRAFT = "n_draft"
+        const val KEY_DRAFT_GPU_LAYERS = "draft_gpu_layers"
+        const val KEY_KV_CACHE_TYPE_K = "kv_cache_type_k"
+        const val KEY_KV_CACHE_TYPE_V = "kv_cache_type_v"
+        const val KEY_ENABLE_FLASH_ATTN = "enable_flash_attn"
 
         fun requiresReload(previous: GenerationSettings, next: GenerationSettings): Boolean =
             previous.contextLength != next.contextLength ||
                 previous.batchSize != next.batchSize ||
-                previous.gpuLayers != next.gpuLayers
+                previous.gpuLayers != next.gpuLayers ||
+                previous.useSpeculative != next.useSpeculative ||
+                previous.draftModelPath != next.draftModelPath ||
+                previous.nDraft != next.nDraft ||
+                previous.draftGpuLayers != next.draftGpuLayers ||
+                previous.kvCacheTypeK != next.kvCacheTypeK ||
+                previous.kvCacheTypeV != next.kvCacheTypeV ||
+                previous.enableFlashAttn != next.enableFlashAttn
     }
 }

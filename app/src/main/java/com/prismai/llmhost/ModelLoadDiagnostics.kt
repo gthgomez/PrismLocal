@@ -15,5 +15,8 @@ data class ModelLoadDiagnostics(
     val availableMemoryMb: Long?,
     val lowMemory: Boolean,
     val message: String?,
+    val gpuLayersOffloaded: Int = 0,
+    val backendName: String = "CPU",
+    val isKleidiAiEnabled: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
 )

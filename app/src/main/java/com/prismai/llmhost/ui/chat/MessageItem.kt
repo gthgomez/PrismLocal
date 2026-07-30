@@ -35,6 +35,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import android.view.HapticFeedbackConstants
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -52,24 +54,25 @@ internal fun MessageBubble(
     performance: GenerationPerformance? = null,
 ) {
     val bubbleColor = if (isUser) {
-        UserBubble
+        userBubbleColor()
     } else {
-        Color.White.copy(alpha = 0.76f)
+        assistantBubbleColor()
     }
     val alignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
     val labelColor = if (isUser) PrismBlue else PrismViolet
     val context = LocalContext.current
+    val view = LocalView.current
     val copyLabel = if (isUser) "prompt" else "response"
 
     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = alignment) {
         Column(
             modifier = Modifier
-                .fillMaxWidth(if (isUser) 0.78f else 0.94f)
+                .fillMaxWidth(if (isUser) 0.82f else 0.94f)
                 .background(
                     color = bubbleColor,
-                    shape = RoundedCornerShape(if (isUser) 28.dp else 32.dp),
+                    shape = RoundedCornerShape(24.dp),
                 )
-                .padding(if (isUser) 18.dp else 16.dp)
+                .padding(16.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -102,23 +105,22 @@ internal fun MessageBubble(
                     )
                 }
                 Spacer(modifier = Modifier.weight(1f))
-                if (!isUser) {
-                    TextButton(
-                        modifier = Modifier.widthIn(min = 56.dp),
-                        enabled = text.isNotBlank(),
-                        onClick = {
-                            copyTextToClipboard(context, label, text)
-                            Toast.makeText(context, "Copied $copyLabel", Toast.LENGTH_SHORT).show()
-                        },
-                    ) {
-                        Text("Copy", maxLines = 1, softWrap = false)
-                    }
+                TextButton(
+                    modifier = Modifier.widthIn(min = 56.dp),
+                    enabled = text.isNotBlank(),
+                    onClick = {
+                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        copyTextToClipboard(context, label, text)
+                        Toast.makeText(context, "Copied $copyLabel", Toast.LENGTH_SHORT).show()
+                    },
+                ) {
+                    Text("Copy", maxLines = 1, softWrap = false)
                 }
             }
             Spacer(modifier = Modifier.height(if (isUser) 10.dp else 12.dp))
             SelectionContainer {
                 if (isUser) {
-                    Text(text = text, style = MaterialTheme.typography.bodyMedium, color = PrismText)
+                    Text(text = text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
                 } else {
                     EnhancedMarkdownText(text = text)
                 }
@@ -130,14 +132,26 @@ internal fun MessageBubble(
 @Composable
 private fun AssistantBadge() {
     Surface(
-        modifier = Modifier.size(36.dp),
-        shape = RoundedCornerShape(18.dp),
-        color = PrismViolet.copy(alpha = 0.10f),
+        modifier = Modifier.size(32.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = PrismViolet.copy(alpha = 0.14f),
         contentColor = PrismViolet,
         border = BorderStroke(1.dp, PrismViolet.copy(alpha = 0.36f)),
     ) {
         Box(contentAlignment = Alignment.Center) {
-            Text("*", color = PrismViolet, style = MaterialTheme.typography.titleMedium)
+            Canvas(modifier = Modifier.size(16.dp)) {
+                val path = androidx.compose.ui.graphics.Path().apply {
+                    val w = size.width
+                    val h = size.height
+                    moveTo(w * 0.5f, 0f)
+                    quadraticTo(w * 0.5f, h * 0.5f, w, h * 0.5f)
+                    quadraticTo(w * 0.5f, h * 0.5f, w * 0.5f, h)
+                    quadraticTo(w * 0.5f, h * 0.5f, 0f, h * 0.5f)
+                    quadraticTo(w * 0.5f, h * 0.5f, w * 0.5f, 0f)
+                    close()
+                }
+                drawPath(path = path, color = PrismViolet)
+            }
         }
     }
 }
@@ -154,11 +168,11 @@ private fun PerformancePill(
     loading: Boolean,
 ) {
     Surface(
-        modifier = modifier.widthIn(max = 150.dp),
+        modifier = modifier.widthIn(min = 80.dp, max = 160.dp),
         shape = RoundedCornerShape(999.dp),
-        color = Color.White.copy(alpha = 0.56f),
-        contentColor = PrismSlate,
-        border = BorderStroke(1.dp, PrismGlassBorder),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.56f),
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        border = BorderStroke(1.dp, prismGlassBorderColor()),
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
@@ -170,7 +184,12 @@ private fun PerformancePill(
             }
             Text(
                 text = when {
-                    performance != null -> "${formatTokensPerSecond(performance.tokensPerSecond)} tok/s"
+                    performance != null -> {
+                        val tpsStr = "${formatTokensPerSecond(performance.tokensPerSecond)} t/s"
+                        val ttftStr = if (performance.ttftMs > 0) " · ${performance.ttftMs}ms" else ""
+                        val threadsStr = if (performance.activeThreads > 0) " · ${performance.activeThreads}th" else ""
+                        "$tpsStr$ttftStr$threadsStr"
+                    }
                     loading -> "typing"
                     else -> "Local LLM"
                 },
@@ -187,61 +206,29 @@ private fun PerformancePill(
 @Composable
 internal fun ToolEventCard(rawText: String) {
     val event = remember(rawText) { AgentToolProtocol.parseToolEvent(rawText) }
-    val status = event?.optString("status")?.takeIf { it.isNotBlank() } ?: "done"
-    val tool = event?.optString("tool")?.takeIf { it.isNotBlank() } ?: "tool"
+    val statusStr = event?.optString("status")?.takeIf { it.isNotBlank() } ?: "done"
+    val toolName = event?.optString("tool")?.takeIf { it.isNotBlank() } ?: "tool"
     val summary = event?.optString("summary")?.takeIf { it.isNotBlank() } ?: rawText
-    val color = when (status) {
-        "done" -> PrismGreen
-        "failed" -> PrismRed
-        "pending" -> PrismAmber
-        "cancelled" -> MaterialTheme.colorScheme.onSurfaceVariant
-        else -> PrismBlue
+    val latencyMs = event?.optLong("latency_ms")?.takeIf { it > 0 }
+    val argsJson = event?.optString("arguments")?.takeIf { it.isNotBlank() }
+    val error = event?.optString("error")?.takeIf { it.isNotBlank() }
+
+    val status = when (statusStr) {
+        "pending", "running" -> com.prismai.llmhost.ui.components.ToolStatus.RUNNING
+        "failed" -> com.prismai.llmhost.ui.components.ToolStatus.FAILED
+        else -> com.prismai.llmhost.ui.components.ToolStatus.SUCCESS
     }
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = Color.White,
-        contentColor = PrismText,
-        border = BorderStroke(1.dp, PrismGlassBorder),
-        shadowElevation = 0.dp,
-    ) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text(
-                    text = "Tool",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = color,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Text(
-                    modifier = Modifier.weight(1f),
-                    text = tool,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = status,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = color,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            Text(
-                text = summary,
-                style = MaterialTheme.typography.bodySmall,
-                color = PrismText,
-            )
-        }
-    }
+
+    val item = com.prismai.llmhost.ui.components.ToolExecutionItem(
+        toolName = toolName,
+        status = status,
+        latencyMs = latencyMs,
+        argumentsJson = argsJson,
+        resultPreview = summary,
+        errorMessage = error
+    )
+
+    com.prismai.llmhost.ui.components.ToolExecutionCard(item = item)
 }
 
 @Composable

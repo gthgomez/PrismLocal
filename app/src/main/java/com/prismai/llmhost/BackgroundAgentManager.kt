@@ -24,6 +24,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -58,7 +59,11 @@ data class BackgroundAgentState(
  * Battery check is best-effort — never blocks foreground work on battery state.
  * Max 5 queued tasks to prevent resource exhaustion.
  */
-class BackgroundAgentManager(private val context: Context) {
+class BackgroundAgentManager(
+    private val context: Context,
+    private val executeTask: (suspend (BackgroundTask) -> String)? = null,
+    private val cancelNativeGeneration: (suspend () -> Unit)? = null,
+) {
     companion object {
         private const val TAG = "BackgroundAgentManager"
         private const val CHANNEL_BG_TASKS = "prism_bg_tasks"
@@ -69,27 +74,37 @@ class BackgroundAgentManager(private val context: Context) {
     }
 
     private val wakeLock: PowerManager.WakeLock?
-    private val notificationManager: NotificationManager
+    private val notificationManager: NotificationManager?
     private val _state = MutableStateFlow(BackgroundAgentState())
     val state: StateFlow<BackgroundAgentState> = _state.asStateFlow()
     private val bgScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var taskIdCounter = 0L
+    private var activeTaskJob: kotlinx.coroutines.Job? = null
+    @Volatile private var cancelInFlight = false
+
+    private fun logD(tag: String, msg: String) { runCatching { Log.d(tag, msg) } }
+    private fun logE(tag: String, msg: String, tr: Throwable? = null) { runCatching { Log.e(tag, msg, tr) } }
+    private fun logW(tag: String, msg: String) { runCatching { Log.w(tag, msg) } }
 
     init {
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = try {
-            powerManager.newWakeLock(
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            powerManager?.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "PrismLocal:BackgroundAgent"
-            ).apply {
+            )?.apply {
                 setReferenceCounted(false)
             }
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Failed to acquire wake lock", e)
+        } catch (e: Exception) {
+            logE(TAG, "Failed to acquire wake lock", e)
             null
         }
-        notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        createNotificationChannels()
+        notificationManager = try {
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        } catch (e: Exception) {
+            null
+        }
+        runCatching { createNotificationChannels() }
     }
 
     /**
@@ -99,7 +114,7 @@ class BackgroundAgentManager(private val context: Context) {
     fun enqueue(prompt: String): BackgroundTask? {
         val current = _state.value
         if (current.queuedTasks.size >= MAX_QUEUED_TASKS) {
-            Log.w(TAG, "Task queue full, rejecting prompt: ${prompt.take(80)}")
+            logW(TAG, "Task queue full, rejecting prompt: ${prompt.take(80)}")
             return null
         }
         val id = "bg_task_${++taskIdCounter}"
@@ -107,19 +122,64 @@ class BackgroundAgentManager(private val context: Context) {
         _state.value = current.copy(
             queuedTasks = current.queuedTasks + task
         )
-        Log.d(TAG, "Enqueued task $id: ${prompt.take(80)}")
+        logD(TAG, "Enqueued task $id: ${prompt.take(80)}")
+        processNextTask()
         return task
     }
 
     /** Start processing the queue. Acquires wake lock. */
     fun startBackgroundMode() {
         val current = _state.value
-        if (current.isBackgroundMode) return
+        if (current.isBackgroundMode) {
+            processNextTask()
+            return
+        }
 
-        wakeLock?.acquire(30_000L) // 30-second timeout guards against dangling locks
+        wakeLock?.acquire(30_000L) // Initial timeout guards against dangling locks
         _state.value = current.copy(isBackgroundMode = true)
         showProgressNotification("Background agent active")
-        Log.d(TAG, "Background mode started, wake lock acquired")
+        logD(TAG, "Background mode started, wake lock acquired")
+        processNextTask()
+    }
+
+    /** Process the next task in queue using [executeTask] */
+    fun processNextTask() {
+        if (_state.value.activeTask != null) return
+        if (cancelInFlight) return
+        if (!checkBudget()) {
+            logW(TAG, "Resource budget constrained, holding background queue processing")
+            return
+        }
+        val task = nextTask() ?: run {
+            if (_state.value.isBackgroundMode && _state.value.queuedTasks.isEmpty()) {
+                stopBackgroundMode()
+            }
+            return
+        }
+
+        if (!_state.value.isBackgroundMode) {
+            startBackgroundMode()
+        }
+
+        activeTaskJob = bgScope.launch {
+            try {
+                wakeLock?.acquire(300_000L) // 5-minute wake lock per background task
+                val summary = executeTask?.invoke(task) ?: "Background task executed"
+                completeCurrentTask(summary)
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                logD(TAG, "Background task ${task.id} cancelled")
+                throw c
+            } catch (e: Exception) {
+                logE(TAG, "Background task ${task.id} failed", e)
+                failCurrentTask(e.message ?: "Task execution error")
+            } finally {
+                releaseWakeLockSafely()
+                activeTaskJob = null
+                if (!cancelInFlight) {
+                    processNextTask()
+                }
+            }
+        }
     }
 
     /** Stop background mode. Releases wake lock. */
@@ -127,23 +187,48 @@ class BackgroundAgentManager(private val context: Context) {
         val current = _state.value
         if (!current.isBackgroundMode) return
 
-        _state.value = current.copy(isBackgroundMode = false, activeTask = null)
-        releaseWakeLockSafely()
-        cancelProgressNotification()
-        Log.d(TAG, "Background mode stopped, wake lock released")
+        cancelInFlight = true
+        bgScope.launch {
+            try {
+                activeTaskJob?.cancelAndJoin()
+                activeTaskJob = null
+                runCatching { cancelNativeGeneration?.invoke() }
+                val latest = _state.value
+                _state.value = latest.copy(isBackgroundMode = false, activeTask = null)
+                releaseWakeLockSafely()
+                cancelProgressNotification()
+                logD(TAG, "Background mode stopped, wake lock released")
+            } finally {
+                cancelInFlight = false
+            }
+        }
     }
 
     /** Cancel a queued or running task */
     fun cancelTask(taskId: String): Boolean {
         val current = _state.value
         if (current.activeTask?.id == taskId) {
-            _state.value = current.copy(
-                activeTask = null,
-                queuedTasks = current.queuedTasks.filterNot { it.id == taskId },
-                completedTasks = current.completedTasks + current.activeTask!!.copy(
-                    status = BackgroundTaskStatus.CANCELLED
-                ),
-            )
+            val task = current.activeTask!!
+            cancelInFlight = true
+            bgScope.launch {
+                try {
+                    activeTaskJob?.cancelAndJoin()
+                    activeTaskJob = null
+                    runCatching { cancelNativeGeneration?.invoke() }
+                    val latest = _state.value
+                    _state.value = latest.copy(
+                        activeTask = null,
+                        queuedTasks = latest.queuedTasks.filterNot { it.id == taskId },
+                        completedTasks = latest.completedTasks + task.copy(
+                            status = BackgroundTaskStatus.CANCELLED
+                        ),
+                    )
+                    releaseWakeLockSafely()
+                } finally {
+                    cancelInFlight = false
+                    processNextTask()
+                }
+            }
             return true
         }
         val wasInQueue = current.queuedTasks.any { it.id == taskId }
@@ -173,7 +258,7 @@ class BackgroundAgentManager(private val context: Context) {
             completedTasks = current.completedTasks + completed,
         )
         notifyTaskComplete(completed)
-        Log.d(TAG, "Task ${active.id} completed: ${summary.take(80)}")
+        logD(TAG, "Task ${active.id} completed: ${summary.take(80)}")
     }
 
     /** Mark the active task as failed */
@@ -189,7 +274,7 @@ class BackgroundAgentManager(private val context: Context) {
             completedTasks = current.completedTasks + failed,
         )
         notifyTaskComplete(failed)
-        Log.d(TAG, "Task ${active.id} failed: ${error.take(80)}")
+        logD(TAG, "Task ${active.id} failed: ${error.take(80)}")
     }
 
     /** Check battery/thermal budget. Returns false if resources are too constrained. */
@@ -201,36 +286,39 @@ class BackgroundAgentManager(private val context: Context) {
     }
 
     /** Show notification for completed task */
+    @android.annotation.SuppressLint("MissingPermission")
     fun notifyTaskComplete(task: BackgroundTask) {
-        val title = when (task.status) {
-            BackgroundTaskStatus.COMPLETED -> "Agent task complete"
-            BackgroundTaskStatus.FAILED -> "Agent task failed"
-            BackgroundTaskStatus.CANCELLED -> "Agent task cancelled"
-            else -> "Agent task"
+        runCatching {
+            val title = when (task.status) {
+                BackgroundTaskStatus.COMPLETED -> "Agent task complete"
+                BackgroundTaskStatus.FAILED -> "Agent task failed"
+                BackgroundTaskStatus.CANCELLED -> "Agent task cancelled"
+                else -> "Agent task"
+            }
+            val body = task.resultSummary?.take(100) ?: "No summary available"
+
+            val intent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            val pendingIntent = PendingIntent.getActivity(
+                context,
+                task.id.hashCode(),
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+
+            val notification = NotificationCompat.Builder(context, CHANNEL_BG_TASKS)
+                .setSmallIcon(android.R.drawable.ic_popup_reminder)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .build()
+
+            val notificationId = NOTIFICATION_ID_BASE + (task.id.hashCode() % 1000).coerceAtLeast(0)
+            notificationManager?.notify(notificationId, notification)
         }
-        val body = task.resultSummary?.take(100) ?: "No summary available"
-
-        val intent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val pendingIntent = PendingIntent.getActivity(
-            context,
-            task.id.hashCode(),
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
-        val notification = NotificationCompat.Builder(context, CHANNEL_BG_TASKS)
-            .setSmallIcon(android.R.drawable.ic_popup_reminder)
-            .setContentTitle(title)
-            .setContentText(body)
-            .setContentIntent(pendingIntent)
-            .setAutoCancel(true)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .build()
-
-        val notificationId = NOTIFICATION_ID_BASE + (task.id.hashCode() % 1000).coerceAtLeast(0)
-        notificationManager.notify(notificationId, notification)
     }
 
     /** Get the next queued task, or null if the queue is empty */
@@ -257,33 +345,36 @@ class BackgroundAgentManager(private val context: Context) {
                 wakeLock!!.release()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error releasing wake lock", e)
+            logE(TAG, "Error releasing wake lock", e)
         }
     }
 
     private fun checkBattery(): Boolean {
-        val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: return true
-        val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: return true
-        if (level < 0 || scale <= 0) return true
-        val percent = (level * 100.0 / scale).toInt()
-        val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1)
-        val isCharging = plugged == BatteryManager.BATTERY_PLUGGED_AC ||
-            plugged == BatteryManager.BATTERY_PLUGGED_USB ||
-            plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS
-        // Allow if charging, only pause if battery is critically low and not charging
-        return if (isCharging) true else percent >= LOW_BATTERY_THRESHOLD
+        return runCatching {
+            val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: return true
+            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: return true
+            if (level < 0 || scale <= 0) return true
+            val percent = (level * 100.0 / scale).toInt()
+            val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1)
+            val isCharging = plugged == BatteryManager.BATTERY_PLUGGED_AC ||
+                plugged == BatteryManager.BATTERY_PLUGGED_USB ||
+                plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS
+            if (isCharging) true else percent >= LOW_BATTERY_THRESHOLD
+        }.getOrDefault(true)
     }
 
     private fun checkThermal(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-        val status = powerManager.currentThermalStatus
-        // Pause on severe+ thermal states (MODERATE is acceptable for background processing)
-        return status < PowerManager.THERMAL_STATUS_SEVERE
+        return runCatching {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return true
+            val status = powerManager.currentThermalStatus
+            status < PowerManager.THERMAL_STATUS_SEVERE
+        }.getOrDefault(true)
     }
 
     private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val tasksChannel = NotificationChannel(
             CHANNEL_BG_TASKS,
             "Background Tasks",
@@ -298,22 +389,27 @@ class BackgroundAgentManager(private val context: Context) {
         ).apply {
             description = "Ongoing background agent work indicator"
         }
-        notificationManager.createNotificationChannel(tasksChannel)
-        notificationManager.createNotificationChannel(progressChannel)
+        notificationManager?.createNotificationChannel(tasksChannel)
+        notificationManager?.createNotificationChannel(progressChannel)
     }
 
+    @android.annotation.SuppressLint("MissingPermission")
     private fun showProgressNotification(message: String) {
-        val notification = NotificationCompat.Builder(context, CHANNEL_BG_PROGRESS)
-            .setSmallIcon(android.R.drawable.ic_popup_reminder)
-            .setContentTitle("Agent Working")
-            .setContentText(message)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-        notificationManager.notify(NOTIFICATION_ID_BASE, notification)
+        runCatching {
+            val notification = NotificationCompat.Builder(context, CHANNEL_BG_PROGRESS)
+                .setSmallIcon(android.R.drawable.ic_popup_reminder)
+                .setContentTitle("Agent Working")
+                .setContentText(message)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+            notificationManager?.notify(NOTIFICATION_ID_BASE, notification)
+        }
     }
 
     private fun cancelProgressNotification() {
-        notificationManager.cancel(NOTIFICATION_ID_BASE)
+        runCatching {
+            notificationManager?.cancel(NOTIFICATION_ID_BASE)
+        }
     }
 }

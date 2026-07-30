@@ -18,9 +18,14 @@ enum class StreamState : uint32_t {
     MaxTokens = 7,
 };
 
+struct LoraAdapterSpec {
+    std::string path;
+    float scale = 1.0f;
+};
+
 struct GenerationConfig {
     int max_tokens = 128;
-    int thread_count = 6;
+    int thread_count = 4;
     int context_length = 2048;
     int batch_size = 512;
     float temperature = 0.70f;
@@ -30,6 +35,14 @@ struct GenerationConfig {
     int gpu_layers = 0;
     bool continue_from_context = false;
     std::string grammar = "";
+    bool use_speculative = false;
+    std::string draft_model_path = "";
+    int draft_gpu_layers = 0;
+    int n_draft = 5;
+    std::string kv_cache_type_k = "q8_0";
+    std::string kv_cache_type_v = "q8_0";
+    bool enable_flash_attn = true;
+    std::vector<LoraAdapterSpec> lora_adapters;
 };
 
 class Engine {
@@ -42,6 +55,10 @@ public:
 
     bool loadModel(const std::string& path, GenerationConfig config = {});
     void unloadModel();
+    bool loadDraftModel(const std::string& draft_path, int draft_gpu_layers = 0);
+    void unloadDraftModel();
+    bool is_speculative_active() const;
+    float get_speculative_acceptance_rate() const;
     void resetConversation();
     int startGeneration(const std::string& prompt, int generation_id, GenerationConfig config);
     std::string runBenchmark(GenerationConfig config, int prompt_tokens, int generation_tokens, int repetitions);
@@ -51,16 +68,30 @@ public:
     std::string decodeTokens(int generation_id, const std::vector<int32_t>& tokens);
     int getState(int generation_id) const;
     void setMemoryPressure(int level);
+    void setThreadCount(int thread_count);
     struct DrainResult {
         std::vector<int32_t> tokens;
         std::string text;
         int state = 0;
         int prompt_tokens = 0;
+        int64_t ttft_ms = 0;
+        float tokens_per_sec = 0.0f;
+        int active_threads = 0;
     };
     DrainResult drainDecodeAndState(int generation_id, int max_tokens);
 
     // Encode text and return float embeddings. Returns empty vector on failure.
     std::vector<float> encode(const std::string& text);
+
+    // Hardware telemetry methods
+    std::string get_backend_name() const;
+    int32_t get_gpu_layers() const;
+    bool is_kleidiai_enabled() const;
+    bool is_vulkan_enabled() const;
+
+    // LoRA Adapter Management
+    bool applyLoraAdapters(const std::vector<LoraAdapterSpec>& adapters);
+    void clearLoraAdapters();
 
 private:
     struct Impl;

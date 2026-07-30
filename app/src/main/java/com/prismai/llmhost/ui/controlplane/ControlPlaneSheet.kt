@@ -30,16 +30,23 @@ import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TabRow
+import androidx.compose.material3.Tab
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -88,9 +95,14 @@ internal fun ControlPlaneSheet(
     isGenerating: Boolean,
     serviceAvailable: Boolean,
     onSwitchModel: (String) -> Unit,
+    onDeleteModel: ((String) -> Unit)? = null,
     onImportModel: () -> Unit,
+    onLinkModel: (() -> Unit)? = null,
     onCancelImport: () -> Unit,
     onDownloadModel: (String) -> Unit,
+    onDownloadCustomHfModel: ((String, String) -> Unit)? = null,
+    storageBreakdown: ModelStorageManager.StorageBreakdown? = null,
+    onClearCache: (() -> Unit)? = null,
     onSettingsChange: (GenerationSettings) -> Unit,
     onRunBenchmark: (String) -> Unit,
     onRunThreadSweep: () -> Unit,
@@ -102,6 +114,7 @@ internal fun ControlPlaneSheet(
     var menuExpanded by remember { mutableStateOf(false) }
     var pendingModelId by remember { mutableStateOf<String?>(null) }
     var riskyModel by remember { mutableStateOf<ModelReadiness?>(null) }
+    var modelToDelete by remember { mutableStateOf<String?>(null) }
     val isImporting = importState is ImportState.Running
     val isLoadingModel = runtimeStatus == RuntimeStatus.LOADING_MODEL
     val controlsEnabled = !isGenerating && !isLoadingModel && !isImporting
@@ -112,188 +125,308 @@ internal fun ControlPlaneSheet(
         }
     }
 
+    var selectedTabIndex by remember { mutableIntStateOf(0) }
+    val tabTitles = listOf("Models", "Sampler", "Storage", "Benchmarks")
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        DashboardCard {
-            SectionHeader(
-                title = "Model & Runtime",
-                subtitle = "Choose a local model and manage imports",
-                action = {
-                    Button(
-                        enabled = serviceAvailable && !isImporting && !isLoadingModel,
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-                        onClick = onImportModel,
-                    ) {
-                        Text("Import", maxLines = 1, softWrap = false)
-                    }
-                },
-            )
-
-            ExposedDropdownMenuBox(
-                expanded = menuExpanded,
-                onExpandedChange = { menuExpanded = !menuExpanded && serviceAvailable && !isLoadingModel && !isImporting },
-            ) {
-                OutlinedTextField(
-                    modifier = Modifier
-                        .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
-                        .fillMaxWidth(),
-                    readOnly = true,
-                    value = compactModelName(pendingModelId ?: currentModel),
-                    onValueChange = {},
-                    label = { Text("Selected model") },
-                    placeholder = { Text(if (models.isEmpty()) "No models installed" else "Select model") },
-                    enabled = serviceAvailable && !isLoadingModel && !isImporting,
-                    singleLine = true,
-                    trailingIcon = {
-                        if (isLoadingModel) {
-                            InfinityLoadingIndicator(modifier = Modifier.size(28.dp))
-                        } else {
-                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = menuExpanded)
-                        }
+        TabRow(
+            selectedTabIndex = selectedTabIndex,
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.primary,
+        ) {
+            tabTitles.forEachIndexed { index, title ->
+                Tab(
+                    selected = selectedTabIndex == index,
+                    onClick = { selectedTabIndex = index },
+                    modifier = Modifier.semantics { role = Role.Tab },
+                    text = {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = if (selectedTabIndex == index) FontWeight.Bold else FontWeight.Normal,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     },
                 )
-                ExposedDropdownMenu(
-                    expanded = menuExpanded,
-                    onDismissRequest = { menuExpanded = false },
-                ) {
-                    if (models.isEmpty()) {
-                        DropdownMenuItem(
-                            text = { Text("No models installed") },
-                            onClick = { menuExpanded = false },
-                            enabled = false,
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            when (selectedTabIndex) {
+                0 -> {
+                    DashboardCard {
+                        SectionHeader(
+                            title = "Model & Runtime",
+                            subtitle = "Choose a local model and manage imports",
+                            action = {
+                                Button(
+                                    enabled = serviceAvailable && !isImporting && !isLoadingModel,
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                                    onClick = onImportModel,
+                                ) {
+                                    Text("Import", maxLines = 1, softWrap = false)
+                                }
+                            },
                         )
-                    } else {
-                        models.forEach { modelId ->
-                            val readiness = modelReadiness.firstOrNull { it.info.id == modelId }
-                            DropdownMenuItem(
-                                text = {
-                                    ModelPickerRow(
-                                        modelId = modelId,
-                                        readiness = readiness,
-                                    )
-                                },
-                                enabled = !isLoadingModel,
-                                onClick = {
-                                    menuExpanded = false
-                                    if (readiness?.fit?.rating != null && readiness.fit.rating != ModelFitRating.SAFE) {
-                                        riskyModel = readiness
+
+                        ExposedDropdownMenuBox(
+                            expanded = menuExpanded,
+                            onExpandedChange = { menuExpanded = !menuExpanded && serviceAvailable && !isLoadingModel && !isImporting },
+                        ) {
+                            OutlinedTextField(
+                                modifier = Modifier
+                                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                                    .fillMaxWidth(),
+                                readOnly = true,
+                                value = compactModelName(pendingModelId ?: currentModel),
+                                onValueChange = {},
+                                label = { Text("Selected model") },
+                                placeholder = { Text(if (models.isEmpty()) "No models installed" else "Select model") },
+                                enabled = serviceAvailable && !isLoadingModel && !isImporting,
+                                singleLine = true,
+                                trailingIcon = {
+                                    if (isLoadingModel) {
+                                        InfinityLoadingIndicator(modifier = Modifier.size(28.dp))
                                     } else {
-                                        pendingModelId = modelId
-                                        onSwitchModel(modelId)
+                                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = menuExpanded)
                                     }
                                 },
                             )
+                            ExposedDropdownMenu(
+                                expanded = menuExpanded,
+                                onDismissRequest = { menuExpanded = false },
+                            ) {
+                                if (models.isEmpty()) {
+                                    DropdownMenuItem(
+                                        text = { Text("No models installed") },
+                                        onClick = { menuExpanded = false },
+                                        enabled = false,
+                                    )
+                                } else {
+                                    models.forEach { modelId ->
+                                        val readiness = modelReadiness.firstOrNull { it.info.id == modelId }
+                                        DropdownMenuItem(
+                                            text = {
+                                                ModelPickerRow(
+                                                    modelId = modelId,
+                                                    readiness = readiness,
+                                                )
+                                            },
+                                            enabled = !isLoadingModel,
+                                            onClick = {
+                                                menuExpanded = false
+                                                if (readiness?.fit?.rating != null && readiness.fit.rating != ModelFitRating.SAFE) {
+                                                    riskyModel = readiness
+                                                } else {
+                                                    pendingModelId = modelId
+                                                    onSwitchModel(modelId)
+                                                }
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (isLoadingModel) {
+                            LoadingModelStatus(
+                                modelId = pendingModelId ?: currentModel,
+                                diagnostics = modelLoadDiagnostics,
+                            )
+                        }
+
+                        if (isImporting) {
+                            Button(
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = onCancelImport,
+                            ) {
+                                Text("Cancel Import", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        } else {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    modifier = Modifier.weight(1f),
+                                    enabled = controlsEnabled && serviceAvailable,
+                                    onClick = onImportModel,
+                                ) {
+                                    Text("Import GGUF", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                if (onLinkModel != null) {
+                                    OutlinedButton(
+                                        modifier = Modifier.weight(1f),
+                                        enabled = controlsEnabled && serviceAvailable,
+                                        onClick = onLinkModel,
+                                    ) {
+                                        Text("Link (No Copy)", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            }
+                        }
+
+                        if (importStatus.isNotEmpty()) {
+                            Text(
+                                text = importStatus,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+
+                        if (importState is ImportState.Running) {
+                            ImportProgressBar(importState)
+                        }
+
+                        if (models.isNotEmpty()) {
+                            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                            Text(
+                                text = "Installed Models (${models.size})",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            models.forEach { modelId ->
+                                val readiness = modelReadiness.firstOrNull { it.info.id == modelId }
+                                val isCurrent = modelId == currentModel
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (isCurrent) PrismBlue.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Text(
+                                                text = compactModelName(modelId),
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            readiness?.let { r ->
+                                                Text(
+                                                    text = "${formatBytes(r.info.bytes)} • ${r.fit.quantization ?: "quant unknown"}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            }
+                                        }
+                                        TextButton(
+                                            enabled = serviceAvailable && !isLoadingModel && !isGenerating && !isImporting,
+                                            onClick = { modelToDelete = modelId },
+                                        ) {
+                                            Text("Delete", color = PrismRed, style = MaterialTheme.typography.labelMedium)
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
+
+                    HuggingFaceDownloadPanel(
+                        entries = hfCatalog,
+                        state = modelDownloadState,
+                        deviceCapabilityProfile = deviceCapabilityProfile,
+                        enabled = serviceAvailable && !isImporting && !isLoadingModel && !isGenerating,
+                        onDownload = onDownloadModel,
+                        onDownloadCustom = onDownloadCustomHfModel,
+                        onCancel = onCancelImport,
+                    )
+
+                    activeModelInfo?.let { model ->
+                        ModelMetadata(
+                            model = model,
+                            diagnostics = modelLoadDiagnostics?.takeIf { it.modelId == model.id },
+                            readiness = modelReadiness.firstOrNull { it.info.id == model.id },
+                        )
+                    }
+                }
+                1 -> {
+                    RuntimeControls(
+                        settings = generationSettings,
+                        performance = generationPerformance,
+                        enabled = controlsEnabled,
+                        deviceCapabilityProfile = deviceCapabilityProfile,
+                        onSettingsChange = onSettingsChange,
+                    )
+                }
+                2 -> {
+                    storageBreakdown?.let { breakdown ->
+                        StorageAnalyticsCard(
+                            breakdown = breakdown,
+                            onClearCache = onClearCache,
+                        )
+                    }
+
+                    deviceCapabilityProfile?.let { profile ->
+                        DeviceCapabilityCard(profile)
+                    }
+
+                    recoveryTranscript?.let { path ->
+                        Text(
+                            text = "Recovery transcript: $path",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                3 -> {
+                    BenchmarkCenter(
+                        models = models,
+                        activeModelInfo = activeModelInfo,
+                        deviceCapabilityProfile = deviceCapabilityProfile,
+                        runs = benchmarkRuns,
+                        readiness = modelReadiness,
+                        presets = BenchmarkPresets.defaults,
+                        status = benchmarkStatus,
+                        isGenerating = isGenerating,
+                        disabledReason = benchmarkDisabledReason(
+                            serviceAvailable = serviceAvailable,
+                            performanceBuild = BuildConfig.LLMHOST_PERFORMANCE_BUILD,
+                            currentModel = currentModel,
+                            isGenerating = isGenerating,
+                            status = benchmarkStatus,
+                        ),
+                        onRunPreset = onRunBenchmark,
+                        onRunThreadSweep = onRunThreadSweep,
+                        onRunNativeBenchmark = onRunNativeBenchmark,
+                        onExportCsv = onExportBenchmarksCsv,
+                        onExportJson = onExportBenchmarksJson,
+                        onClear = onClearBenchmarks,
+                    )
                 }
             }
-
-            if (isLoadingModel) {
-                LoadingModelStatus(
-                    modelId = pendingModelId ?: currentModel,
-                    diagnostics = modelLoadDiagnostics,
-                )
-            }
-
-            if (isImporting) {
-                Button(
-                    modifier = Modifier.fillMaxWidth(),
-                    onClick = onCancelImport,
-                ) {
-                    Text("Cancel Import", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-            }
-
-            if (importStatus.isNotEmpty()) {
-                Text(
-                    text = importStatus,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-
-            if (importState is ImportState.Running) {
-                ImportProgressBar(importState)
-            }
         }
-
-        HuggingFaceDownloadPanel(
-            entries = hfCatalog,
-            state = modelDownloadState,
-            deviceCapabilityProfile = deviceCapabilityProfile,
-            enabled = serviceAvailable && !isImporting && !isLoadingModel && !isGenerating,
-            onDownload = onDownloadModel,
-            onCancel = onCancelImport,
-        )
-
-        deviceCapabilityProfile?.let { profile ->
-            DeviceCapabilityCard(profile)
-        }
-
-        activeModelInfo?.let { model ->
-            ModelMetadata(
-                model = model,
-                diagnostics = modelLoadDiagnostics?.takeIf { it.modelId == model.id },
-                readiness = modelReadiness.firstOrNull { it.info.id == model.id },
-            )
-        }
-
-        recoveryTranscript?.let { path ->
-            Text(
-                text = "Recovery transcript: $path",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-
-        RuntimeControls(
-            settings = generationSettings,
-            performance = generationPerformance,
-            enabled = controlsEnabled,
-            deviceCapabilityProfile = deviceCapabilityProfile,
-            onSettingsChange = onSettingsChange,
-        )
-
-        BenchmarkCenter(
-            models = models,
-            activeModelInfo = activeModelInfo,
-            deviceCapabilityProfile = deviceCapabilityProfile,
-            runs = benchmarkRuns,
-            readiness = modelReadiness,
-            presets = BenchmarkPresets.defaults,
-            status = benchmarkStatus,
-            isGenerating = isGenerating,
-            disabledReason = benchmarkDisabledReason(
-                serviceAvailable = serviceAvailable,
-                performanceBuild = BuildConfig.LLMHOST_PERFORMANCE_BUILD,
-                currentModel = currentModel,
-                isGenerating = isGenerating,
-                status = benchmarkStatus,
-            ),
-            onRunPreset = onRunBenchmark,
-            onRunThreadSweep = onRunThreadSweep,
-            onRunNativeBenchmark = onRunNativeBenchmark,
-            onExportCsv = onExportBenchmarksCsv,
-            onExportJson = onExportBenchmarksJson,
-            onClear = onClearBenchmarks,
-        )
     }
 
     riskyModel?.let { readiness ->
         val isTooLarge = readiness.fit.rating == ModelFitRating.TOO_LARGE
+        val isProvenUsable = readiness.fit.reason.startsWith("Proven usable")
         AlertDialog(
             onDismissRequest = { riskyModel = null },
             title = {
-                Text(if (isTooLarge) "Model too large right now" else "Load risky model?")
+                Text(
+                    text = when {
+                        isProvenUsable -> "Load Empirically Verified Model"
+                        isTooLarge -> "Model Too Large (High RAM Requirement)"
+                        else -> "Load Risky Model?"
+                    },
+                )
             },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -306,9 +439,22 @@ internal fun ControlPlaneSheet(
                         text = "${readiness.fit.reason}. Estimated RAM need ${formatBytes(readiness.fit.requiredRamBytes)} with ${formatBytes(readiness.fit.availableRamAfterUnloadBytes)} available after unload.",
                         style = MaterialTheme.typography.bodySmall,
                     )
-                    if (isTooLarge) {
+                    if (isProvenUsable) {
+                        Surface(
+                            shape = MaterialTheme.shapes.extraSmall,
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                text = "Verified Usable: Past execution runs confirmed this model runs cleanly on your device without memory crashes.",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.padding(8.dp),
+                            )
+                        }
+                    } else if (isTooLarge) {
                         Text(
-                            text = "This model is visible because it is installed, but the native loader will not start it until the current RAM estimate has enough headroom.",
+                            text = "This model requires significant RAM. You may proceed to load it, but background applications could be closed by Android if memory pressure increases.",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
@@ -319,28 +465,51 @@ internal fun ControlPlaneSheet(
                 }
             },
             confirmButton = {
-                if (isTooLarge) {
-                    TextButton(onClick = { riskyModel = null }) {
-                        Text("OK")
-                    }
-                } else {
-                    TextButton(
-                        enabled = !isLoadingModel && !isImporting,
-                        onClick = {
-                            pendingModelId = readiness.info.id
-                            onSwitchModel(readiness.info.id)
-                            riskyModel = null
-                        },
-                    ) {
-                        Text("Load Anyway")
-                    }
+                TextButton(
+                    enabled = !isLoadingModel && !isImporting,
+                    onClick = {
+                        pendingModelId = readiness.info.id
+                        onSwitchModel(readiness.info.id)
+                        riskyModel = null
+                    },
+                ) {
+                    Text(
+                        text = if (isProvenUsable) "Load Model" else if (isTooLarge) "Load Model Anyway" else "Load Model",
+                        color = if (isProvenUsable) MaterialTheme.colorScheme.primary else if (isTooLarge) PrismRed else MaterialTheme.colorScheme.primary,
+                    )
                 }
             },
             dismissButton = {
-                if (!isTooLarge) {
-                    TextButton(onClick = { riskyModel = null }) {
-                        Text("Cancel")
-                    }
+                TextButton(onClick = { riskyModel = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+
+    modelToDelete?.let { targetId ->
+        val targetReadiness = modelReadiness.firstOrNull { it.info.id == targetId }
+        val sizeLabel = targetReadiness?.let { formatBytes(it.info.bytes) } ?: "model"
+        AlertDialog(
+            onDismissRequest = { modelToDelete = null },
+            title = { Text("Delete Model?") },
+            text = {
+                Text("Are you sure you want to delete ${compactModelName(targetId)} ($sizeLabel) from device storage? This cannot be undone.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val toDelete = targetId
+                        modelToDelete = null
+                        onDeleteModel?.invoke(toDelete)
+                    },
+                ) {
+                    Text("Delete", color = PrismRed)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { modelToDelete = null }) {
+                    Text("Cancel")
                 }
             },
         )
@@ -410,6 +579,19 @@ private fun ModelPickerRow(
 private fun DeviceCapabilityCard(profile: DeviceCapabilityProfile) {
     DashboardCard {
         SectionHeader(title = "Device", subtitle = "Local runtime capacity")
+        if (profile.isSamsungS25Ultra) {
+            val ramTierLabel = if (profile.s25RamTier == "16GB_REGION") "16GB LPDDR5X (Asia 1TB Tier)" else "12GB LPDDR5X (US/Global Tier)"
+            InfoBadge(
+                text = "Samsung S25 Ultra • Snapdragon 8 Elite • $ramTierLabel",
+                color = PrismBlue,
+            )
+        }
+        if (profile.hasSPenSupport) {
+            InfoBadge(
+                text = "Wacom S-Pen Hover Controls Active",
+                color = PrismGreen,
+            )
+        }
         MetricGrid(
             listOf(
                 "RAM free" to formatBytes(profile.availableRamBytes),
@@ -437,6 +619,7 @@ private fun HuggingFaceDownloadPanel(
     deviceCapabilityProfile: DeviceCapabilityProfile?,
     enabled: Boolean,
     onDownload: (String) -> Unit,
+    onDownloadCustom: ((String, String) -> Unit)? = null,
     onCancel: () -> Unit,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
@@ -454,11 +637,23 @@ private fun HuggingFaceDownloadPanel(
                 style = MaterialTheme.typography.bodySmall,
                 color = PrismAmber,
             )
-            is ModelDownloadState.Failure -> Text(
-                text = "${state.entryName}: ${state.message}",
-                style = MaterialTheme.typography.bodySmall,
-                color = PrismRed,
-            )
+            is ModelDownloadState.Failure -> {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = "${state.entryName}: ${state.message}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = PrismRed,
+                    )
+                    selectedEntry?.let { entry ->
+                        TextButton(
+                            contentPadding = PaddingValues(0.dp),
+                            onClick = { onDownload(entry.id) },
+                        ) {
+                            Text("Retry Download", color = PrismBlue, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+            }
             is ModelDownloadState.Success -> Text(
                 text = "Downloaded ${state.entryName}",
                 style = MaterialTheme.typography.bodySmall,
@@ -697,6 +892,8 @@ private fun ModelMetadata(
                 diagnostics?.loadMs?.let { "Load time" to "$it ms" },
                 diagnostics?.availableMemoryMb?.let { "RAM free" to "$it MB" },
                 diagnostics?.state?.let { "Status" to it.replaceFirstChar { char -> char.titlecase(Locale.US) } },
+                diagnostics?.backendName?.let { "Backend" to it },
+                diagnostics?.gpuLayersOffloaded?.takeIf { it > 0 }?.let { "GPU layers" to "$it" },
             )
         )
         readiness?.let { modelReadiness ->
@@ -725,6 +922,35 @@ private fun ModelMetadata(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StorageAnalyticsCard(
+    breakdown: ModelStorageManager.StorageBreakdown,
+    onClearCache: (() -> Unit)?,
+) {
+    DashboardCard {
+        SectionHeader(
+            title = "Storage & Cache Analytics",
+            subtitle = "Device memory allocation breakdown",
+        )
+        MetricGrid(
+            listOf(
+                "Installed GGUFs" to formatBytes(breakdown.installedModelsBytes),
+                "Downloads Cache" to formatBytes(breakdown.downloadsCacheBytes),
+                "Free Storage" to formatBytes(breakdown.freeStorageBytes),
+                "Total Space" to formatBytes(breakdown.totalStorageBytes),
+            )
+        )
+        if (onClearCache != null) {
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onClearCache,
+            ) {
+                Text("Clean Cache & Temp Files")
             }
         }
     }

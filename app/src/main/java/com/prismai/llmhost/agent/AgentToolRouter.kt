@@ -6,11 +6,13 @@ import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
+import com.prismai.llmhost.util.SanitizerUtils
 import android.os.SystemClock
 import com.prismai.llmhost.*
 import com.prismai.llmhost.model.DeviceProfiler
 import com.prismai.llmhost.ui.ServiceUiState
 import org.json.JSONObject
+import java.io.File
 import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -53,7 +55,7 @@ class AgentToolRouter(
         )
     }
 
-    val activeAgentToolHistory = mutableListOf<AgentToolCall>()
+    val activeAgentToolHistory = java.util.Collections.synchronizedList(mutableListOf<AgentToolCall>())
 
     // ── Main routing entry point ────────────────────────────────────────
 
@@ -126,14 +128,16 @@ class AgentToolRouter(
             return
         }
 
-        val isExactOrSimilarLoop = activeAgentToolHistory.any {
-            it.name == validatedCall.name && AgentToolProtocol.areArgumentsSimilar(it.arguments, validatedCall.arguments)
+        val (isExactOrSimilarLoop, isStatelessLoop, historicalCount) = synchronized(activeAgentToolHistory) {
+            val exactOrSimilar = activeAgentToolHistory.any {
+                it.name == validatedCall.name && AgentToolProtocol.areArgumentsSimilar(it.arguments, validatedCall.arguments)
+            }
+            val count = activeAgentToolHistory.count { it.name == validatedCall.name }
+            val stateless = validatedCall.name in setOf(
+                "get_model_status", "get_storage_status", "get_app_version_info", "get_tool_capabilities",
+            ) && count >= 3
+            Triple(exactOrSimilar, stateless, count)
         }
-        val isStatelessLoop = validatedCall.name in setOf(
-            "get_model_status", "get_storage_status", "get_app_version_info", "get_tool_capabilities",
-        ) && activeAgentToolHistory.count { it.name == validatedCall.name } >= 3
-
-        val historicalCount = activeAgentToolHistory.count { it.name == validatedCall.name }
         val tooManyInvocations = if (validatedCall.name in cheapTools) {
             historicalCount >= 5
         } else {
@@ -201,12 +205,21 @@ class AgentToolRouter(
             AgentToolRisk.SAFE -> {
                 scope.launch {
                     val stepStart = SystemClock.elapsedRealtime()
-                    val result = executeTool(validatedCall, false)
+                    val result = try {
+                        executeTool(validatedCall, false)
+                    } catch (e: Exception) {
+                        AgentToolResult(
+                            call = validatedCall,
+                            success = false,
+                            summary = "Tool execution failed with exception: ${e.message ?: "unknown error"}",
+                            errorCode = AgentToolErrorCode.FAILED,
+                        )
+                    }
                     val latency = SystemClock.elapsedRealtime() - stepStart
                     agentTrace.recordStep(validatedCall, result, latency)
                     appendToolResult(result)
                     val maxIter = uiState.generationSettings.value.maxAgentIterations
-                    if (result.success && depth + 1 < maxIter) {
+                    if (depth + 1 < maxIter) {
                         onFollowUp(originalPrompt, result, depth + 1)
                     }
                 }
@@ -242,6 +255,7 @@ class AgentToolRouter(
             "rename_current_chat",
             "clear_chat",
             "delete_or_clear_chat",
+            "delete_model",
             "download_model",
             "switch_model",
             "cancel_active_job",
@@ -257,6 +271,10 @@ class AgentToolRouter(
             "stop_speaking",
             // Phase 3 Knowledge Pack
             "download_knowledge_pack",
+            // Phase 5 Workspace Files
+            "list_workspace_files",
+            "read_workspace_file",
+            "search_workspace_files",
             // Phase 7a Background
             "run_in_background",
             "check_background_tasks" -> true
@@ -272,25 +290,25 @@ class AgentToolRouter(
                 AgentToolCall("get_tool_capabilities", JSONObject().put("include_schemas", true))
             ("version" in lower || "build info" in lower || "app info" in lower) ->
                 AgentToolCall("get_app_version_info")
-            ("storage" in lower || "space" in lower) && ("status" in lower || "free" in lower || "used" in lower) ->
+            ("storage status" in lower || "disk space" in lower || "app storage" in lower || ("storage" in lower && ("model" in lower || "app" in lower))) ->
                 AgentToolCall("get_storage_status")
             ("download" in lower && "status" in lower) ->
                 AgentToolCall("get_download_status")
-            ("active" in lower && "operation" in lower) || ("what" in lower && "running" in lower) ->
+            ("active" in lower && "operation" in lower) || ("what" in lower && "running" in lower && "task" in lower) ->
                 AgentToolCall("get_active_operation")
-            ("privacy" in lower || "private" in lower) && ("summary" in lower || "explain" in lower || "data" in lower) ->
+            ("privacy summary" in lower || "app privacy" in lower || ("privacy" in lower && "app" in lower)) ->
                 AgentToolCall("get_privacy_summary")
             ("list" in lower || "show" in lower) && ("curated" in lower || "downloadable" in lower) && "model" in lower ->
                 AgentToolCall("list_curated_downloadable_models")
             ("validate" in lower || "check" in lower) && ("runtime" in lower || "settings" in lower) ->
                 AgentToolCall("validate_runtime_settings", JSONObject().put("proposed_settings", parseRuntimeSettingsFromPrompt(prompt)))
-            "status" in lower || "loaded" in lower || "current model" in lower || "model info" in lower ->
+            "model status" in lower || "current model" in lower || "model info" in lower || ("status" in lower && "model" in lower) ->
                 AgentToolCall("get_model_status")
             ("list" in lower || "show" in lower || "what" in lower) && "installed" in lower && "model" in lower ->
                 AgentToolCall("list_installed_models")
             ("benchmark" in lower || "run" in lower) && ("history" in lower || "runs" in lower || "recent" in lower) ->
                 AgentToolCall("list_benchmark_runs")
-            "diagnose" in lower || ("why" in lower && ("slow" in lower || "performance" in lower)) || "performance diagnosis" in lower ->
+            ("diagnose performance" in lower || "performance diagnosis" in lower) ->
                 AgentToolCall("diagnose_performance")
             ("summarize" in lower || "summary" in lower) && ("chat" in lower || "conversation" in lower) ->
                 AgentToolCall("summarize_current_chat")
@@ -315,8 +333,7 @@ class AgentToolRouter(
                 AgentToolCall("cancel_generation")
             ("cancel" in lower || "stop" in lower) && ("operation" in lower || "download" in lower || "import" in lower || "benchmark" in lower) ->
                 AgentToolCall("cancel_active_job", JSONObject().put("target", operationTargetFromPrompt(lower)))
-            ("skill" in lower || "help me with" in lower) &&
-                ("performance" in lower || "model" in lower || "benchmark" in lower || "workspace" in lower || "privacy" in lower || "safety" in lower) ->
+            ("guidance skill" in lower || "use skill" in lower) ->
                 AgentToolCall("use_guidance_skill", JSONObject().put("skill", skillFromPrompt(lower)))
             ("rename" in lower || "title" in lower) && ("chat" in lower || "conversation" in lower) -> {
                 val title = prompt

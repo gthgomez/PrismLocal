@@ -19,7 +19,7 @@ import java.util.Locale
  */
 class ChatSearchIndex {
 
-    private val index = mutableMapOf<String, String>()
+    private val index = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     // ── Index maintenance ────────────────────────────────────────────────
 

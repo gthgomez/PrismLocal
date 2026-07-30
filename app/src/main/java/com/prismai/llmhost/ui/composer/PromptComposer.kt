@@ -35,7 +35,12 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -45,6 +50,8 @@ import androidx.compose.foundation.layout.ime
 import com.prismai.llmhost.GenerationPerformance
 import com.prismai.llmhost.PromptAttachment
 import com.prismai.llmhost.ui.theme.*
+import androidx.compose.ui.platform.LocalView
+import android.view.HapticFeedbackConstants
 import com.prismai.llmhost.ui.formatBytes
 import com.prismai.llmhost.ui.formatTokensPerSecond
 
@@ -53,6 +60,7 @@ private enum class ComposerAction {
     Send,
     Stop,
     More,
+    Voice,
 }
 
 @Composable
@@ -71,6 +79,8 @@ internal fun PromptComposer(
     onCancel: () -> Unit,
     onContinue: () -> Unit,
     onSend: () -> Unit,
+    onVoiceClick: (() -> Unit)? = null,
+    voiceState: com.prismai.llmhost.tools.VoiceState? = null,
 ) {
     val placeholder = when {
         !enabled -> "Reconnecting to Prism Local"
@@ -82,9 +92,9 @@ internal fun PromptComposer(
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(30.dp),
-        color = Color.White.copy(alpha = 0.78f),
-        contentColor = PrismText,
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.80f)),
+        color = prismGlassColor(),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, prismGlassBorderColor()),
         shadowElevation = 6.dp,
     ) {
         Column(
@@ -105,6 +115,13 @@ internal fun PromptComposer(
                     placeholder = placeholder,
                     enabled = enabled,
                 )
+                if (!isGenerating && onVoiceClick != null && voiceState?.sttAvailable == true) {
+                    ComposerIconButton(
+                        action = ComposerAction.Voice,
+                        enabled = enabled,
+                        onClick = onVoiceClick,
+                    )
+                }
                 if (isGenerating) {
                     ComposerIconButton(
                         action = ComposerAction.Stop,
@@ -134,7 +151,7 @@ internal fun PromptComposer(
             if (!imeVisible) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ComposerChip(label = "Local & Private", accent = PrismGreen)
-                    ComposerChip(label = "Python", accent = PrismBlue)
+                    ComposerChip(label = "Offline GGUF", accent = PrismBlue)
                     ComposerChip(
                         label = performance?.let { "${formatTokensPerSecond(it.tokensPerSecond)} tok/s" } ?: "Local LLM",
                         accent = PrismViolet,
@@ -220,9 +237,9 @@ private fun ComposerTextInput(
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(20.dp),
-        color = Color.White.copy(alpha = 0.44f),
-        contentColor = PrismText,
-        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.68f)),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.50f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.40f)),
         shadowElevation = 0.dp,
     ) {
         BasicTextField(
@@ -232,7 +249,7 @@ private fun ComposerTextInput(
             enabled = enabled,
             maxLines = 4,
             textStyle = MaterialTheme.typography.bodyMedium.merge(
-                TextStyle(color = if (enabled) PrismText else MaterialTheme.colorScheme.onSurfaceVariant)
+                TextStyle(color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
             ),
             decorationBox = { innerTextField ->
                 Box(
@@ -258,22 +275,40 @@ private fun ComposerTextInput(
     }
 }
 
+private val ComposerAction.contentDescription: String
+    get() = when (this) {
+        ComposerAction.Add -> "Add attachment"
+        ComposerAction.Send -> "Send message"
+        ComposerAction.Stop -> "Stop generation"
+        ComposerAction.Voice -> "Voice input"
+        ComposerAction.More -> "More options"
+    }
+
 @Composable
 private fun ComposerIconButton(
     action: ComposerAction,
     enabled: Boolean,
     onClick: () -> Unit,
 ) {
+    val view = LocalView.current
     val isPrimary = action == ComposerAction.Send || action == ComposerAction.Stop || action == ComposerAction.More
     Surface(
-        modifier = Modifier.size(52.dp),
+        modifier = Modifier
+            .size(52.dp)
+            .semantics {
+                contentDescription = action.contentDescription
+                role = Role.Button
+            },
         shape = RoundedCornerShape(29.dp),
-        color = if (isPrimary) Color.Transparent else Color.White.copy(alpha = 0.72f),
+        color = if (isPrimary) Color.Transparent else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.60f),
         contentColor = if (isPrimary) Color.White else PrismBlue,
-        border = if (isPrimary) null else BorderStroke(1.dp, PrismGlassBorder),
+        border = if (isPrimary) null else BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.40f)),
         shadowElevation = if (enabled && isPrimary) 4.dp else 0.dp,
         enabled = enabled,
-        onClick = onClick,
+        onClick = {
+            view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            onClick()
+        },
     ) {
         Box(
             modifier = Modifier
@@ -375,6 +410,24 @@ private fun ComposerActionGlyph(
                     )
                 }
             }
+            ComposerAction.Voice -> {
+                drawRoundRect(
+                    color = color,
+                    topLeft = Offset(size.width * 0.35f, size.height * 0.18f),
+                    size = Size(size.width * 0.30f, size.height * 0.44f),
+                    cornerRadius = CornerRadius(8f, 8f),
+                    style = Stroke(width = strokeWidth),
+                )
+                drawArc(
+                    color = color,
+                    startAngle = 0f,
+                    sweepAngle = 180f,
+                    useCenter = false,
+                    topLeft = Offset(size.width * 0.22f, size.height * 0.32f),
+                    size = Size(size.width * 0.56f, size.height * 0.42f),
+                    style = Stroke(width = strokeWidth, cap = StrokeCap.Round),
+                )
+            }
         }
     }
 }
@@ -383,9 +436,9 @@ private fun ComposerActionGlyph(
 private fun ComposerChip(label: String, accent: Color) {
     Surface(
         shape = RoundedCornerShape(999.dp),
-        color = Color.White.copy(alpha = 0.54f),
-        contentColor = PrismSlate,
-        border = BorderStroke(1.dp, accent.copy(alpha = 0.10f)),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.54f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.20f)),
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
@@ -398,7 +451,7 @@ private fun ComposerChip(label: String, accent: Color) {
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelSmall,
-                color = PrismSlate,
+                color = MaterialTheme.colorScheme.onSurface,
                 maxLines = 1,
                 softWrap = false,
                 overflow = TextOverflow.Ellipsis,

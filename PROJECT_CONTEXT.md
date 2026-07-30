@@ -92,9 +92,15 @@ cd C:\Workspace\Project_Android\PrismLocal
 .\gradlew.bat --no-daemon assembleDebug
 .\gradlew.bat --no-daemon assembleDebugAndroidTest
 .\gradlew.bat --no-daemon connectedDebugAndroidTest
-.\gradlew.bat --no-daemon assembleBenchmark
-.\gradlew.bat --no-daemon assembleRelease
+# Minified variants: build ONE at a time on ~16 GB hosts (parallel R8 OOM'd daemon).
+.\gradlew.bat --no-daemon --max-workers=2 assembleBenchmark
+.\gradlew.bat --no-daemon --max-workers=2 assembleRelease
+# Optional: assembleProfile, assembleAdreno (Adreno needs OpenCL include/lib props)
 ```
+
+Package IDs by variant: `com.prismai.llmhost` (release), `.debug`, `.benchmark`,
+`.profile`, `.adreno`. JNI exports must match `com.prismai.llmhost.bridge.NativeLlmBridge`
+(`Java_com_prismai_llmhost_bridge_NativeLlmBridge_*`). ProGuard keeps use the same package.
 
 From composite root only (uses this project’s wrapper + `-p`):
 
@@ -172,7 +178,8 @@ an older artifact path; adapt commands to this repo path before use.
 
 ## Current Limitations And Gaps
 
-- Build compilation (`assembleDebug`) and unit tests (`:app:testDebugUnitTest`) are verified and passing.
+- Build compilation (`assembleDebug`, `assembleBenchmark`, `assembleRelease`) and unit tests (`:app:testDebugUnitTest`) verified 2026-07-24 after JNI/ProGuard package rename fix.
+- Do not assemble multiple minified variants in one Gradle invocation on low-RAM hosts.
 - `RUNTIME_LIMITS.md` is updated to document the configurable context length (512 to 16,384), prompt batch sizes, max generated tokens (up to 1,024), and agent iterations (up to 12).
 - The local JNI layer is performance-hardened with zero heap allocations on the polling fast path, and cancel latency has been optimized via C++ intra-batch cancellation checks in `decodeTokensAt`.
 - The local smoke GGUF asset exists in this checkout but is ignored by git. Device tests may need asset setup on another machine.

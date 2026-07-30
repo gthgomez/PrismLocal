@@ -117,7 +117,7 @@ object HuggingFaceModelCatalog {
             license = "Llama 3.2 Community",
             parameters = "1B",
             quantization = "Q4_K_M",
-            notes = "Popular small instruct baseline; license is open-weight, not Apache/MIT style.",
+            notes = "Fast demo instruct baseline; not recommended for coding benchmarks. License is open-weight, not Apache/MIT style.",
         ),
         HuggingFaceModelEntry(
             id = "gemma3_1b_q4km",
@@ -129,7 +129,7 @@ object HuggingFaceModelCatalog {
             license = "Gemma terms",
             parameters = "1B",
             quantization = "Q4_K_M",
-            notes = "Useful Gemma-family baseline; license requires review before redistribution.",
+            notes = "Fast on-device demo; not recommended for coding benchmarks (prefer 3B+). License requires review before redistribution.",
         ),
         // --- Expanded catalog: more sizes, architectures, and quants ---
         HuggingFaceModelEntry(
@@ -251,7 +251,7 @@ object HuggingFaceModelCatalog {
             license = "Apache-2.0",
             parameters = "1.1B",
             quantization = "Q4_K_M",
-            notes = "TinyLlama 1.1B; very fast on weak hardware, good for quick answers.",
+            notes = "TinyLlama 1.1B; very fast on weak hardware for demos. Not recommended for coding benchmarks.",
         ),
         HuggingFaceModelEntry(
             id = "stablelm_zephyr_3b_q4km",
@@ -312,5 +312,26 @@ object HuggingFaceModelCatalog {
         ),
     )
 
-    fun find(id: String): HuggingFaceModelEntry? = entries.firstOrNull { it.id == id }
+    private val customEntries = mutableMapOf<String, HuggingFaceModelEntry>()
+
+    fun find(id: String): HuggingFaceModelEntry? = entries.firstOrNull { it.id == id } ?: customEntries[id]
+
+    fun createCustomEntry(repoId: String, fileName: String): HuggingFaceModelEntry {
+        val cleanRepo = repoId.trim().trim('/')
+        val cleanFile = fileName.trim().removePrefix("/")
+        val id = "custom_" + (cleanRepo + "_" + cleanFile).replace(Regex("[^A-Za-z0-9._-]+"), "_").take(40)
+        val entry = HuggingFaceModelEntry(
+            id = id,
+            name = cleanFile.removeSuffix(".gguf"),
+            repoId = cleanRepo,
+            fileName = cleanFile,
+            expectedBytes = -1L,
+            license = "Community / Unspecified",
+            parameters = "Custom",
+            quantization = "Auto",
+            notes = "User-submitted custom Hugging Face GGUF repository",
+        )
+        customEntries[id] = entry
+        return entry
+    }
 }

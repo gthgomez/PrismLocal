@@ -47,6 +47,10 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -72,6 +76,15 @@ internal fun ChatListSheet(
     var renameTitle by remember { mutableStateOf("") }
     var deleteTarget by remember { mutableStateOf<ChatSession?>(null) }
     var clearCurrentRequested by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+
+    val filteredSessions = remember(sessions, searchQuery) {
+        if (searchQuery.isBlank()) sessions
+        else sessions.filter { session ->
+            session.title.contains(searchQuery, ignoreCase = true) ||
+                (session.modelId?.contains(searchQuery, ignoreCase = true) == true)
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -107,17 +120,20 @@ internal fun ChatListSheet(
             }
         }
 
-        Text(
-            text = "Offline AI workspace",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        if (sessions.isNotEmpty()) {
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("Search conversations...") },
+                singleLine = true,
+                textStyle = MaterialTheme.typography.bodySmall,
+            )
+        }
 
-        if (sessions.isEmpty()) {
+        if (filteredSessions.isEmpty()) {
             Text(
-                text = "No chats yet",
+                text = if (sessions.isEmpty()) "No chats yet" else "No matching conversations",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -128,7 +144,7 @@ internal fun ChatListSheet(
                     .heightIn(max = 420.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                items(sessions, key = { it.id }) { session ->
+                items(filteredSessions, key = { it.id }) { session ->
                     ChatSessionRow(
                         session = session,
                         selected = session.id == currentChatId,
@@ -252,9 +268,9 @@ private fun ChatSessionRow(
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
-        color = if (selected) Color(0xFFF8FBFF) else Color.White,
-        contentColor = PrismText,
-        border = BorderStroke(1.dp, if (selected) PrismViolet.copy(alpha = 0.30f) else PrismGlassBorder),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, if (selected) PrismViolet.copy(alpha = 0.50f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)),
         shadowElevation = 0.dp,
         enabled = !isGenerating,
         onClick = {
@@ -295,6 +311,7 @@ private fun ChatSessionRow(
                         modifier = Modifier.weight(1f),
                         text = polishedChatTitle(session.title),
                         style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
@@ -408,12 +425,18 @@ internal fun ChatOverflowButton(
     enabled: Boolean,
     onClick: () -> Unit,
 ) {
+    val dotColor = MaterialTheme.colorScheme.onSurfaceVariant
     Surface(
-        modifier = Modifier.size(34.dp),
-        shape = RoundedCornerShape(17.dp),
-        color = Color.White.copy(alpha = 0.56f),
-        contentColor = PrismSlate,
-        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.70f)),
+        modifier = Modifier
+            .size(48.dp)
+            .semantics {
+                contentDescription = "Chat options"
+                role = Role.Button
+            },
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.60f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)),
         enabled = enabled,
         onClick = onClick,
     ) {
@@ -421,7 +444,7 @@ internal fun ChatOverflowButton(
             Canvas(modifier = Modifier.size(18.dp)) {
                 repeat(3) { index ->
                     drawCircle(
-                        color = PrismSlate,
+                        color = dotColor,
                         radius = size.minDimension * 0.08f,
                         center = Offset(center.x, size.height * (0.28f + index * 0.22f)),
                     )

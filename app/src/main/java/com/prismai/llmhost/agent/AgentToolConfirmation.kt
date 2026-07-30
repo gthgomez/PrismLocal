@@ -49,14 +49,19 @@ class AgentToolConfirmation(
         call: AgentToolCall,
         definition: AgentToolDefinition,
     ): PendingAgentToolAction {
+        val sanitizedName = com.prismai.llmhost.util.SanitizerUtils.stripControlCharacters(call.name)
+        val sanitizedDescription = com.prismai.llmhost.util.SanitizerUtils.stripControlCharacters(definition.description)
+        val sanitizedArguments = com.prismai.llmhost.util.SanitizerUtils.stripControlCharacters(call.arguments.toString(2))
+        val sanitizedReason = call.reason?.takeIf { it.isNotBlank() }?.let { com.prismai.llmhost.util.SanitizerUtils.stripControlCharacters(it) }
+
         val base = PendingAgentToolAction(
             id = id,
-            name = call.name,
-            description = definition.description,
-            argumentsJson = call.arguments.toString(2),
-            title = "Confirm ${call.name}",
-            summary = definition.description,
-            riskNotes = call.reason?.takeIf { it.isNotBlank() }?.let { listOf("Agent reason: $it") }.orEmpty(),
+            name = sanitizedName,
+            description = sanitizedDescription,
+            argumentsJson = sanitizedArguments,
+            title = "Confirm $sanitizedName",
+            summary = sanitizedDescription,
+            riskNotes = sanitizedReason?.let { listOf("Agent reason: $it") }.orEmpty(),
             confirmLabel = "Run",
         )
         return when (call.name) {
@@ -132,6 +137,19 @@ class AgentToolConfirmation(
                     riskNotes = listOf("Uses network and app storage. Only curated catalog entries are allowed."),
                     confirmLabel = "Download",
                     networkRequired = true,
+                )
+            }
+            "delete_model" -> {
+                val modelId = call.arguments.optString("model_id")
+                base.copy(
+                    title = "Delete installed model?",
+                    summary = "Delete GGUF model $modelId from app storage.",
+                    changes = listOf(
+                        "Model: $modelId",
+                    ),
+                    riskNotes = listOf("Permanently removes the GGUF model binary from device storage."),
+                    confirmLabel = "Delete Model",
+                    destructive = true,
                 )
             }
             "switch_model" -> {

@@ -80,4 +80,95 @@ class AttachmentTextExtractorTest {
         assertTrue(prompt.contains("Extraction status: metadata_only"))
         assertTrue(prompt.contains("do not infer contents from the file name"))
     }
+
+    @Test
+    fun multiAttachmentPromptBuilderEnforcesGlobalCharCap() {
+        val longText = "A".repeat(5_000)
+        val attachment1 = PromptAttachment(
+            uriString = "content://test/file1.txt",
+            name = "file1.txt",
+            mimeType = "text/plain",
+            sizeBytes = 5000L,
+            extractionStatus = AttachmentExtractionStatus.EXTRACTED,
+            promptText = longText,
+        )
+        val attachment2 = PromptAttachment(
+            uriString = "content://test/file2.txt",
+            name = "file2.txt",
+            mimeType = "text/plain",
+            sizeBytes = 5000L,
+            extractionStatus = AttachmentExtractionStatus.EXTRACTED,
+            promptText = longText,
+        )
+
+        val maxTotal = 2_000
+        val prompt = AttachmentTextExtractor.buildPrompt(
+            prompt = "Review files",
+            attachments = listOf(attachment1, attachment2),
+            maxTotalAttachmentChars = maxTotal,
+        )
+
+        assertTrue(prompt.contains("[Truncated for attachment budget]"))
+        // Body content only: equal share 1000 + 1000, marker included in each share
+        assertTrue(
+            "attachment body chars must not exceed global cap",
+            prompt.count { it == 'A' } <= maxTotal,
+        )
+    }
+
+    @Test
+    fun manyAttachmentsDoNotOvershootGlobalCapViaPerFileFloor() {
+        // Previous bug: coerceAtLeast(400) made 10 files * 400 = 4000 > cap 2000
+        val longText = "B".repeat(5_000)
+        val attachments = (1..10).map { i ->
+            PromptAttachment(
+                uriString = "content://test/file$i.txt",
+                name = "file$i.txt",
+                mimeType = "text/plain",
+                sizeBytes = 5000L,
+                extractionStatus = AttachmentExtractionStatus.EXTRACTED,
+                promptText = longText,
+            )
+        }
+        val maxTotal = 2_000
+        val prompt = AttachmentTextExtractor.buildPrompt(
+            prompt = "Review many",
+            attachments = attachments,
+            maxTotalAttachmentChars = maxTotal,
+        )
+
+        assertTrue(
+            "10-file equal share must stay within global body budget (was overshooting with 400 floor)",
+            prompt.count { it == 'B' } <= maxTotal,
+        )
+        // 2000 / 10 = 200 per file; bodies should be truncated
+        assertTrue(prompt.contains("[Truncated for attachment budget]"))
+    }
+
+    @Test
+    fun truncateAttachmentBodyKeepsMarkerInsideLimit() {
+        val text = "C".repeat(100)
+        val truncated = AttachmentTextExtractor.truncateAttachmentBody(text, limit = 40)
+        assertEquals(40, truncated.length)
+        assertTrue(truncated.endsWith("[Truncated for attachment budget]"))
+        assertTrue(truncated.count { it == 'C' } < 40)
+    }
+
+    @Test
+    fun zeroAttachmentBudgetYieldsEmptyBodies() {
+        val attachment = PromptAttachment(
+            uriString = "content://test/file.txt",
+            name = "file.txt",
+            mimeType = "text/plain",
+            sizeBytes = 100L,
+            extractionStatus = AttachmentExtractionStatus.EXTRACTED,
+            promptText = "SECRET_PAYLOAD",
+        )
+        val prompt = AttachmentTextExtractor.buildPrompt(
+            prompt = "Hi",
+            attachments = listOf(attachment),
+            maxTotalAttachmentChars = 0,
+        )
+        assertTrue(!prompt.contains("SECRET_PAYLOAD"))
+    }
 }

@@ -14,4 +14,7 @@ data class GenerationChunk(
     val isTerminal: Boolean,
     val terminalReason: String = "NONE",
     val promptTokens: Int = 0,
+    val ttftMs: Long = 0L,
+    val tokensPerSec: Float = 0.0f,
+    val activeThreads: Int = 0,
 )

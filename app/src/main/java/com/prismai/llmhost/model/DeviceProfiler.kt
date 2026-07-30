@@ -60,6 +60,17 @@ class DeviceProfiler(private val context: Context) {
         }
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
         val stat = StatFs(context.filesDir.absolutePath)
+        val isSamsung = Build.MANUFACTURER.contains("samsung", ignoreCase = true)
+        val isS25UltraModel = isSamsung && (Build.MODEL.contains("SM-S938", ignoreCase = true) || Build.DEVICE.contains("q2q", ignoreCase = true))
+        val s25RamTierString = when {
+            !isS25UltraModel -> "STANDARD"
+            memoryInfo.totalMem >= 14L * 1024 * 1024 * 1024 -> "16GB_REGION"
+            else -> "12GB_STANDARD"
+        }
+        val hasSPen = runCatching {
+            context.packageManager.hasSystemFeature("com.samsung.feature.device.sppen")
+        }.getOrDefault(false) || (isSamsung && (Build.MODEL.contains("S938") || Build.MODEL.contains("S928") || Build.MODEL.contains("S918")))
+
         return DeviceCapabilityProfile(
             totalRamBytes = memoryInfo.totalMem,
             availableRamBytes = memoryInfo.availMem,
@@ -78,6 +89,9 @@ class DeviceProfiler(private val context: Context) {
             memoryClassMb = activityManager.memoryClass,
             largeMemoryClassMb = activityManager.largeMemoryClass,
             appHeapMaxBytes = Runtime.getRuntime().maxMemory(),
+            isSamsungS25Ultra = isS25UltraModel,
+            s25RamTier = s25RamTierString,
+            hasSPenSupport = hasSPen,
         )
     }
 

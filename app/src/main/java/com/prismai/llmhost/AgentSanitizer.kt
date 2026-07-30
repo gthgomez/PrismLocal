@@ -31,4 +31,24 @@ object AgentSanitizer {
         }
         return clean
     }
+    /**
+     * Validates that [file] resides strictly within [contextFilesDir] or [contextExternalFilesDir].
+     * Uses canonicalPath and trailing file separators to prevent directory traversal and symlink escape.
+     */
+    fun isPathWithinSandbox(file: java.io.File, contextFilesDir: java.io.File, contextExternalFilesDir: java.io.File?): Boolean {
+        val target = runCatching { file.canonicalPath }.getOrNull() ?: return false
+        val internalRoot = runCatching { contextFilesDir.canonicalPath }.getOrNull() ?: return false
+        val internalPrefix = if (internalRoot.endsWith(java.io.File.separator)) internalRoot else internalRoot + java.io.File.separator
+        if (target.startsWith(internalPrefix) || target == internalRoot) {
+            return true
+        }
+        if (contextExternalFilesDir != null) {
+            val externalRoot = runCatching { contextExternalFilesDir.canonicalPath }.getOrNull() ?: return false
+            val externalPrefix = if (externalRoot.endsWith(java.io.File.separator)) externalRoot else externalRoot + java.io.File.separator
+            if (target.startsWith(externalPrefix) || target == externalRoot) {
+                return true
+            }
+        }
+        return false
+    }
 }

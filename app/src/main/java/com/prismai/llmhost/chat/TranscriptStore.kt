@@ -98,6 +98,7 @@ class TranscriptStore(private val context: Context) {
 
     // ── Atomic temp-file promotion ──────────────────────────────────────
 
+
     fun promoteTempFile(temp: File, target: File) {
         runCatching {
             Files.move(temp.toPath(), target.toPath(), REPLACE_EXISTING, ATOMIC_MOVE)

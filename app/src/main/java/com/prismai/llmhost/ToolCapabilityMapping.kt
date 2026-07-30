@@ -75,6 +75,11 @@ object ToolCapabilityMapping {
         "run_in_background" to setOf(Capability.CHAT_MANAGE),
         "check_background_tasks" to setOf(Capability.SYSTEM_INFO),
         "cancel_background_task" to setOf(Capability.CHAT_MANAGE),
+
+        // Phase 5 Workspace tools
+        "list_workspace_files" to setOf(Capability.FILE_READ),
+        "read_workspace_file" to setOf(Capability.FILE_READ),
+        "search_workspace_files" to setOf(Capability.FILE_READ),
     )
 
     fun capabilitiesFor(toolName: String): Set<Capability> = map[toolName] ?: emptySet()

@@ -44,40 +44,67 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.prismai.llmhost.ui.theme.*
 
+import androidx.compose.foundation.isSystemInDarkTheme
+
 @Composable
 internal fun PrismBackdrop(modifier: Modifier = Modifier) {
+    val darkTheme = isSystemInDarkTheme()
     Canvas(modifier = modifier) {
-        drawRect(
-            brush = Brush.linearGradient(
-                colors = listOf(
-                    Color(0xFFF8FCFF),
-                    Color(0xFFF3F8FF),
-                    Color(0xFFFDF6FF),
-                ),
-                start = Offset.Zero,
-                end = Offset(size.width, size.height),
+        if (darkTheme) {
+            drawRect(
+                brush = Brush.linearGradient(
+                    colors = listOf(
+                        Color(0xFF0F172A),
+                        Color(0xFF0B0F19),
+                        Color(0xFF181825),
+                    ),
+                    start = Offset.Zero,
+                    end = Offset(size.width, size.height),
+                )
             )
-        )
-        drawCircle(
-            color = PrismCyan.copy(alpha = 0.14f),
-            radius = size.minDimension * 0.28f,
-            center = Offset(size.width * 0.04f, size.height * 0.34f),
-        )
-        drawCircle(
-            color = PrismCyan.copy(alpha = 0.10f),
-            radius = size.minDimension * 0.22f,
-            center = Offset(size.width * 0.02f, size.height * 0.78f),
-        )
-        drawCircle(
-            color = PrismViolet.copy(alpha = 0.14f),
-            radius = size.minDimension * 0.30f,
-            center = Offset(size.width * 1.02f, size.height * 0.66f),
-        )
-        drawCircle(
-            color = Color.White.copy(alpha = 0.58f),
-            radius = size.minDimension * 0.38f,
-            center = Offset(size.width * 0.62f, size.height * 0.48f),
-        )
+            drawCircle(
+                color = PrismCyan.copy(alpha = 0.08f),
+                radius = size.minDimension * 0.28f,
+                center = Offset(size.width * 0.04f, size.height * 0.34f),
+            )
+            drawCircle(
+                color = PrismViolet.copy(alpha = 0.08f),
+                radius = size.minDimension * 0.30f,
+                center = Offset(size.width * 1.02f, size.height * 0.66f),
+            )
+        } else {
+            drawRect(
+                brush = Brush.linearGradient(
+                    colors = listOf(
+                        Color(0xFFF8FCFF),
+                        Color(0xFFF3F8FF),
+                        Color(0xFFFDF6FF),
+                    ),
+                    start = Offset.Zero,
+                    end = Offset(size.width, size.height),
+                )
+            )
+            drawCircle(
+                color = PrismCyan.copy(alpha = 0.14f),
+                radius = size.minDimension * 0.28f,
+                center = Offset(size.width * 0.04f, size.height * 0.34f),
+            )
+            drawCircle(
+                color = PrismCyan.copy(alpha = 0.10f),
+                radius = size.minDimension * 0.22f,
+                center = Offset(size.width * 0.02f, size.height * 0.78f),
+            )
+            drawCircle(
+                color = PrismViolet.copy(alpha = 0.14f),
+                radius = size.minDimension * 0.30f,
+                center = Offset(size.width * 1.02f, size.height * 0.66f),
+            )
+            drawCircle(
+                color = Color.White.copy(alpha = 0.58f),
+                radius = size.minDimension * 0.38f,
+                center = Offset(size.width * 0.62f, size.height * 0.48f),
+            )
+        }
     }
 }
 
@@ -92,7 +119,7 @@ internal fun SheetDragHandle() {
         Surface(
             modifier = Modifier.size(width = 40.dp, height = 4.dp),
             shape = RoundedCornerShape(999.dp),
-            color = Color(0xFFD1D5DB),
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
             contentColor = Color.Transparent,
             shadowElevation = 0.dp,
         ) {}
@@ -104,9 +131,9 @@ internal fun PrismLogoTile(size: Dp = 62.dp) {
     Surface(
         modifier = Modifier.size(size),
         shape = RoundedCornerShape(24.dp),
-        color = Color.White.copy(alpha = 0.72f),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
         contentColor = PrismBlue,
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.74f)),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
         tonalElevation = 2.dp,
         shadowElevation = 0.dp,
     ) {
@@ -119,15 +146,16 @@ internal fun PrismLogoTile(size: Dp = 62.dp) {
 @Composable
 internal fun DashboardCard(
     modifier: Modifier = Modifier,
-    tint: Color = Color.White,
+    tint: Color = Color.Unspecified,
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    val cardColor = if (tint == Color.Unspecified) MaterialTheme.colorScheme.surface else tint
     Surface(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
-        color = tint,
-        contentColor = PrismText,
-        border = BorderStroke(1.dp, PrismGlassBorder.copy(alpha = 0.58f)),
+        color = cardColor,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, prismGlassBorderColor()),
         shadowElevation = 0.dp,
     ) {
         Column(
@@ -312,9 +340,9 @@ internal fun GlassSurface(
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(radius),
-        color = PrismGlass,
-        contentColor = PrismText,
-        border = BorderStroke(1.dp, PrismGlassBorder),
+        color = prismGlassColor(),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, prismGlassBorderColor()),
         tonalElevation = 2.dp,
         shadowElevation = 2.dp,
         content = content,

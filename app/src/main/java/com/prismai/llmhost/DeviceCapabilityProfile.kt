@@ -21,6 +21,9 @@ data class DeviceCapabilityProfile(
     val memoryClassMb: Int,
     val largeMemoryClassMb: Int,
     val appHeapMaxBytes: Long,
+    val isSamsungS25Ultra: Boolean = false,
+    val s25RamTier: String = "STANDARD",
+    val hasSPenSupport: Boolean = false,
     val capturedAt: Long = System.currentTimeMillis(),
 )
 

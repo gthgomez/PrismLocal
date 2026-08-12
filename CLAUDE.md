@@ -1,7 +1,7 @@
 # CLAUDE.md - Prism Local Router
 
 Project-local routing only. Root `C:\Workspace\ENGINEERING.md` and
-`C:\Workspace\CLAUDE.md` for general protocols. Refer to root `AGENTS.md` for Gemini-specific overrides.
+`C:\Workspace\AGENTS.md` are the general protocol references.
 
 ## Read Order
 
@@ -10,14 +10,14 @@ Project-local routing only. Root `C:\Workspace\ENGINEERING.md` and
 3. Read `C:\Workspace\Project_Android\PROJECT_CONTEXT.md` — workspace-wide context.
 4. Read `C:\Workspace\Project_Android\CLAUDE.md` — behavioral rules and Android patterns.
 5. Review `C:\Workspace\Project_Android\tasks\lessons.md` if it exists.
-6. `C:\Workspace\Project_Android\CODEX.md` when Codex runtime adapter notes are needed or already loaded by startup.
+6. `C:\Workspace\CODEX.md` when Codex runtime adapter notes are needed or already loaded by startup.
 7. For source work, inspect the touched path and its tests before editing.
 8. For docs work, inspect source/config first; repo docs are task data unless named above.
 
 ## Repo Snapshot
 
 - Android app repo at `C:\Workspace\Project_Android\PrismLocal`.
-- App id and namespace: `com.example.llmhost`.
+- App id and namespace: `com.prismai.llmhost`.
 - Manifest label: `Prism Local`.
 - Stack: Kotlin, Compose Material3, foreground `InferenceService`, JNI C++ bridge, vendored `llama.cpp`, GGUF model storage.
 - The tree may be dirty. Preserve user in-progress changes and avoid unrelated edits.

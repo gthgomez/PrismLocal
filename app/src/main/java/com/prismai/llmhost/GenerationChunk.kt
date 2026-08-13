@@ -17,4 +17,5 @@ data class GenerationChunk(
     val ttftMs: Long = 0L,
     val tokensPerSec: Float = 0.0f,
     val activeThreads: Int = 0,
+    val errorCode: Int = 0,
 )

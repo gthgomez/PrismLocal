@@ -83,7 +83,7 @@ internal fun PromptComposer(
     voiceState: com.prismai.llmhost.tools.VoiceState? = null,
 ) {
     val placeholder = when {
-        !enabled -> "Reconnecting to Prism Local"
+        !enabled -> "Starting Prism Local..."
         hasModel -> "Ask about code..."
         else -> "Ask for model help or import a GGUF"
     }

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -263,6 +264,7 @@ struct ModelRuntime {
     int gpu_layers = 0;             // verified offloaded layer count (0 if GPU init failed at runtime)
     std::string actual_backend_name = "CPU"; // set at load time from verified runtime state
     llama_pos current_position = 0;
+    int system_prefix_length = 0;
     std::string model_path;
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
@@ -442,15 +444,73 @@ bool isTerminal(uint32_t state) {
            state == static_cast<uint32_t>(StreamState::MaxTokens);
 }
 
+int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_vocab* vocab) {
+    if (vocab == nullptr || tokens.empty()) return 0;
+
+    std::string accumulated;
+    std::vector<size_t> token_end_offsets;
+    token_end_offsets.reserve(std::min(tokens.size(), static_cast<size_t>(512)));
+
+    const size_t max_tokens_to_check = std::min(tokens.size(), static_cast<size_t>(512));
+    for (size_t i = 0; i < max_tokens_to_check; i++) {
+        char buf[256];
+        int32_t len = llama_token_to_piece(vocab, tokens[i], buf, sizeof(buf) - 1, 0, true);
+        if (len < 0 || len > static_cast<int32_t>(sizeof(buf) - 1)) {
+            return 0;
+        }
+        if (len > 0) {
+            accumulated.append(buf, static_cast<size_t>(len));
+        }
+        token_end_offsets.push_back(accumulated.size());
+    }
+
+    std::string closing_tag;
+    const std::string chatml_system_prefix = "<|im_start|>system";
+    const bool has_chatml_system_role =
+        accumulated.rfind(chatml_system_prefix, 0) == 0 &&
+        accumulated.size() > chatml_system_prefix.size() &&
+        (accumulated[chatml_system_prefix.size()] == '\n' ||
+         accumulated[chatml_system_prefix.size()] == '\r' ||
+         accumulated[chatml_system_prefix.size()] == ' ' ||
+         accumulated[chatml_system_prefix.size()] == '\t');
+
+    if (has_chatml_system_role) {
+        closing_tag = "<|im_end|>";
+    } else if (accumulated.rfind("<|start_header_id|>system<|end_header_id|>", 0) == 0) {
+        closing_tag = "<|eot_id|>";
+    } else if (accumulated.rfind("<system>", 0) == 0) {
+        closing_tag = "</system>";
+    }
+
+    if (closing_tag.empty()) {
+        return 0;
+    }
+
+    const size_t end_tag = accumulated.find(closing_tag);
+    if (end_tag == std::string::npos) {
+        return 0;
+    }
+    const size_t system_end_pos = end_tag + closing_tag.size();
+
+    for (size_t i = 0; i < token_end_offsets.size(); i++) {
+        if (token_end_offsets[i] >= system_end_pos) {
+            return static_cast<int>(i + 1);
+        }
+    }
+
+    return 0;
+}
+
 void resetRuntimeContext(ModelRuntime& runtime, bool clear_data) {
     if (runtime.ctx != nullptr) {
         llama_memory_clear(llama_get_memory(runtime.ctx), clear_data);
     }
     runtime.current_position = 0;
     runtime.active_tokens.clear();
+    runtime.system_prefix_length = 0;
 }
 
-bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens) {
+bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, bool allow_full_reset) {
     if (runtime.ctx == nullptr) {
         return false;
     }
@@ -458,10 +518,58 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens) {
     if (runtime.current_position + required_tokens < limit) {
         return true;
     }
-    LOGW("context_limit_exceeded current_pos=%d required=%d limit=%d; resetting kv cache",
-         static_cast<int>(runtime.current_position), required_tokens, static_cast<int>(limit));
-    resetRuntimeContext(runtime, false);
-    return required_tokens < limit;
+
+    const int max_prefix = static_cast<int>(runtime.current_position) / 2;
+    const int system_prefix_tokens = std::min(runtime.system_prefix_length, max_prefix);
+    const int available_tokens = static_cast<int>(runtime.current_position) - system_prefix_tokens;
+    if (available_tokens <= 0) {
+        if (allow_full_reset) {
+            resetRuntimeContext(runtime, false);
+            return required_tokens < limit;
+        }
+        return false;
+    }
+
+    int drop_count = available_tokens / 4;
+    if (drop_count < 1) drop_count = 1;
+    if (drop_count > available_tokens) drop_count = available_tokens;
+
+    auto* memory = llama_get_memory(runtime.ctx);
+    const llama_pos seq_start = static_cast<llama_pos>(system_prefix_tokens);
+    const llama_pos seq_end = seq_start + static_cast<llama_pos>(drop_count);
+
+    // Remove old entries from sequence
+    bool rm_ok = llama_memory_seq_rm(memory, kMainSequence, seq_start, seq_end);
+    if (rm_ok) {
+        // Compact remaining sequence positions
+        llama_memory_seq_add(memory, kMainSequence, seq_end, runtime.current_position, -static_cast<llama_pos>(drop_count));
+        if (static_cast<size_t>(system_prefix_tokens + drop_count) > runtime.active_tokens.size()) {
+            LOGW("KV compaction token range mismatch: prefix=%d drop=%d active=%zu",
+                 system_prefix_tokens, drop_count, runtime.active_tokens.size());
+            resetRuntimeContext(runtime, false);
+            return allow_full_reset && required_tokens < limit;
+        }
+        runtime.active_tokens.erase(runtime.active_tokens.begin() + system_prefix_tokens,
+                                    runtime.active_tokens.begin() + system_prefix_tokens + drop_count);
+        runtime.current_position -= static_cast<llama_pos>(drop_count);
+        if (runtime.current_position != static_cast<llama_pos>(runtime.active_tokens.size())) {
+            LOGW("KV compaction position mismatch: pos=%d active=%zu; resetting context",
+                 static_cast<int>(runtime.current_position), runtime.active_tokens.size());
+            resetRuntimeContext(runtime, false);
+            return allow_full_reset && required_tokens < limit;
+        }
+        assert(runtime.current_position == static_cast<llama_pos>(runtime.active_tokens.size()));
+        LOGI("kv_cache_sliding_window_shift dropped=%d prefix=%d new_pos=%d limit=%d",
+             drop_count, system_prefix_tokens, static_cast<int>(runtime.current_position), static_cast<int>(limit));
+    } else {
+        LOGW("llama_memory_seq_rm failed; allow_full_reset=%s", allow_full_reset ? "true" : "false");
+        if (allow_full_reset) {
+            resetRuntimeContext(runtime, false);
+            return required_tokens < limit;
+        }
+        return false;
+    }
+    return (runtime.current_position + required_tokens) < limit;
 }
 
 // Returns:
@@ -725,6 +833,21 @@ struct Engine::Impl {
             return;
         }
 
+        // Register per-generation abort callback so llama_decode can be interrupted mid-batch
+        auto abort_fn = [](void* data) -> bool {
+            return static_cast<std::atomic<bool>*>(data)->load(std::memory_order_acquire);
+        };
+        llama_set_abort_callback(runtime->ctx, abort_fn, const_cast<std::atomic<bool>*>(&session->cancel_requested));
+
+        struct AbortCallbackGuard {
+            llama_context* ctx;
+            ~AbortCallbackGuard() {
+                if (ctx != nullptr) {
+                    llama_set_abort_callback(ctx, nullptr, nullptr);
+                }
+            }
+        } abort_guard{runtime->ctx};
+
         llama_set_n_threads(runtime->ctx, session->config.thread_count, session->config.thread_count);
         LOGI("generation_config generation_id=%u max_tokens=%d threads=%d n_ctx=%d n_batch=%d temp=%.2f top_k=%d top_p=%.2f repeat=%.2f kv_pos=%d",
              session->generation_id,
@@ -746,7 +869,7 @@ struct Engine::Impl {
                 finishSession(session, StreamState::Error);
                 return;
             }
-            if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens + kContextHeadroom)) {
+            if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens + kContextHeadroom, false)) {
                 ctrl->error_code.store(426, std::memory_order_release);
                 LOGE("continue_context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
@@ -806,6 +929,13 @@ struct Engine::Impl {
             }
 
             int32_t usable_prompt_tokens = actual_tokens;
+            if (actual_tokens > static_cast<int32_t>(prompt_tokens.size())) {
+                ctrl->error_code.store(423, std::memory_order_release);
+                LOGE("tokenize_count_mismatch actual=%d capacity=%zu", actual_tokens, prompt_tokens.size());
+                finishSession(session, StreamState::Error);
+                return;
+            }
+            prompt_tokens.resize(static_cast<size_t>(actual_tokens));
             const int max_prompt_tokens = runtime->context_length - session->config.max_tokens - kContextHeadroom;
             if (usable_prompt_tokens > max_prompt_tokens) {
                 if (max_prompt_tokens <= 0) {
@@ -843,9 +973,13 @@ struct Engine::Impl {
                 LOGI("prefix_cache_miss; fully cleared kv");
             }
 
+            runtime->system_prefix_length = std::min(
+                findSystemPrefixLength(prompt_tokens, runtime->vocab),
+                usable_prompt_tokens);
+
             const int32_t tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
 
-            if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens + kContextHeadroom)) {
+            if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens + kContextHeadroom, true)) {
                 ctrl->error_code.store(426, std::memory_order_release);
                 LOGE("context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
@@ -854,6 +988,12 @@ struct Engine::Impl {
                 finishSession(session, StreamState::Error);
                 return;
             }
+
+            // A full-reset fallback is allowed for new prompts. Restore the
+            // current prompt's prefix metadata before decoding it again.
+            runtime->system_prefix_length = std::min(
+                findSystemPrefixLength(prompt_tokens, runtime->vocab),
+                usable_prompt_tokens);
 
             if (session->cancel_requested.load(std::memory_order_acquire)) {
                 finishSession(session, StreamState::Cancelled);
@@ -879,6 +1019,9 @@ struct Engine::Impl {
                         if (retry_rc == 0) {
                             runtime->current_position = usable_prompt_tokens;
                             runtime->active_tokens = prompt_tokens;
+                            runtime->system_prefix_length = std::min(
+                                findSystemPrefixLength(prompt_tokens, runtime->vocab),
+                                usable_prompt_tokens);
                             LOGI("prefix_cache_retry_success prompt_tokens=%d", usable_prompt_tokens);
                         } else {
                             ctrl->error_code.store(static_cast<uint32_t>(5000 + std::abs(retry_rc)), std::memory_order_release);
@@ -1699,6 +1842,9 @@ Engine::DrainResult Engine::drainDecodeAndState(int generation_id, int max_token
             result.ttft_ms = impl_->active_session->ttft_ms.load(std::memory_order_relaxed);
             result.tokens_per_sec = impl_->active_session->tokens_per_sec.load(std::memory_order_relaxed);
             result.active_threads = impl_->active_session->active_threads.load(std::memory_order_relaxed);
+        }
+        if (impl_->buffers.control != nullptr) {
+            result.error_code = impl_->buffers.control->error_code.load(std::memory_order_acquire);
         }
     }
 

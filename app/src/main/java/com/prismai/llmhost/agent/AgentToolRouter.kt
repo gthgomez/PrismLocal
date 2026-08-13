@@ -216,11 +216,12 @@ class AgentToolRouter(
                         )
                     }
                     val latency = SystemClock.elapsedRealtime() - stepStart
-                    agentTrace.recordStep(validatedCall, result, latency)
-                    appendToolResult(result)
+                    val sanitizedResult = ToolInputSanitizer.sanitizeResult(result)
+                    agentTrace.recordStep(validatedCall, sanitizedResult, latency)
+                    appendToolResult(sanitizedResult)
                     val maxIter = uiState.generationSettings.value.maxAgentIterations
                     if (depth + 1 < maxIter) {
-                        onFollowUp(originalPrompt, result, depth + 1)
+                        onFollowUp(originalPrompt, sanitizedResult, depth + 1)
                     }
                 }
             }

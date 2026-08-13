@@ -77,6 +77,7 @@ public:
         int64_t ttft_ms = 0;
         float tokens_per_sec = 0.0f;
         int active_threads = 0;
+        int error_code = 0;
     };
     DrainResult drainDecodeAndState(int generation_id, int max_tokens);
 

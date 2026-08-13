@@ -49,6 +49,7 @@ jfieldID g_drain_result_prompt_tokens_field = nullptr;
 jfieldID g_drain_result_ttft_ms_field = nullptr;
 jfieldID g_drain_result_tokens_per_sec_field = nullptr;
 jfieldID g_drain_result_active_threads_field = nullptr;
+jfieldID g_drain_result_error_code_field = nullptr;
 std::once_flag g_drain_result_cache_flag;
 
 bool drainResultFieldsReady() {
@@ -62,7 +63,8 @@ bool drainResultFieldsReady() {
         && g_drain_result_prompt_tokens_field != nullptr
         && g_drain_result_ttft_ms_field != nullptr
         && g_drain_result_tokens_per_sec_field != nullptr
-        && g_drain_result_active_threads_field != nullptr;
+        && g_drain_result_active_threads_field != nullptr
+        && g_drain_result_error_code_field != nullptr;
 }
 
 void ensureDrainResultCache(JNIEnv* env) {
@@ -83,6 +85,7 @@ void ensureDrainResultCache(JNIEnv* env) {
             g_drain_result_ttft_ms_field = env->GetFieldID(g_drain_result_class, "ttftMs", "J");
             g_drain_result_tokens_per_sec_field = env->GetFieldID(g_drain_result_class, "tokensPerSec", "F");
             g_drain_result_active_threads_field = env->GetFieldID(g_drain_result_class, "activeThreads", "I");
+            g_drain_result_error_code_field = env->GetFieldID(g_drain_result_class, "errorCode", "I");
             env->DeleteLocalRef(local_class);
             if (!drainResultFieldsReady()) {
                 LOGE("ensureDrainResultCache: incomplete field IDs (Kotlin/native layout mismatch)");
@@ -464,8 +467,11 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
         return;
     }
 
+    env->SetIntField(result, g_drain_result_error_code_field, 0);
+
     if (engine == nullptr) {
         env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Tombstoned));
+        env->SetIntField(result, g_drain_result_error_code_field, 404);
         return;
     }
 
@@ -538,8 +544,10 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
         env->SetLongField(result, g_drain_result_ttft_ms_field, static_cast<jlong>(drain_result.ttft_ms));
         env->SetFloatField(result, g_drain_result_tokens_per_sec_field, static_cast<jfloat>(drain_result.tokens_per_sec));
         env->SetIntField(result, g_drain_result_active_threads_field, static_cast<jint>(drain_result.active_threads));
+        env->SetIntField(result, g_drain_result_error_code_field, static_cast<jint>(drain_result.error_code));
     } catch (const std::exception&) {
         env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Error));
+        env->SetIntField(result, g_drain_result_error_code_field, 500);
     }
 }
 

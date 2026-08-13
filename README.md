@@ -14,4 +14,4 @@ cd C:\Workspace\Project_Android\PrismLocal
 
 `PrismLocal` is also linked in the workspace composite via `includeBuild("PrismLocal")` for Android Studio multi-project opens. App tasks still run with this project’s wrapper (`gradle-9.4.1`, AGP `9.2.0`).
 
-**Detailed docs:** [AGENTS.md](AGENTS.md) | [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) | [SIGNING.md](SIGNING.md)
+**Detailed docs:** [AGENTS.md](AGENTS.md) | [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) | [STATUS.md](STATUS.md) | [QA_CHECKLIST.md](QA_CHECKLIST.md) | [ROADMAP.md](ROADMAP.md) | [SIGNING.md](SIGNING.md)

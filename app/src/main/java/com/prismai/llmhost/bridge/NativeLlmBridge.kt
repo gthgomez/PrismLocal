@@ -329,11 +329,13 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     reusableResult.textCount = 0
                     reusableResult.textOverflow = ""
                     reusableResult.state = STATE_TOMBSTONED
+                    reusableResult.errorCode = 0
                 } else {
                     reusableResult.tokensCount = 0
                     reusableResult.textCount = 0
                     reusableResult.textOverflow = ""
                     reusableResult.state = 0
+                    reusableResult.errorCode = 0
                     nativeDrainDecodeAndState(nativeHandle, genId, 128, reusableResult)
                 }
                 if (jniTimingsCount < jniTimingsUs.size) {
@@ -368,6 +370,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                                 ttftMs = reusableResult.ttftMs,
                                 tokensPerSec = reusableResult.tokensPerSec,
                                 activeThreads = reusableResult.activeThreads,
+                                errorCode = reusableResult.errorCode,
                             )
                         )
                     }
@@ -393,6 +396,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             ttftMs = reusableResult.ttftMs,
                             tokensPerSec = reusableResult.tokensPerSec,
                             activeThreads = reusableResult.activeThreads,
+                            errorCode = reusableResult.errorCode,
                         )
                     )
                     break

@@ -35,6 +35,9 @@ class RagManager(
 
         /** Separator between chunks in the context block */
         private const val CHUNK_SEPARATOR = "\n---\n"
+
+        /** Minimum cosine similarity score threshold for RAG retrieval */
+        const val DEFAULT_MIN_RAG_SCORE = 0.35f
     }
 
     /**
@@ -109,7 +112,7 @@ class RagManager(
             return emptyList()
         }
 
-        return vectorStore.search(queryEmbedding, topK = topK, minScore = 0.0f)
+        return vectorStore.search(queryEmbedding, topK = topK, minScore = DEFAULT_MIN_RAG_SCORE)
     }
 
     /**

@@ -33,6 +33,7 @@ class NativeDrainResult {
     @JvmField var ttftMs: Long = 0L
     @JvmField var tokensPerSec: Float = 0.0f
     @JvmField var activeThreads: Int = 0
+    @JvmField var errorCode: Int = 0
 
     companion object {
         // Matches kTokenCapacity (2048) in Engine.cpp.

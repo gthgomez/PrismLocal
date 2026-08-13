@@ -580,9 +580,9 @@ class GenerationOrchestrator(
                     terminalState.reason != "QUALITY_ABORT"
                 ) {
                     uiState._runtimeStatus.value = RuntimeStatus.ERROR
-                    val detail = terminalState.detail ?: "native_runtime_error"
+                    val mappedMessage = mapErrorCodeToUserMessage(uiChunk.errorCode, terminalState.detail)
                     eventBus.publish(
-                        "${config.errorLabel.replaceFirstChar { it.uppercase() }} failed in native runtime ($detail)",
+                        "${config.errorLabel.replaceFirstChar { it.uppercase() }} failed: $mappedMessage",
                     )
                 }
             }
@@ -839,5 +839,20 @@ class GenerationOrchestrator(
         }
 
         return result.copy(details = finalDetails)
+    }
+
+    private fun mapErrorCodeToUserMessage(errorCode: Int, detail: String?): String {
+        return when (errorCode) {
+            403 -> "Debug hooks rejected operation"
+            404 -> "Model is not loaded"
+            422 -> "Context window too small for prompt"
+            423 -> "Tokenization failed"
+            424 -> "Sampler initialization failed"
+            425 -> "Null token produced"
+            426 -> "Context shift operation failed"
+            427 -> "Cannot continue without prior context"
+            in 5000..5999 -> "Native decode error (code $errorCode)"
+            else -> if (errorCode > 0) "Error code $errorCode ($detail)" else detail ?: "native runtime error"
+        }
     }
 }

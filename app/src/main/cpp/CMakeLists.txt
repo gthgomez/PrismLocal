@@ -4,6 +4,10 @@ project(llmhost)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 16 KB page-size alignment for Play (Android 15+). Hoist to shared linker flags so
+# libc++_shared and other shared deps inherit the same LOAD segment alignment.
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
+
 option(LLMHOST_DEBUG_HOOKS "Enable DEBUG_MOCK_MODEL and DEBUG_SIMULATE_RING hooks" OFF)
 option(LLMHOST_ENABLE_KLEIDIAI "Enable KleidiAI optimized ARM CPU kernels for arm64 builds" OFF)
 option(LLMHOST_ENABLE_VULKAN "Enable ggml Vulkan GPU acceleration for Android builds" ON)

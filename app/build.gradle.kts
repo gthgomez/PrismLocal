@@ -57,7 +57,7 @@ val openClCmakeArgs = buildList {
 android {
     namespace = "com.prismai.llmhost"
     compileSdk = 36
-    ndkVersion = "27.1.12297006"
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.prismai.llmhost"
@@ -72,6 +72,7 @@ android {
                 cppFlags += listOf("-std=c++20")
                 arguments += listOf(
                     "-DANDROID_PLATFORM=android-29",
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
                     "-DLLMHOST_ENABLE_KLEIDIAI=${if (kleidiAiEnabled) "ON" else "OFF"}",
                     "-DLLMHOST_ENABLE_VULKAN=${if (vulkanEnabled) "ON" else "OFF"}"
                 )

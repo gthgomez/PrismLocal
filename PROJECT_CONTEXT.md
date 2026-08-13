@@ -18,7 +18,7 @@ root workspace policy, source code, current build output, or fresh device logs.
 - Kotlin Compose plugin: `2.2.10`; Compose BOM `2026.04.01`.
 - Java/Kotlin target: JVM 17.
 - Android SDKs: min 26, compile 36, target 36.
-- NDK: `27.1.12297006`; CMake version requested by Gradle: `3.22.1`.
+- NDK: `28.2.13676358`; CMake version requested by Gradle: `3.22.1`.
 - Native ABIs in `defaultConfig`: `arm64-v8a`, `x86_64`.
 - Build types observed: `debug`, `release`, `benchmark`, `profile`, `adreno`.
 - `debug` enables `LLMHOST_DEBUG_HOOKS`; release-like builds disable it.

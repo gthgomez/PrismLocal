@@ -223,7 +223,8 @@
           "maxLength": 256
         },
         "goal": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "acceptance_criteria": {
           "type": "array",
@@ -242,92 +243,211 @@
         "required_verifiers": {
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           }
         }
       }
     },
     "StageInputV1": {
-      "type": "object",
-      "required": [
-        "kind",
-        "task"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "orient",
-            "review",
-            "attack",
-            "integrate"
-          ]
-        },
-        "task": {
-          "$ref": "#/$defs/TaskRefV1"
-        },
-        "target_refs": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/EvidenceRefV1"
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "task"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "orient"
+            },
+            "task": {
+              "$ref": "#/$defs/TaskRefV1"
+            }
           }
         },
-        "stage_refs": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "task",
+            "target_refs"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "review"
+            },
+            "task": {
+              "$ref": "#/$defs/TaskRefV1"
+            },
+            "target_refs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EvidenceRefV1"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "task",
+            "target_refs"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "attack"
+            },
+            "task": {
+              "$ref": "#/$defs/TaskRefV1"
+            },
+            "target_refs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EvidenceRefV1"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "task",
+            "stage_refs"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "integrate"
+            },
+            "task": {
+              "$ref": "#/$defs/TaskRefV1"
+            },
+            "stage_refs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            }
           }
         }
-      }
+      ]
     },
     "StageResultV1": {
-      "type": "object",
-      "required": [
-        "kind"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "orient",
-            "review",
-            "attack",
-            "integrate"
-          ]
-        },
-        "findings": {
-          "type": "array",
-          "items": {
-            "type": "string"
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "findings"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "orient"
+            },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
           }
         },
-        "required_changes": {
-          "type": "array",
-          "items": {
-            "type": "string"
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "findings",
+            "required_changes"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "review"
+            },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "required_changes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
           }
         },
-        "reproductions": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/EvidenceRefV1"
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "findings",
+            "reproductions"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "attack"
+            },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "reproductions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EvidenceRefV1"
+              }
+            }
           }
         },
-        "verifier_receipts": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/VerifierReceiptV1"
-          }
-        },
-        "changed_refs": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/EvidenceRefV1"
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "verifier_receipts",
+            "changed_refs"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "integrate"
+            },
+            "verifier_receipts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/VerifierReceiptV1"
+              }
+            },
+            "changed_refs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EvidenceRefV1"
+              }
+            }
           }
         }
-      }
+      ]
     },
     "StageRecordV1": {
       "type": "object",
@@ -446,49 +566,165 @@
       }
     },
     "TerminalOutcomeV1": {
-      "type": "object",
-      "required": [
-        "kind"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "completed_verified",
-            "completed_unverified",
-            "blocked_external",
-            "blocked_policy",
-            "budget_exhausted",
-            "cancelled",
-            "infra_failure",
-            "agent_failure"
-          ]
-        },
-        "receipts": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "receipts",
+            "revision"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "completed_verified"
+            },
+            "receipts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "revision": {
+              "$ref": "#/$defs/RevisionRefV1"
+            }
           }
         },
-        "revision": {
-          "$ref": "#/$defs/RevisionRefV1"
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "completed_unverified"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
         },
-        "reason": {
-          "type": "string",
-          "minLength": 1
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "blocked_external"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
         },
-        "dimension": {
-          "type": "string",
-          "enum": [
-            "turns",
-            "tokens",
-            "repair",
-            "infra"
-          ]
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "blocked_policy"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "dimension"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "budget_exhausted"
+            },
+            "dimension": {
+              "type": "string",
+              "enum": [
+                "turns",
+                "tokens",
+                "repair",
+                "infra"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancelled"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "infra_failure"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "agent_failure"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
         }
-      }
+      ]
     },
     "WorkflowRunV1": {
       "type": "object",

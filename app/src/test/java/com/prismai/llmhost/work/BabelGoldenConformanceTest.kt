@@ -3,6 +3,7 @@ package com.prismai.llmhost.work
 import com.prismai.llmhost.work.portable.PortableWorkflowJson
 import com.prismai.llmhost.work.portable.PortableWorkflowValidator
 import com.prismai.llmhost.work.portable.ValidationResult
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -88,16 +89,39 @@ class BabelGoldenConformanceTest {
     }
 
     @Test
-    fun canonicalBabelSchemaArtifactIsValid() {
+    fun canonicalBabelSchemaArtifactIsValidDraft2020Schema() {
         val schemaJson = loadResourceJson("golden/portable-workflow-v1.schema.json")
         assertEquals("PortableExportV1", schemaJson.getString("title"))
         assertEquals("object", schemaJson.getString("type"))
+        assertEquals("https://json-schema.org/draft/2020-12/schema", schemaJson.getString("\$schema"))
         assertTrue("Schema must have properties", schemaJson.has("properties"))
         assertTrue("Schema must have definitions", schemaJson.has("\$defs"))
         val defs = schemaJson.getJSONObject("\$defs")
         assertTrue(defs.has("WorkflowRunV1"))
         assertTrue(defs.has("VerifierReceiptV1"))
         assertTrue(defs.has("TaskRefV1"))
+        assertTrue(defs.has("StageInputV1"))
+        assertTrue(defs.has("StageResultV1"))
+        assertTrue(defs.has("TerminalOutcomeV1"))
+
+        // Assert discriminated unions have oneOf with const kinds and additionalProperties: false
+        val stageInputSchema = defs.getJSONObject("StageInputV1")
+        assertTrue("StageInputV1 must use oneOf for discriminated union", stageInputSchema.has("oneOf"))
+        val stageInputVariants = stageInputSchema.getJSONArray("oneOf")
+        assertEquals(4, stageInputVariants.length())
+
+        val stageResultSchema = defs.getJSONObject("StageResultV1")
+        assertTrue("StageResultV1 must use oneOf for discriminated union", stageResultSchema.has("oneOf"))
+        val stageResultVariants = stageResultSchema.getJSONArray("oneOf")
+        assertEquals(4, stageResultVariants.length())
+
+        val terminalSchema = defs.getJSONObject("TerminalOutcomeV1")
+        assertTrue("TerminalOutcomeV1 must use oneOf for discriminated union", terminalSchema.has("oneOf"))
+
+        // Validate valid fixture against the full JSON schema
+        val validFixture = loadResourceJson("golden/portable-workflow-v1-valid.json")
+        val errors = validateAgainstSchema(validFixture, schemaJson, schemaJson)
+        assertTrue("Valid fixture must conform to Draft 2020-12 JSON Schema: $errors", errors.isEmpty())
     }
 
     @Test
@@ -132,5 +156,115 @@ class BabelGoldenConformanceTest {
             fixtureSetHash,
             computedFixtureSetSha256,
         )
+    }
+
+    private fun validateAgainstSchema(
+        instance: Any?,
+        schemaNode: JSONObject,
+        rootSchema: JSONObject,
+    ): List<String> {
+        val errors = mutableListOf<String>()
+
+        if (schemaNode.has("\$ref")) {
+            val ref = schemaNode.getString("\$ref")
+            val target = resolveRef(ref, rootSchema)
+            return validateAgainstSchema(instance, target, rootSchema)
+        }
+
+        if (schemaNode.has("oneOf")) {
+            val variants = schemaNode.getJSONArray("oneOf")
+            var matched = false
+            for (i in 0 until variants.length()) {
+                val variantSchema = variants.getJSONObject(i)
+                val variantErrors = validateAgainstSchema(instance, variantSchema, rootSchema)
+                if (variantErrors.isEmpty()) {
+                    matched = true
+                    break
+                }
+            }
+            if (!matched) {
+                errors.add("Instance does not match any variant in oneOf")
+            }
+            return errors
+        }
+
+        if (schemaNode.has("type")) {
+            val type = schemaNode.getString("type")
+            when (type) {
+                "object" -> {
+                    if (instance !is JSONObject) {
+                        errors.add("Expected object, got $instance")
+                        return errors
+                    }
+                    if (schemaNode.has("required")) {
+                        val req = schemaNode.getJSONArray("required")
+                        for (i in 0 until req.length()) {
+                            val key = req.getString(i)
+                            if (!instance.has(key)) {
+                                errors.add("Missing required property: $key")
+                            }
+                        }
+                    }
+                    val props = schemaNode.optJSONObject("properties") ?: JSONObject()
+                    val additionalProperties = schemaNode.optBoolean("additionalProperties", true)
+                    for (key in instance.keys()) {
+                        if (props.has(key)) {
+                            val propSchema = props.getJSONObject(key)
+                            errors.addAll(validateAgainstSchema(instance.opt(key), propSchema, rootSchema))
+                        } else if (!additionalProperties) {
+                            errors.add("Forbidden additional property: $key")
+                        }
+                    }
+                }
+                "array" -> {
+                    if (instance !is JSONArray) {
+                        errors.add("Expected array, got $instance")
+                        return errors
+                    }
+                    val itemsSchema = schemaNode.optJSONObject("items")
+                    if (itemsSchema != null) {
+                        for (i in 0 until instance.length()) {
+                            errors.addAll(validateAgainstSchema(instance.get(i), itemsSchema, rootSchema))
+                        }
+                    }
+                }
+                "string" -> {
+                    if (instance !is String) {
+                        errors.add("Expected string, got $instance")
+                    } else {
+                        if (schemaNode.has("const")) {
+                            val constVal = schemaNode.getString("const")
+                            if (instance != constVal) errors.add("Expected const '$constVal', got '$instance'")
+                        }
+                        if (schemaNode.has("enum")) {
+                            val enumArr = schemaNode.getJSONArray("enum")
+                            val allowed = (0 until enumArr.length()).map { enumArr.getString(it) }
+                            if (instance !in allowed) errors.add("Value '$instance' not in enum $allowed")
+                        }
+                        if (schemaNode.has("pattern")) {
+                            val pat = Regex(schemaNode.getString("pattern"))
+                            if (!pat.matches(instance)) errors.add("Value '$instance' does not match pattern")
+                        }
+                    }
+                }
+                "boolean" -> {
+                    if (instance !is Boolean) errors.add("Expected boolean, got $instance")
+                }
+                "integer" -> {
+                    if (instance !is Int && instance !is Long) errors.add("Expected integer, got $instance")
+                }
+            }
+        }
+
+        return errors
+    }
+
+    private fun resolveRef(ref: String, rootSchema: JSONObject): JSONObject {
+        val prefix = "#/\$defs/"
+        if (ref.startsWith(prefix)) {
+            val defName = ref.substring(prefix.length)
+            return rootSchema.getJSONObject("\$defs").getJSONObject(defName)
+        }
+        throw IllegalArgumentException("Unsupported \$ref: $ref")
     }
 }

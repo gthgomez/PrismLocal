@@ -135,10 +135,11 @@ class AndroidKeystoreKeyProvider(
             val getSecurityLevelMethod = keyInfoClass.getMethod("getSecurityLevel")
             val level = getSecurityLevelMethod.invoke(keyInfo) as Int
             when (level) {
-                1 -> KeystoreSecurityLevel.TRUSTED_ENVIRONMENT // SECURITY_LEVEL_TRUSTED_ENVIRONMENT
-                2 -> KeystoreSecurityLevel.STRONGBOX // SECURITY_LEVEL_STRONGBOX
-                3 -> KeystoreSecurityLevel.UNKNOWN_SECURE // SECURITY_LEVEL_UNKNOWN_SECURE
-                0 -> KeystoreSecurityLevel.SOFTWARE // SECURITY_LEVEL_SOFTWARE
+                1 -> KeystoreSecurityLevel.TRUSTED_ENVIRONMENT // KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT (1)
+                2 -> KeystoreSecurityLevel.STRONGBOX // KeyProperties.SECURITY_LEVEL_STRONGBOX (2)
+                -1 -> KeystoreSecurityLevel.UNKNOWN_SECURE // KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE (-1)
+                0 -> KeystoreSecurityLevel.SOFTWARE // KeyProperties.SECURITY_LEVEL_SOFTWARE (0)
+                -2 -> KeystoreSecurityLevel.UNKNOWN // KeyProperties.SECURITY_LEVEL_UNKNOWN (-2)
                 else -> KeystoreSecurityLevel.UNKNOWN
             }
         } catch (_: Exception) {

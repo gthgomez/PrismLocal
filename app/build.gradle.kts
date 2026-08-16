@@ -34,7 +34,7 @@ val vulkanEnabled = signingValue("LLMHOST_ENABLE_VULKAN")
             value.equals("yes", ignoreCase = true) ||
             value == "1"
     }
-    ?: false
+    ?: true
 val openClRequested = signingValue("LLMHOST_ENABLE_OPENCL")
     ?.let { value ->
         value.equals("true", ignoreCase = true) ||

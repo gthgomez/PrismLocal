@@ -73,12 +73,13 @@ value class WorkspacePath(val rawRelativePath: String) {
          */
         fun resolveSafely(workspaceRoot: File, workspacePath: WorkspacePath): File? {
             return try {
-                val rootCanonical = workspaceRoot.canonicalFile.toPath().normalize()
-                val target = File(workspaceRoot, workspacePath.normalizedPath)
-                val targetCanonical = target.canonicalFile.toPath().normalize()
+                val rootCanonicalPath = workspaceRoot.canonicalFile.toPath().toAbsolutePath().normalize()
+                val rawTarget = File(workspaceRoot, workspacePath.normalizedPath)
+                val targetCanonical = rawTarget.canonicalFile
+                val targetCanonicalPath = targetCanonical.toPath().toAbsolutePath().normalize()
 
-                if (targetCanonical.startsWith(rootCanonical)) {
-                    target
+                if (targetCanonicalPath.startsWith(rootCanonicalPath)) {
+                    targetCanonical
                 } else {
                     null
                 }

@@ -27,10 +27,16 @@ object PortableWorkflowValidator {
 
         if (!isValidId(run.run_id)) errors.add("invalid run_id: '${run.run_id}'")
         if (!isValidId(run.task.task_id)) errors.add("invalid task_id: '${run.task.task_id}'")
+        if (!isValidId(run.authority.native_id)) errors.add("invalid authority native_id: '${run.authority.native_id}'")
         if (!isValidHash(run.authority.sha256)) errors.add("invalid authority hash: '${run.authority.sha256}'")
 
         if (run.revision != null && !isValidHash(run.revision.composite_tree_hash)) {
             errors.add("invalid revision composite_tree_hash: '${run.revision.composite_tree_hash}'")
+        }
+
+        for (ev in run.evidence) {
+            if (!isValidId(ev.id)) errors.add("invalid evidence id: '${ev.id}'")
+            if (!isValidHash(ev.sha256)) errors.add("invalid evidence hash: '${ev.sha256}'")
         }
 
         val stageIds = mutableSetOf<String>()
@@ -39,6 +45,7 @@ object PortableWorkflowValidator {
         val knownEvidence = collectEvidenceIds(run)
 
         for (stage in run.stages) {
+            if (!isValidId(stage.stage_id)) errors.add("invalid stage_id: '${stage.stage_id}'")
             if (!stageIds.add(stage.stage_id)) {
                 errors.add("duplicate stage: ${stage.stage_id}")
             }
@@ -51,12 +58,22 @@ object PortableWorkflowValidator {
             if (stageTaskId != run.task.task_id) {
                 errors.add("stage task mismatch: ${stage.stage_id}")
             }
-            if (stage.status == "passed" && (stage.result == null || stage.evidence.isEmpty())) {
+            if (stage.status == StageStatus.PASSED && (stage.result == null || stage.evidence.isEmpty())) {
                 errors.add("passed stage requires result and evidence: ${stage.stage_id}")
+            }
+
+            for (ev in stage.evidence) {
+                if (!isValidId(ev.id)) errors.add("invalid stage evidence id: '${ev.id}'")
+                if (!isValidHash(ev.sha256)) errors.add("invalid stage evidence hash: '${ev.sha256}'")
             }
 
             if (stage.result is StageResultV1.Integrate) {
                 for (receipt in stage.result.verifier_receipts) {
+                    if (!isValidId(receipt.id)) errors.add("invalid receipt id: '${receipt.id}'")
+                    if (!isValidHash(receipt.verifier.command_sha256)) errors.add("invalid receipt verifier command_sha256: '${receipt.verifier.command_sha256}'")
+                    if (!isValidHash(receipt.bound_revision.composite_tree_hash)) errors.add("invalid receipt bound_revision hash: '${receipt.bound_revision.composite_tree_hash}'")
+                    if (!isValidHash(receipt.authority.sha256)) errors.add("invalid receipt authority hash: '${receipt.authority.sha256}'")
+
                     if (receiptById.containsKey(receipt.id)) {
                         errors.add("duplicate receipt: ${receipt.id}")
                     }
@@ -72,7 +89,7 @@ object PortableWorkflowValidator {
                         val target = run.stages.find { it.stage_id == referencedStage }
                         if (target == null) {
                             errors.add("missing integrated stage: $referencedStage")
-                        } else if (target.status !in setOf("passed", "failed", "blocked", "cancelled")) {
+                        } else if (target.status !in setOf(StageStatus.PASSED, StageStatus.FAILED, StageStatus.BLOCKED, StageStatus.CANCELLED)) {
                             errors.add("integrate stage references non-terminal stage: $referencedStage")
                         }
                     }
@@ -81,6 +98,7 @@ object PortableWorkflowValidator {
         }
 
         for (worker in run.workers) {
+            if (!isValidId(worker.worker_id)) errors.add("invalid worker_id: '${worker.worker_id}'")
             if (!workerIds.add(worker.worker_id)) {
                 errors.add("duplicate worker: ${worker.worker_id}")
             }
@@ -101,7 +119,7 @@ object PortableWorkflowValidator {
                 if (receipt == null) {
                     errors.add("verified completion references missing receipt: $receiptId")
                 } else {
-                    if (receipt.status != "passed") {
+                    if (receipt.status != VerifierStatus.PASSED) {
                         errors.add("receipt is not passed: $receiptId")
                     }
                     if (run.revision != null && receipt.bound_revision.composite_tree_hash != run.revision.composite_tree_hash) {
@@ -114,7 +132,7 @@ object PortableWorkflowValidator {
             }
         }
 
-        if (run.terminal != null && run.stages.any { it.status in setOf("pending", "running") }) {
+        if (run.terminal != null && run.stages.any { it.status in setOf(StageStatus.PENDING, StageStatus.RUNNING) }) {
             errors.add("terminal run has unresolved stages")
         }
 

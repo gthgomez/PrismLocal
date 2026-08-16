@@ -90,30 +90,44 @@ class AndroidLocalExecutionTarget(
     override suspend fun searchFiles(query: String, maxResults: Int): Result<List<WorkspaceSearchResult>> = runCatching {
         require(query.isNotBlank()) { "Query must not be blank" }
         val results = mutableListOf<WorkspaceSearchResult>()
+        val rootPath = workspaceRoot.canonicalFile.toPath().toAbsolutePath().normalize()
 
-        workspaceRoot.walkTopDown()
-            .filter { it.isFile && it.length() <= MAX_SEARCH_FILE_SIZE }
-            .take(200)
-            .forEach { file ->
-                if (results.size >= maxResults) return@forEach
-                try {
-                    val text = file.readText(Charsets.UTF_8)
-                    if (!text.take(500).contains('\u0000') && text.contains(query, ignoreCase = true)) {
-                        val relPath = file.relativeTo(workspaceRoot).path.replace('\\', '/')
-                        val matchingLines = text.lines()
-                            .mapIndexedNotNull { index, line ->
-                                if (line.contains(query, ignoreCase = true)) {
-                                    "${index + 1}: ${line.trim().take(120)}"
-                                } else null
-                            }
-                            .take(3)
-
-                        results.add(WorkspaceSearchResult(relativePath = relPath, matchingLines = matchingLines))
+        val stream = java.nio.file.Files.walk(rootPath)
+        try {
+            stream.filter { java.nio.file.Files.isRegularFile(it, java.nio.file.LinkOption.NOFOLLOW_LINKS) }
+                .filter { path ->
+                    try {
+                        val canonical = path.toFile().canonicalFile.toPath().toAbsolutePath().normalize()
+                        canonical.startsWith(rootPath) && java.nio.file.Files.size(path) <= MAX_SEARCH_FILE_SIZE
+                    } catch (_: Exception) {
+                        false
                     }
-                } catch (_: Exception) {
-                    // Ignore unreadable / binary files
                 }
-            }
+                .limit(200)
+                .forEach { path ->
+                    if (results.size >= maxResults) return@forEach
+                    try {
+                        val file = path.toFile().canonicalFile
+                        val text = file.readText(Charsets.UTF_8)
+                        if (!text.take(500).contains('\u0000') && text.contains(query, ignoreCase = true)) {
+                            val relPath = rootPath.relativize(file.toPath()).toString().replace('\\', '/')
+                            val matchingLines = text.lines()
+                                .mapIndexedNotNull { index, line ->
+                                    if (line.contains(query, ignoreCase = true)) {
+                                        "${index + 1}: ${line.trim().take(120)}"
+                                    } else null
+                                }
+                                .take(3)
+
+                            results.add(WorkspaceSearchResult(relativePath = relPath, matchingLines = matchingLines))
+                        }
+                    } catch (_: Exception) {
+                        // Ignore unreadable / binary files
+                    }
+                }
+        } finally {
+            stream.close()
+        }
 
         results
     }

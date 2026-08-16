@@ -17,25 +17,25 @@ class PortableWorkflowProjectionTest {
     private val revision = RevisionRefV1(
         kind = "workspace-revision",
         composite_tree_hash = sha256("revision"),
-        source = "git",
+        source = RevisionSource.GIT,
     )
 
     private val authority = AuthorityRefV1(
-        native_kind = "task-contract",
+        native_kind = AuthorityKind.TASK_CONTRACT,
         native_id = "tc1:test",
         sha256 = sha256("authority"),
     )
 
     private val evidence = EvidenceRefV1(
         id = "evidence-1",
-        kind = "verifier-receipt",
+        kind = EvidenceKind.VERIFIER_RECEIPT,
         sha256 = sha256("evidence"),
-        native_path = "C:\\Users\\operator\\run\\receipt.json",
+        native_path = "/workspace/build/receipt.json",
     )
 
     private val receipt = VerifierReceiptV1(
         id = "receipt-1",
-        status = "passed",
+        status = VerifierStatus.PASSED,
         verifier = VerifierIdentityV1(
             command = "npm test",
             command_sha256 = sha256("npm test"),
@@ -57,13 +57,13 @@ class PortableWorkflowProjectionTest {
         ),
         runRevision: RevisionRefV1? = revision,
         receipts: List<VerifierReceiptV1> = listOf(receipt),
-        stageStatus: String = "passed",
+        stageStatus: StageStatus = StageStatus.PASSED,
     ): WorkflowRunV1 {
         val task = TaskRefV1(
             task_id = "task-1",
             goal = "prove the portable contract",
             acceptance_criteria = listOf("schema passes"),
-            mutation_policy = "read_only",
+            mutation_policy = MutationPolicy.READ_ONLY,
             required_verifiers = listOf("npm test"),
         )
         return WorkflowRunV1(
@@ -74,7 +74,7 @@ class PortableWorkflowProjectionTest {
             stages = listOf(
                 StageRecordV1(
                     stage_id = "stage-1",
-                    kind = "integrate",
+                    kind = StageKind.INTEGRATE,
                     status = stageStatus,
                     input = StageInputV1.Integrate(task = task, stage_refs = emptyList()),
                     result = StageResultV1.Integrate(
@@ -89,8 +89,8 @@ class PortableWorkflowProjectionTest {
                 WorkerRunV1(
                     worker_id = "worker-1",
                     stage_id = "stage-1",
-                    role = "verifier",
-                    status = "passed",
+                    role = WorkerRole.VERIFIER,
+                    status = WorkerStatus.PASSED,
                     native_authority = authority,
                     evidence = listOf(evidence),
                 )
@@ -159,7 +159,7 @@ class PortableWorkflowProjectionTest {
 
     @Test
     fun rejectsVerifiedCompletionWithNonPassedReceipt() {
-        val failedReceipt = receipt.copy(status = "failed")
+        val failedReceipt = receipt.copy(status = VerifierStatus.FAILED)
         val invalidRun = createValidRun(receipts = listOf(failedReceipt))
         val validation = PortableWorkflowValidator.validateRun(invalidRun)
 
@@ -170,7 +170,7 @@ class PortableWorkflowProjectionTest {
 
     @Test
     fun rejectsTerminalRunWithUnresolvedStages() {
-        val invalidRun = createValidRun(stageStatus = "running")
+        val invalidRun = createValidRun(stageStatus = StageStatus.RUNNING)
         val validation = PortableWorkflowValidator.validateRun(invalidRun)
 
         assertFalse(validation.isOk)
@@ -184,7 +184,6 @@ class PortableWorkflowProjectionTest {
             terminal = TerminalOutcomeV1.CompletedUnverified("Tests not executed"),
         )
 
-        // If Babel returns completed_unverified, Prism WorkSession must NOT report isAuthoritativelyVerified
         val session = WorkSession(
             sessionId = "session-1",
             objective = "Fix bug in repo",
@@ -203,7 +202,6 @@ class PortableWorkflowProjectionTest {
 
     @Test
     fun prismLocalAuthorityCanNeverClaimVerifiedSWECompletion() {
-        // Local Prism authority cannot claim SWE verified completion
         val session = WorkSession(
             sessionId = "session-2",
             objective = "Edit local file",

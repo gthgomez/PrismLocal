@@ -69,7 +69,7 @@
                   "id": "evidence-1",
                   "kind": "verifier-receipt",
                   "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
-                  "native_path": "C:\\Users\\operator\\run\\receipt.json"
+                  "native_path": "/workspace/build/receipt.json"
                 }
               ],
               "exit_code": 0,
@@ -86,7 +86,7 @@
             "id": "evidence-1",
             "kind": "verifier-receipt",
             "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
-            "native_path": "C:\\Users\\operator\\run\\receipt.json"
+            "native_path": "/workspace/build/receipt.json"
           }
         ]
       }
@@ -107,7 +107,7 @@
             "id": "evidence-1",
             "kind": "verifier-receipt",
             "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
-            "native_path": "C:\\Users\\operator\\run\\receipt.json"
+            "native_path": "/workspace/build/receipt.json"
           }
         ]
       }
@@ -133,7 +133,7 @@
         "id": "evidence-1",
         "kind": "verifier-receipt",
         "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
-        "native_path": "C:\\Users\\operator\\run\\receipt.json"
+        "native_path": "/workspace/build/receipt.json"
       }
     ]
   },

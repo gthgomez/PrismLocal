@@ -56,7 +56,7 @@
               },
               "bound_revision": {
                 "kind": "workspace-revision",
-                "composite_tree_hash": "720eaa4d74943ae08642bf8f60c30ff563f1f62a6dc57fd19d26a3e5c54b9370",
+                "composite_tree_hash": "2b214ddf3326016519afcb268f63623b80b91a65265277668e4d020d87dd9078",
                 "source": "git"
               },
               "authority": {
@@ -138,5 +138,6 @@
     ]
   },
   "redaction_profile": "public",
-  "exported_at": "2026-08-08T12:00:00.000Z"
+  "exported_at": "2026-08-08T12:00:00.000Z",
+  "unauthorized_injected_field": "malicious-payload"
 }

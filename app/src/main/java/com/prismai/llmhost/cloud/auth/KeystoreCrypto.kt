@@ -28,6 +28,7 @@ data class EncryptedPayload(
 enum class KeystoreSecurityLevel {
     STRONGBOX,
     TRUSTED_ENVIRONMENT,
+    UNKNOWN_SECURE,
     SOFTWARE,
     UNKNOWN,
 }
@@ -136,6 +137,7 @@ class AndroidKeystoreKeyProvider(
             when (level) {
                 1 -> KeystoreSecurityLevel.TRUSTED_ENVIRONMENT // SECURITY_LEVEL_TRUSTED_ENVIRONMENT
                 2 -> KeystoreSecurityLevel.STRONGBOX // SECURITY_LEVEL_STRONGBOX
+                3 -> KeystoreSecurityLevel.UNKNOWN_SECURE // SECURITY_LEVEL_UNKNOWN_SECURE
                 0 -> KeystoreSecurityLevel.SOFTWARE // SECURITY_LEVEL_SOFTWARE
                 else -> KeystoreSecurityLevel.UNKNOWN
             }

@@ -173,17 +173,21 @@ class BabelGoldenConformanceTest {
 
         if (schemaNode.has("oneOf")) {
             val variants = schemaNode.getJSONArray("oneOf")
-            var matched = false
+            var matchCount = 0
+            val variantErrorsList = mutableListOf<String>()
             for (i in 0 until variants.length()) {
                 val variantSchema = variants.getJSONObject(i)
                 val variantErrors = validateAgainstSchema(instance, variantSchema, rootSchema)
                 if (variantErrors.isEmpty()) {
-                    matched = true
-                    break
+                    matchCount++
+                } else {
+                    variantErrorsList.add("Variant $i rejected: ${variantErrors.joinToString(", ")}")
                 }
             }
-            if (!matched) {
-                errors.add("Instance does not match any variant in oneOf")
+            if (matchCount == 0) {
+                errors.add("Instance does not match any variant in oneOf [${variantErrorsList.joinToString("; ")}]")
+            } else if (matchCount > 1) {
+                errors.add("Instance matches $matchCount variants in oneOf (must match exactly 1)")
             }
             return errors
         }
@@ -221,6 +225,12 @@ class BabelGoldenConformanceTest {
                         errors.add("Expected array, got $instance")
                         return errors
                     }
+                    if (schemaNode.has("minItems") && instance.length() < schemaNode.getInt("minItems")) {
+                        errors.add("Array length ${instance.length()} is less than minItems ${schemaNode.getInt("minItems")}")
+                    }
+                    if (schemaNode.has("maxItems") && instance.length() > schemaNode.getInt("maxItems")) {
+                        errors.add("Array length ${instance.length()} is greater than maxItems ${schemaNode.getInt("maxItems")}")
+                    }
                     val itemsSchema = schemaNode.optJSONObject("items")
                     if (itemsSchema != null) {
                         for (i in 0 until instance.length()) {
@@ -232,6 +242,12 @@ class BabelGoldenConformanceTest {
                     if (instance !is String) {
                         errors.add("Expected string, got $instance")
                     } else {
+                        if (schemaNode.has("minLength") && instance.length < schemaNode.getInt("minLength")) {
+                            errors.add("String length ${instance.length} is less than minLength ${schemaNode.getInt("minLength")}")
+                        }
+                        if (schemaNode.has("maxLength") && instance.length > schemaNode.getInt("maxLength")) {
+                            errors.add("String length ${instance.length} is greater than maxLength ${schemaNode.getInt("maxLength")}")
+                        }
                         if (schemaNode.has("const")) {
                             val constVal = schemaNode.getString("const")
                             if (instance != constVal) errors.add("Expected const '$constVal', got '$instance'")
@@ -243,7 +259,14 @@ class BabelGoldenConformanceTest {
                         }
                         if (schemaNode.has("pattern")) {
                             val pat = Regex(schemaNode.getString("pattern"))
-                            if (!pat.matches(instance)) errors.add("Value '$instance' does not match pattern")
+                            if (!pat.matches(instance)) errors.add("Value '$instance' does not match pattern '${schemaNode.getString("pattern")}'")
+                        }
+                        if (schemaNode.has("format") && schemaNode.getString("format") == "date-time") {
+                            try {
+                                java.time.Instant.parse(instance)
+                            } catch (e: Exception) {
+                                errors.add("Value '$instance' is not a valid ISO-8601 date-time: ${e.message}")
+                            }
                         }
                     }
                 }

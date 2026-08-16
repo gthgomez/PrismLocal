@@ -2,42 +2,41 @@
   "version": "portable-workflow-v1",
   "run": {
     "version": "portable-workflow-v1",
-    "run_id": "run-1",
+    "run_id": "run-valid-1",
     "task": {
       "task_id": "task-1",
-      "goal": "prove the portable contract",
+      "goal": "Validate portable workflow schemas against golden fixtures",
       "acceptance_criteria": [
-        "schema passes"
+        "Golden fixtures must validate with zero errors"
       ],
       "mutation_policy": "read_only",
       "required_verifiers": [
-        "npm test"
+        "verifier-test-1"
       ]
     },
     "authority": {
       "native_kind": "task-contract",
-      "native_id": "tc1:test",
-      "sha256": "8f76fd501bb68ef71f4e276bc28f29bce1003b0c2c9d9478de81b5bfc0cde1e9"
+      "native_id": "task-contract-1",
+      "sha256": "5c9f363e444f666644120781c30c6f4d92c2ff0f4dbe646af9ba39c90d2d1a7c"
     },
     "stages": [
       {
-        "stage_id": "stage-1",
-        "kind": "integrate",
+        "stage_id": "stage-0",
+        "kind": "orient",
         "status": "passed",
         "input": {
-          "kind": "integrate",
+          "kind": "orient",
           "task": {
             "task_id": "task-1",
-            "goal": "prove the portable contract",
+            "goal": "Validate portable workflow schemas against golden fixtures",
             "acceptance_criteria": [
-              "schema passes"
+              "Golden fixtures must validate with zero errors"
             ],
             "mutation_policy": "read_only",
             "required_verifiers": [
-              "npm test"
+              "verifier-test-1"
             ]
-          },
-          "stage_refs": []
+          }
         },
         "result": {
           "kind": "integrate",
@@ -46,10 +45,10 @@
               "id": "receipt-1",
               "status": "passed",
               "verifier": {
-                "command": "npm test",
-                "command_sha256": "328e123c63857fd8473bd4bd3581e655b08b7440d7f5d2c31cc375607582f539",
+                "command": "npm run test:portable-workflow",
+                "command_sha256": "69ffa46089ce1de749c20127bd2ea3b970ff66ae212019b732587737783acedd",
                 "scope": [
-                  "portable-workflow"
+                  "src/portable/workflow.ts"
                 ],
                 "independent": true,
                 "clean_room": true
@@ -61,15 +60,15 @@
               },
               "authority": {
                 "native_kind": "task-contract",
-                "native_id": "tc1:test",
-                "sha256": "8f76fd501bb68ef71f4e276bc28f29bce1003b0c2c9d9478de81b5bfc0cde1e9"
+                "native_id": "task-contract-1",
+                "sha256": "5c9f363e444f666644120781c30c6f4d92c2ff0f4dbe646af9ba39c90d2d1a7c"
               },
               "evidence": [
                 {
-                  "id": "evidence-1",
-                  "kind": "verifier-receipt",
-                  "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
-                  "native_path": "/workspace/build/receipt.json"
+                  "id": "ev-1",
+                  "kind": "event",
+                  "sha256": "1c0d9b2b6c5e6d4b36308119dd630198f1aea3122dbe8e49e25f79c6b096983e",
+                  "native_path": "logs/events.jsonl"
                 }
               ],
               "exit_code": 0,
@@ -79,19 +78,38 @@
           "changed_refs": []
         },
         "workers": [
-          "worker-1"
+          "worker-0"
         ],
         "evidence": [
           {
-            "id": "evidence-1",
-            "kind": "verifier-receipt",
-            "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
-            "native_path": "/workspace/build/receipt.json"
+            "id": "ev-1",
+            "kind": "event",
+            "sha256": "1c0d9b2b6c5e6d4b36308119dd630198f1aea3122dbe8e49e25f79c6b096983e",
+            "native_path": "logs/events.jsonl"
           }
         ]
       }
     ],
     "workers": [
+      {
+        "worker_id": "worker-0",
+        "stage_id": "stage-0",
+        "role": "primary",
+        "status": "passed",
+        "native_authority": {
+          "native_kind": "task-contract",
+          "native_id": "task-contract-1",
+          "sha256": "5c9f363e444f666644120781c30c6f4d92c2ff0f4dbe646af9ba39c90d2d1a7c"
+        },
+        "evidence": [
+          {
+            "id": "ev-1",
+            "kind": "event",
+            "sha256": "1c0d9b2b6c5e6d4b36308119dd630198f1aea3122dbe8e49e25f79c6b096983e",
+            "native_path": "logs/events.jsonl"
+          }
+        ]
+      },
       {
         "worker_id": "worker-1",
         "stage_id": "stage-1",
@@ -99,15 +117,15 @@
         "status": "passed",
         "native_authority": {
           "native_kind": "task-contract",
-          "native_id": "tc1:test",
-          "sha256": "8f76fd501bb68ef71f4e276bc28f29bce1003b0c2c9d9478de81b5bfc0cde1e9"
+          "native_id": "task-contract-1",
+          "sha256": "5c9f363e444f666644120781c30c6f4d92c2ff0f4dbe646af9ba39c90d2d1a7c"
         },
         "evidence": [
           {
-            "id": "evidence-1",
-            "kind": "verifier-receipt",
-            "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
-            "native_path": "/workspace/build/receipt.json"
+            "id": "ev-1",
+            "kind": "event",
+            "sha256": "1c0d9b2b6c5e6d4b36308119dd630198f1aea3122dbe8e49e25f79c6b096983e",
+            "native_path": "logs/events.jsonl"
           }
         ]
       }
@@ -119,21 +137,21 @@
       ],
       "revision": {
         "kind": "workspace-revision",
-        "composite_tree_hash": "2b214ddf3326016519afcb268f63623b80b91a65265277668e4d020d87dd9078",
+        "composite_tree_hash": "bbbc6cb51427f839caa90fc37ccbf481469471acc8e8cd81d337ac086b306427",
         "source": "git"
       }
     },
     "revision": {
       "kind": "workspace-revision",
-      "composite_tree_hash": "2b214ddf3326016519afcb268f63623b80b91a65265277668e4d020d87dd9078",
+      "composite_tree_hash": "bbbc6cb51427f839caa90fc37ccbf481469471acc8e8cd81d337ac086b306427",
       "source": "git"
     },
     "evidence": [
       {
-        "id": "evidence-1",
-        "kind": "verifier-receipt",
-        "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
-        "native_path": "/workspace/build/receipt.json"
+        "id": "ev-1",
+        "kind": "event",
+        "sha256": "1c0d9b2b6c5e6d4b36308119dd630198f1aea3122dbe8e49e25f79c6b096983e",
+        "native_path": "logs/events.jsonl"
       }
     ]
   },

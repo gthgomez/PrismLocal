@@ -33,6 +33,14 @@
     }
   },
   "$defs": {
+    "PortableId": {
+      "type": "string",
+      "pattern": "^[^\\u0000-\\u001f]{1,256}$"
+    },
+    "PortableHash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32,64}$"
+    },
     "RevisionRefV1": {
       "type": "object",
       "required": [
@@ -47,8 +55,7 @@
           "const": "workspace-revision"
         },
         "composite_tree_hash": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{32,64}$"
+          "$ref": "#/$defs/PortableHash"
         },
         "source": {
           "type": "string",
@@ -70,9 +77,7 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
+          "$ref": "#/$defs/PortableId"
         },
         "kind": {
           "type": "string",
@@ -84,8 +89,7 @@
           ]
         },
         "sha256": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{32,64}$"
+          "$ref": "#/$defs/PortableHash"
         },
         "native_path": {
           "type": "string",
@@ -112,13 +116,10 @@
           ]
         },
         "native_id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
+          "$ref": "#/$defs/PortableId"
         },
         "sha256": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{32,64}$"
+          "$ref": "#/$defs/PortableHash"
         }
       }
     },
@@ -138,8 +139,7 @@
           "minLength": 1
         },
         "command_sha256": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{32,64}$"
+          "$ref": "#/$defs/PortableHash"
         },
         "scope": {
           "type": "array",
@@ -170,9 +170,7 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
+          "$ref": "#/$defs/PortableId"
         },
         "status": {
           "type": "string",
@@ -218,13 +216,10 @@
       "additionalProperties": false,
       "properties": {
         "task_id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
+          "$ref": "#/$defs/PortableId"
         },
         "goal": {
-          "type": "string",
-          "minLength": 1
+          "type": "string"
         },
         "acceptance_criteria": {
           "type": "array",
@@ -243,8 +238,7 @@
         "required_verifiers": {
           "type": "array",
           "items": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           }
         }
       }
@@ -335,9 +329,7 @@
             "stage_refs": {
               "type": "array",
               "items": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256
+                "$ref": "#/$defs/PortableId"
               }
             }
           }
@@ -462,9 +454,7 @@
       "additionalProperties": false,
       "properties": {
         "stage_id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
+          "$ref": "#/$defs/PortableId"
         },
         "kind": {
           "type": "string",
@@ -495,9 +485,7 @@
         "workers": {
           "type": "array",
           "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
+            "$ref": "#/$defs/PortableId"
           }
         },
         "evidence": {
@@ -521,14 +509,10 @@
       "additionalProperties": false,
       "properties": {
         "worker_id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
+          "$ref": "#/$defs/PortableId"
         },
         "stage_id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
+          "$ref": "#/$defs/PortableId"
         },
         "role": {
           "type": "string",
@@ -583,9 +567,7 @@
             "receipts": {
               "type": "array",
               "items": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256
+                "$ref": "#/$defs/PortableId"
               }
             },
             "revision": {
@@ -744,9 +726,7 @@
           "const": "portable-workflow-v1"
         },
         "run_id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
+          "$ref": "#/$defs/PortableId"
         },
         "task": {
           "$ref": "#/$defs/TaskRefV1"

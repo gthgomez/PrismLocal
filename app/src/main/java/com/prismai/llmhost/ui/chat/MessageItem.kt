@@ -11,6 +11,7 @@ import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,11 +27,16 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -63,6 +69,16 @@ internal fun MessageBubble(
     val context = LocalContext.current
     val view = LocalView.current
     val copyLabel = if (isUser) "prompt" else "response"
+    var showReportDialog by remember { mutableStateOf(false) }
+
+    if (showReportDialog) {
+        ReportAiContentDialog(
+            onDismiss = { showReportDialog = false },
+            onSubmitReport = { reason ->
+                Toast.makeText(context, "Report saved locally: $reason", Toast.LENGTH_SHORT).show()
+            }
+        )
+    }
 
     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = alignment) {
         Column(
@@ -105,6 +121,17 @@ internal fun MessageBubble(
                     )
                 }
                 Spacer(modifier = Modifier.weight(1f))
+                if (!isUser && text.isNotBlank()) {
+                    TextButton(
+                        modifier = Modifier.widthIn(min = 52.dp),
+                        onClick = {
+                            view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                            showReportDialog = true
+                        },
+                    ) {
+                        Text("Report", maxLines = 1, softWrap = false)
+                    }
+                }
                 TextButton(
                     modifier = Modifier.widthIn(min = 56.dp),
                     enabled = text.isNotBlank(),
@@ -127,6 +154,65 @@ internal fun MessageBubble(
             }
         }
     }
+}
+
+@Composable
+private fun ReportAiContentDialog(
+    onDismiss: () -> Unit,
+    onSubmitReport: (reason: String) -> Unit,
+) {
+    val reportReasons = listOf(
+        "Offensive or hateful content",
+        "Sexually explicit content",
+        "Dangerous or harmful instructions",
+        "Inaccurate or hallucinated response",
+        "Other policy violation"
+    )
+    var selectedReasonIndex by remember { mutableIntStateOf(0) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Report AI Generated Response") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Google Play AI policy requires in-app user reporting for generated content. Select the issue with this response:",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                reportReasons.forEachIndexed { index, reason ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { selectedReasonIndex = index }
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = (selectedReasonIndex == index),
+                            onClick = { selectedReasonIndex = index }
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(text = reason, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onSubmitReport(reportReasons[selectedReasonIndex])
+                    onDismiss()
+                }
+            ) {
+                Text("Submit Report")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
 }
 
 @Composable

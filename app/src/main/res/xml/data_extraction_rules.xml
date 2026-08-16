@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="prism_auth_secure_prefs.xml" />
+        <exclude domain="file" path="key_store" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="prism_auth_secure_prefs.xml" />
+        <exclude domain="file" path="key_store" />
+    </device-transfer>
+</data-extraction-rules>

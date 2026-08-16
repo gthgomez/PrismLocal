@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PortableWorkflowV1",
+  "version": "portable-workflow-v1",
+  "type": "object",
+  "required": [
+    "version",
+    "run_id",
+    "task",
+    "authority",
+    "stages",
+    "workers",
+    "evidence"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "portable-workflow-v1"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[^\\u0000-\\u001f]{1,256}$"
+    },
+    "task": {
+      "type": "object"
+    },
+    "authority": {
+      "type": "object"
+    },
+    "stages": {
+      "type": "array"
+    },
+    "workers": {
+      "type": "array"
+    },
+    "terminal": {
+      "type": "object"
+    },
+    "revision": {
+      "type": "object"
+    },
+    "evidence": {
+      "type": "array"
+    }
+  },
+  "additionalProperties": false
+}

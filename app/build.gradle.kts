@@ -34,7 +34,7 @@ val vulkanEnabled = signingValue("LLMHOST_ENABLE_VULKAN")
             value.equals("yes", ignoreCase = true) ||
             value == "1"
     }
-    ?: true
+    ?: false
 val openClRequested = signingValue("LLMHOST_ENABLE_OPENCL")
     ?.let { value ->
         value.equals("true", ignoreCase = true) ||
@@ -66,6 +66,7 @@ android {
         versionCode = 1
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        manifestPlaceholders["appLabel"] = "Prism Local"
 
         externalNativeBuild {
             cmake {
@@ -81,6 +82,26 @@ android {
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    flavorDimensions += "distribution"
+
+    productFlavors {
+        create("play") {
+            dimension = "distribution"
+            buildConfigField("boolean", "DEVELOPER_WORK_MODE", "false")
+            buildConfigField("String", "DISTRIBUTION", "\"play\"")
+            manifestPlaceholders["appLabel"] = "Prism Local"
+        }
+
+        create("dev") {
+            dimension = "distribution"
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev"
+            buildConfigField("boolean", "DEVELOPER_WORK_MODE", "true")
+            buildConfigField("String", "DISTRIBUTION", "\"dev\"")
+            manifestPlaceholders["appLabel"] = "Prism Dev"
         }
     }
 

@@ -1,0 +1,142 @@
+{
+  "version": "portable-workflow-v2",
+  "run": {
+    "version": "portable-workflow-v2",
+    "run_id": "run-1",
+    "task": {
+      "task_id": "task-1",
+      "goal": "prove the portable contract",
+      "acceptance_criteria": [
+        "schema passes"
+      ],
+      "mutation_policy": "read_only",
+      "required_verifiers": [
+        "npm test"
+      ]
+    },
+    "authority": {
+      "native_kind": "task-contract",
+      "native_id": "tc1:test",
+      "sha256": "8f76fd501bb68ef71f4e276bc28f29bce1003b0c2c9d9478de81b5bfc0cde1e9"
+    },
+    "stages": [
+      {
+        "stage_id": "stage-1",
+        "kind": "integrate",
+        "status": "passed",
+        "input": {
+          "kind": "integrate",
+          "task": {
+            "task_id": "task-1",
+            "goal": "prove the portable contract",
+            "acceptance_criteria": [
+              "schema passes"
+            ],
+            "mutation_policy": "read_only",
+            "required_verifiers": [
+              "npm test"
+            ]
+          },
+          "stage_refs": []
+        },
+        "result": {
+          "kind": "integrate",
+          "verifier_receipts": [
+            {
+              "id": "receipt-1",
+              "status": "passed",
+              "verifier": {
+                "command": "npm test",
+                "command_sha256": "328e123c63857fd8473bd4bd3581e655b08b7440d7f5d2c31cc375607582f539",
+                "scope": [
+                  "portable-workflow"
+                ],
+                "independent": true,
+                "clean_room": true
+              },
+              "bound_revision": {
+                "kind": "workspace-revision",
+                "composite_tree_hash": "2b214ddf3326016519afcb268f63623b80b91a65265277668e4d020d87dd9078",
+                "source": "git"
+              },
+              "authority": {
+                "native_kind": "task-contract",
+                "native_id": "tc1:test",
+                "sha256": "8f76fd501bb68ef71f4e276bc28f29bce1003b0c2c9d9478de81b5bfc0cde1e9"
+              },
+              "evidence": [
+                {
+                  "id": "evidence-1",
+                  "kind": "verifier-receipt",
+                  "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
+                  "native_path": "C:\\Users\\operator\\run\\receipt.json"
+                }
+              ],
+              "exit_code": 0,
+              "produced_at": "2026-08-08T12:00:00.000Z"
+            }
+          ],
+          "changed_refs": []
+        },
+        "workers": [
+          "worker-1"
+        ],
+        "evidence": [
+          {
+            "id": "evidence-1",
+            "kind": "verifier-receipt",
+            "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
+            "native_path": "C:\\Users\\operator\\run\\receipt.json"
+          }
+        ]
+      }
+    ],
+    "workers": [
+      {
+        "worker_id": "worker-1",
+        "stage_id": "stage-1",
+        "role": "verifier",
+        "status": "passed",
+        "native_authority": {
+          "native_kind": "task-contract",
+          "native_id": "tc1:test",
+          "sha256": "8f76fd501bb68ef71f4e276bc28f29bce1003b0c2c9d9478de81b5bfc0cde1e9"
+        },
+        "evidence": [
+          {
+            "id": "evidence-1",
+            "kind": "verifier-receipt",
+            "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
+            "native_path": "C:\\Users\\operator\\run\\receipt.json"
+          }
+        ]
+      }
+    ],
+    "terminal": {
+      "kind": "completed_verified",
+      "receipts": [
+        "receipt-1"
+      ],
+      "revision": {
+        "kind": "workspace-revision",
+        "composite_tree_hash": "2b214ddf3326016519afcb268f63623b80b91a65265277668e4d020d87dd9078",
+        "source": "git"
+      }
+    },
+    "revision": {
+      "kind": "workspace-revision",
+      "composite_tree_hash": "2b214ddf3326016519afcb268f63623b80b91a65265277668e4d020d87dd9078",
+      "source": "git"
+    },
+    "evidence": [
+      {
+        "id": "evidence-1",
+        "kind": "verifier-receipt",
+        "sha256": "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e",
+        "native_path": "C:\\Users\\operator\\run\\receipt.json"
+      }
+    ]
+  },
+  "redaction_profile": "public",
+  "exported_at": "2026-08-08T12:00:00.000Z"
+}

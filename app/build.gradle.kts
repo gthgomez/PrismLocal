@@ -13,12 +13,15 @@ val releaseStoreFile = signingValue("LLMHOST_RELEASE_STORE_FILE")
 val releaseStorePassword = signingValue("LLMHOST_RELEASE_STORE_PASSWORD")
 val releaseKeyAlias = signingValue("LLMHOST_RELEASE_KEY_ALIAS")
 val releaseKeyPassword = signingValue("LLMHOST_RELEASE_KEY_PASSWORD")
+val releaseStoreFileResolved = releaseStoreFile?.let { rootProject.file(it) }
+// Usable requires both configured values AND an on-disk keystore, so a stale
+// ~/.gradle/gradle.properties cannot hard-fail every release assembly.
 val releaseSigningReady = listOf(
     releaseStoreFile,
     releaseStorePassword,
     releaseKeyAlias,
     releaseKeyPassword,
-).all { it != null }
+).all { it != null } && releaseStoreFileResolved?.exists() == true
 val kleidiAiEnabled = signingValue("LLMHOST_ENABLE_KLEIDIAI")
     ?.let { value ->
         value.equals("true", ignoreCase = true) ||
@@ -114,6 +117,12 @@ android {
                 keyPassword = requireNotNull(releaseKeyPassword)
             }
         }
+    } else if (releaseStoreFile != null && releaseStoreFileResolved?.exists() != true) {
+        logger.lifecycle(
+            "Release signing disabled: LLMHOST_RELEASE_STORE_FILE is set to '$releaseStoreFile' " +
+                "but the keystore file does not exist. Building UNSIGNED release; restore the " +
+                "keystore or update ~/.gradle/gradle.properties before shipping."
+        )
     } else {
         logger.lifecycle(
             "Release signing disabled: set LLMHOST_RELEASE_STORE_FILE, " +

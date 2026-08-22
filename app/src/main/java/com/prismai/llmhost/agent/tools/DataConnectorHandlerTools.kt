@@ -14,7 +14,8 @@ import org.json.JSONObject
 class DataConnectorHandlerTools(
     private val dataConnectorTools: DataConnectorTools,
 ) {
-    suspend fun searchContacts(call: AgentToolCall): AgentToolResult {
+    suspend fun searchContacts(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+        if (!confirmed) return AgentToolResult(call = call, success = false, summary = "Confirmation required for search_contacts", errorCode = AgentToolErrorCode.CONFIRMATION_REQUIRED)
         val query = call.arguments.optString("query").trim().take(100)
         if (query.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Search query is empty")
         if (!dataConnectorTools.hasPermission(android.Manifest.permission.READ_CONTACTS)) {
@@ -39,7 +40,8 @@ class DataConnectorHandlerTools(
         }
     }
 
-    suspend fun getCalendarEvents(call: AgentToolCall): AgentToolResult {
+    suspend fun getCalendarEvents(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+        if (!confirmed) return AgentToolResult(call = call, success = false, summary = "Confirmation required for get_calendar_events", errorCode = AgentToolErrorCode.CONFIRMATION_REQUIRED)
         if (!dataConnectorTools.hasPermission(android.Manifest.permission.READ_CALENDAR)) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "READ_CALENDAR permission not granted. Grant it in Settings > Apps > Prism Local > Permissions.")
@@ -68,7 +70,8 @@ class DataConnectorHandlerTools(
         }
     }
 
-    suspend fun listSmsThreads(call: AgentToolCall): AgentToolResult {
+    suspend fun listSmsThreads(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+        if (!confirmed) return AgentToolResult(call = call, success = false, summary = "Confirmation required for list_sms_threads", errorCode = AgentToolErrorCode.CONFIRMATION_REQUIRED)
         if (!dataConnectorTools.hasPermission(android.Manifest.permission.READ_SMS)) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "READ_SMS permission not granted. Grant it in Settings > Apps > Prism Local > Permissions.")

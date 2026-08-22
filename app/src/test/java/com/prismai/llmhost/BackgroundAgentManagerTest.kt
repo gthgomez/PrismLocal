@@ -2,10 +2,12 @@ package com.prismai.llmhost
 
 import android.content.Context
 import android.content.ContextWrapper
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -194,5 +196,121 @@ class BackgroundAgentManagerTest {
         assertEquals(2, manager.state.value.completedTasks.size)
         assertEquals(BackgroundTaskStatus.CANCELLED, manager.state.value.completedTasks.first { it.id == taskA!!.id }.status)
         assertEquals(BackgroundTaskStatus.COMPLETED, manager.state.value.completedTasks.first { it.id == taskB!!.id }.status)
+    }
+
+    @Test
+    fun queueFullRejectsBeyondMaxQueuedTasks() = runBlocking {
+        val testContext = FakeTestContext()
+        val releaseTasks = AtomicBoolean(false)
+
+        val manager = BackgroundAgentManager(
+            context = testContext,
+            executeTask = { _ ->
+                while (!releaseTasks.get()) {
+                    delay(20)
+                }
+                "Done"
+            },
+        )
+
+        val acceptedIds = mutableListOf<String>()
+        repeat(7) { index ->
+            val task = manager.enqueue("Queue fill $index")
+            if (index < 6) {
+                assertNotNull(task)
+                acceptedIds.add(task!!.id)
+            } else {
+                assertNull(task)
+            }
+        }
+
+        assertEquals(6, acceptedIds.size)
+        assertEquals(acceptedIds.size, acceptedIds.toSet().size)
+        assertNotNull(manager.state.value.activeTask)
+        assertEquals(5, manager.state.value.queuedTasks.size)
+
+        releaseTasks.set(true)
+        var attempts = 0
+        while (manager.state.value.completedTasks.size < 6 && attempts < 100) {
+            delay(50)
+            attempts++
+        }
+
+        assertEquals(6, manager.state.value.completedTasks.size)
+    }
+
+    @Test
+    fun rapidProcessNextTaskDoesNotExecuteTwice() = runBlocking {
+        val testContext = FakeTestContext()
+        val executedIds = mutableListOf<String>()
+
+        val manager = BackgroundAgentManager(
+            context = testContext,
+            executeTask = { task ->
+                executedIds.add(task.id)
+                delay(150)
+                "Slow done"
+            },
+        )
+
+        val task = manager.enqueue("Only task")
+        assertNotNull(task)
+
+        manager.processNextTask()
+        manager.processNextTask()
+
+        var attempts = 0
+        while (manager.state.value.completedTasks.isEmpty() && attempts < 40) {
+            delay(50)
+            attempts++
+        }
+
+        assertEquals(listOf(task!!.id), executedIds)
+        assertEquals(1, manager.state.value.completedTasks.size)
+        assertEquals(BackgroundTaskStatus.COMPLETED, manager.state.value.completedTasks.first().status)
+        assertNull(manager.state.value.activeTask)
+    }
+
+    @Test
+    fun busyDeviceHoldsQueuedTaskUntilUserGenerationFrees() = runBlocking {
+        val testContext = FakeTestContext()
+        val userGenerationActive = AtomicBoolean(true)
+        val executed = AtomicBoolean(false)
+
+        val manager = BackgroundAgentManager(
+            context = testContext,
+            executeTask = { _ ->
+                executed.set(true)
+                "Ran after user generation"
+            },
+            isDeviceBusyWithUserGeneration = { userGenerationActive.get() },
+        )
+
+        assertNotNull(manager.enqueue("Held while busy"))
+
+        delay(200)
+        assertTrue(!executed.get())
+        assertNull(manager.state.value.activeTask)
+        assertEquals(1, manager.state.value.queuedTasks.size)
+        assertEquals(BackgroundTaskStatus.QUEUED, manager.state.value.queuedTasks.first().status)
+
+        userGenerationActive.set(false)
+        var attempts = 0
+        while (!executed.get() && attempts < 80) {
+            delay(100)
+            attempts++
+        }
+        assertTrue(executed.get())
+
+        attempts = 0
+        while (manager.state.value.completedTasks.isEmpty() && attempts < 20) {
+            delay(50)
+            attempts++
+        }
+
+        assertEquals(1, manager.state.value.completedTasks.size)
+        assertEquals(BackgroundTaskStatus.COMPLETED, manager.state.value.completedTasks.first().status)
+        assertEquals(0, manager.state.value.queuedTasks.size)
+        assertNull(manager.state.value.activeTask)
     }
 }

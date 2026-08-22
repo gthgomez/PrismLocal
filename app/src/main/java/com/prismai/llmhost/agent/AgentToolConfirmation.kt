@@ -38,8 +38,11 @@ class AgentToolConfirmation(
 
     // ── In-memory pending state ─────────────────────────────────────────
 
+    @Volatile
     var pendingCall: AgentToolCall? = null
+    @Volatile
     var pendingOriginalPrompt: String? = null
+    @Volatile
     var pendingDepth: Int = 0
 
     // ── Confirmation builder ────────────────────────────────────────────
@@ -247,21 +250,22 @@ class AgentToolConfirmation(
 
                 val arguments = if (argumentsStr.isNotBlank()) JSONObject(argumentsStr) else JSONObject()
                 val call = AgentToolCall(toolName, arguments, reason)
-                val definition = AgentToolRegistry.find(toolName)
 
-                if (definition != null) {
-                    pendingCall = call
-                    pendingOriginalPrompt = originalPrompt
-                    pendingDepth = depth
-                    val actionId = "agent_tool_${SystemClock.uptimeMillis()}"
-                    uiState._pendingAgentToolAction.value = build(actionId, call, definition)
-                    Log.d(TAG, "Restored pending agent tool call: $toolName for chat $chatId")
-                    true
-                } else {
-                    Log.w(TAG, "Restored pending agent tool call failed: Unknown tool $toolName")
+                val validation = AgentToolRegistry.validate(call)
+                val definition = validation.definition
+                if (!validation.valid || definition == null) {
+                    Log.w(TAG, "Restored pending agent tool call failed validation: ${validation.message}")
                     clearPrefs(chatId)
-                    false
+                    return false
                 }
+
+                pendingCall = call
+                pendingOriginalPrompt = originalPrompt
+                pendingDepth = depth.coerceIn(0, uiState.generationSettings.value.maxAgentIterations - 1)
+                val actionId = "agent_tool_${SystemClock.uptimeMillis()}"
+                uiState._pendingAgentToolAction.value = build(actionId, call, definition)
+                Log.d(TAG, "Restored pending agent tool call: $toolName for chat $chatId")
+                true
             } else {
                 Log.d(TAG, "Discarded stale pending agent tool call for chat $storedChatId (current: $chatId)")
                 clearPrefs(chatId)

@@ -122,8 +122,11 @@ class InferenceService : Service() {
     @Volatile
     private var generationForegroundActive = false
     private val operationMutex = Mutex()
+    @Volatile
+    private var activeGenerationSource: String = "user"
     private val transcriptLock = Any()
     private var generationSession = 0L
+    @Volatile
     private var previousRuntimeSettings: GenerationSettings? = null
     // nextTranscriptId / activeAssistantTranscriptId / lastTranscriptPersistAt
     // are now delegated to chatManager (see delegation properties below)
@@ -169,6 +172,7 @@ class InferenceService : Service() {
     private lateinit var backgroundAgentHandlerTools: com.prismai.llmhost.agent.tools.BackgroundAgentTools
     private lateinit var webSearchTools: com.prismai.llmhost.agent.tools.WebSearchTools
     private lateinit var systemHandlerTools: com.prismai.llmhost.agent.tools.SystemTools
+    private lateinit var workspaceTools: com.prismai.llmhost.agent.tools.WorkspaceTools
 
     // ── Chat state delegated to ChatManager ───────────────────────────
     private var nextTranscriptId
@@ -262,6 +266,7 @@ class InferenceService : Service() {
         configStore = EngineConfigStore(getSharedPreferences(PREFS_NAME, MODE_PRIVATE))
         chatManager = ChatManager(this, transcriptStore, chatSearchIndex, uiState, eventBus, serviceScope)
         createNotificationChannel()
+        CapabilityRegistryHolder.auditLog.init(filesDir)
         engine = NativeLlmBridge.create()
         memoryGovernor = MemoryGovernor(this)
         modelStorageManager = ModelStorageManager(this)
@@ -326,10 +331,20 @@ class InferenceService : Service() {
         backgroundAgentManager = BackgroundAgentManager(
             context = this,
             executeTask = { bgTask ->
-                generateSafelyAndAwait(prompt = bgTask.prompt, preserveBenchmarkQueue = true)
+                generateSafelyAndAwait(
+                    prompt = bgTask.prompt,
+                    preserveBenchmarkQueue = true,
+                    initiatedByBackground = true,
+                )
             },
             cancelNativeGeneration = {
-                cancelGenerationAndJoin("background task cancelled")
+                val sourceIsBackground = operationMutex.withLock { activeGenerationSource == "background" }
+                if (sourceIsBackground) {
+                    cancelGenerationAndJoin("background task cancelled")
+                }
+            },
+            isDeviceBusyWithUserGeneration = {
+                _isGenerating.value || _pendingAgentToolAction.value != null
             },
         )
 
@@ -444,6 +459,7 @@ class InferenceService : Service() {
             grokipediaClient = grokipediaClient,
         )
         voiceHandlerTools = com.prismai.llmhost.agent.tools.VoiceTools(
+            appContext = this,
             voiceIoManager = voiceIoManager,
             uiState = uiState,
         )
@@ -471,6 +487,9 @@ class InferenceService : Service() {
             activeOperationJson = { activeOperationJson() },
             onCancelImport = { cancelImport() },
             importJobIsActive = { importJob?.isActive == true },
+        )
+        workspaceTools = com.prismai.llmhost.agent.tools.WorkspaceTools(
+            rootDir = filesDir,
         )
 
         // ── Phase E: benchmark classes ──────────────────────────────────
@@ -748,9 +767,16 @@ class InferenceService : Service() {
         prompt: String,
         benchmarkPreset: BenchmarkPreset? = null,
         preserveBenchmarkQueue: Boolean = false,
+        initiatedByBackground: Boolean = false,
     ): String {
         var activeJob: Job? = null
         operationMutex.withLock {
+            if (initiatedByBackground &&
+                (_isGenerating.value || _pendingAgentToolAction.value != null)
+            ) {
+                return "Background task deferred: device busy"
+            }
+            activeGenerationSource = if (initiatedByBackground) "background" else "user"
             cancelAndJoinGenerationLocked(
                 reason = "new generation",
                 clearQueuedBenchmarks = !preserveBenchmarkQueue,
@@ -804,6 +830,11 @@ class InferenceService : Service() {
 
     fun cancelPendingAgentTool() {
         val action = _pendingAgentToolAction.value ?: return
+        val capturedCall = agentToolConfirmation.pendingCall
+        if (capturedCall != null) {
+            agentToolRouter.removeFromHistory(capturedCall)
+        }
+        CapabilityRegistryHolder.auditLog.record("CONFIRM_CANCELLED", action.name, "")
         agentToolConfirmation.clearMemory()
         agentToolConfirmation.clearPrefs()
         appendTranscriptMessage(
@@ -827,8 +858,10 @@ class InferenceService : Service() {
             val stepStart = SystemClock.elapsedRealtime()
             val result = executeAgentTool(call, confirmed = true)
             val latency = SystemClock.elapsedRealtime() - stepStart
-            agentTrace.recordStep(call, result, latency)
-            appendToolResult(result)
+            val sanitizedResult = com.prismai.llmhost.agent.ToolInputSanitizer.sanitizeResult(result)
+            agentTrace.recordStep(call, sanitizedResult, latency)
+            appendToolResult(sanitizedResult)
+            CapabilityRegistryHolder.auditLog.record("CONFIRM_EXECUTED", call.name, result.summary.take(160))
             val maxIterations = _generationSettings.value.maxAgentIterations
             if (result.success && agentToolRouter.shouldContinueAfterTool(call) && depth + 1 < maxIterations) {
                 startAgentFollowUpGeneration(originalPrompt, result, depth + 1)
@@ -918,13 +951,13 @@ class InferenceService : Service() {
             "forget_fact" -> memoryTools.forgetFact(call, confirmed)
             "list_memories" -> memoryTools.listMemories(call)
             // ── RAG tools ────────────────────────────────────────────────────
-            "ingest_document" -> ragHandlerTools.ingestDocument(call)
+            "ingest_document" -> ragHandlerTools.ingestDocument(call, confirmed)
             "search_documents" -> ragHandlerTools.searchDocuments(call)
             "list_documents" -> ragHandlerTools.listDocuments(call)
-            "delete_document" -> ragHandlerTools.deleteDocument(call)
+            "delete_document" -> ragHandlerTools.deleteDocument(call, confirmed)
             // ── Knowledge Pack tools ─────────────────────────────────────────
             "search_knowledge" -> knowledgePackHandlerTools.searchKnowledge(call)
-            "fetch_grokipedia_article" -> knowledgePackHandlerTools.fetchGrokipediaArticle(call)
+            "fetch_grokipedia_article" -> knowledgePackHandlerTools.fetchGrokipediaArticle(call, confirmed)
             "list_knowledge_packs" -> knowledgePackHandlerTools.listKnowledgePacks(call)
             "download_knowledge_pack" -> knowledgePackHandlerTools.downloadKnowledgePack(call, confirmed)
             // ── Voice I/O tools ──────────────────────────────────────────────
@@ -932,9 +965,13 @@ class InferenceService : Service() {
             "speak_output" -> voiceHandlerTools.speakOutput(call)
             "stop_speaking" -> voiceHandlerTools.stopSpeaking(call)
             // ── Data connector tools ─────────────────────────────────────────
-            "search_contacts" -> dataConnectorHandlerTools.searchContacts(call)
-            "get_calendar_events" -> dataConnectorHandlerTools.getCalendarEvents(call)
-            "list_sms_threads" -> dataConnectorHandlerTools.listSmsThreads(call)
+            "search_contacts" -> dataConnectorHandlerTools.searchContacts(call, confirmed)
+            "get_calendar_events" -> dataConnectorHandlerTools.getCalendarEvents(call, confirmed)
+            "list_sms_threads" -> dataConnectorHandlerTools.listSmsThreads(call, confirmed)
+            // ── Workspace file tools ─────────────────────────────────────────
+            "list_workspace_files" -> workspaceTools.listWorkspaceFiles(call)
+            "read_workspace_file" -> workspaceTools.readWorkspaceFile(call)
+            "search_workspace_files" -> workspaceTools.searchWorkspaceFiles(call)
             // ── Background agent tools ───────────────────────────────────────
             "run_in_background" -> backgroundAgentHandlerTools.runInBackground(call, confirmed)
             "check_background_tasks" -> backgroundAgentHandlerTools.checkBackgroundTasks(call)

@@ -12,6 +12,8 @@ import com.prismai.llmhost.model.ModelImportManager
 import com.prismai.llmhost.model.ModelManager
 import com.prismai.llmhost.model.ModelReadinessAssessor
 import com.prismai.llmhost.util.FormatUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -198,7 +200,7 @@ class ModelTools(
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Model delete requires confirmation")
         val modelId = call.arguments.optString("model_id").trim()
         if (modelId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Missing model_id parameter")
-        val activeModel = modelStorageManager.activeModelInfo(modelId)
+        val activeModel = withContext(Dispatchers.IO) { modelStorageManager.activeModelInfo(modelId) }
             ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "Model not found: $modelId")
         val deleted = modelManager.deleteModel(modelId)
         return if (deleted) {

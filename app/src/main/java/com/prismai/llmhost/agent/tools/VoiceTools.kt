@@ -7,15 +7,22 @@ import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
 import com.prismai.llmhost.ui.ServiceUiState
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 class VoiceTools(
+    private val appContext: Context,
     private val voiceIoManager: VoiceIoManager,
     private val uiState: ServiceUiState,
 ) {
     suspend fun voiceInput(call: AgentToolCall): AgentToolResult {
+        if (appContext.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            return toolFailure(call, AgentToolErrorCode.FAILED, "Microphone permission not granted.")
+        }
         val timeoutSeconds = call.arguments.optInt("timeout_seconds", 10).coerceIn(3, 30)
         if (!voiceIoManager.isSttAvailable()) {
             return toolFailure(call, AgentToolErrorCode.FAILED,

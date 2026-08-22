@@ -20,11 +20,14 @@ import android.os.Build
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -58,11 +61,17 @@ data class BackgroundAgentState(
  *
  * Battery check is best-effort — never blocks foreground work on battery state.
  * Max 5 queued tasks to prevent resource exhaustion.
+ *
+ * All state transitions are guarded by a single lock; task execution is always
+ * launched outside of it. While [isDeviceBusyWithUserGeneration] reports the
+ * device busy with user-facing generation, queued tasks stay QUEUED at the
+ * head and are retried via a cooperative poll instead of preempting generation.
  */
 class BackgroundAgentManager(
     private val context: Context,
     private val executeTask: (suspend (BackgroundTask) -> String)? = null,
     private val cancelNativeGeneration: (suspend () -> Unit)? = null,
+    private val isDeviceBusyWithUserGeneration: () -> Boolean = { false },
 ) {
     companion object {
         private const val TAG = "BackgroundAgentManager"
@@ -71,15 +80,20 @@ class BackgroundAgentManager(
         private const val NOTIFICATION_ID_BASE = 3000
         private const val MAX_QUEUED_TASKS = 5
         private const val LOW_BATTERY_THRESHOLD = 15
+        private const val DEVICE_BUSY_RETRY_INTERVAL_MS = 2_000L
     }
 
+    // Guards every BackgroundAgentState read-modify-write and task promotion;
+    // never held across blocking work, wake locks, or task execution launches.
+    private val stateLock = Any()
     private val wakeLock: PowerManager.WakeLock?
     private val notificationManager: NotificationManager?
     private val _state = MutableStateFlow(BackgroundAgentState())
     val state: StateFlow<BackgroundAgentState> = _state.asStateFlow()
     private val bgScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private var taskIdCounter = 0L
-    private var activeTaskJob: kotlinx.coroutines.Job? = null
+    private val taskIdCounter = AtomicLong(0L)
+    private var activeTaskJob: Job? = null
+    private var deviceBusyRetryJob: Job? = null
     @Volatile private var cancelInFlight = false
 
     private fun logD(tag: String, msg: String) { runCatching { Log.d(tag, msg) } }
@@ -112,55 +126,100 @@ class BackgroundAgentManager(
      * Rejects if the queue is full (max [MAX_QUEUED_TASKS]).
      */
     fun enqueue(prompt: String): BackgroundTask? {
-        val current = _state.value
-        if (current.queuedTasks.size >= MAX_QUEUED_TASKS) {
-            logW(TAG, "Task queue full, rejecting prompt: ${prompt.take(80)}")
-            return null
+        val queued: BackgroundTask = synchronized(stateLock) {
+            val current = _state.value
+            if (current.queuedTasks.size >= MAX_QUEUED_TASKS) {
+                logW(TAG, "Task queue full, rejecting prompt: ${prompt.take(80)}")
+                return null
+            }
+            val id = "bg_task_${taskIdCounter.incrementAndGet()}"
+            val task = BackgroundTask(id = id, prompt = prompt)
+            _state.value = current.copy(queuedTasks = current.queuedTasks + task)
+            task
         }
-        val id = "bg_task_${++taskIdCounter}"
-        val task = BackgroundTask(id = id, prompt = prompt)
-        _state.value = current.copy(
-            queuedTasks = current.queuedTasks + task
-        )
-        logD(TAG, "Enqueued task $id: ${prompt.take(80)}")
+
+        logD(TAG, "Enqueued task ${queued.id}: ${prompt.take(80)}")
         processNextTask()
-        return task
+        return queued
     }
 
     /** Start processing the queue. Acquires wake lock. */
     fun startBackgroundMode() {
-        val current = _state.value
-        if (current.isBackgroundMode) {
+        val alreadyActive = synchronized(stateLock) { _state.value.isBackgroundMode }
+        if (alreadyActive) {
             processNextTask()
             return
         }
 
         wakeLock?.acquire(30_000L) // Initial timeout guards against dangling locks
-        _state.value = current.copy(isBackgroundMode = true)
+        synchronized(stateLock) {
+            _state.value = _state.value.copy(isBackgroundMode = true)
+        }
         showProgressNotification("Background agent active")
         logD(TAG, "Background mode started, wake lock acquired")
         processNextTask()
     }
 
+    /**
+     * Promote the next queued task in a single atomic step. Caller must hold
+     * [stateLock]; the returned task is owned by the caller and must be
+     * executed only after the lock is released.
+     */
+    private fun promoteHeadLocked(current: BackgroundAgentState): BackgroundTask {
+        val head = current.queuedTasks.first().copy(status = BackgroundTaskStatus.RUNNING)
+        _state.value = current.copy(
+            activeTask = head,
+            queuedTasks = current.queuedTasks.drop(1),
+        )
+        return head
+    }
+
     /** Process the next task in queue using [executeTask] */
     fun processNextTask() {
-        if (_state.value.activeTask != null) return
-        if (cancelInFlight) return
         if (!checkBudget()) {
             logW(TAG, "Resource budget constrained, holding background queue processing")
             return
         }
-        val task = nextTask() ?: run {
-            if (_state.value.isBackgroundMode && _state.value.queuedTasks.isEmpty()) {
-                stopBackgroundMode()
+
+        var promoted: BackgroundTask? = null
+        var startNeeded = false
+        var idleStopNeeded = false
+        var busyHoldNeeded = false
+
+        synchronized(stateLock) {
+            val current = _state.value
+            if (current.activeTask != null || cancelInFlight) return
+            if (current.queuedTasks.isEmpty()) {
+                if (current.isBackgroundMode) {
+                    idleStopNeeded = true
+                }
+                return
             }
+            if (isDeviceBusyWithUserGeneration()) {
+                // Hold the head task QUEUED; fall through below so the retry
+                // poller gets scheduled instead of stranding the task.
+                busyHoldNeeded = true
+            } else {
+                promoted = promoteHeadLocked(current)
+                if (!current.isBackgroundMode) {
+                    startNeeded = true
+                }
+            }
+        }
+
+        if (idleStopNeeded) {
+            stopBackgroundMode()
+            return
+        }
+        if (startNeeded) {
+            startBackgroundMode()
+        }
+        if (busyHoldNeeded) {
+            scheduleDeviceBusyRetry()
             return
         }
 
-        if (!_state.value.isBackgroundMode) {
-            startBackgroundMode()
-        }
-
+        val task = promoted ?: return
         activeTaskJob = bgScope.launch {
             try {
                 wakeLock?.acquire(300_000L) // 5-minute wake lock per background task
@@ -174,7 +233,11 @@ class BackgroundAgentManager(
                 failCurrentTask(e.message ?: "Task execution error")
             } finally {
                 releaseWakeLockSafely()
-                activeTaskJob = null
+                synchronized(stateLock) {
+                    if (activeTaskJob === coroutineContext[Job]) {
+                        activeTaskJob = null
+                    }
+                }
                 if (!cancelInFlight) {
                     processNextTask()
                 }
@@ -182,19 +245,64 @@ class BackgroundAgentManager(
         }
     }
 
+    /**
+     * Keeps the head task QUEUED while user-facing generation holds the device,
+     * retrying [processNextTask] via a cooperative poll. Only one retry poll
+     * runs at a time and it never blocks a thread while waiting.
+     */
+    private fun scheduleDeviceBusyRetry() {
+        synchronized(stateLock) {
+            if (deviceBusyRetryJob?.isActive == true || cancelInFlight ||
+                _state.value.activeTask != null || _state.value.queuedTasks.isEmpty()
+            ) {
+                return
+            }
+            deviceBusyRetryJob = bgScope.launch {
+                val selfJob = coroutineContext[Job]
+                var cancelled = false
+                try {
+                    while (isDeviceBusyWithUserGeneration()) {
+                        delay(DEVICE_BUSY_RETRY_INTERVAL_MS)
+                    }
+                } catch (c: kotlinx.coroutines.CancellationException) {
+                    cancelled = true
+                    throw c
+                } finally {
+                    synchronized(stateLock) {
+                        if (deviceBusyRetryJob === selfJob) {
+                            deviceBusyRetryJob = null
+                        }
+                    }
+                    if (!cancelled) {
+                        processNextTask()
+                    }
+                }
+            }
+        }
+    }
+
     /** Stop background mode. Releases wake lock. */
     fun stopBackgroundMode() {
-        val current = _state.value
-        if (!current.isBackgroundMode) return
+        val isActive = synchronized(stateLock) { _state.value.isBackgroundMode }
+        if (!isActive) return
 
         cancelInFlight = true
         bgScope.launch {
             try {
-                activeTaskJob?.cancelAndJoin()
-                activeTaskJob = null
+                val job = synchronized(stateLock) { activeTaskJob }
+                job?.cancelAndJoin()
+                val retryJob = synchronized(stateLock) { deviceBusyRetryJob }
+                retryJob?.cancel()
+                synchronized(stateLock) {
+                    activeTaskJob = null
+                    if (deviceBusyRetryJob === retryJob) {
+                        deviceBusyRetryJob = null
+                    }
+                }
                 runCatching { cancelNativeGeneration?.invoke() }
-                val latest = _state.value
-                _state.value = latest.copy(isBackgroundMode = false, activeTask = null)
+                synchronized(stateLock) {
+                    _state.value = _state.value.copy(isBackgroundMode = false, activeTask = null)
+                }
                 releaseWakeLockSafely()
                 cancelProgressNotification()
                 logD(TAG, "Background mode stopped, wake lock released")
@@ -206,82 +314,103 @@ class BackgroundAgentManager(
 
     /** Cancel a queued or running task */
     fun cancelTask(taskId: String): Boolean {
-        val current = _state.value
-        if (current.activeTask?.id == taskId) {
-            val task = current.activeTask!!
-            cancelInFlight = true
-            bgScope.launch {
-                try {
-                    activeTaskJob?.cancelAndJoin()
-                    activeTaskJob = null
-                    runCatching { cancelNativeGeneration?.invoke() }
+        var activeSnapshot: BackgroundTask? = null
+        var queuedCancelled = false
+        synchronized(stateLock) {
+            val current = _state.value
+            val active = current.activeTask
+            when {
+                active?.id == taskId -> activeSnapshot = active
+                current.queuedTasks.any { it.id == taskId } -> {
+                    val task = current.queuedTasks.first { it.id == taskId }
+                    _state.value = current.copy(
+                        queuedTasks = current.queuedTasks.filterNot { it.id == taskId },
+                        completedTasks = current.completedTasks + task.copy(
+                            status = BackgroundTaskStatus.CANCELLED
+                        ),
+                    )
+                    queuedCancelled = true
+                }
+            }
+        }
+
+        val active = activeSnapshot ?: return queuedCancelled
+
+        cancelInFlight = true
+        bgScope.launch {
+            try {
+                val job = synchronized(stateLock) { activeTaskJob }
+                job?.cancelAndJoin()
+                synchronized(stateLock) {
+                    if (activeTaskJob === job) {
+                        activeTaskJob = null
+                    }
+                }
+                runCatching { cancelNativeGeneration?.invoke() }
+                synchronized(stateLock) {
                     val latest = _state.value
                     _state.value = latest.copy(
                         activeTask = null,
                         queuedTasks = latest.queuedTasks.filterNot { it.id == taskId },
-                        completedTasks = latest.completedTasks + task.copy(
+                        completedTasks = latest.completedTasks + active.copy(
                             status = BackgroundTaskStatus.CANCELLED
                         ),
                     )
-                    releaseWakeLockSafely()
-                } finally {
-                    cancelInFlight = false
-                    processNextTask()
                 }
+                releaseWakeLockSafely()
+            } finally {
+                cancelInFlight = false
+                processNextTask()
             }
-            return true
         }
-        val wasInQueue = current.queuedTasks.any { it.id == taskId }
-        if (wasInQueue) {
-            val task = current.queuedTasks.first { it.id == taskId }
-            _state.value = current.copy(
-                queuedTasks = current.queuedTasks.filterNot { it.id == taskId },
-                completedTasks = current.completedTasks + task.copy(
-                    status = BackgroundTaskStatus.CANCELLED
-                ),
-            )
-            return true
-        }
-        return false
+        return true
     }
 
     /** Mark the active task as complete with summary */
     fun completeCurrentTask(summary: String) {
-        val current = _state.value
-        val active = current.activeTask ?: return
-        val completed = active.copy(
-            status = BackgroundTaskStatus.COMPLETED,
-            resultSummary = summary,
-        )
-        _state.value = current.copy(
-            activeTask = null,
-            completedTasks = current.completedTasks + completed,
-        )
+        val completed: BackgroundTask = synchronized(stateLock) {
+            val current = _state.value
+            val active = current.activeTask ?: return
+            val done = active.copy(
+                status = BackgroundTaskStatus.COMPLETED,
+                resultSummary = summary,
+            )
+            _state.value = current.copy(
+                activeTask = null,
+                completedTasks = current.completedTasks + done,
+            )
+            done
+        }
         notifyTaskComplete(completed)
-        logD(TAG, "Task ${active.id} completed: ${summary.take(80)}")
+        logD(TAG, "Task ${completed.id} completed: ${summary.take(80)}")
     }
 
     /** Mark the active task as failed */
     fun failCurrentTask(error: String) {
-        val current = _state.value
-        val active = current.activeTask ?: return
-        val failed = active.copy(
-            status = BackgroundTaskStatus.FAILED,
-            resultSummary = error,
-        )
-        _state.value = current.copy(
-            activeTask = null,
-            completedTasks = current.completedTasks + failed,
-        )
+        val failed: BackgroundTask = synchronized(stateLock) {
+            val current = _state.value
+            val active = current.activeTask ?: return
+            val done = active.copy(
+                status = BackgroundTaskStatus.FAILED,
+                resultSummary = error,
+            )
+            _state.value = current.copy(
+                activeTask = null,
+                completedTasks = current.completedTasks + done,
+            )
+            done
+        }
         notifyTaskComplete(failed)
-        logD(TAG, "Task ${active.id} failed: ${error.take(80)}")
+        logD(TAG, "Task ${failed.id} failed: ${error.take(80)}")
     }
 
     /** Check battery/thermal budget. Returns false if resources are too constrained. */
     fun checkBudget(): Boolean {
         val batteryOk = checkBattery()
         val thermalOk = checkThermal()
-        _state.value = _state.value.copy(batteryOk = batteryOk, thermalOk = thermalOk)
+        synchronized(stateLock) {
+            _state.value = _state.value.copy(batteryOk = batteryOk, thermalOk = thermalOk)
+        }
         return batteryOk && thermalOk
     }
 
@@ -323,14 +452,11 @@ class BackgroundAgentManager(
 
     /** Get the next queued task, or null if the queue is empty */
     fun nextTask(): BackgroundTask? {
-        val current = _state.value
-        if (current.queuedTasks.isEmpty() || current.activeTask != null) return null
-        val next = current.queuedTasks.first()
-        _state.value = current.copy(
-            activeTask = next,
-            queuedTasks = current.queuedTasks.drop(1),
-        )
-        return next
+        synchronized(stateLock) {
+            val current = _state.value
+            if (current.queuedTasks.isEmpty() || current.activeTask != null) return null
+            return promoteHeadLocked(current)
+        }
     }
 
     /** Release resources */

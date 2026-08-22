@@ -595,36 +595,6 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeIsVulkanEnabled(JNIEnv*, j
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeLoadDraftModel(JNIEnv* env, jobject, jlong handle, jstring path, jint draft_gpu_layers) {
-    auto* engine = toEngine(handle);
-    if (engine == nullptr || path == nullptr) {
-        return JNI_FALSE;
-    }
-    std::string path_str = toString(env, path);
-    return engine->loadDraftModel(path_str, draft_gpu_layers) ? JNI_TRUE : JNI_FALSE;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeUnloadDraftModel(JNIEnv*, jobject, jlong handle) {
-    auto* engine = toEngine(handle);
-    if (engine != nullptr) {
-        engine->unloadDraftModel();
-    }
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeIsSpeculativeActive(JNIEnv*, jobject, jlong handle) {
-    auto* engine = toEngine(handle);
-    return (engine != nullptr && engine->is_speculative_active()) ? JNI_TRUE : JNI_FALSE;
-}
-
-extern "C" JNIEXPORT jfloat JNICALL
-Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeGetSpeculativeAcceptanceRate(JNIEnv*, jobject, jlong handle) {
-    auto* engine = toEngine(handle);
-    return engine != nullptr ? static_cast<jfloat>(engine->get_speculative_acceptance_rate()) : 0.0f;
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
 Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeApplyLoraAdapters(
         JNIEnv* env,
         jobject,

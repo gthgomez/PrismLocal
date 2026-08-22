@@ -94,7 +94,7 @@ class GenerationOrchestrator(
 
     // ── Public API ──────────────────────────────────────────────────────
 
-    /** Main entry point for chat generation. Called from within [InferenceService]'s mutex lock. */
+    /** Main entry point for chat generation. Acquires [InferenceService]'s operation mutex itself. */
     suspend fun generate(
         prompt: String,
         benchmarkPreset: BenchmarkPreset? = null,
@@ -278,7 +278,7 @@ class GenerationOrchestrator(
         storeGenerationJob(job)
     }
 
-    /** Continuation generation. Called from within [InferenceService]'s mutex lock. */
+    /** Continuation generation. Acquires [InferenceService]'s operation mutex via [com.prismai.llmhost.InferenceService.continueGenerationSafely]. */
     fun continueGeneration() {
         if (uiState.currentModel.value == null) {
             eventBus.publish("Select a model before continuing")
@@ -356,7 +356,7 @@ class GenerationOrchestrator(
         storeGenerationJob(job)
     }
 
-    /** Agent follow-up generation after a tool result. Called from within [InferenceService]'s mutex lock. */
+    /** Agent follow-up generation after a tool result. Acquires [InferenceService]'s operation mutex itself. */
     fun startFollowUp(
         originalPrompt: String,
         toolResult: AgentToolResult,

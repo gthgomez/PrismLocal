@@ -4,7 +4,7 @@
 #include <unistd.h>
 
 #include "llama.h"
-#include "speculative.h"
+#include "common.h"
 #include "sampling.h"
 
 #include <algorithm>
@@ -165,14 +165,15 @@ std::string formatPromptForGeneration(llama_model* model, const std::string& pro
         return prompt;
     }
 
-    // Prevent double-wrapping if prompt is already formatted with ChatML/LLaMA/Role headers
+    // Prevent double-wrapping if prompt is already formatted with real chat-
+    // template markers. Do NOT match bare "User:"/"Assistant:" prose here:
+    // the app's own transcript formatting prefixes every history line that
+    // way, which previously disabled templating for all multi-turn chats.
     if (prompt.find("<|im_start|>") != std::string::npos ||
         prompt.find("<|start_header_id|>") != std::string::npos ||
         prompt.find("[INST]") != std::string::npos ||
         prompt.find("<|system|>") != std::string::npos ||
-        prompt.find("<|user|>") != std::string::npos ||
-        prompt.find("User:") != std::string::npos ||
-        prompt.find("Assistant:") != std::string::npos) {
+        prompt.find("<|user|>") != std::string::npos) {
         LOGI("prompt_already_formatted length=%zu", prompt.size());
         return prompt;
     }
@@ -278,28 +279,11 @@ struct ModelRuntime {
 
     std::vector<llama_token> active_tokens;
 
-    // Speculative Decoding State
-    llama_model* draft_model = nullptr;
-    common_speculative* spec = nullptr;
-    std::string draft_model_path;
-    int draft_gpu_layers = 0;
-    int n_draft = 5;
-    std::atomic<uint64_t> total_drafted_tokens{0};
-    std::atomic<uint64_t> total_accepted_tokens{0};
-
     // Dynamic LoRA Adapters
     std::vector<llama_adapter_lora*> loaded_loras;
 
     ~ModelRuntime() {
         std::lock_guard<std::mutex> lock(decode_mu);
-        if (spec != nullptr) {
-            common_speculative_free(spec);
-            spec = nullptr;
-        }
-        if (draft_model != nullptr) {
-            llama_model_free(draft_model);
-            draft_model = nullptr;
-        }
         if (single_batch_initialized) {
             llama_batch_free(single_batch);
             single_batch_initialized = false;
@@ -1321,103 +1305,6 @@ void Engine::unloadModel() {
     clearRing(impl_->buffers.control);
     impl_->buffers.control->state.store(static_cast<uint32_t>(StreamState::Idle), std::memory_order_release);
     LOGI("model_unloaded previous_path=%s", previous_path.c_str());
-}
-
-bool Engine::loadDraftModel(const std::string& draft_path, int draft_gpu_layers) {
-    if (!impl_ || draft_path.empty()) {
-        return false;
-    }
-    impl_->cancelAndJoinActiveSession();
-    std::shared_ptr<ModelRuntime> runtime;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mu);
-        runtime = impl_->active_runtime;
-    }
-    if (!runtime || runtime->model == nullptr || runtime->ctx == nullptr) {
-        LOGW("loadDraftModel failed: target model not loaded");
-        return false;
-    }
-
-    std::lock_guard<std::mutex> decode_lock(runtime->decode_mu);
-    if (runtime->spec != nullptr) {
-        common_speculative_free(runtime->spec);
-        runtime->spec = nullptr;
-    }
-    if (runtime->draft_model != nullptr) {
-        llama_model_free(runtime->draft_model);
-        runtime->draft_model = nullptr;
-    }
-
-    common_params params;
-    params.model.path = draft_path;
-    params.n_gpu_layers = draft_gpu_layers;
-    params.n_ctx = runtime->context_length;
-    params.speculative.draft.mparams.path = draft_path;
-    params.speculative.draft.n_gpu_layers = draft_gpu_layers;
-    params.speculative.draft.n_ctx = runtime->context_length;
-
-    auto mparams_dft = common_model_params_to_llama(params);
-    runtime->draft_model = llama_model_load_from_file(draft_path.c_str(), mparams_dft);
-    if (runtime->draft_model == nullptr) {
-        LOGE("failed to load draft model from %s", draft_path.c_str());
-        return false;
-    }
-
-    params.speculative.draft.model = runtime->draft_model;
-    params.speculative.draft.cparams = common_context_params_to_llama(params);
-    runtime->spec = common_speculative_init(params.speculative, runtime->ctx);
-
-    if (runtime->spec == nullptr) {
-        LOGE("failed to initialize common_speculative for %s", draft_path.c_str());
-        llama_model_free(runtime->draft_model);
-        runtime->draft_model = nullptr;
-        return false;
-    }
-
-    runtime->draft_model_path = draft_path;
-    runtime->draft_gpu_layers = draft_gpu_layers;
-    runtime->total_drafted_tokens.store(0);
-    runtime->total_accepted_tokens.store(0);
-    LOGI("draft_model_loaded path=%s gpu_layers=%d", draft_path.c_str(), draft_gpu_layers);
-    return true;
-}
-
-void Engine::unloadDraftModel() {
-    if (!impl_) return;
-    impl_->cancelAndJoinActiveSession();
-    std::shared_ptr<ModelRuntime> runtime;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mu);
-        runtime = impl_->active_runtime;
-    }
-    if (!runtime) return;
-    std::lock_guard<std::mutex> decode_lock(runtime->decode_mu);
-    if (runtime->spec != nullptr) {
-        common_speculative_free(runtime->spec);
-        runtime->spec = nullptr;
-    }
-    if (runtime->draft_model != nullptr) {
-        llama_model_free(runtime->draft_model);
-        runtime->draft_model = nullptr;
-    }
-    runtime->draft_model_path.clear();
-    LOGI("draft_model_unloaded");
-}
-
-bool Engine::is_speculative_active() const {
-    if (!impl_) return false;
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    return impl_->active_runtime && impl_->active_runtime->spec != nullptr;
-}
-
-float Engine::get_speculative_acceptance_rate() const {
-    if (!impl_) return 0.0f;
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    if (!impl_->active_runtime) return 0.0f;
-    uint64_t drafted = impl_->active_runtime->total_drafted_tokens.load();
-    uint64_t accepted = impl_->active_runtime->total_accepted_tokens.load();
-    if (drafted == 0) return 0.0f;
-    return static_cast<float>(accepted) / static_cast<float>(drafted);
 }
 
 int Engine::startGeneration(const std::string& prompt, int generation_id, GenerationConfig config) {

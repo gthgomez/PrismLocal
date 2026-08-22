@@ -275,15 +275,7 @@ struct ModelRuntime {
     llama_batch single_batch;
 
     llama_sampler* cached_sampler = nullptr;
-    GenerationConfig cached_config;
 
-    struct GrammarCacheSlot {
-        llama_sampler* sampler = nullptr;
-        std::string grammar;
-        int64_t last_access = 0;
-    };
-    GrammarCacheSlot grammar_cache[2];
-    int64_t grammar_access_counter = 0;
     std::vector<llama_token> active_tokens;
 
     // Speculative Decoding State
@@ -315,12 +307,6 @@ struct ModelRuntime {
         if (cached_sampler != nullptr) {
             llama_sampler_free(cached_sampler);
             cached_sampler = nullptr;
-        }
-        for (auto& slot : grammar_cache) {
-            if (slot.sampler != nullptr) {
-                llama_sampler_free(slot.sampler);
-                slot.sampler = nullptr;
-            }
         }
         if (ctx != nullptr) {
             if (!loaded_loras.empty()) {
@@ -1064,77 +1050,41 @@ struct Engine::Impl {
             return;
         }
 
-        llama_sampler* sampler = nullptr;
-        const bool non_grammar_matches =
-            runtime->cached_sampler != nullptr &&
-            runtime->cached_config.temperature == session->config.temperature &&
-            runtime->cached_config.top_k == session->config.top_k &&
-            runtime->cached_config.top_p == session->config.top_p &&
-            runtime->cached_config.repeat_penalty == session->config.repeat_penalty;
-        int grammar_cache_hit_slot = -1;
-        for (int gi = 0; gi < 2; gi++) {
-            if (!session->config.grammar.empty() &&
-                runtime->grammar_cache[gi].sampler != nullptr &&
-                runtime->grammar_cache[gi].grammar == session->config.grammar) {
-                grammar_cache_hit_slot = gi;
-                break;
+        // Build a fresh sampler chain for every generation. llama_sampler_chain_add
+        // transfers ownership of each member into the chain (llama.h), so caching
+        // chain or grammar sampler objects across generations previously produced
+        // dangling cache entries and double-free/UAF paths. A fresh chain costs
+        // microseconds; the GBNF recompile below is logged and is sub-millisecond
+        // for the tool-call grammars this app uses.
+        if (runtime->cached_sampler != nullptr) {
+            llama_sampler_free(runtime->cached_sampler);
+            runtime->cached_sampler = nullptr;
+        }
+        llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        if (sampler == nullptr) {
+            ctrl->error_code.store(424, std::memory_order_release);
+            finishSession(session, StreamState::Error);
+            return;
+        }
+        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, session->config.repeat_penalty, 0.2f, 0.2f));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(session->config.top_k));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(session->config.top_p, 1));
+        llama_sampler_chain_add(sampler, llama_sampler_init_temp(session->config.temperature));
+        if (!session->config.grammar.empty()) {
+            const auto grammar_start = std::chrono::steady_clock::now();
+            auto* grammar_sampler = llama_sampler_init_grammar(runtime->vocab, session->config.grammar.c_str(), "root");
+            const auto grammar_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - grammar_start).count();
+            LOGI("grammar_compile_time_us=%lld", static_cast<long long>(grammar_elapsed));
+            if (grammar_sampler != nullptr) {
+                llama_sampler_chain_add(sampler, grammar_sampler);
+            } else {
+                LOGW("Failed to compile grammar. Proceeding unconstrained.");
             }
         }
-        const bool grammar_matches = grammar_cache_hit_slot >= 0;
+        llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-        if (non_grammar_matches && (grammar_matches || session->config.grammar.empty())) {
-            // Full cache hit: non-grammar params and grammar both unchanged
-            sampler = runtime->cached_sampler;
-            llama_sampler_reset(sampler);
-        } else {
-            // Rebuild chain (cheap), but reuse cached grammar (expensive) when possible
-            if (runtime->cached_sampler != nullptr) {
-                llama_sampler_free(runtime->cached_sampler);
-                runtime->cached_sampler = nullptr;
-            }
-            sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-            if (sampler == nullptr) {
-                ctrl->error_code.store(424, std::memory_order_release);
-                finishSession(session, StreamState::Error);
-                return;
-            }
-            llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, session->config.repeat_penalty, 0.2f, 0.2f));
-            llama_sampler_chain_add(sampler, llama_sampler_init_top_k(session->config.top_k));
-            llama_sampler_chain_add(sampler, llama_sampler_init_top_p(session->config.top_p, 1));
-            llama_sampler_chain_add(sampler, llama_sampler_init_temp(session->config.temperature));
-            if (!session->config.grammar.empty()) {
-                if (grammar_matches) {
-                    // Reuse cached grammar — avoids expensive recompilation
-                    runtime->grammar_cache[grammar_cache_hit_slot].last_access = ++runtime->grammar_access_counter;
-                    llama_sampler_reset(runtime->grammar_cache[grammar_cache_hit_slot].sampler);
-                    llama_sampler_chain_add(sampler, runtime->grammar_cache[grammar_cache_hit_slot].sampler);
-                } else {
-                    // Find LRU slot to evict
-                    const int evict_slot = runtime->grammar_cache[0].last_access <= runtime->grammar_cache[1].last_access ? 0 : 1;
-                    if (runtime->grammar_cache[evict_slot].sampler != nullptr) {
-                        llama_sampler_free(runtime->grammar_cache[evict_slot].sampler);
-                        runtime->grammar_cache[evict_slot].sampler = nullptr;
-                    }
-                    const auto grammar_start = std::chrono::steady_clock::now();
-                    auto* grammar_sampler = llama_sampler_init_grammar(runtime->vocab, session->config.grammar.c_str(), "root");
-                    const auto grammar_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - grammar_start).count();
-                    LOGI("grammar_compile_time_us=%lld", static_cast<long long>(grammar_elapsed));
-                    if (grammar_sampler != nullptr) {
-                        runtime->grammar_cache[evict_slot].sampler = grammar_sampler;
-                        runtime->grammar_cache[evict_slot].grammar = session->config.grammar;
-                        runtime->grammar_cache[evict_slot].last_access = ++runtime->grammar_access_counter;
-                        llama_sampler_chain_add(sampler, grammar_sampler);
-                    } else {
-                        LOGW("Failed to compile grammar. Proceeding unconstrained.");
-                    }
-                }
-            }
-            llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-            runtime->cached_sampler = sampler;
-            runtime->cached_config = session->config;
-        }
+        runtime->cached_sampler = sampler;
 
         const auto generation_start = std::chrono::steady_clock::now();
         int generated_tokens = 0;
@@ -1781,6 +1731,15 @@ std::vector<float> Engine::encode(const std::string& text) {
         tokens.data(), token_count,
         add_special, true);
     if (actual < 0) return {};
+
+    // llama_encode runs the encoder graph, which hard-requires
+    // n_ubatch >= n_tokens (GGML_ABORT otherwise) and would crash the whole
+    // process on oversized inputs. Reject them instead; callers treat an empty
+    // result as failure and can re-chunk.
+    if (actual > runtime->batch_size) {
+        LOGW("encode_input_too_large tokens=%d batch_size=%d", actual, runtime->batch_size);
+        return {};
+    }
 
     // Enable embeddings mode
     llama_set_embeddings(runtime->ctx, true);

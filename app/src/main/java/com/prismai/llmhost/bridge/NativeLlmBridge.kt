@@ -12,6 +12,7 @@ import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
@@ -128,29 +129,6 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     private external fun nativeGetGpuLayersOffloaded(handle: Long): Int
     private external fun nativeIsKleidiAiEnabled(handle: Long): Boolean
     private external fun nativeIsVulkanEnabled(handle: Long): Boolean
-    private external fun nativeLoadDraftModel(handle: Long, path: String, draftGpuLayers: Int): Boolean
-    private external fun nativeUnloadDraftModel(handle: Long)
-    private external fun nativeIsSpeculativeActive(handle: Long): Boolean
-    private external fun nativeGetSpeculativeAcceptanceRate(handle: Long): Float
-
-    suspend fun loadDraftModel(draftPath: String, draftGpuLayers: Int = 0): Boolean = modelMutex.withLock {
-        if (isDestroyed) return@withLock false
-        nativeLoadDraftModel(nativeHandle, draftPath, draftGpuLayers)
-    }
-
-    suspend fun unloadDraftModel() = modelMutex.withLock {
-        if (!isDestroyed) {
-            nativeUnloadDraftModel(nativeHandle)
-        }
-    }
-
-    suspend fun isSpeculativeActive(): Boolean = modelMutex.withLock {
-        if (isDestroyed) false else nativeIsSpeculativeActive(nativeHandle)
-    }
-
-    suspend fun getSpeculativeAcceptanceRate(): Float = modelMutex.withLock {
-        if (isDestroyed) 0.0f else nativeGetSpeculativeAcceptanceRate(nativeHandle)
-    }
 
     suspend fun isVulkanEnabled(): Boolean = modelMutex.withLock {
         if (isDestroyed) return@withLock false
@@ -276,6 +254,27 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         }
     }
 
+    /**
+     * Backpressure-aware emission. Silently dropped chunks previously corrupted
+     * transcripts and could lose the terminal event entirely, degrading real
+     * ERROR/CANCELLED outcomes into the EOF heuristic. Terminal chunks retry
+     * until delivered; data chunks cap retries at ~100 ms, then drop with a
+     * logged warning rather than stalling the drain loop forever.
+     */
+    private suspend fun ProducerScope<GenerationChunk>.emitChunk(chunk: GenerationChunk) {
+        var attempt = 0
+        while (true) {
+            if (trySend(chunk).isSuccess) return
+            if (!isActive) return
+            if (!chunk.isTerminal && attempt >= 50) {
+                Log.w(TAG, "chunk_dropped_backpressure genId=${chunk.generationId} tokens=${chunk.tokenCount}")
+                return
+            }
+            attempt++
+            delay(2)
+        }
+    }
+
     fun generate(
         prompt: String,
         settings: GenerationSettings = GenerationSettings(),
@@ -360,7 +359,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
                     val normalizedText = Utf8TextPipeline.normalizeNativeText(text)
                     if (normalizedText.isNotEmpty() || tokenCount > 0) {
-                        trySend(
+                        emitChunk(
                             GenerationChunk(
                                 text = normalizedText,
                                 tokenCount = tokenCount,
@@ -385,7 +384,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                         else -> "UNKNOWN"
                     }
                     observedTerminal = true
-                    trySend(
+                    emitChunk(
                         GenerationChunk(
                             text = "",
                             tokenCount = 0,

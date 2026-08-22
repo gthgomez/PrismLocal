@@ -87,6 +87,13 @@ class AgentToolRouter(
                 errorCode = AgentToolErrorCode.BUSY,
             )
             appendToolResult(safetyResult)
+            CapabilityRegistryHolder.auditLog.record(
+                SecurityEvent(
+                    eventType = "RESOURCE_GATE",
+                    toolName = validatedCall.name,
+                    detail = "Device thermal state is $thermalStatus".take(160),
+                ),
+            )
             agentTrace.finalizeTrace(success = false, abortReason = "Device thermal state is $thermalStatus")
             onAppendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
@@ -102,6 +109,13 @@ class AgentToolRouter(
                 errorCode = AgentToolErrorCode.BUSY,
             )
             appendToolResult(safetyResult)
+            CapabilityRegistryHolder.auditLog.record(
+                SecurityEvent(
+                    eventType = "RESOURCE_GATE",
+                    toolName = validatedCall.name,
+                    detail = "Battery is low (${profile.batteryPercent}%)".take(160),
+                ),
+            )
             agentTrace.finalizeTrace(success = false, abortReason = "Battery is low (${profile.batteryPercent}%)")
             onAppendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
@@ -120,6 +134,13 @@ class AgentToolRouter(
                 errorCode = AgentToolErrorCode.FAILED,
             )
             appendToolResult(maxStepsResult)
+            CapabilityRegistryHolder.auditLog.record(
+                SecurityEvent(
+                    eventType = "RESOURCE_GATE",
+                    toolName = validatedCall.name,
+                    detail = "Reached maximum tool depth of $maxIterations".take(160),
+                ),
+            )
             agentTrace.finalizeTrace(success = false, abortReason = "Reached maximum tool depth of $maxIterations")
             onAppendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
@@ -129,7 +150,11 @@ class AgentToolRouter(
         }
 
         val (isExactOrSimilarLoop, isStatelessLoop, historicalCount) = synchronized(activeAgentToolHistory) {
-            val exactOrSimilar = activeAgentToolHistory.any {
+            val exactOrSimilar = validatedCall.name !in setOf(
+                "get_download_status",
+                "get_active_operation",
+                "check_background_tasks",
+            ) && activeAgentToolHistory.any {
                 it.name == validatedCall.name && AgentToolProtocol.areArgumentsSimilar(it.arguments, validatedCall.arguments)
             }
             val count = activeAgentToolHistory.count { it.name == validatedCall.name }
@@ -157,6 +182,13 @@ class AgentToolRouter(
                 errorCode = AgentToolErrorCode.FAILED,
             )
             appendToolResult(loopResult)
+            CapabilityRegistryHolder.auditLog.record(
+                SecurityEvent(
+                    eventType = "LOOP_ABORT",
+                    toolName = validatedCall.name,
+                    detail = reason.take(160),
+                ),
+            )
             agentTrace.finalizeTrace(success = false, abortReason = reason)
             onAppendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
@@ -176,6 +208,13 @@ class AgentToolRouter(
                 errorCode = AgentToolErrorCode.FAILED,
             )
             appendToolResult(budgetResult)
+            CapabilityRegistryHolder.auditLog.record(
+                SecurityEvent(
+                    eventType = "LOOP_ABORT",
+                    toolName = validatedCall.name,
+                    detail = "Token budget exceeded: ${agentTrace.activeAgentChainTokens} tokens".take(160),
+                ),
+            )
             agentTrace.finalizeTrace(
                 success = false,
                 abortReason = "Token budget exceeded: ${agentTrace.activeAgentChainTokens} tokens",
@@ -221,7 +260,7 @@ class AgentToolRouter(
                     appendToolResult(sanitizedResult)
                     val maxIter = uiState.generationSettings.value.maxAgentIterations
                     if (depth + 1 < maxIter) {
-                        onFollowUp(originalPrompt, sanitizedResult, depth + 1)
+                        onFollowUp(originalPrompt, result, depth + 1)
                     }
                 }
             }
@@ -243,6 +282,17 @@ class AgentToolRouter(
                 )
                 appendToolResult(restrictedResult)
                 agentTrace.recordStep(validatedCall, restrictedResult, 0L)
+            }
+        }
+    }
+
+    // ── History maintenance ─────────────────────────────────────────────
+
+    /** Removes history entries matching name + similar arguments; used when a pending CONFIRM call is cancelled. */
+    fun removeFromHistory(call: AgentToolCall) {
+        synchronized(activeAgentToolHistory) {
+            activeAgentToolHistory.removeAll {
+                it.name == call.name && AgentToolProtocol.areArgumentsSimilar(it.arguments, call.arguments)
             }
         }
     }
@@ -272,6 +322,7 @@ class AgentToolRouter(
             "stop_speaking",
             // Phase 3 Knowledge Pack
             "download_knowledge_pack",
+            "fetch_grokipedia_article",
             // Phase 5 Workspace Files
             "list_workspace_files",
             "read_workspace_file",
@@ -379,7 +430,7 @@ class AgentToolRouter(
                 val entry = HuggingFaceModelCatalog.entries.firstOrNull { entry ->
                     entry.id.lowercase(Locale.US) in lower ||
                         entry.name.lowercase(Locale.US).split(' ').all { part -> part.length < 3 || part in lower }
-                } ?: HuggingFaceModelCatalog.entries.firstOrNull()
+                }
                 entry?.let { AgentToolCall("download_model", JSONObject().put("entry_id", it.id)) }
             }
             else -> null

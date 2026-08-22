@@ -51,6 +51,16 @@ enum class Capability(
 
     // System
     SYSTEM_INFO("Read device/system information", AgentToolRisk.SAFE),
+
+    // Work / Software Engineering
+    WORKSPACE_READ("Read files inside an active workspace", AgentToolRisk.SAFE),
+    WORKSPACE_WRITE("Modify files inside an active workspace", AgentToolRisk.CONFIRM),
+    WORKSPACE_DELETE("Delete files inside an active workspace", AgentToolRisk.CONFIRM),
+    SHELL_EXEC("Execute processes in a developer workspace", AgentToolRisk.RESTRICTED),
+    GIT_READ("Inspect Git state and history", AgentToolRisk.SAFE),
+    GIT_WRITE("Create branches and commits", AgentToolRisk.CONFIRM),
+    GIT_REMOTE_WRITE("Push or modify remote Git repositories", AgentToolRisk.RESTRICTED),
+    SWE_TASK_SUBMIT("Submit a software engineering task to execution authority", AgentToolRisk.SAFE),
 }
 
 data class CapabilityCheck(

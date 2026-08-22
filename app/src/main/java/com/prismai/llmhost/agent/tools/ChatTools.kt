@@ -11,6 +11,8 @@ import com.prismai.llmhost.chat.ChatManager
 import com.prismai.llmhost.chat.ChatSearchIndex
 import com.prismai.llmhost.chat.TranscriptStore
 import com.prismai.llmhost.export.ChatExporter
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -75,25 +77,27 @@ class ChatTools(
             details = JSONObject().put("chat_id", chatId).put("title", safeTitle))
     }
 
-    fun searchChats(call: AgentToolCall): AgentToolResult {
+    suspend fun searchChats(call: AgentToolCall): AgentToolResult {
         val query = call.arguments.optString("query").replace(Regex("\\s+"), " ").trim().take(120)
         val limit = call.arguments.optInt("limit", 10).coerceIn(1, 25)
         val snippetLength = call.arguments.optInt("snippet_length", 240).coerceIn(80, 360)
         if (query.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Missing search query")
         onPersistTranscript()
         val terms = query.lowercase(Locale.US).split(' ').filter { it.length > 1 }
-        val matches = chatSessions().mapNotNull { session ->
-            val haystack = chatSearchIndex.get(session.id) ?: buildString {
-                append(session.title)
-                append(' ')
-                transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id)).forEach { append(it.text).append(' ') }
-            }.lowercase(Locale.US)
-            val score = terms.count { it in haystack } + if (query.lowercase(Locale.US) in session.title.lowercase(Locale.US)) 2 else 0
-            if (score <= 0) null else {
-                val messages = transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id))
-                Triple(session, messages, score)
-            }
-        }.sortedByDescending { it.third }.take(limit)
+        val matches = withContext(Dispatchers.IO) {
+            chatSessions().mapNotNull { session ->
+                val haystack = chatSearchIndex.get(session.id) ?: buildString {
+                    append(session.title)
+                    append(' ')
+                    transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id)).forEach { append(it.text).append(' ') }
+                }.lowercase(Locale.US)
+                val score = terms.count { it in haystack } + if (query.lowercase(Locale.US) in session.title.lowercase(Locale.US)) 2 else 0
+                if (score <= 0) null else {
+                    val messages = transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id))
+                    Triple(session, messages, score)
+                }
+            }.sortedByDescending { it.third }.take(limit)
+        }
         val results = JSONArray()
         matches.forEach { match ->
             val session = match.first
@@ -112,14 +116,16 @@ class ChatTools(
                 .put("snippet_length", snippetLength).put("results", results))
     }
 
-    fun exportChat(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+    suspend fun exportChat(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Chat export requires confirmation")
         onPersistTranscript()
         val chatIdArg = call.arguments.optString("chat_id", "current")
         val chatId = if (chatIdArg == "current" || chatIdArg.isBlank()) currentChatId() else chatIdArg
         val session = chatSessions().firstOrNull { it.id == chatId }
             ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "Chat not found")
-        val messages = transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id))
+        val messages = withContext(Dispatchers.IO) {
+            transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id))
+        }
         val format = call.arguments.optString("format", "markdown").lowercase(Locale.US)
         val extension = when (format) { "json" -> "json"; "text", "txt" -> "txt"; else -> "md" }
         val content = when (extension) {
@@ -127,10 +133,11 @@ class ChatTools(
             "txt" -> ChatExporter.toText(session, messages)
             else -> ChatExporter.toMarkdown(session, messages)
         }
-        val dir = File(filesDir, "agent_exports").apply { mkdirs() }
-        val safeName = AgentSanitizer.sanitizeFileName(session.title).take(48)
-        val file = File(dir, "${safeName}_${System.currentTimeMillis()}.$extension")
-        file.writeText(content)
+        val file = withContext(Dispatchers.IO) {
+            val dir = File(filesDir, "agent_exports").apply { mkdirs() }
+            val safeName = AgentSanitizer.sanitizeFileName(session.title).take(48)
+            File(dir, "${safeName}_${System.currentTimeMillis()}.$extension").apply { writeText(content) }
+        }
         return AgentToolResult(call = call, success = true,
             summary = "Exported ${session.title} as $extension",
             details = JSONObject().put("chat_id", session.id).put("title", session.title)

@@ -35,10 +35,6 @@ struct GenerationConfig {
     int gpu_layers = 0;
     bool continue_from_context = false;
     std::string grammar = "";
-    bool use_speculative = false;
-    std::string draft_model_path = "";
-    int draft_gpu_layers = 0;
-    int n_draft = 5;
     std::string kv_cache_type_k = "q8_0";
     std::string kv_cache_type_v = "q8_0";
     bool enable_flash_attn = true;
@@ -55,10 +51,6 @@ public:
 
     bool loadModel(const std::string& path, GenerationConfig config = {});
     void unloadModel();
-    bool loadDraftModel(const std::string& draft_path, int draft_gpu_layers = 0);
-    void unloadDraftModel();
-    bool is_speculative_active() const;
-    float get_speculative_acceptance_rate() const;
     void resetConversation();
     int startGeneration(const std::string& prompt, int generation_id, GenerationConfig config);
     std::string runBenchmark(GenerationConfig config, int prompt_tokens, int generation_tokens, int repetitions);

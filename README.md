@@ -8,9 +8,15 @@ Android app for local GGUF inference using a JNI C++ bridge to llama.cpp. Provid
 
 ```powershell
 cd C:\Workspace\Project_Android\PrismLocal
-.\gradlew.bat --no-daemon :app:testDebugUnitTest
-.\gradlew.bat --no-daemon assembleDebug
+.\gradlew.bat --no-daemon :app:testDevDebugUnitTest   # unit tests
+.\gradlew.bat --no-daemon :app:assembleDevDebug       # quick debug build
+
+# Full pre-push gate: also builds the release-like variants (RelWithDebInfo
+# native + R8) that catch native/ProGuard regressions early:
+.\scripts\verify.ps1
 ```
+
+Variants are `<flavor><buildType>`: flavors `dev`/`play`, build types `debug`/`release`/`benchmark`/`profile`/`adreno` (see `app/build.gradle.kts`). Bare `testDebugUnitTest`/`assembleDebug` fail as ambiguous.
 
 `PrismLocal` is also linked in the workspace composite via `includeBuild("PrismLocal")` for Android Studio multi-project opens. App tasks still run with this project’s wrapper (`gradle-9.4.1`, AGP `9.2.0`).
 

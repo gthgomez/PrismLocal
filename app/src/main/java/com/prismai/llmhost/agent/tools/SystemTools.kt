@@ -12,6 +12,8 @@ import com.prismai.llmhost.model.DeviceProfiler
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.ui.UiEventBus
 import com.prismai.llmhost.util.FormatUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -33,17 +35,18 @@ class SystemTools(
     private val onCancelImport: () -> Unit,
     private val importJobIsActive: () -> Boolean,
 ) {
-    fun modelStatus(call: AgentToolCall): AgentToolResult {
+    suspend fun modelStatus(call: AgentToolCall): AgentToolResult {
         onRefreshReadiness()
         val settings = uiState.generationSettings.value.clamped()
         val profile = uiState.deviceCapabilityProfile.value
         val active = uiState.activeModelInfo.value
+        val installedCount = withContext(Dispatchers.IO) { modelStorageManager.listInstalledModels().size }
         val details = JSONObject()
             .put("current_model", uiState.currentModel.value)
             .put("confidence", "observed_app_state")
             .put("active_model_bytes", active?.bytes)
             .put("active_model_hash_prefix", active?.sha256?.take(12))
-            .put("installed_models", modelStorageManager.listInstalledModels().size)
+            .put("installed_models", installedCount)
             .put("context_length", settings.contextLength).put("batch_size", settings.batchSize)
             .put("threads", settings.threadCount).put("gpu_layers", settings.gpuLayers)
             .put("runtime_backend", BuildConfig.LLMHOST_RUNTIME_BACKEND)
@@ -98,27 +101,30 @@ class SystemTools(
                 .put("cpu_cores", profile.cpuCoreCount))
     }
 
-    fun getStorageStatus(call: AgentToolCall): AgentToolResult {
+    suspend fun getStorageStatus(call: AgentToolCall): AgentToolResult {
         onRefreshReadiness()
         val profile = uiState.deviceCapabilityProfile.value
-        val modelsBytes = modelStorageManager.listInstalledModelInfos().sumOf { it.bytes }
-        val exportsDir = File(filesDir, "agent_exports")
-        val chatsDir = chatDirectory()
-        val benchmarkFile = benchmarkRunsFile()
+        val usage = withContext(Dispatchers.IO) {
+            StorageUsage(
+                modelsBytes = modelStorageManager.listInstalledModelInfos().sumOf { it.bytes },
+                exportsBytes = File(filesDir, "agent_exports").sizeRecursive(),
+                chatsBytes = chatDirectory().sizeRecursive() + chatIndexFile().sizeRecursive(),
+                benchmarkBytes = benchmarkRunsFile().sizeRecursive(),
+                appFilesBytes = filesDir.sizeRecursive())
+        }
         return toolSuccess(call,
-            "Storage: ${FormatUtils.formatBytesForMessage(profile?.storageFreeBytes ?: 0L)} free, ${FormatUtils.formatBytesForMessage(modelsBytes)} in models",
+            "Storage: ${FormatUtils.formatBytesForMessage(profile?.storageFreeBytes ?: 0L)} free, ${FormatUtils.formatBytesForMessage(usage.modelsBytes)} in models",
             JSONObject().put("storage_free_bytes", profile?.storageFreeBytes ?: JSONObject.NULL)
-                .put("models_bytes", modelsBytes).put("exports_bytes", exportsDir.sizeRecursive())
-                .put("chats_bytes", chatsDir.sizeRecursive() + chatIndexFile().sizeRecursive())
-                .put("benchmark_bytes", benchmarkFile.sizeRecursive())
-                .put("app_files_bytes", filesDir.sizeRecursive()))
+                .put("models_bytes", usage.modelsBytes).put("exports_bytes", usage.exportsBytes)
+                .put("chats_bytes", usage.chatsBytes).put("benchmark_bytes", usage.benchmarkBytes)
+                .put("app_files_bytes", usage.appFilesBytes))
     }
 
     fun getPrivacySummary(call: AgentToolCall): AgentToolResult =
         toolSuccess(call,
             "Prism Local runs inference on-device; outbound GET requests are limited to Hugging Face downloads, DuckDuckGo search, and Grokipedia.",
             JSONObject()
-                .put("local_data", JSONArray(listOf("Chats", "Benchmark history", "Runtime settings", "Installed model metadata", "App-local exports", "Grokipedia knowledge-pack index (after download)")))
+                .put("local_data", JSONArray(listOf("Chats", "Benchmark history", "Runtime settings", "Installed model metadata", "App-local exports", "Grokipedia knowledge-pack index (after download)", "Security audit trail of agent tool decisions (app-local JSONL, ~512 KB cap)")))
                 .put("network_actions", JSONArray(listOf(
                     "Curated Hugging Face GGUF model downloads (GET huggingface.co) after user confirmation",
                     "Web search via DuckDuckGo HTML endpoint (GET html.duckduckgo.com) when the agent invokes web_search",
@@ -228,6 +234,14 @@ class SystemTools(
             .put("confirm_label", action.confirmLabel).put("cancel_label", action.cancelLabel)
             .put("destructive", action.destructive).put("privacy_sensitive", action.privacySensitive)
             .put("network_required", action.networkRequired)
+
+    private data class StorageUsage(
+        val modelsBytes: Long,
+        val exportsBytes: Long,
+        val chatsBytes: Long,
+        val benchmarkBytes: Long,
+        val appFilesBytes: Long,
+    )
 
     companion object {
         private fun File.sizeRecursive(): Long {

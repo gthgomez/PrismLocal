@@ -12,6 +12,7 @@ import com.prismai.llmhost.*
 import com.prismai.llmhost.agent.AgentToolConfirmation
 import com.prismai.llmhost.agent.AgentToolRouter
 import com.prismai.llmhost.agent.AgentTrace
+import com.prismai.llmhost.agent.ToolInputSanitizer
 import com.prismai.llmhost.chat.ChatManager
 import com.prismai.llmhost.model.DeviceProfiler
 import com.prismai.llmhost.model.ModelTierHints
@@ -65,6 +66,9 @@ class GenerationOrchestrator(
         private const val TAG = "GenOrchestrator"
         /** Soft warning threshold only — does not hard-block generation (B4). */
         private const val SOFT_LOW_RAM_MB = 1024L
+        private const val TRUNCATION_MAX_DEPTH = 4
+        private const val TRUNCATED_STRING_LIMIT = 150
+        private const val TRUNCATED_ARRAY_LIMIT = 5
     }
 
     // ── Flow deduplication types ─────────────────────────────────────────
@@ -90,20 +94,21 @@ class GenerationOrchestrator(
 
     // ── Public API ──────────────────────────────────────────────────────
 
-    /** Main entry point for chat generation. Called from within [InferenceService]'s mutex lock. */
+    /** Main entry point for chat generation. Acquires [InferenceService]'s operation mutex itself. */
     suspend fun generate(
         prompt: String,
         benchmarkPreset: BenchmarkPreset? = null,
     ) {
+        val baseSettings = uiState.generationSettings.value.clamped()
+
         // ── Direct NL → agent tool call path ────────────────────────────
-        if (benchmarkPreset == null) {
+        if (benchmarkPreset == null && baseSettings.agentEnabled && uiState.currentModel.value != null) {
             val directToolCall = agentToolRouter.directToolCall(prompt)
             if (directToolCall != null) {
                 chatManager.appendTranscriptMessage(TranscriptRole.USER, prompt)
                 agentTrace.reset()
                 agentTrace.activeAgentChainPrompt = prompt
                 agentTrace.activeAgentChainStartTime = System.currentTimeMillis()
-                agentTrace.activeAgentChainTokens = 0
                 agentToolRouter.activeAgentToolHistory.clear()
                 agentToolRouter.handleToolCall(directToolCall, prompt, depth = 0)
                 return
@@ -135,7 +140,6 @@ class GenerationOrchestrator(
             runCatching { engine.resetConversation() }
         }
 
-        val baseSettings = uiState.generationSettings.value.clamped()
         // Preset overrides apply only to this generation call — never write them into persisted UI settings.
         val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
         if (baseSettings != uiState.generationSettings.value) {
@@ -147,7 +151,6 @@ class GenerationOrchestrator(
             agentTrace.reset()
             agentTrace.activeAgentChainPrompt = prompt
             agentTrace.activeAgentChainStartTime = System.currentTimeMillis()
-            agentTrace.activeAgentChainTokens = 0
             agentToolRouter.activeAgentToolHistory.clear()
         }
 
@@ -248,11 +251,11 @@ class GenerationOrchestrator(
                     result.terminalDetail,
                 )
                 if (agentEnabled) {
-                    agentTrace.activeAgentChainTokens += result.generatedTokens
+                    agentTrace.addChainTokens(result.generatedTokens)
                     agentTrace.finalizeTrace(success = (result.finalReason == "EOF" || result.finalReason == "MAX_TOKENS"))
                 }
             } else if (result.finalReason == "ERROR" && agentEnabled) {
-                agentTrace.activeAgentChainTokens += result.generatedTokens
+                agentTrace.addChainTokens(result.generatedTokens)
                 agentTrace.finalizeTrace(success = false)
             }
 
@@ -275,7 +278,7 @@ class GenerationOrchestrator(
         storeGenerationJob(job)
     }
 
-    /** Continuation generation. Called from within [InferenceService]'s mutex lock. */
+    /** Continuation generation. Acquires [InferenceService]'s operation mutex via [com.prismai.llmhost.InferenceService.continueGenerationSafely]. */
     fun continueGeneration() {
         if (uiState.currentModel.value == null) {
             eventBus.publish("Select a model before continuing")
@@ -353,7 +356,7 @@ class GenerationOrchestrator(
         storeGenerationJob(job)
     }
 
-    /** Agent follow-up generation after a tool result. Called from within [InferenceService]'s mutex lock. */
+    /** Agent follow-up generation after a tool result. Acquires [InferenceService]'s operation mutex itself. */
     fun startFollowUp(
         originalPrompt: String,
         toolResult: AgentToolResult,
@@ -399,8 +402,9 @@ class GenerationOrchestrator(
         metrics.activeTokens = 0
         metrics.activePromptTokens = 0
         metrics.activeSettings = settings
-        val budgetedResult = truncateToolResultForBudget(toolResult, originalPrompt, settings)
-        val toolPayloadChars = with(AgentToolProtocol) { budgetedResult.toJson().toString().length }
+        val truncatedRaw = truncateToolResultForBudget(toolResult, originalPrompt, settings)      // truncate RAW first
+        val sanitized = ToolInputSanitizer.sanitizeResult(truncatedRaw) // sanitize ONCE
+        val toolPayloadChars = with(AgentToolProtocol) { sanitized.toJson().toString().length }   // measure SANITIZED payload
         val maxHistoryChars = GenerationBudget.calculateAgentHistoryCharBudget(
             contextLength = settings.contextLength,
             maxTokens = settings.maxTokens,
@@ -410,7 +414,7 @@ class GenerationOrchestrator(
         )
         val enginePrompt = AgentToolProtocol.buildToolResultPrompt(
             originalPrompt,
-            budgetedResult,
+            sanitized,
             getFormattedHistoryForAgent(setOf(assistantMessageId), maxHistoryChars = maxHistoryChars),
         )
 
@@ -429,7 +433,7 @@ class GenerationOrchestrator(
             ),
         ) { result ->
             val nextToolCall = if (result.finalReason == "EOF") AgentToolProtocol.parseToolCall(result.finalOutput) else null
-            agentTrace.activeAgentChainTokens += result.generatedTokens
+            agentTrace.addChainTokens(result.generatedTokens)
             if (nextToolCall == null) {
                 agentTrace.finalizeTrace(success = (result.finalReason == "EOF" || result.finalReason == "MAX_TOKENS"))
             } else if (result.finalReason == "ERROR") {
@@ -821,17 +825,7 @@ class GenerationOrchestrator(
         } else {
             val fallback = JSONObject()
             details.keys().forEach { key ->
-                val value = details.opt(key)
-                when {
-                    value is String && value.length > 150 ->
-                        fallback.put(key, value.substring(0, 150) + " (Truncated for context size)")
-                    value is JSONArray && value.length() > 5 -> {
-                        val arr = JSONArray()
-                        for (i in 0 until 5) arr.put(value.opt(i))
-                        fallback.put(key, arr)
-                    }
-                    else -> fallback.put(key, value)
-                }
+                fallback.put(key, truncateBudgetValue(details.opt(key), depth = 0))
             }
             fallback.put("truncated", true)
             fallback.put("note", "Results truncated for context. Full data available in app if needed.")
@@ -839,6 +833,26 @@ class GenerationOrchestrator(
         }
 
         return result.copy(details = finalDetails)
+    }
+
+    private fun truncateBudgetValue(value: Any?, depth: Int): Any? = when {
+        value is String && value.length > TRUNCATED_STRING_LIMIT ->
+            value.substring(0, TRUNCATED_STRING_LIMIT) + " (Truncated for context size)"
+        value is JSONObject && depth < TRUNCATION_MAX_DEPTH -> {
+            val nested = JSONObject()
+            value.keys().forEach { key ->
+                nested.put(key, truncateBudgetValue(value.opt(key), depth + 1))
+            }
+            nested
+        }
+        value is JSONArray -> {
+            val arr = JSONArray()
+            for (i in 0 until minOf(value.length(), TRUNCATED_ARRAY_LIMIT)) {
+                arr.put(truncateBudgetValue(value.opt(i), depth + 1))
+            }
+            arr
+        }
+        else -> value
     }
 
     private fun mapErrorCodeToUserMessage(errorCode: Int, detail: String?): String {

@@ -3,22 +3,49 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+import java.util.Properties
+import java.io.FileInputStream
+
 fun signingValue(name: String): String? =
     providers.gradleProperty(name)
         .orElse(providers.environmentVariable(name))
         .orNull
         ?.takeIf { it.isNotBlank() }
 
+val localProperties = Properties().apply {
+    val localPropsFile = rootProject.file("local.properties")
+    if (localPropsFile.exists()) {
+        FileInputStream(localPropsFile).use { load(it) }
+    }
+}
+
+fun localProperty(key: String): String? =
+    localProperties.getProperty(key)?.takeIf { it.isNotBlank() }
+
+fun configValue(gradleOrEnvName: String, localKey: String? = null): String? =
+  localKey?.let { localProperty(it) }
+      ?: signingValue(gradleOrEnvName)
+
+fun quoteBuildConfig(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
+val supabaseAuthUrl = configValue("LLMHOST_SUPABASE_AUTH_URL", "supabase.auth.url")
+    ?: "https://api.prismatix.ai/auth/v1"
+val supabaseAnonKey = configValue("LLMHOST_SUPABASE_ANON_KEY", "supabase.anon.key") ?: ""
+
 val releaseStoreFile = signingValue("LLMHOST_RELEASE_STORE_FILE")
 val releaseStorePassword = signingValue("LLMHOST_RELEASE_STORE_PASSWORD")
 val releaseKeyAlias = signingValue("LLMHOST_RELEASE_KEY_ALIAS")
 val releaseKeyPassword = signingValue("LLMHOST_RELEASE_KEY_PASSWORD")
+val releaseStoreFileResolved = releaseStoreFile?.let { rootProject.file(it) }
+// Usable requires both configured values AND an on-disk keystore, so a stale
+// ~/.gradle/gradle.properties cannot hard-fail every release assembly.
 val releaseSigningReady = listOf(
     releaseStoreFile,
     releaseStorePassword,
     releaseKeyAlias,
     releaseKeyPassword,
-).all { it != null }
+).all { it != null } && releaseStoreFileResolved?.exists() == true
 val kleidiAiEnabled = signingValue("LLMHOST_ENABLE_KLEIDIAI")
     ?.let { value ->
         value.equals("true", ignoreCase = true) ||
@@ -66,6 +93,9 @@ android {
         versionCode = 1
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        manifestPlaceholders["appLabel"] = "Prism Local"
+        buildConfigField("String", "SUPABASE_AUTH_URL", quoteBuildConfig(supabaseAuthUrl))
+        buildConfigField("String", "SUPABASE_ANON_KEY", quoteBuildConfig(supabaseAnonKey))
 
         externalNativeBuild {
             cmake {
@@ -84,6 +114,26 @@ android {
         }
     }
 
+    flavorDimensions += "distribution"
+
+    productFlavors {
+        create("play") {
+            dimension = "distribution"
+            buildConfigField("boolean", "DEVELOPER_WORK_MODE", "false")
+            buildConfigField("String", "DISTRIBUTION", "\"play\"")
+            manifestPlaceholders["appLabel"] = "Prism Local"
+        }
+
+        create("dev") {
+            dimension = "distribution"
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev"
+            buildConfigField("boolean", "DEVELOPER_WORK_MODE", "true")
+            buildConfigField("String", "DISTRIBUTION", "\"dev\"")
+            manifestPlaceholders["appLabel"] = "Prism Dev"
+        }
+    }
+
     if (releaseSigningReady) {
         signingConfigs {
             create("release") {
@@ -93,6 +143,12 @@ android {
                 keyPassword = requireNotNull(releaseKeyPassword)
             }
         }
+    } else if (releaseStoreFile != null && releaseStoreFileResolved?.exists() != true) {
+        logger.lifecycle(
+            "Release signing disabled: LLMHOST_RELEASE_STORE_FILE is set to '$releaseStoreFile' " +
+                "but the keystore file does not exist. Building UNSIGNED release; restore the " +
+                "keystore or update ~/.gradle/gradle.properties before shipping."
+        )
     } else {
         logger.lifecycle(
             "Release signing disabled: set LLMHOST_RELEASE_STORE_FILE, " +
@@ -249,6 +305,23 @@ android {
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+gradle.taskGraph.whenReady {
+    val requiresSupabaseAnonKey = allTasks.any { task ->
+        val name = task.name
+        name.startsWith("assemblePlayRelease") ||
+            name.startsWith("bundlePlayRelease") ||
+            name.startsWith("assemblePlayBenchmark") ||
+            name.startsWith("bundlePlayBenchmark")
+    }
+    if (requiresSupabaseAnonKey && supabaseAnonKey.isBlank()) {
+        error(
+            "Play release/benchmark builds require a Supabase anon key. " +
+                "Set supabase.anon.key in local.properties or LLMHOST_SUPABASE_ANON_KEY " +
+                "as a Gradle property / environment variable. Never commit secrets to git.",
+        )
     }
 }
 

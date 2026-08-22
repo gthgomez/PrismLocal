@@ -186,6 +186,7 @@ class RuntimeTools(
     }
 
     fun cancelActiveOperation(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+        if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Cancelling an active operation requires confirmation")
         if (call.arguments.optString("target", "auto") == "generation") {
             return cancelGeneration(call.copy(name = "cancel_generation"))
         }

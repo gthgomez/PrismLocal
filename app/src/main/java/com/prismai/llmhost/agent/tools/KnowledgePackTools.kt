@@ -33,7 +33,8 @@ class KnowledgePackTools(
             JSONObject().put("results", resultsArray).put("source", "grokipedia").put("untrusted_data", true).put("knowledge_base", "local"))
     }
 
-    suspend fun fetchGrokipediaArticle(call: AgentToolCall): AgentToolResult {
+    suspend fun fetchGrokipediaArticle(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+        if (!confirmed) return AgentToolResult(call = call, success = false, summary = "Confirmation required for fetch_grokipedia_article", errorCode = AgentToolErrorCode.CONFIRMATION_REQUIRED)
         val slug = call.arguments.optString("slug").trim().take(200)
         if (slug.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Article slug is required")
         val chunks = runCatching { knowledgePackManager.fetchAndIndex(slug) }.getOrDefault(-1)

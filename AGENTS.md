@@ -14,16 +14,20 @@
 
 ```powershell
 cd C:\Workspace\Project_Android\PrismLocal
-.\gradlew.bat --no-daemon :app:testDebugUnitTest
-.\gradlew.bat --no-daemon assembleDebug
+.\gradlew.bat --no-daemon :app:testDevDebugUnitTest
+.\gradlew.bat --no-daemon :app:assembleDevDebug
 ```
+
+The project has `dev` and `play` product flavors — bare `testDebugUnitTest` / `assembleDebug` fail with "ambiguous task". Use the flavor-qualified names (`DevDebug`, `PlayDebug`).
 
 From the composite workspace root only:
 
 ```powershell
-.\PrismLocal\gradlew.bat -p PrismLocal --no-daemon :app:assembleDebug
+.\PrismLocal\gradlew.bat -p PrismLocal --no-daemon :app:assembleDevDebug
 ```
 
 **Do not** run `.\gradlew.bat :app:assembleDebug` from `Project_Android` — the composite root has no `:app` module (`project 'app' not found`).
 
-**Verification gate:** from `PrismLocal/`, `.\gradlew.bat --no-daemon assembleDebug`
+**Verification gate:** from `PrismLocal/`, `.\gradlew.bat --no-daemon :app:assembleDevDebug` (quick loop). Before pushing anything touching native code, Gradle config, or ProGuard rules, run the full gate: `.\scripts\verify.ps1` — unit tests + `assembleDevBenchmark` + `assemblePlayRelease`. Debug-only builds never compile the RelWithDebInfo native config, R8/ProGuard rules, or the vulkan-shaders-gen host tool; CI enforces this via the `native-builds` job.
+
+**Native builds on Windows:** the vendored llama.cpp local patch (`patches/llama.cpp/ggml-vulkan-local-build.patch`) forwards `CMAKE_MAKE_PROGRAM` into the `vulkan-shaders-gen` ExternalProject, so no PATH setup is required. If you ever reset/update the submodule and skip `git apply` of that patch, vulkan-shaders-gen fails with "CMake was unable to find a build program corresponding to Ninja" — re-apply the patch (preferred) or prepend `$env:PATH = "C:\Users\<user>\AppData\Local\Android\Sdk\cmake\3.22.1\bin;$env:PATH"` as a fallback.

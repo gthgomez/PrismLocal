@@ -39,7 +39,7 @@ The app features a complete C++/NDK JNI bridge to `llama.cpp`. Native memory lim
 
 ## Verification
 
-- `.\gradlew.bat --no-daemon :app:testDebugUnitTest` and `.\gradlew.bat --no-daemon assembleDebug` verified in `README.md`.
+- `.\scripts\verify.ps1` (unit tests + `assembleDevBenchmark` + `assemblePlayRelease`) verified; CI runs the same set in the `native-builds` job.
 
 ## Next Actions
 

@@ -4,7 +4,7 @@
 #include <unistd.h>
 
 #include "llama.h"
-#include "speculative.h"
+#include "common.h"
 #include "sampling.h"
 
 #include <algorithm>
@@ -165,14 +165,15 @@ std::string formatPromptForGeneration(llama_model* model, const std::string& pro
         return prompt;
     }
 
-    // Prevent double-wrapping if prompt is already formatted with ChatML/LLaMA/Role headers
+    // Prevent double-wrapping if prompt is already formatted with real chat-
+    // template markers. Do NOT match bare "User:"/"Assistant:" prose here:
+    // the app's own transcript formatting prefixes every history line that
+    // way, which previously disabled templating for all multi-turn chats.
     if (prompt.find("<|im_start|>") != std::string::npos ||
         prompt.find("<|start_header_id|>") != std::string::npos ||
         prompt.find("[INST]") != std::string::npos ||
         prompt.find("<|system|>") != std::string::npos ||
-        prompt.find("<|user|>") != std::string::npos ||
-        prompt.find("User:") != std::string::npos ||
-        prompt.find("Assistant:") != std::string::npos) {
+        prompt.find("<|user|>") != std::string::npos) {
         LOGI("prompt_already_formatted length=%zu", prompt.size());
         return prompt;
     }
@@ -275,39 +276,14 @@ struct ModelRuntime {
     llama_batch single_batch;
 
     llama_sampler* cached_sampler = nullptr;
-    GenerationConfig cached_config;
 
-    struct GrammarCacheSlot {
-        llama_sampler* sampler = nullptr;
-        std::string grammar;
-        int64_t last_access = 0;
-    };
-    GrammarCacheSlot grammar_cache[2];
-    int64_t grammar_access_counter = 0;
     std::vector<llama_token> active_tokens;
-
-    // Speculative Decoding State
-    llama_model* draft_model = nullptr;
-    common_speculative* spec = nullptr;
-    std::string draft_model_path;
-    int draft_gpu_layers = 0;
-    int n_draft = 5;
-    std::atomic<uint64_t> total_drafted_tokens{0};
-    std::atomic<uint64_t> total_accepted_tokens{0};
 
     // Dynamic LoRA Adapters
     std::vector<llama_adapter_lora*> loaded_loras;
 
     ~ModelRuntime() {
         std::lock_guard<std::mutex> lock(decode_mu);
-        if (spec != nullptr) {
-            common_speculative_free(spec);
-            spec = nullptr;
-        }
-        if (draft_model != nullptr) {
-            llama_model_free(draft_model);
-            draft_model = nullptr;
-        }
         if (single_batch_initialized) {
             llama_batch_free(single_batch);
             single_batch_initialized = false;
@@ -315,12 +291,6 @@ struct ModelRuntime {
         if (cached_sampler != nullptr) {
             llama_sampler_free(cached_sampler);
             cached_sampler = nullptr;
-        }
-        for (auto& slot : grammar_cache) {
-            if (slot.sampler != nullptr) {
-                llama_sampler_free(slot.sampler);
-                slot.sampler = nullptr;
-            }
         }
         if (ctx != nullptr) {
             if (!loaded_loras.empty()) {
@@ -1064,77 +1034,41 @@ struct Engine::Impl {
             return;
         }
 
-        llama_sampler* sampler = nullptr;
-        const bool non_grammar_matches =
-            runtime->cached_sampler != nullptr &&
-            runtime->cached_config.temperature == session->config.temperature &&
-            runtime->cached_config.top_k == session->config.top_k &&
-            runtime->cached_config.top_p == session->config.top_p &&
-            runtime->cached_config.repeat_penalty == session->config.repeat_penalty;
-        int grammar_cache_hit_slot = -1;
-        for (int gi = 0; gi < 2; gi++) {
-            if (!session->config.grammar.empty() &&
-                runtime->grammar_cache[gi].sampler != nullptr &&
-                runtime->grammar_cache[gi].grammar == session->config.grammar) {
-                grammar_cache_hit_slot = gi;
-                break;
+        // Build a fresh sampler chain for every generation. llama_sampler_chain_add
+        // transfers ownership of each member into the chain (llama.h), so caching
+        // chain or grammar sampler objects across generations previously produced
+        // dangling cache entries and double-free/UAF paths. A fresh chain costs
+        // microseconds; the GBNF recompile below is logged and is sub-millisecond
+        // for the tool-call grammars this app uses.
+        if (runtime->cached_sampler != nullptr) {
+            llama_sampler_free(runtime->cached_sampler);
+            runtime->cached_sampler = nullptr;
+        }
+        llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        if (sampler == nullptr) {
+            ctrl->error_code.store(424, std::memory_order_release);
+            finishSession(session, StreamState::Error);
+            return;
+        }
+        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, session->config.repeat_penalty, 0.2f, 0.2f));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(session->config.top_k));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(session->config.top_p, 1));
+        llama_sampler_chain_add(sampler, llama_sampler_init_temp(session->config.temperature));
+        if (!session->config.grammar.empty()) {
+            const auto grammar_start = std::chrono::steady_clock::now();
+            auto* grammar_sampler = llama_sampler_init_grammar(runtime->vocab, session->config.grammar.c_str(), "root");
+            const auto grammar_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - grammar_start).count();
+            LOGI("grammar_compile_time_us=%lld", static_cast<long long>(grammar_elapsed));
+            if (grammar_sampler != nullptr) {
+                llama_sampler_chain_add(sampler, grammar_sampler);
+            } else {
+                LOGW("Failed to compile grammar. Proceeding unconstrained.");
             }
         }
-        const bool grammar_matches = grammar_cache_hit_slot >= 0;
+        llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-        if (non_grammar_matches && (grammar_matches || session->config.grammar.empty())) {
-            // Full cache hit: non-grammar params and grammar both unchanged
-            sampler = runtime->cached_sampler;
-            llama_sampler_reset(sampler);
-        } else {
-            // Rebuild chain (cheap), but reuse cached grammar (expensive) when possible
-            if (runtime->cached_sampler != nullptr) {
-                llama_sampler_free(runtime->cached_sampler);
-                runtime->cached_sampler = nullptr;
-            }
-            sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-            if (sampler == nullptr) {
-                ctrl->error_code.store(424, std::memory_order_release);
-                finishSession(session, StreamState::Error);
-                return;
-            }
-            llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, session->config.repeat_penalty, 0.2f, 0.2f));
-            llama_sampler_chain_add(sampler, llama_sampler_init_top_k(session->config.top_k));
-            llama_sampler_chain_add(sampler, llama_sampler_init_top_p(session->config.top_p, 1));
-            llama_sampler_chain_add(sampler, llama_sampler_init_temp(session->config.temperature));
-            if (!session->config.grammar.empty()) {
-                if (grammar_matches) {
-                    // Reuse cached grammar — avoids expensive recompilation
-                    runtime->grammar_cache[grammar_cache_hit_slot].last_access = ++runtime->grammar_access_counter;
-                    llama_sampler_reset(runtime->grammar_cache[grammar_cache_hit_slot].sampler);
-                    llama_sampler_chain_add(sampler, runtime->grammar_cache[grammar_cache_hit_slot].sampler);
-                } else {
-                    // Find LRU slot to evict
-                    const int evict_slot = runtime->grammar_cache[0].last_access <= runtime->grammar_cache[1].last_access ? 0 : 1;
-                    if (runtime->grammar_cache[evict_slot].sampler != nullptr) {
-                        llama_sampler_free(runtime->grammar_cache[evict_slot].sampler);
-                        runtime->grammar_cache[evict_slot].sampler = nullptr;
-                    }
-                    const auto grammar_start = std::chrono::steady_clock::now();
-                    auto* grammar_sampler = llama_sampler_init_grammar(runtime->vocab, session->config.grammar.c_str(), "root");
-                    const auto grammar_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - grammar_start).count();
-                    LOGI("grammar_compile_time_us=%lld", static_cast<long long>(grammar_elapsed));
-                    if (grammar_sampler != nullptr) {
-                        runtime->grammar_cache[evict_slot].sampler = grammar_sampler;
-                        runtime->grammar_cache[evict_slot].grammar = session->config.grammar;
-                        runtime->grammar_cache[evict_slot].last_access = ++runtime->grammar_access_counter;
-                        llama_sampler_chain_add(sampler, grammar_sampler);
-                    } else {
-                        LOGW("Failed to compile grammar. Proceeding unconstrained.");
-                    }
-                }
-            }
-            llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-            runtime->cached_sampler = sampler;
-            runtime->cached_config = session->config;
-        }
+        runtime->cached_sampler = sampler;
 
         const auto generation_start = std::chrono::steady_clock::now();
         int generated_tokens = 0;
@@ -1371,103 +1305,6 @@ void Engine::unloadModel() {
     clearRing(impl_->buffers.control);
     impl_->buffers.control->state.store(static_cast<uint32_t>(StreamState::Idle), std::memory_order_release);
     LOGI("model_unloaded previous_path=%s", previous_path.c_str());
-}
-
-bool Engine::loadDraftModel(const std::string& draft_path, int draft_gpu_layers) {
-    if (!impl_ || draft_path.empty()) {
-        return false;
-    }
-    impl_->cancelAndJoinActiveSession();
-    std::shared_ptr<ModelRuntime> runtime;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mu);
-        runtime = impl_->active_runtime;
-    }
-    if (!runtime || runtime->model == nullptr || runtime->ctx == nullptr) {
-        LOGW("loadDraftModel failed: target model not loaded");
-        return false;
-    }
-
-    std::lock_guard<std::mutex> decode_lock(runtime->decode_mu);
-    if (runtime->spec != nullptr) {
-        common_speculative_free(runtime->spec);
-        runtime->spec = nullptr;
-    }
-    if (runtime->draft_model != nullptr) {
-        llama_model_free(runtime->draft_model);
-        runtime->draft_model = nullptr;
-    }
-
-    common_params params;
-    params.model.path = draft_path;
-    params.n_gpu_layers = draft_gpu_layers;
-    params.n_ctx = runtime->context_length;
-    params.speculative.draft.mparams.path = draft_path;
-    params.speculative.draft.n_gpu_layers = draft_gpu_layers;
-    params.speculative.draft.n_ctx = runtime->context_length;
-
-    auto mparams_dft = common_model_params_to_llama(params);
-    runtime->draft_model = llama_model_load_from_file(draft_path.c_str(), mparams_dft);
-    if (runtime->draft_model == nullptr) {
-        LOGE("failed to load draft model from %s", draft_path.c_str());
-        return false;
-    }
-
-    params.speculative.draft.model = runtime->draft_model;
-    params.speculative.draft.cparams = common_context_params_to_llama(params);
-    runtime->spec = common_speculative_init(params.speculative, runtime->ctx);
-
-    if (runtime->spec == nullptr) {
-        LOGE("failed to initialize common_speculative for %s", draft_path.c_str());
-        llama_model_free(runtime->draft_model);
-        runtime->draft_model = nullptr;
-        return false;
-    }
-
-    runtime->draft_model_path = draft_path;
-    runtime->draft_gpu_layers = draft_gpu_layers;
-    runtime->total_drafted_tokens.store(0);
-    runtime->total_accepted_tokens.store(0);
-    LOGI("draft_model_loaded path=%s gpu_layers=%d", draft_path.c_str(), draft_gpu_layers);
-    return true;
-}
-
-void Engine::unloadDraftModel() {
-    if (!impl_) return;
-    impl_->cancelAndJoinActiveSession();
-    std::shared_ptr<ModelRuntime> runtime;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mu);
-        runtime = impl_->active_runtime;
-    }
-    if (!runtime) return;
-    std::lock_guard<std::mutex> decode_lock(runtime->decode_mu);
-    if (runtime->spec != nullptr) {
-        common_speculative_free(runtime->spec);
-        runtime->spec = nullptr;
-    }
-    if (runtime->draft_model != nullptr) {
-        llama_model_free(runtime->draft_model);
-        runtime->draft_model = nullptr;
-    }
-    runtime->draft_model_path.clear();
-    LOGI("draft_model_unloaded");
-}
-
-bool Engine::is_speculative_active() const {
-    if (!impl_) return false;
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    return impl_->active_runtime && impl_->active_runtime->spec != nullptr;
-}
-
-float Engine::get_speculative_acceptance_rate() const {
-    if (!impl_) return 0.0f;
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    if (!impl_->active_runtime) return 0.0f;
-    uint64_t drafted = impl_->active_runtime->total_drafted_tokens.load();
-    uint64_t accepted = impl_->active_runtime->total_accepted_tokens.load();
-    if (drafted == 0) return 0.0f;
-    return static_cast<float>(accepted) / static_cast<float>(drafted);
 }
 
 int Engine::startGeneration(const std::string& prompt, int generation_id, GenerationConfig config) {
@@ -1781,6 +1618,15 @@ std::vector<float> Engine::encode(const std::string& text) {
         tokens.data(), token_count,
         add_special, true);
     if (actual < 0) return {};
+
+    // llama_encode runs the encoder graph, which hard-requires
+    // n_ubatch >= n_tokens (GGML_ABORT otherwise) and would crash the whole
+    // process on oversized inputs. Reject them instead; callers treat an empty
+    // result as failure and can re-chunk.
+    if (actual > runtime->batch_size) {
+        LOGW("encode_input_too_large tokens=%d batch_size=%d", actual, runtime->batch_size);
+        return {};
+    }
 
     // Enable embeddings mode
     llama_set_embeddings(runtime->ctx, true);

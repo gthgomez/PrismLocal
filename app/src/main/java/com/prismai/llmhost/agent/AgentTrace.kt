@@ -36,8 +36,17 @@ class AgentTrace(
     val activeAgentSteps = mutableListOf<AgentStep>()
     var activeAgentChainPrompt: String? = null
     var activeAgentChainStartTime: Long = 0L
-    var activeAgentChainTokens: Int = 0
+    private val chainTokens = java.util.concurrent.atomic.AtomicInteger(0)
 
+    /** Live token count for the active agent chain; mutate only via [addChainTokens]. */
+    val activeAgentChainTokens: Int get() = chainTokens.get()
+
+    /** Atomically accumulates generated tokens into the chain budget (thread-safe). */
+    fun addChainTokens(delta: Int) {
+        chainTokens.addAndGet(delta)
+    }
+
+    @Synchronized
     fun recordStep(call: AgentToolCall, result: AgentToolResult, latencyMs: Long) {
         val index = activeAgentSteps.size
         activeAgentSteps.add(
@@ -51,6 +60,7 @@ class AgentTrace(
         )
     }
 
+    @Synchronized
     fun finalizeTrace(success: Boolean, abortReason: String? = null) {
         val prompt = activeAgentChainPrompt ?: return
         val steps = activeAgentSteps.toList()
@@ -107,13 +117,15 @@ class AgentTrace(
             }
         }
         activeAgentChainStartTime = 0L
+        chainTokens.set(0)
     }
 
     /** Resets chain state for a new agent interaction. */
+    @Synchronized
     fun reset() {
         activeAgentSteps.clear()
         activeAgentChainPrompt = null
         activeAgentChainStartTime = 0L
-        activeAgentChainTokens = 0
+        chainTokens.set(0)
     }
 }

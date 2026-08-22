@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Exclude sensitive auth credentials & keystore preferences from cloud backup -->
+    <exclude domain="sharedpref" path="prism_auth_secure_prefs.xml" />
+    <exclude domain="file" path="key_store" />
+</full-backup-content>

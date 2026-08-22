@@ -12,7 +12,7 @@ These patches capture local modifications made to the `llama.cpp` submodule
   - `ggml/src/ggml-vulkan/CMakeLists.txt`
   - `ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp`
 
-Purpose: [INFERRED] local ggml-vulkan build fixes so shader generation works with the vendored Vulkan headers in `app/src/main/cpp/third_party/{vulkan,spirv,vk_video}`.
+Purpose: [INFERRED] local ggml-vulkan build fixes so shader generation works with the vendored Vulkan headers in `app/src/main/cpp/third_party/{vulkan,spirv,vk_video}`. Also forwards `CMAKE_MAKE_PROGRAM` into the `vulkan-shaders-gen` ExternalProject so the child Ninja configure does not depend on PATH (fixes "CMake was unable to find a build program corresponding to Ninja" under Android Studio and fresh shells).
 
 ## Applying after a submodule update/reset
 

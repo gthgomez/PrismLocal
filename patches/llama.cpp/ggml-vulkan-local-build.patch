@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-vulkan/CMakeLists.txt b/ggml/src/ggml-vulkan/CMakeLists.txt
-index 715a263a6..b5951652f 100644
+index 715a263a6..4c0b5abf9 100644
 --- a/ggml/src/ggml-vulkan/CMakeLists.txt
 +++ b/ggml/src/ggml-vulkan/CMakeLists.txt
 @@ -32,7 +32,7 @@ endfunction()
@@ -42,7 +42,22 @@ index 715a263a6..b5951652f 100644
  
      test_shader_extension_support(
          "GL_EXT_bfloat16"
-@@ -196,6 +185,14 @@ if (Vulkan_FOUND)
+@@ -146,6 +135,14 @@ if (Vulkan_FOUND)
+         message(STATUS "vulkan-shaders-gen toolchain file: ${HOST_CMAKE_TOOLCHAIN_FILE}")
+     endif()
+ 
++    # Forward the generator's make program explicitly. Without this, the child
++    # project inherits -G Ninja from the parent but not CMAKE_MAKE_PROGRAM and
++    # falls back to searching PATH, which breaks under Android Studio builds
++    # where the SDK cmake bin directory is not on PATH. (local patch)
++    if (CMAKE_MAKE_PROGRAM)
++        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM})
++    endif()
++
+     ExternalProject_Add(
+         vulkan-shaders-gen
+         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders
+@@ -196,6 +193,14 @@ if (Vulkan_FOUND)
  
      foreach (file_full ${_ggml_vk_shader_files})
          get_filename_component(file ${file_full} NAME)

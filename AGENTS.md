@@ -30,4 +30,4 @@ From the composite workspace root only:
 
 **Verification gate:** from `PrismLocal/`, `.\gradlew.bat --no-daemon :app:assembleDevDebug`
 
-**Native builds on Windows:** if the vulkan-shaders-gen step fails with "CMake was unable to find a build program corresponding to Ninja", prepend the SDK cmake dir to PATH first: `$env:PATH = "C:\Users\<user>\AppData\Local\Android\Sdk\cmake\3.22.1\bin;$env:PATH"`.
+**Native builds on Windows:** the vendored llama.cpp local patch (`patches/llama.cpp/ggml-vulkan-local-build.patch`) forwards `CMAKE_MAKE_PROGRAM` into the `vulkan-shaders-gen` ExternalProject, so no PATH setup is required. If you ever reset/update the submodule and skip `git apply` of that patch, vulkan-shaders-gen fails with "CMake was unable to find a build program corresponding to Ninja" — re-apply the patch (preferred) or prepend `$env:PATH = "C:\Users\<user>\AppData\Local\Android\Sdk\cmake\3.22.1\bin;$env:PATH"` as a fallback.

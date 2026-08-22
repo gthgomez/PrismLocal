@@ -322,6 +322,7 @@ class AgentToolRouter(
             "stop_speaking",
             // Phase 3 Knowledge Pack
             "download_knowledge_pack",
+            "fetch_grokipedia_article",
             // Phase 5 Workspace Files
             "list_workspace_files",
             "read_workspace_file",

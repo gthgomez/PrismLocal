@@ -124,7 +124,7 @@ class SystemTools(
         toolSuccess(call,
             "Prism Local runs inference on-device; outbound GET requests are limited to Hugging Face downloads, DuckDuckGo search, and Grokipedia.",
             JSONObject()
-                .put("local_data", JSONArray(listOf("Chats", "Benchmark history", "Runtime settings", "Installed model metadata", "App-local exports", "Grokipedia knowledge-pack index (after download)")))
+                .put("local_data", JSONArray(listOf("Chats", "Benchmark history", "Runtime settings", "Installed model metadata", "App-local exports", "Grokipedia knowledge-pack index (after download)", "Security audit trail of agent tool decisions (app-local JSONL, ~512 KB cap)")))
                 .put("network_actions", JSONArray(listOf(
                     "Curated Hugging Face GGUF model downloads (GET huggingface.co) after user confirmation",
                     "Web search via DuckDuckGo HTML endpoint (GET html.duckduckgo.com) when the agent invokes web_search",

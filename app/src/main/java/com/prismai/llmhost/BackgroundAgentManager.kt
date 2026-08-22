@@ -301,7 +301,17 @@ class BackgroundAgentManager(
                 }
                 runCatching { cancelNativeGeneration?.invoke() }
                 synchronized(stateLock) {
-                    _state.value = _state.value.copy(isBackgroundMode = false, activeTask = null)
+                    val latest = _state.value
+                    val dropped = latest.activeTask
+                    _state.value = latest.copy(
+                        isBackgroundMode = false,
+                        activeTask = null,
+                        completedTasks = if (dropped != null) {
+                            latest.completedTasks + dropped.copy(status = BackgroundTaskStatus.CANCELLED)
+                        } else {
+                            latest.completedTasks
+                        },
+                    )
                 }
                 releaseWakeLockSafely()
                 cancelProgressNotification()

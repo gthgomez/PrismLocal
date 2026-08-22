@@ -1,0 +1,12 @@
+# Copy to local.properties (gitignored) for machine-local secrets and SDK paths.
+# Android Studio usually creates local.properties with sdk.dir automatically.
+
+# Required for Play release/benchmark cloud-auth builds (never commit real keys).
+supabase.anon.key=
+
+# Optional override; defaults to https://api.prismatix.ai/auth/v1
+# supabase.auth.url=https://api.prismatix.ai/auth/v1
+
+# Equivalent Gradle property / environment variable names:
+# LLMHOST_SUPABASE_ANON_KEY
+# LLMHOST_SUPABASE_AUTH_URL

@@ -20,8 +20,8 @@ interface SupabaseAuthClient {
 }
 
 class HttpSupabaseAuthClient(
-    private val authBaseUrl: String = DEFAULT_AUTH_URL,
-    private val apiKey: String = DEFAULT_ANON_KEY,
+    private val authBaseUrl: String = SupabaseAuthConfig.authBaseUrl,
+    private val apiKey: String,
     private val distributionConfig: DistributionConfig = DistributionConfigProvider,
     private val connectionFactory: (URL) -> HttpURLConnection = { url ->
         url.openConnection() as HttpURLConnection
@@ -29,8 +29,16 @@ class HttpSupabaseAuthClient(
 ) : SupabaseAuthClient {
 
     companion object {
-        const val DEFAULT_AUTH_URL = "https://api.prismatix.ai/auth/v1"
-        const val DEFAULT_ANON_KEY = "anon-key-placeholder"
+        fun createDefault(
+            distributionConfig: DistributionConfig = DistributionConfigProvider,
+            connectionFactory: (URL) -> HttpURLConnection = { url ->
+                url.openConnection() as HttpURLConnection
+            },
+        ): HttpSupabaseAuthClient = HttpSupabaseAuthClient(
+            apiKey = SupabaseAuthConfig.requireAnonKey(),
+            distributionConfig = distributionConfig,
+            connectionFactory = connectionFactory,
+        )
     }
 
     override suspend fun signInWithPassword(email: String, password: String): Result<SupabaseAuthSession> =

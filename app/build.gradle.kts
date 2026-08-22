@@ -3,11 +3,35 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+import java.util.Properties
+import java.io.FileInputStream
+
 fun signingValue(name: String): String? =
     providers.gradleProperty(name)
         .orElse(providers.environmentVariable(name))
         .orNull
         ?.takeIf { it.isNotBlank() }
+
+val localProperties = Properties().apply {
+    val localPropsFile = rootProject.file("local.properties")
+    if (localPropsFile.exists()) {
+        FileInputStream(localPropsFile).use { load(it) }
+    }
+}
+
+fun localProperty(key: String): String? =
+    localProperties.getProperty(key)?.takeIf { it.isNotBlank() }
+
+fun configValue(gradleOrEnvName: String, localKey: String? = null): String? =
+  localKey?.let { localProperty(it) }
+      ?: signingValue(gradleOrEnvName)
+
+fun quoteBuildConfig(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
+val supabaseAuthUrl = configValue("LLMHOST_SUPABASE_AUTH_URL", "supabase.auth.url")
+    ?: "https://api.prismatix.ai/auth/v1"
+val supabaseAnonKey = configValue("LLMHOST_SUPABASE_ANON_KEY", "supabase.anon.key") ?: ""
 
 val releaseStoreFile = signingValue("LLMHOST_RELEASE_STORE_FILE")
 val releaseStorePassword = signingValue("LLMHOST_RELEASE_STORE_PASSWORD")
@@ -70,6 +94,8 @@ android {
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders["appLabel"] = "Prism Local"
+        buildConfigField("String", "SUPABASE_AUTH_URL", quoteBuildConfig(supabaseAuthUrl))
+        buildConfigField("String", "SUPABASE_ANON_KEY", quoteBuildConfig(supabaseAnonKey))
 
         externalNativeBuild {
             cmake {
@@ -279,6 +305,23 @@ android {
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+gradle.taskGraph.whenReady {
+    val requiresSupabaseAnonKey = allTasks.any { task ->
+        val name = task.name
+        name.startsWith("assemblePlayRelease") ||
+            name.startsWith("bundlePlayRelease") ||
+            name.startsWith("assemblePlayBenchmark") ||
+            name.startsWith("bundlePlayBenchmark")
+    }
+    if (requiresSupabaseAnonKey && supabaseAnonKey.isBlank()) {
+        error(
+            "Play release/benchmark builds require a Supabase anon key. " +
+                "Set supabase.anon.key in local.properties or LLMHOST_SUPABASE_ANON_KEY " +
+                "as a Gradle property / environment variable. Never commit secrets to git.",
+        )
     }
 }
 

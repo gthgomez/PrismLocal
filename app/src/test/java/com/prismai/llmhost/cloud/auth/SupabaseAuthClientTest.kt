@@ -102,6 +102,7 @@ class SupabaseAuthClientTest {
     fun rejectsUntrustedAuthEndpointOnPlayDistribution() = runBlocking {
         val client = HttpSupabaseAuthClient(
             authBaseUrl = "https://untrusted-host.com/auth/v1",
+            apiKey = "test-anon-key",
             distributionConfig = playConfig,
         )
 
@@ -122,6 +123,7 @@ class SupabaseAuthClientTest {
 
         val client = HttpSupabaseAuthClient(
             authBaseUrl = "https://api.prismatix.ai/auth/v1",
+            apiKey = "test-anon-key",
             distributionConfig = playConfig,
             connectionFactory = { url ->
                 MockHttpURLConnection(

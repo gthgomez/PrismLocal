@@ -1,0 +1,86 @@
+diff --git a/ggml/src/ggml-vulkan/CMakeLists.txt b/ggml/src/ggml-vulkan/CMakeLists.txt
+index 715a263a6..b5951652f 100644
+--- a/ggml/src/ggml-vulkan/CMakeLists.txt
++++ b/ggml/src/ggml-vulkan/CMakeLists.txt
+@@ -32,7 +32,7 @@ endfunction()
+ #  RESULT_VARIABLE - Name of the variable to set (ON/OFF) based on test result
+ function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
+     execute_process(
+-        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
++        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.1 "${TEST_SHADER_FILE}"
+         OUTPUT_VARIABLE glslc_output
+         ERROR_VARIABLE glslc_error
+     )
+@@ -61,24 +61,13 @@ if (Vulkan_FOUND)
+ 
+     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
+ 
+-    # Test all shader extensions
+-    test_shader_extension_support(
+-        "GL_KHR_cooperative_matrix"
+-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat.comp"
+-        "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
+-    )
++    set(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT OFF CACHE BOOL "" FORCE)
++    set(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT OFF CACHE BOOL "" FORCE)
++    set(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT OFF CACHE BOOL "" FORCE)
+ 
+-    test_shader_extension_support(
+-        "GL_NV_cooperative_matrix2"
+-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
+-        "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
+-    )
+-
+-    test_shader_extension_support(
+-        "GL_EXT_integer_dot_product"
+-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
+-        "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
+-    )
++    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=OFF)
++    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT=OFF)
++    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=OFF)
+ 
+     test_shader_extension_support(
+         "GL_EXT_bfloat16"
+@@ -196,6 +185,14 @@ if (Vulkan_FOUND)
+ 
+     foreach (file_full ${_ggml_vk_shader_files})
+         get_filename_component(file ${file_full} NAME)
++        if (NOT GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT AND file MATCHES ".*cm2\\.comp$")
++            message(STATUS "Skipping ${file} (GL_NV_cooperative_matrix2 not supported by glslc)")
++            continue()
++        endif()
++        if (NOT GGML_VULKAN_COOPMAT_GLSLC_SUPPORT AND file MATCHES ".*cm1\\.comp$")
++            message(STATUS "Skipping ${file} (GL_KHR_cooperative_matrix not supported by glslc)")
++            continue()
++        endif()
+         set (_ggml_vk_target_cpp "${CMAKE_CURRENT_BINARY_DIR}/${file}.cpp")
+ 
+         add_custom_command(
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 6f2a929c4..2e7e9c1e9 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -102,12 +102,19 @@ void execute_command(std::vector<std::string>& command, std::string& stdout_str,
+     si.hStdError = stderr_write;
+ 
+     std::string cmd;
+-    for (const auto& part : command) {
+-        cmd += part + " ";
++    for (size_t i = 0; i < command.size(); ++i) {
++        if (command[i].find(' ') != std::string::npos) {
++            cmd += "\"" + command[i] + "\"";
++        } else {
++            cmd += command[i];
++        }
++        if (i + 1 < command.size()) {
++            cmd += " ";
++        }
+     }
+ 
+     if (!CreateProcessA(NULL, cmd.data(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+-        throw std::runtime_error("Failed to create process");
++        throw std::runtime_error("Failed to create process: " + cmd);
+     }
+ 
+     CloseHandle(stdout_write);

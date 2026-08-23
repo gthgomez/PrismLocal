@@ -8,7 +8,7 @@ PrismLocal incorporates open-source software and headers subject to the followin
 
 - **Repository:** https://github.com/ggml-org/llama.cpp
 - **Submodule Path:** `app/src/main/cpp/third_party/llama.cpp`
-- **Pinned Commit:** `bbeb89d76c41bc250f16e4a6fefcc9b530d6e3f3`
+- **Pinned Snapshot Commit:** `bbeb89d76c41bc250f16e4a6fefcc9b530d6e3f3`
 - **License:** MIT License
 
 ```text
@@ -37,30 +37,37 @@ SOFTWARE.
 
 ---
 
-## 2. AndroidX & Jetpack Libraries
+## 2. Khronos Vulkan & SPIR-V Headers
 
-- **Components:** AndroidX Compose, Lifecycle, Navigation, Room, WorkManager, Security Crypto
-- **License:** Apache License, Version 2.0
-- **Copyright:** Copyright (C) 2005-2026 The Android Open Source Project
-
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at `http://www.apache.org/licenses/LICENSE-2.0`.
-
----
-
-## 3. KotlinX Coroutines
-
-- **Components:** `kotlinx-coroutines-core`, `kotlinx-coroutines-android`
-- **License:** Apache License, Version 2.0
-- **Copyright:** Copyright (C) 2016-2026 JetBrains s.r.o.
-
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at `http://www.apache.org/licenses/LICENSE-2.0`.
-
----
-
-## 4. Vulkan & SPIR-V Headers
-
-- **Headers:** `app/src/main/cpp/third_party/vulkan_headers`
-- **License:** Apache License 2.0 / MIT
-- **Copyright:** Copyright (c) 2015-2026 The Khronos Group Inc.
+- **Headers Path:** `app/src/main/cpp/third_party/{vulkan, spirv, vk_video}`
+- **Copyright:** Copyright 2014-2024 The Khronos Group Inc.
+- **License:** Apache License 2.0 (`vulkan/vulkan_core.h`, `vk_video/vulkan_video_codecs_common.h`) / MIT License (`spirv/unified1/spirv.h`)
 
 Licensed under the Apache License, Version 2.0 or the MIT License.
+
+---
+
+## 3. AndroidX & Jetpack Components
+
+- **Resolved Dependencies:**
+  - `androidx.activity:activity-compose:1.13.0`
+  - `androidx.annotation:annotation:1.10.0`
+  - `androidx.core:core-ktx:1.18.0`
+  - `androidx.compose.*` (BOM `2026.04.01`)
+  - `androidx.lifecycle:lifecycle-runtime-compose:2.10.0`
+  - `androidx.navigation:navigation-compose:2.9.7`
+  - `androidx.room:room-runtime:2.8.4`
+  - `androidx.work:work-runtime-ktx:2.10.0`
+  - `androidx.security:security-crypto:1.1.0-alpha06`
+- **Copyright:** Copyright (C) 2005-2026 The Android Open Source Project
+- **License:** Apache License, Version 2.0
+
+---
+
+## 4. KotlinX Coroutines
+
+- **Resolved Dependencies:**
+  - `org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1`
+  - `org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1`
+- **Copyright:** Copyright (C) 2016-2026 JetBrains s.r.o.
+- **License:** Apache License, Version 2.0

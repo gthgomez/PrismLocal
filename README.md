@@ -8,7 +8,7 @@
 [![Page Alignment](https://img.shields.io/badge/16_KB_Page_Alignment-Compatible-success.svg)](https://developer.android.com/guide/practices/page-sizes)
 [![Android CI](https://github.com/gthgomez/PrismLocal/actions/workflows/android-ci.yml/badge.svg)](https://github.com/gthgomez/PrismLocal/actions/workflows/android-ci.yml)
 
-Prism Local is an open-source Android application for high-performance, private, on-device GGUF large language model (LLM) inference. It embeds a C++20 `llama.cpp` runtime into an Android foreground service via a thread-safe JNI bridge, providing local chat, tool dispatch, document retrieval (RAG), and model lifecycle management without cloud dependencies.
+Prism Local is an open-source Android application for high-performance, private, on-device GGUF large language model (LLM) inference. It embeds a C++20 `llama.cpp` runtime into an Android foreground service via a thread-safe JNI bridge, providing local inference without requiring a cloud LLM provider, alongside chat, tool dispatch, document retrieval (RAG), and model lifecycle management.
 
 ---
 
@@ -51,12 +51,12 @@ graph TD
 
 1. **Thread-Safe JNI & Native LLM Engine**:
    - Thread-safe JNI bridge embedding a vendored C++20 `llama.cpp` runtime.
-   - Streams generated tokens via a pre-allocated carrier buffer as `Flow<GenerationChunk>` to keep token streaming off the UI thread and prevent GC pauses.
-   - Intra-batch C++ cancellation checks in `decodeTokensAt` enable responsive, sub-second user interrupts.
+   - Streams generated tokens via a pre-allocated carrier buffer as `Flow<GenerationChunk>` to keep token streaming off the UI thread and reduce allocation pressure.
+   - Intra-batch C++ cancellation checks in `decodeTokensAt` enable responsive user interrupts.
 
 2. **Platform & Hardware Lifecycle Governors**:
    - `ThermalBatteryGovernor` monitors Android thermal status and battery level, auto-pausing active inference when device thermals reach `SEVERE+` or battery drops below `15%`.
-   - `MemoryGovernor` polls system memory pressure (`ComponentCallbacks2`) and throttles native allocations to prevent OOM process termination.
+   - `MemoryGovernor` polls system memory pressure (`ComponentCallbacks2`) and throttles native allocations to mitigate OOM risk.
 
 3. **Fail-Closed Production Signing Infrastructure**:
    - Custom Gradle build convention plugin (`AndroidProductionSigningPlugin`) executing pre-build PKCS12 keystore verification, pinned certificate SHA-256 fingerprint checks, and validity window validation.
@@ -122,4 +122,5 @@ cd PrismLocal
 ## License & Attribution
 
 - **PrismLocal Source:** Licensed under the [Apache License, Version 2.0](LICENSE).
+- **NOTICE:** [NOTICE](NOTICE)
 - **Third-Party Notices:** Upstream third-party components (including `llama.cpp` under MIT) and notices are cataloged in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

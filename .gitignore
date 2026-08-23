@@ -13,9 +13,15 @@ out/
 *.iml
 local.properties
 
-# Signing and packaged app outputs
+# Signing, secrets, and packaged app outputs
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+.env
+.env.*
 *.apk
 *.aab
 release/
@@ -43,6 +49,8 @@ llm_host_prefs.xml
 # Per-run plans and test outputs
 commitPlan.json
 walkthrough.md
-*.png
 runs/
+*.png
+!docs/assets/*.png
+
 

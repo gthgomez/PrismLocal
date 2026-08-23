@@ -10,16 +10,19 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   unit-tests:
     name: Unit Tests & Golden Conformance
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -30,3 +33,32 @@ jobs:
 
       - name: Run Unit Tests (Dev & Play Debug)
         run: ./gradlew :app:testDevDebugUnitTest :app:testPlayDebugUnitTest --no-daemon --stacktrace
+
+  native-builds:
+    # Release-like variants are the ones that break silently: they use
+    # RelWithDebInfo native configs, R8, and the vulkan-shaders-gen host
+    # ExternalProject that debug builds never exercise. Build both flavors.
+    name: Native Builds (benchmark & release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    needs: unit-tests
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Accept SDK licenses (auto-installs NDK 28.2 / cmake 3.22.1 pinned by AGP)
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Assemble DevBenchmark & PlayRelease (unsigned)
+        run: ./gradlew :app:assembleDevBenchmark :app:assemblePlayRelease --no-daemon --stacktrace
+

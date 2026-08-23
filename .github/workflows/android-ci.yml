@@ -60,5 +60,8 @@ jobs:
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Assemble DevBenchmark & PlayRelease (unsigned)
+        env:
+          LLMHOST_SUPABASE_ANON_KEY: "ci-public-build-placeholder"
         run: ./gradlew :app:assembleDevBenchmark :app:assemblePlayRelease --no-daemon --stacktrace
+
 

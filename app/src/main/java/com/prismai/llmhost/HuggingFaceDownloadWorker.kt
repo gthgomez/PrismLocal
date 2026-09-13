@@ -6,6 +6,8 @@ import com.prismai.llmhost.storage.*
 import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
+import com.prismai.llmhost.util.MAX_REMOTE_RESPONSE_CHARS
+import com.prismai.llmhost.util.readTextBounded
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -205,7 +207,7 @@ class HuggingFaceDownloadWorker(
         return RemoteFileMetadata(size, sha256)
     }
 
-    private fun openTextConnection(url: String, maxChars: Int? = null): String {
+    private fun openTextConnection(url: String, maxChars: Int = MAX_REMOTE_RESPONSE_CHARS): String {
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = true
             connectTimeout = 20_000
@@ -219,13 +221,7 @@ class HuggingFaceDownloadWorker(
                 throw IllegalStateException("HTTP $code from Hugging Face metadata")
             }
             connection.inputStream.bufferedReader().use { reader ->
-                if (maxChars == null) {
-                    reader.readText()
-                } else {
-                    val buffer = CharArray(maxChars)
-                    val read = reader.read(buffer)
-                    if (read <= 0) "" else String(buffer, 0, read)
-                }
+                reader.readTextBounded(maxChars)
             }
         } finally {
             connection.disconnect()

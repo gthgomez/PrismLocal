@@ -75,20 +75,19 @@ orchestrator/service.
 
 ---
 
-## 2. Known issues intentionally **not** fixed
+## 2. Remaining known issues
 
 These need a build/device turn, a product decision, or a larger, riskier refactor.
 
 | # | Issue | Why deferred |
 |---|-------|--------------|
 | D1 | Hugging Face integrity can be skipped: `expectedSha256 ?: return` with only 3/25 catalog entries pinning a hash, and dynamic imports pass `null` | Requiring a SHA would break legitimate dynamic downloads; needs a product decision (pin or reject). |
-| D2 | `VectorStore.search` loads every row (text + embedding BLOB) into heap under a global lock, no `LIMIT`/pagination | Correct fix is a query/pagination redesign; needs profiling + build. |
 | D3 | `InferenceService.onDestroy` runs `runBlocking { … engine.destroySafely() }` on the main thread | Moving native teardown off-main with a bounded wait is risky without a device. |
-| D4 | Dev validator permits cleartext `localhost`/`127.0.0.1`/`10.0.2.2` but no network-security-config exists and targetSdk 36 blocks cleartext | Needs a debug-only `network_security_config`; no build to verify. |
-| D5 | Unbounded `readText()` on remote metadata/search responses | Low impact; cap or stream-parse in a follow-up. |
 | D6 | `WorkspaceTools` root is the whole `filesDir`, so SAFE reads can reach chats/traces/audit log | Changing the root would orphan existing data; needs migration + tests. |
 | D7 | Broad reuse refactors (path-containment helpers ×6, SHA-256/hex, atomic writes, byte formatters, tool registries) | High churn across many files; must be validated by the build. |
 | D8 | Babel public-export policy hits: Windows host paths in docs, `.supabase.co` in pinned hosts | Documentation/policy decision; cross-repo consistency. |
+
+> D2, D4, and D5 were addressed in a follow-up pass on the same day — see §5.
 
 ---
 
@@ -117,3 +116,32 @@ These need a build/device turn, a product decision, or a larger, riskier refacto
 - Highest-risk-to-compile changes: the `inline` `PrismatixSseParser.parseStream`
   + `emit` pattern, the `withContext` wrappers in `NativeLlmBridge`/`RagManager`,
   and the reflective Keystore calls.
+
+---
+
+## 5. Follow-up pass (2026-09-13): D2, D4, D5
+
+Same host constraints as §1 — no JDK, Gradle, or Android SDK — so these changes
+are static-review-only. Two new pure-JVM unit tests cover the extracted helpers.
+
+| # | Issue | Fix | Files |
+|---|-------|-----|-------|
+| D2 | `VectorStore.search` materialized every row (text + embedding BLOB) on the heap under a global lock | `search` now streams the cursor and retains only the top-K in a bounded min-heap via a new testable `selectTopK`; the full table is never materialized | `storage/VectorStore.kt`, `app/src/test/.../storage/VectorStoreTopKTest.kt` |
+| D5 | Unbounded `readText()` on remote response bodies | New `readTextBounded` (fail-closed) and `readTextTruncated` (diagnostic) reader extensions; applied to Grokipedia, DuckDuckGo search, HF search/metadata, Supabase auth, and Prismatix error bodies | `util/RemoteResponseText.kt`, `tools/GrokipediaClient.kt`, `agent/tools/WebSearchTools.kt`, `model/HuggingFaceSearchEngine.kt`, `HuggingFaceDownloadWorker.kt`, `cloud/auth/SupabaseAuthClient.kt`, `cloud/prismatix/PrismatixClient.kt`, `app/src/test/.../util/RemoteResponseTextTest.kt` |
+| D4 | Dev permits cleartext `localhost`/`127.0.0.1`/`10.0.2.2` but no network-security-config exists, and targetSdk 36 blocks cleartext | Added a `dev`-flavor manifest + network security config allowing cleartext only for those three hosts; the `play` flavor ships no config, so cleartext stays blocked | `app/src/dev/AndroidManifest.xml`, `app/src/dev/res/xml/network_security_config.xml` |
+
+Notes / residual risk:
+
+- D2 no longer preserves stable ordering among exactly-equal scores (the old code
+  used a stable sort after loading all rows). The top-K *set* is identical; ties
+  are semantically unordered for retrieval.
+- D4 is scoped to the `dev` **flavor**, not only the `debug` build type, because
+  `developerWorkMode` and the localhost allowance are flavor properties and
+  `devRelease` needs them too. `play*` builds remain cleartext-blocked.
+  Not compile/device-verified here.
+- D5's `HuggingFaceDownloadWorker.openTextConnection` cap now also covers API
+  metadata that was previously read with an unbounded `readText()`; an oversized
+  body fails the metadata fetch and falls back to catalog values via the existing
+  `runCatching`.
+- Follow-up tests to run with the rest of the gate:
+  `RemoteResponseTextTest`, `VectorStoreTopKTest`.

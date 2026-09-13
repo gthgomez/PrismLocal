@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Developer ("dev") distribution only.
+
+    PrismatixConfig.validateEndpoint() permits cleartext HTTP exclusively to the
+    local development hosts, but targetSdk 36 blocks cleartext by default. This
+    manifest attaches a network security config that re-opens cleartext for those
+    three hosts only. The "play" distribution ships no such config, so cleartext
+    remains blocked there.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:networkSecurityConfig="@xml/network_security_config" />
+</manifest>

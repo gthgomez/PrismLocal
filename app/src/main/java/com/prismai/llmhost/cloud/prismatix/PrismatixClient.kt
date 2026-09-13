@@ -2,6 +2,7 @@ package com.prismai.llmhost.cloud.prismatix
 
 import com.prismai.llmhost.work.DistributionConfig
 import com.prismai.llmhost.work.DistributionConfigProvider
+import com.prismai.llmhost.util.readTextTruncated
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -106,7 +107,7 @@ class HttpPrismatixClient(
             } else {
                 // Non-200 HTTP response
                 val errorStream: InputStream? = connection.errorStream
-                val errorMessage = errorStream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() }
+                val errorMessage = errorStream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readTextTruncated() }
                     ?: "HTTP $responseCode ${connection.responseMessage}"
 
                 val parsedErrorMessage = try {

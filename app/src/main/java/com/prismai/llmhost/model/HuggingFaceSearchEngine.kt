@@ -1,6 +1,7 @@
 package com.prismai.llmhost.model
 
 import com.prismai.llmhost.HuggingFaceModelEntry
+import com.prismai.llmhost.util.readTextBounded
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -42,7 +43,7 @@ object HuggingFaceSearchEngine {
 
         return try {
             if (connection.responseCode !in 200..299) return emptyList()
-            val text = connection.inputStream.bufferedReader().use { it.readText() }
+            val text = connection.inputStream.bufferedReader().use { it.readTextBounded() }
             val array = JSONArray(text)
             val results = mutableListOf<HuggingFaceSearchResult>()
 

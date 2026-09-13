@@ -13,10 +13,35 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import java.nio.ByteBuffer
+import java.util.PriorityQueue
 import java.util.UUID
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.sqrt
+
+/**
+ * Streams [scored] once and retains only the [topK] highest-scoring entries at or
+ * above [minScore], sorted by descending score.
+ *
+ * A bounded min-heap is used so the caller never has to materialize the whole
+ * candidate set; the heap head is the weakest current survivor.
+ */
+internal fun <T> selectTopK(
+    scored: Iterator<Pair<T, Float>>,
+    topK: Int,
+    minScore: Float,
+): List<Pair<T, Float>> {
+    if (topK <= 0) return emptyList()
+    val best = PriorityQueue<Pair<T, Float>>(compareBy { it.second })
+    while (scored.hasNext()) {
+        val candidate = scored.next()
+        if (candidate.second < minScore) continue
+        if (best.size >= topK && candidate.second <= best.peek()!!.second) continue
+        if (best.size >= topK) best.poll()
+        best.add(candidate)
+    }
+    return best.sortedByDescending { it.second }
+}
 
 /**
  * A stored embedding chunk with its text and metadata.
@@ -112,20 +137,61 @@ class VectorStore(context: Context) {
      * Search for the top-K chunks most similar to [queryEmbedding].
      * Returns a list of (chunk, cosineSimilarity) pairs, sorted by descending similarity.
      * Results below [minScore] are filtered out.
+     *
+     * Rows are streamed from the cursor one at a time and only the current best
+     * [topK] chunks are retained, so the full table (text + embedding BLOBs) is
+     * never materialized on the heap.
      */
     fun search(queryEmbedding: FloatArray, topK: Int = 5, minScore: Float = 0.0f): List<Pair<VectorChunk, Float>> {
+        if (topK <= 0 || queryEmbedding.isEmpty()) return emptyList()
         lock.withLock {
-            val all = getAllChunks()
-            if (all.isEmpty() || queryEmbedding.isEmpty()) return emptyList()
-
-            val scored = all.map { chunk ->
-                chunk to cosineSimilarity(queryEmbedding, chunk.embedding)
+            val cursor = dbHelper.readableDatabase.query(
+                TABLE, null, null, null, null, null, "$COL_CREATED ASC"
+            )
+            try {
+                return selectTopK(chunkScoreIterator(cursor, queryEmbedding), topK, minScore)
+            } finally {
+                cursor.close()
             }
-                .filter { it.second >= minScore }
-                .sortedByDescending { it.second }
-                .take(topK)
+        }
+    }
 
-            return scored
+    /**
+     * Lazily yields `(chunk, cosineSimilarity)` for each row of [cursor], decoding
+     * one embedding/chunk at a time. Callers must keep [cursor] open until the
+     * iterator is exhausted.
+     */
+    private fun chunkScoreIterator(
+        cursor: Cursor,
+        queryEmbedding: FloatArray,
+    ): Iterator<Pair<VectorChunk, Float>> {
+        val idIndex = cursor.getColumnIndexOrThrow(COL_ID)
+        val documentIndex = cursor.getColumnIndexOrThrow(COL_DOCUMENT_ID)
+        val chunkIndex = cursor.getColumnIndexOrThrow(COL_CHUNK_INDEX)
+        val textIndex = cursor.getColumnIndexOrThrow(COL_TEXT)
+        val embeddingIndex = cursor.getColumnIndexOrThrow(COL_EMBEDDING)
+        val createdIndex = cursor.getColumnIndexOrThrow(COL_CREATED)
+
+        return object : Iterator<Pair<VectorChunk, Float>> {
+            private var hasNextRow = cursor.moveToFirst()
+
+            override fun hasNext(): Boolean = hasNextRow
+
+            override fun next(): Pair<VectorChunk, Float> {
+                check(hasNextRow) { "No more rows in vector store" }
+                val embedding = bytesToFloatArray(cursor.getBlob(embeddingIndex))
+                val score = cosineSimilarity(queryEmbedding, embedding)
+                val chunk = VectorChunk(
+                    id = cursor.getString(idIndex),
+                    documentId = cursor.getString(documentIndex),
+                    chunkIndex = cursor.getInt(chunkIndex),
+                    text = cursor.getString(textIndex),
+                    embedding = embedding,
+                    createdAt = cursor.getLong(createdIndex),
+                )
+                hasNextRow = cursor.moveToNext()
+                return chunk to score
+            }
         }
     }
 
@@ -171,7 +237,8 @@ class VectorStore(context: Context) {
     }
 
     /**
-     * Return every stored chunk (used internally by search, also exposed for debugging).
+     * Return every stored chunk. Materializes the whole table, so prefer targeted
+     * queries; retained for callers that genuinely need the full set.
      */
     fun getAllChunks(): List<VectorChunk> {
         lock.withLock {

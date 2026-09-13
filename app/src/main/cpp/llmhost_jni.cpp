@@ -70,9 +70,6 @@ bool drainResultFieldsReady() {
 void ensureDrainResultCache(JNIEnv* env) {
     std::call_once(g_drain_result_cache_flag, [env]() {
         jclass local_class = env->FindClass("com/prismai/llmhost/bridge/NativeDrainResult");
-        if (local_class == nullptr) {
-            local_class = env->FindClass("com/prismai/llmhost/NativeDrainResult");
-        }
         if (local_class != nullptr) {
             g_drain_result_class = static_cast<jclass>(env->NewGlobalRef(local_class));
             g_tokens_buffer_field = env->GetFieldID(g_drain_result_class, "tokensBuffer", "[I");

@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicInteger
@@ -214,11 +215,13 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
      * Returns empty FloatArray on failure (no model loaded, encode error, etc.).
      * Thread-safe via modelMutex.
      */
-    suspend fun encode(text: String): FloatArray = modelMutex.withLock {
-        if (isDestroyed) return@withLock floatArrayOf()
-        val h = nativeHandle
-        if (h == 0L) return@withLock floatArrayOf()
-        nativeEncode(h, text)
+    suspend fun encode(text: String): FloatArray = withContext(Dispatchers.Default) {
+        modelMutex.withLock {
+            if (isDestroyed) return@withLock floatArrayOf()
+            val h = nativeHandle
+            if (h == 0L) return@withLock floatArrayOf()
+            nativeEncode(h, text)
+        }
     }
 
     suspend fun applyLoraAdapters(adapters: List<Pair<String, Float>>): Boolean = modelMutex.withLock {

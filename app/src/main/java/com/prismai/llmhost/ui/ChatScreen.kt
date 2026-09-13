@@ -20,6 +20,7 @@ import com.prismai.llmhost.ui.controlplane.*
 import com.prismai.llmhost.ui.rag.*
 import com.prismai.llmhost.ui.voice.*
 import android.widget.Toast
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -726,7 +727,7 @@ fun ChatScreen(
                                 DocumentBrowser(
                                     chunks = vectorChunks,
                                     onIngestDocument = { id, title, text ->
-                                        scope.launch { service?.ingestDocument(id, title, text) }
+                                        scope.launch(Dispatchers.IO) { service?.ingestDocument(id, title, text) }
                                     },
                                     onDeleteDocument = { id -> service?.deleteDocument(id) },
                                     onQueryVectorStore = { query ->

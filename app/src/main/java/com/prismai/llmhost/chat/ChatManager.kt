@@ -379,7 +379,10 @@ class ChatManager(
                 }
             }
         }
-        touchCurrentChat(uiState._transcript.value, updateTitle = false)
+        // Intentionally does NOT touch/persist the chat index here. Streaming
+        // calls this on a ~75 ms cadence; rewriting chat_index.json and
+        // re-sorting every session per token is wasteful. The index is
+        // persisted on append/rename/delete instead.
     }
 
     // ── Persist transcript to disk (thread-safe under ioMutex) ─────────────

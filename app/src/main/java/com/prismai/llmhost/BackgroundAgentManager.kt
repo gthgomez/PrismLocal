@@ -95,6 +95,7 @@ class BackgroundAgentManager(
     private var activeTaskJob: Job? = null
     private var deviceBusyRetryJob: Job? = null
     @Volatile private var cancelInFlight = false
+    @Volatile private var shutdownStarted = false
 
     private fun logD(tag: String, msg: String) { runCatching { Log.d(tag, msg) } }
     private fun logE(tag: String, msg: String, tr: Throwable? = null) { runCatching { Log.e(tag, msg, tr) } }
@@ -129,7 +130,7 @@ class BackgroundAgentManager(
         val queued: BackgroundTask = synchronized(stateLock) {
             val current = _state.value
             if (current.queuedTasks.size >= MAX_QUEUED_TASKS) {
-                logW(TAG, "Task queue full, rejecting prompt: ${prompt.take(80)}")
+                logW(TAG, "Task queue full, rejecting prompt (len=${prompt.length})")
                 return null
             }
             val id = "bg_task_${taskIdCounter.incrementAndGet()}"
@@ -138,7 +139,7 @@ class BackgroundAgentManager(
             task
         }
 
-        logD(TAG, "Enqueued task ${queued.id}: ${prompt.take(80)}")
+        if (BuildConfig.DEBUG) logD(TAG, "Enqueued task ${queued.id}: ${prompt.take(80)}")
         processNextTask()
         return queued
     }
@@ -289,37 +290,46 @@ class BackgroundAgentManager(
         cancelInFlight = true
         bgScope.launch {
             try {
-                val job = synchronized(stateLock) { activeTaskJob }
-                job?.cancelAndJoin()
-                val retryJob = synchronized(stateLock) { deviceBusyRetryJob }
-                retryJob?.cancel()
-                synchronized(stateLock) {
-                    activeTaskJob = null
-                    if (deviceBusyRetryJob === retryJob) {
-                        deviceBusyRetryJob = null
-                    }
-                }
-                runCatching { cancelNativeGeneration?.invoke() }
-                synchronized(stateLock) {
-                    val latest = _state.value
-                    val dropped = latest.activeTask
-                    _state.value = latest.copy(
-                        isBackgroundMode = false,
-                        activeTask = null,
-                        completedTasks = if (dropped != null) {
-                            latest.completedTasks + dropped.copy(status = BackgroundTaskStatus.CANCELLED)
-                        } else {
-                            latest.completedTasks
-                        },
-                    )
-                }
-                releaseWakeLockSafely()
-                cancelProgressNotification()
-                logD(TAG, "Background mode stopped, wake lock released")
+                performStopCleanup()
             } finally {
                 cancelInFlight = false
             }
         }
+    }
+
+    /**
+     * Cancel in-flight work, drop the active task, release the wake lock and
+     * clear the progress notification. Must run on [bgScope]; never blocks the
+     * caller.
+     */
+    private suspend fun performStopCleanup() {
+        val job = synchronized(stateLock) { activeTaskJob }
+        job?.cancelAndJoin()
+        val retryJob = synchronized(stateLock) { deviceBusyRetryJob }
+        retryJob?.cancel()
+        synchronized(stateLock) {
+            activeTaskJob = null
+            if (deviceBusyRetryJob === retryJob) {
+                deviceBusyRetryJob = null
+            }
+        }
+        runCatching { cancelNativeGeneration?.invoke() }
+        synchronized(stateLock) {
+            val latest = _state.value
+            val dropped = latest.activeTask
+            _state.value = latest.copy(
+                isBackgroundMode = false,
+                activeTask = null,
+                completedTasks = if (dropped != null) {
+                    latest.completedTasks + dropped.copy(status = BackgroundTaskStatus.CANCELLED)
+                } else {
+                    latest.completedTasks
+                },
+            )
+        }
+        releaseWakeLockSafely()
+        cancelProgressNotification()
+        logD(TAG, "Background mode stopped, wake lock released")
     }
 
     /** Cancel a queued or running task */
@@ -392,7 +402,7 @@ class BackgroundAgentManager(
             done
         }
         notifyTaskComplete(completed)
-        logD(TAG, "Task ${completed.id} completed: ${summary.take(80)}")
+        if (BuildConfig.DEBUG) logD(TAG, "Task ${completed.id} completed: ${summary.take(80)}")
     }
 
     /** Mark the active task as failed */
@@ -411,7 +421,7 @@ class BackgroundAgentManager(
             done
         }
         notifyTaskComplete(failed)
-        logD(TAG, "Task ${failed.id} failed: ${error.take(80)}")
+        if (BuildConfig.DEBUG) logD(TAG, "Task ${failed.id} failed: ${error.take(80)}")
     }
 
     /** Check battery/thermal budget. Returns false if resources are too constrained. */
@@ -469,10 +479,31 @@ class BackgroundAgentManager(
         }
     }
 
-    /** Release resources */
+    /** Release resources. Safe to call more than once and when never started. */
     fun shutdown() {
-        stopBackgroundMode()
-        bgScope.cancel()
+        synchronized(stateLock) {
+            if (shutdownStarted) return
+            shutdownStarted = true
+        }
+        val wasActive = synchronized(stateLock) { _state.value.isBackgroundMode }
+        if (wasActive) {
+            // Run the real cleanup on bgScope and tear the scope down only after
+            // it completes, so the in-flight task, native cancellation and wake
+            // lock release are not aborted. Never blocks the calling thread.
+            cancelInFlight = true
+            bgScope.launch {
+                try {
+                    performStopCleanup()
+                } finally {
+                    bgScope.cancel()
+                }
+            }
+        } else {
+            // Nothing running: release any residual resources and tear down.
+            releaseWakeLockSafely()
+            cancelProgressNotification()
+            bgScope.cancel()
+        }
     }
 
     private fun releaseWakeLockSafely() {

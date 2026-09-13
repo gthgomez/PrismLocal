@@ -1,5 +1,6 @@
 package com.prismai.llmhost.cloud.auth
 
+import java.security.Key
 import java.security.KeyStore
 import java.security.SecureRandom
 import javax.crypto.Cipher
@@ -103,6 +104,17 @@ class AndroidKeystoreKeyProvider(
         val setKeySize = specClass.getMethod("setKeySize", Int::class.java)
         setKeySize.invoke(builder, 256)
 
+        // Caller-provided IVs (GCMParameterSpec in KeystoreCrypto) require randomized
+        // encryption to be disabled. AndroidKeyStore defaults this to true, which would
+        // otherwise reject the explicit IV at cipher init time.
+        try {
+            val setRandomizedEncryptionRequired =
+                specClass.getMethod("setRandomizedEncryptionRequired", Boolean::class.java)
+            setRandomizedEncryptionRequired.invoke(builder, false)
+        } catch (_: NoSuchMethodException) {
+            // API level without randomized-encryption control; caller IVs may be rejected.
+        }
+
         val buildMethod = specClass.getMethod("build")
         val spec = buildMethod.invoke(builder)
 
@@ -130,7 +142,7 @@ class AndroidKeystoreKeyProvider(
             val keyInfoClass = Class.forName("android.security.keystore.KeyInfo")
             val getInstanceMethod = factoryClass.getMethod("getInstance", String::class.java, String::class.java)
             val factory = getInstanceMethod.invoke(null, secretKey.algorithm, ANDROID_KEY_STORE)
-            val getKeySpecMethod = factoryClass.getMethod("getKeySpec", SecretKey::class.java, Class::class.java)
+            val getKeySpecMethod = factoryClass.getMethod("getKeySpec", Key::class.java, Class::class.java)
             val keyInfo = getKeySpecMethod.invoke(factory, secretKey, keyInfoClass)
             val getSecurityLevelMethod = keyInfoClass.getMethod("getSecurityLevel")
             val level = getSecurityLevelMethod.invoke(keyInfo) as Int

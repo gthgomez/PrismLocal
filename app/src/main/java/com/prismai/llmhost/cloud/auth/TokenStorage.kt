@@ -60,7 +60,7 @@ class EncryptedTokenStorage(
         prefs.edit()
             .putString(KEY_IV_B64, ivB64)
             .putString(KEY_CIPHERTEXT_B64, ciphertextB64)
-            .apply()
+            .commit()
     }
 
     override fun loadSession(): SupabaseAuthSession? {
@@ -85,6 +85,6 @@ class EncryptedTokenStorage(
         prefs.edit()
             .remove(KEY_IV_B64)
             .remove(KEY_CIPHERTEXT_B64)
-            .apply()
+            .commit()
     }
 }

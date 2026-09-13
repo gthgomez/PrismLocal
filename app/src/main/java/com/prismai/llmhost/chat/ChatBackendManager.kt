@@ -56,7 +56,14 @@ class ChatBackendManager(
             return current.accessToken
         }
 
-        val refreshToken = current.refreshToken ?: return null
+        val refreshToken = current.refreshToken
+        if (refreshToken.isNullOrBlank()) {
+            // Unrecoverable expiry: no refresh token to renew with. Purge the
+            // session and drop back to local so Cloud is not left selected
+            // without a usable token.
+            signOut()
+            return null
+        }
         val refreshResult = authClient.refreshSession(refreshToken)
         if (refreshResult.isSuccess) {
             val newSession = refreshResult.getOrThrow()

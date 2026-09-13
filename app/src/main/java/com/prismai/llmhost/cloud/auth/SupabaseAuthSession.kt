@@ -42,8 +42,11 @@ data class SupabaseAuthSession(
             }
         }
 
-        fun fromAuthResponse(jsonObj: JSONObject): SupabaseAuthSession {
-            val accessToken = jsonObj.getString("access_token")
+        fun fromAuthResponse(jsonObj: JSONObject): SupabaseAuthOutcome {
+            val accessToken = jsonObj.optString("access_token").takeIf { it.isNotBlank() }
+                ?: return SupabaseAuthOutcome.ConfirmationRequired(
+                    jsonObj.optJSONObject("user")?.optString("email"),
+                )
             val refreshToken = jsonObj.optString("refresh_token").takeIf { it.isNotBlank() }
             val expiresInSeconds = jsonObj.optLong("expires_in", 3600L)
             val expiresAt = System.currentTimeMillis() + (expiresInSeconds * 1000L)
@@ -51,13 +54,27 @@ data class SupabaseAuthSession(
             val userId = userObj?.optString("id") ?: "unknown-user"
             val email = userObj?.optString("email")
 
-            return SupabaseAuthSession(
-                accessToken = accessToken,
-                refreshToken = refreshToken,
-                expiresAtEpochMs = expiresAt,
-                userId = userId,
-                email = email,
+            return SupabaseAuthOutcome.SessionCreated(
+                SupabaseAuthSession(
+                    accessToken = accessToken,
+                    refreshToken = refreshToken,
+                    expiresAtEpochMs = expiresAt,
+                    userId = userId,
+                    email = email,
+                )
             )
         }
     }
+}
+
+/**
+ * Outcome of parsing a Supabase auth response.
+ *
+ * Supabase returns a user without a session when email confirmation is enabled,
+ * so a created-but-unconfirmed account must be distinguished from a session.
+ */
+sealed class SupabaseAuthOutcome {
+    data class SessionCreated(val session: SupabaseAuthSession) : SupabaseAuthOutcome()
+
+    data class ConfirmationRequired(val email: String?) : SupabaseAuthOutcome()
 }

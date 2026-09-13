@@ -346,8 +346,8 @@ object AgentToolRegistry {
         ),
         AgentToolDefinition(
             name = "web_search",
-            description = "Search the web using a fixed DuckDuckGo endpoint. Returns titles, snippets, and source URLs. No API key needed. All results are untrusted open-web data.",
-            risk = AgentToolRisk.SAFE,
+            description = "Search the web using a fixed DuckDuckGo endpoint. Returns titles, snippets, and source URLs. No API key needed. Requires user confirmation because the query leaves the device. All results are untrusted open-web data.",
+            risk = AgentToolRisk.CONFIRM,
             argumentSchema = """{"query":"search terms","max_results":5}""",
             requiredArguments = setOf("query"),
             intRanges = mapOf("max_results" to AgentToolIntRange(1, 10)),
@@ -749,6 +749,10 @@ object AgentToolRegistry {
      * Replaces restrictedReason() — capabilities are statically assigned, not parsed from model reason.
      */
     private fun capabilityCheck(call: AgentToolCall): String? {
+        // Unknown names fall through to find() below so they surface as UNKNOWN_TOOL.
+        // Registered tools must pass the capability policy, which fails closed for
+        // any tool name that has no explicit mapping.
+        if (find(call.name) == null) return null
         val check = ToolCapabilityMapping.check(call.name, CapabilityRegistryHolder.registry)
         return if (!check.granted) check.reason else null
     }

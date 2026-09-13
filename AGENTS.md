@@ -4,7 +4,7 @@
 
 ## Gemini-Specific Risks
 - Hallucinated JNI method signatures — name mangling must match C++ function names exactly
-- Incorrect CMakeLists.txt NDK configuration — ABI targets, C++17 standard, include paths
+- Incorrect CMakeLists.txt NDK configuration — ABI targets, C++20 standard, include paths
 - Confusion between Kotlin coroutine cancellation and native thread safety — native state needs mutex guards
 - Hallucinated llama.cpp API bindings — verify against the vendored llama.cpp headers
 

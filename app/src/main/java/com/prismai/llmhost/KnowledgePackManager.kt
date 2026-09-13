@@ -226,7 +226,7 @@ class KnowledgePackManager(
                 )
 
                 totalIndexed += chunkCount
-                Log.d(TAG, "downloadPack slug=$slug title=\"${article.title}\" chunks=$chunkCount")
+                Log.d(TAG, "downloadPack slug=$slug chunks=$chunkCount")
             }
 
             if (result.isFailure) {
@@ -270,7 +270,9 @@ class KnowledgePackManager(
 
         // Filter to only Grokipedia-sourced chunks
         val filtered = results.filter { it.first.documentId.startsWith("$GROKIPEDIA_DOC_ID_PREFIX:") }
-        Log.d(TAG, "search query=\"${query.take(60)}\" total=${results.size} filtered=${filtered.size}")
+        if (BuildConfig.DEBUG) {
+            Log.d(TAG, "search query=\"${query.take(60)}\" total=${results.size} filtered=${filtered.size}")
+        }
         return@withContext filtered
     }
 
@@ -297,7 +299,7 @@ class KnowledgePackManager(
                 title = article.title,
                 text = content,
             )
-            Log.i(TAG, "fetchAndIndex slug=$slug title=\"${article.title}\" chunks=$chunkCount")
+            Log.i(TAG, "fetchAndIndex slug=$slug chunks=$chunkCount")
             chunkCount
         }
 

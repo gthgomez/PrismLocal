@@ -327,6 +327,8 @@ class AgentToolRouter(
             "list_workspace_files",
             "read_workspace_file",
             "search_workspace_files",
+            // Network egress (confirmation-gated; results feed the model)
+            "web_search",
             // Phase 7a Background
             "run_in_background",
             "check_background_tasks" -> true

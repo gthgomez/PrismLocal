@@ -23,17 +23,37 @@ class RagTools(
         if (documentId.isBlank() || text.isBlank()) {
             return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "document_id and text are required")
         }
-        val chunkCount = try {
-            ragManager.ingestDocument(documentId, title, text)
+        val result = try {
+            ragManager.ingestDocumentWithResult(documentId, title, text)
         } catch (e: Exception) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "Ingestion failed: ${(e.message ?: e::class.java.simpleName).compactForAgent(160)}")
         }
-        if (chunkCount == 0) {
-            return toolFailure(call, AgentToolErrorCode.FAILED, "No chunks produced from document")
+        if (result.storedCount == 0) {
+            val reason = if (result.failedCount > 0) {
+                "No chunks could be embedded (${result.failedCount} failed)"
+            } else {
+                "No chunks produced from document"
+            }
+            return toolFailure(call, AgentToolErrorCode.FAILED, reason,
+                if (result.failedCount > 0) {
+                    JSONObject().put("stored", false).put("failed_count", result.failedCount).put("document_id", documentId)
+                } else {
+                    JSONObject()
+                })
         }
-        return toolSuccess(call, "Ingested $chunkCount chunks from '$title'",
-            JSONObject().put("stored", true).put("chunk_count", chunkCount).put("document_id", documentId))
+        if (result.partial) {
+            return toolFailure(call, AgentToolErrorCode.FAILED,
+                "Ingested ${result.storedCount} of ${result.totalChunks} chunks from '$title' (${result.failedCount} failed)",
+                JSONObject()
+                    .put("stored", true)
+                    .put("partial", true)
+                    .put("chunk_count", result.storedCount)
+                    .put("failed_count", result.failedCount)
+                    .put("document_id", documentId))
+        }
+        return toolSuccess(call, "Ingested ${result.storedCount} chunks from '$title'",
+            JSONObject().put("stored", true).put("chunk_count", result.storedCount).put("document_id", documentId))
     }
 
     suspend fun searchDocuments(call: AgentToolCall): AgentToolResult {

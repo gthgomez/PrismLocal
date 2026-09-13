@@ -13,6 +13,16 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
 
+/**
+ * Raised when Supabase creates a user but returns no session because the account
+ * must confirm its email address before it can sign in.
+ */
+class EmailConfirmationRequiredException(email: String?) : Exception(
+    "Email confirmation required" +
+        (email?.takeIf { it.isNotBlank() }?.let { " for $it" } ?: "") +
+        ": confirm your email before signing in",
+)
+
 interface SupabaseAuthClient {
     suspend fun signInWithPassword(email: String, password: String): Result<SupabaseAuthSession>
     suspend fun signUpWithPassword(email: String, password: String): Result<SupabaseAuthSession>
@@ -88,6 +98,9 @@ class HttpSupabaseAuthClient(
             connection.doOutput = true
             connection.doInput = true
             connection.useCaches = false
+            // Auth requests carry credentials/tokens; never follow redirects that
+            // could exfiltrate them to an unvalidated host. 3xx is treated as an error.
+            connection.instanceFollowRedirects = false
             connection.connectTimeout = 15_000
             connection.readTimeout = 30_000
 
@@ -105,8 +118,11 @@ class HttpSupabaseAuthClient(
             if (code in 200..299) {
                 val responseText = connection.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
                 val json = JSONObject(responseText)
-                val session = SupabaseAuthSession.fromAuthResponse(json)
-                return Result.success(session)
+                return when (val outcome = SupabaseAuthSession.fromAuthResponse(json)) {
+                    is SupabaseAuthOutcome.SessionCreated -> Result.success(outcome.session)
+                    is SupabaseAuthOutcome.ConfirmationRequired ->
+                        Result.failure(EmailConfirmationRequiredException(outcome.email))
+                }
             } else {
                 val errorText = connection.errorStream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() }
                     ?: "HTTP $code ${connection.responseMessage}"

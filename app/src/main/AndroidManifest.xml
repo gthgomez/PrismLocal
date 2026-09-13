@@ -44,10 +44,6 @@
                 android:value="Local LLM Token Generation &amp; Offline RAG Vectorization" />
         </service>
         <service
-            android:name=".service.ModelDownloadService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
-        <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"
             tools:node="merge" />

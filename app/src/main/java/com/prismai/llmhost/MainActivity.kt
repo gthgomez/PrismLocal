@@ -7,18 +7,23 @@ import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -35,16 +40,25 @@ class MainActivity : ComponentActivity() {
     private var keepServiceBoundForPicker = false
     private var uiMessageJob: Job? = null
 
+    // Result is intentionally ignored: denial is non-fatal, notifications are
+    // simply dropped until the user grants the permission.
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val boundService = (binder as InferenceService.LocalBinder).getService()
             service = boundService
             uiMessage = boundService.uiMessage.value
-            Log.d(TAG, "service connected uiMessage=$uiMessage")
+            if (BuildConfig.DEBUG) {
+                Log.d(TAG, "service connected uiMessage=$uiMessage")
+            }
             uiMessageJob?.cancel()
             uiMessageJob = lifecycleScope.launch {
                 boundService.uiMessage.collect { message ->
-                    Log.d(TAG, "uiMessage collected=$message")
+                    if (BuildConfig.DEBUG) {
+                        Log.d(TAG, "uiMessage collected=$message")
+                    }
                     uiMessage = message
                 }
             }
@@ -84,6 +98,17 @@ class MainActivity : ComponentActivity() {
                 }
             )
         }
+        requestNotificationPermissionIfNeeded()
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+        ) return
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
     override fun onStart() {

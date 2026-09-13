@@ -200,13 +200,14 @@ class ModelTools(
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Model delete requires confirmation")
         val modelId = call.arguments.optString("model_id").trim()
         if (modelId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Missing model_id parameter")
-        val activeModel = withContext(Dispatchers.IO) { modelStorageManager.activeModelInfo(modelId) }
-            ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "Model not found: $modelId")
+        val installedModel = withContext(Dispatchers.IO) {
+            modelStorageManager.listInstalledModelInfos().firstOrNull { it.id == modelId }
+        } ?: return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Unknown installed model_id: $modelId")
         val deleted = modelManager.deleteModel(modelId)
         return if (deleted) {
             onRefreshReadiness()
             toolSuccess(call, "Deleted model $modelId",
-                JSONObject().put("model_id", modelId).put("bytes_freed", activeModel.bytes))
+                JSONObject().put("model_id", modelId).put("bytes_freed", installedModel.bytes))
         } else {
             toolFailure(call, AgentToolErrorCode.FAILED, "Failed to delete model $modelId")
         }

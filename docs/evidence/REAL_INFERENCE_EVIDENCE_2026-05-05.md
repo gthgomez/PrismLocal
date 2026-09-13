@@ -4,7 +4,7 @@
 
 Status: GREEN
 
-`C:\Workspace\artifacts\llm-host-apk-20260505` now builds and runs a real `llama.cpp`-backed local GGUF one-token smoke path. The final connected Android instrumentation run passed 8/8 tests on `TD_Pixel8_API36(AVD) - 16`.
+`<workspace>\artifacts\llm-host-apk-20260505` now builds and runs a real `llama.cpp`-backed local GGUF one-token smoke path. The final connected Android instrumentation run passed 8/8 tests on `TD_Pixel8_API36(AVD) - 16`.
 
 ## Implementation Evidence
 
@@ -42,13 +42,13 @@ Instrumentation uses the same model bytes under the isolated id `tinystories-1m-
 ## Build And Device Verification
 
 ```text
-C:\Workspace\Project_Android\gradlew.bat -p C:\Workspace\artifacts\llm-host-apk-20260505 assembleDebug assembleDebugAndroidTest assembleRelease
+<workspace>\Project_Android\gradlew.bat -p <workspace>\artifacts\llm-host-apk-20260505 assembleDebug assembleDebugAndroidTest assembleRelease
 BUILD SUCCESSFUL in 4s
 128 actionable tasks: 13 executed, 115 up-to-date
 ```
 
 ```text
-C:\Workspace\Project_Android\gradlew.bat -p C:\Workspace\artifacts\llm-host-apk-20260505 connectedDebugAndroidTest
+<workspace>\Project_Android\gradlew.bat -p <workspace>\artifacts\llm-host-apk-20260505 connectedDebugAndroidTest
 Starting 8 tests on TD_Pixel8_API36(AVD) - 16
 Finished 8 tests on TD_Pixel8_API36(AVD) - 16
 BUILD SUCCESSFUL in 48s

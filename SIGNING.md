@@ -14,11 +14,11 @@ properties or environment variables are set:
 Example local invocation:
 
 ```powershell
-$env:LLMHOST_RELEASE_STORE_FILE='C:\path\to\release.jks'
+$env:LLMHOST_RELEASE_STORE_FILE='<keystore-dir>\release.jks'
 $env:LLMHOST_RELEASE_STORE_PASSWORD='...'
 $env:LLMHOST_RELEASE_KEY_ALIAS='llmhost'
 $env:LLMHOST_RELEASE_KEY_PASSWORD='...'
-cd C:\Workspace\Project_Android\PrismLocal
+cd <workspace>\Project_Android\PrismLocal
 .\gradlew.bat --no-daemon assembleRelease
 ```
 

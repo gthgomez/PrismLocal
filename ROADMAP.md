@@ -90,7 +90,7 @@ Syntax highlighting + copy button for code blocks. Tables render as actual table
 **Completed**: Phase 7 markdown visual components using Compose.
 
 ### 12. Modularize UI Monolith 🟢 COMPLETED
-Split the 4,194-line [ChatScreen.kt](file:///C:/Workspace/Project_Android/PrismLocal/app/src/main/java/com/example/llmhost/ChatScreen.kt) screen file into focused composable classes.
+Split the 4,194-line [ChatScreen.kt](app/src/main/java/com/prismai/llmhost/ui/ChatScreen.kt) screen file into focused composable classes.
 **Completed**: Reduced ChatScreen.kt to 691 lines (-83.5% reduction) across 11 subpackages under `ui/`.
 
 ---

@@ -2,7 +2,7 @@
 
 ## Objective
 
-Move `C:\Workspace\artifacts\llm-host-apk-20260505` from a debug JNI lifecycle harness to a real local GGUF inference APK.
+Move `<workspace>\artifacts\llm-host-apk-20260505` from a debug JNI lifecycle harness to a real local GGUF inference APK.
 
 The project is **GREEN only when every required gate below has direct evidence**. Any `FAIL`, `NOT RUN`, missing asset, mock-only path, or inferred claim keeps the status **RED** or **YELLOW**.
 

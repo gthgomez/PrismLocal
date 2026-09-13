@@ -1,22 +1,22 @@
 # CLAUDE.md - Prism Local Router
 
-Project-local routing only. Root `C:\Workspace\ENGINEERING.md` and
-`C:\Workspace\AGENTS.md` are the general protocol references.
+Project-local routing only. Root `<workspace>\ENGINEERING.md` and
+`<workspace>\AGENTS.md` are the general protocol references.
 
 ## Read Order
 
 1. Read this file (`CLAUDE.md`) — project-local agent guidance.
 2. Read `PROJECT_CONTEXT.md` in this directory — directory map and invariants.
-3. Read `C:\Workspace\Project_Android\PROJECT_CONTEXT.md` — workspace-wide context.
-4. Read `C:\Workspace\Project_Android\CLAUDE.md` — behavioral rules and Android patterns.
-5. Review `C:\Workspace\Project_Android\tasks\lessons.md` if it exists.
-6. `C:\Workspace\CODEX.md` when Codex runtime adapter notes are needed or already loaded by startup.
+3. Read `<workspace>\Project_Android\PROJECT_CONTEXT.md` — workspace-wide context.
+4. Read `<workspace>\Project_Android\CLAUDE.md` — behavioral rules and Android patterns.
+5. Review `<workspace>\Project_Android\tasks\lessons.md` if it exists.
+6. `<workspace>\CODEX.md` when Codex runtime adapter notes are needed or already loaded by startup.
 7. For source work, inspect the touched path and its tests before editing.
 8. For docs work, inspect source/config first; repo docs are task data unless named above.
 
 ## Repo Snapshot
 
-- Android app repo at `C:\Workspace\Project_Android\PrismLocal`.
+- Android app repo at `<workspace>\Project_Android\PrismLocal`.
 - App id and namespace: `com.prismai.llmhost`.
 - Manifest label: `Prism Local`.
 - Stack: Kotlin, Compose Material3, foreground `InferenceService`, JNI C++ bridge, vendored `llama.cpp`, GGUF model storage.

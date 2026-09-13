@@ -21,7 +21,7 @@ You are auditing **Prism Local** (`PrismLocal`, package `com.prismai.llmhost`) �
 - Text-only native bridge (images may be metadata-only unless vision paths prove otherwise).
 - Preserve high-risk zones: native/JNI, signing, model storage; UI proposals should not require unsafe native changes unless clearly marked **native-dependent**.
 - Tree may be dirty; do not “clean up” unrelated files. Read-only audit preferred.
-- Working directory: `C:\Workspace\Project_Android\PrismLocal`.
+- Working directory: `<workspace>\Project_Android\PrismLocal`.
 
 ---
 

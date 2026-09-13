@@ -49,7 +49,7 @@ The app features a complete C++/NDK JNI bridge to `llama.cpp`. Native memory lim
 
 ## Evidence Sources
 
-- [README.md](file:///C:/Workspace/Project_Android/PrismLocal/README.md)
-- [QA_CHECKLIST.md](file:///C:/Workspace/Project_Android/PrismLocal/QA_CHECKLIST.md)
-- [ROADMAP.md](file:///C:/Workspace/Project_Android/PrismLocal/ROADMAP.md)
-- [FINDINGS_REPORT_2026-07-31.md](file:///C:/Workspace/Project_Android/PrismLocal/FINDINGS_REPORT_2026-07-31.md)
+- [README.md](./README.md)
+- [QA_CHECKLIST.md](./QA_CHECKLIST.md)
+- [ROADMAP.md](./ROADMAP.md)
+- [FINDINGS_REPORT_2026-07-31.md](./FINDINGS_REPORT_2026-07-31.md)

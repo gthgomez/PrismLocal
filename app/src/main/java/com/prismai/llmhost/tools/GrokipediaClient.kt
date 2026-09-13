@@ -6,6 +6,7 @@ import com.prismai.llmhost.storage.*
 import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
+import com.prismai.llmhost.BuildConfig
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
@@ -84,7 +85,9 @@ class GrokipediaClient(
                 val html = fetchUrl(url)
 
                 val results = parseSearchResults(html, safeMax)
-                Log.i(TAG, "search query=\"$query\" results=${results.size}")
+                if (BuildConfig.DEBUG) {
+                    Log.i(TAG, "search query=\"$query\" results=${results.size}")
+                }
                 results
             }.getOrDefault(emptyList())
         }
@@ -110,7 +113,7 @@ class GrokipediaClient(
             val html = fetchUrl(url)
 
             val article = parseArticle(safeSlug, html)
-            Log.i(TAG, "fetchArticle slug=$safeSlug title=\"${article.title}\" contentLen=${article.content.length}")
+            Log.i(TAG, "fetchArticle slug=$safeSlug contentLen=${article.content.length}")
             article
         }.getOrNull()
     }

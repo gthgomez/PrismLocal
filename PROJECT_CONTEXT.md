@@ -32,11 +32,11 @@ that AGP 9.x owns this path and double-declaration can break the build.
 - `ChatScreen.kt` is the central Compose UI. It collects service `StateFlow`s for
   model state, chat sessions, transcripts, runtime settings, downloads,
   benchmarks, device capability, and pending agent-tool confirmations.
-- `InferenceService.kt` is a thin coordinator/foreground service manager (reduced from 5,391 to 1,044 lines). It initializes and binds the modular subsystems:
-  - `com.example.llmhost.generation.GenerationOrchestrator` — Coordinates generation flows, token collection, and metrics.
-  - `com.example.llmhost.chat.ChatManager` — Governs transcript files, chat CRUD, and full-text search indexing.
-  - `com.example.llmhost.model.ModelManager` / `ModelStorageManager` — Oversees GGUF loading, profiling, and memory assessment.
-  - `com.example.llmhost.agent.AgentToolRouter` — Dispatches execution of the 11 modular agent tools.
+- `InferenceService.kt` is a thin coordinator/foreground service manager (reduced from 5,391 to 1,345 lines). It initializes and binds the modular subsystems:
+  - `com.prismai.llmhost.generation.GenerationOrchestrator` — Coordinates generation flows, token collection, and metrics.
+  - `com.prismai.llmhost.chat.ChatManager` — Governs transcript files, chat CRUD, and full-text search indexing.
+  - `com.prismai.llmhost.model.ModelManager` / `ModelStorageManager` — Oversees GGUF loading, profiling, and memory assessment.
+  - `com.prismai.llmhost.agent.AgentToolRouter` — Dispatches execution of the 11 modular agent tools.
 - `NativeLlmBridge.kt` loads `libllmhost`, serializes JNI calls with a mutex, and
   exposes streaming generation as `Flow<GenerationChunk>` using a pre-allocated carrier buffer.
 - `app/src/main/cpp/CMakeLists.txt` builds `libllmhost.so` from
@@ -64,8 +64,8 @@ that AGP 9.x owns this path and double-declaration can break the build.
 - `MarkdownText.kt`, `StreamingTextState.kt`, and `Utf8TextPipeline.kt` handle
   display markdown, throttled stream text, and native UTF-8 cleanup.
 
-`app/src/main/cpp/llm_host.cpp` still exists but is not included by the current
-CMake source list. Treat it as inactive unless CMake is changed.
+`app/src/main/cpp/llm_host.cpp` no longer exists in the tree; the active CMake
+sources are `llmhost_jni.cpp` and `Engine.cpp`.
 
 ## Data And Storage
 
@@ -124,11 +124,11 @@ Packaging/release checks, when relevant:
 
 ## Tests And Evidence
 
-Unit tests under `app/src/test/java/com/example/llmhost` cover agent-tool
+Unit tests under `app/src/test/java/com/prismai/llmhost` cover agent-tool
 registry validation, attachment extraction, UI text helpers, markdown cleanup,
 and UTF-8 normalization.
 
-Instrumentation tests under `app/src/androidTest/java/com/example/llmhost`
+Instrumentation tests under `app/src/androidTest/java/com/prismai/llmhost`
 cover native engine stress paths, model storage import/resolve/failure cleanup,
 real tiny-model smoke generation and cancellation, service model switching,
 foreground generation cancellation, transcript persistence, runtime settings

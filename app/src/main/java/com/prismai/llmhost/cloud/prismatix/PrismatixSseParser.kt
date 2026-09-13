@@ -19,8 +19,12 @@ object PrismatixSseParser {
      * - `[DONE]` frame emits [PrismatixStreamEvent.Done] and closes the stream.
      * - Malformed JSON data frames MUST emit [PrismatixStreamEvent.Error] and abort,
      *   preventing silent truncation or corrupted message persistence.
+     *
+     * Declared `inline` so a caller already inside a suspending context (for example a
+     * `Flow` builder) may perform suspending work in [onEvent] while events are still
+     * emitted incrementally as each frame is read. Non-suspending callers are unaffected.
      */
-    fun parseStream(
+    inline fun parseStream(
         inputStream: InputStream,
         onEvent: (PrismatixStreamEvent) -> Unit,
     ) {

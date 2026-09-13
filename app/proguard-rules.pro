@@ -39,11 +39,6 @@
 -keep class * extends androidx.work.Worker { *; }
 -keep class * extends androidx.work.CoroutineWorker { *; }
 
-# Room entities / DAOs if present under storage.db
--keep class * extends androidx.room.RoomDatabase
--keep @androidx.room.Entity class *
--dontwarn androidx.room.paging.**
-
 # General Android
 -keepattributes Signature
 -keepattributes Exceptions

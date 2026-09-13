@@ -10,6 +10,7 @@ import com.prismai.llmhost.model.*
 import android.content.Context
 import android.net.Uri
 import android.os.StatFs
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.util.Log
 import androidx.annotation.VisibleForTesting
@@ -256,6 +257,13 @@ class ModelStorageManager(private val context: Context) {
 
     fun deleteModel(modelId: String): Boolean {
         val modelRoot = File(modelsDir, modelId)
+        val isSafeModelDir = runCatching {
+            modelRoot.canonicalFile != modelsDir.canonicalFile && isInside(modelsDir, modelRoot)
+        }.getOrDefault(false)
+        if (!isSafeModelDir) {
+            Log.w(TAG, "Refusing to delete model outside models dir modelId=$modelId")
+            return false
+        }
         if (!modelRoot.exists()) return false
         val deleted = runCatching { modelRoot.deleteRecursively() }.getOrDefault(false)
         Log.d(TAG, "deleteModel modelId=$modelId deleted=$deleted")
@@ -525,6 +533,8 @@ class ModelStorageManager(private val context: Context) {
     ) {
         destination.parentFile?.mkdirs()
         var copied = 0L
+        var lastEmittedBytes = 0L
+        var lastProgressAt = 0L
         val total = totalBytes.takeIf { it > 0 }
         val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
         destination.outputStream().use { output ->
@@ -533,7 +543,12 @@ class ModelStorageManager(private val context: Context) {
                 if (read == -1) break
                 output.write(buffer, 0, read)
                 copied += read
-                onProgress(ImportProgress(copied, total))
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastProgressAt > 500L) {
+                    lastProgressAt = now
+                    lastEmittedBytes = copied
+                    onProgress(ImportProgress(copied, total))
+                }
                 if (copied > MAX_MODEL_BYTES) {
                     throw IOException("Model exceeds maximum size $MAX_MODEL_BYTES")
                 }
@@ -541,6 +556,9 @@ class ModelStorageManager(private val context: Context) {
                     throw IOException("Insufficient storage space during import")
                 }
             }
+        }
+        if (copied != lastEmittedBytes) {
+            onProgress(ImportProgress(copied, total))
         }
     }
 

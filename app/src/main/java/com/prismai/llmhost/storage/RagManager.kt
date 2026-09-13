@@ -6,8 +6,11 @@ import com.prismai.llmhost.storage.*
 import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
+import com.prismai.llmhost.BuildConfig
 
 import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 /**
@@ -24,6 +27,25 @@ class RagManager(
     /** Suspending function that returns float embedding for a text string. */
     private val encode: suspend (String) -> FloatArray,
 ) {
+    /**
+     * Outcome of an ingestion. [failedCount] counts chunks that could not be
+     * embedded (e.g. oversized chunks rejected by the native size guard), which
+     * would otherwise be silently dropped.
+     */
+    data class IngestResult(
+        val storedCount: Int,
+        val failedCount: Int,
+    ) {
+        /** True only when at least one chunk stored and none failed. */
+        val success: Boolean get() = storedCount > 0 && failedCount == 0
+
+        /** True when some chunks stored but others failed. */
+        val partial: Boolean get() = storedCount > 0 && failedCount > 0
+
+        /** Total chunks attempted (stored + failed). */
+        val totalChunks: Int get() = storedCount + failedCount
+    }
+
     companion object {
         private const val TAG = "RagManager"
 
@@ -49,50 +71,60 @@ class RagManager(
      * @param text       full document text
      * @return number of chunks stored
      */
-    suspend fun ingestDocument(documentId: String, title: String, text: String): Int {
-        if (text.isBlank()) {
-            Log.w(TAG, "ingestDocument skipped: empty text documentId=$documentId title=$title")
-            return 0
-        }
+    suspend fun ingestDocument(documentId: String, title: String, text: String): Int =
+        ingestDocumentWithResult(documentId, title, text).storedCount
 
-        val chunks = chunker.chunk(text)
-        if (chunks.isEmpty()) {
-            Log.w(TAG, "ingestDocument no chunks produced documentId=$documentId")
-            return 0
-        }
-
-        val vectorChunks = mutableListOf<VectorChunk>()
-        var failedCount = 0
-
-        for (chunk in chunks) {
-            val embedding = runCatching {
-                encode(chunk.text)
-            }.getOrNull()
-
-            if (embedding == null || embedding.isEmpty()) {
-                failedCount++
-                continue
+    /**
+     * Ingest a document and report both stored and failed chunk counts.
+     *
+     * Chunks whose embedding is empty (e.g. rejected by the native size guard)
+     * are counted in [IngestResult.failedCount] instead of being silently dropped.
+     */
+    suspend fun ingestDocumentWithResult(documentId: String, title: String, text: String): IngestResult =
+        withContext(Dispatchers.IO) {
+            if (text.isBlank()) {
+                Log.w(TAG, "ingestDocument skipped: empty text documentId=$documentId")
+                return@withContext IngestResult(storedCount = 0, failedCount = 0)
             }
 
-            vectorChunks.add(
-                VectorChunk(
-                    id = UUID.randomUUID().toString().take(12),
-                    documentId = documentId,
-                    chunkIndex = chunk.index,
-                    text = chunk.text,
-                    embedding = embedding,
+            val chunks = chunker.chunk(text)
+            if (chunks.isEmpty()) {
+                Log.w(TAG, "ingestDocument no chunks produced documentId=$documentId")
+                return@withContext IngestResult(storedCount = 0, failedCount = 0)
+            }
+
+            val vectorChunks = mutableListOf<VectorChunk>()
+            var failedCount = 0
+
+            for (chunk in chunks) {
+                val embedding = runCatching {
+                    encode(chunk.text)
+                }.getOrNull()
+
+                if (embedding == null || embedding.isEmpty()) {
+                    failedCount++
+                    continue
+                }
+
+                vectorChunks.add(
+                    VectorChunk(
+                        id = UUID.randomUUID().toString().take(12),
+                        documentId = documentId,
+                        chunkIndex = chunk.index,
+                        text = chunk.text,
+                        embedding = embedding,
+                    )
                 )
-            )
-        }
+            }
 
-        if (vectorChunks.isNotEmpty()) {
-            vectorStore.insertBatch(vectorChunks)
-        }
+            if (vectorChunks.isNotEmpty()) {
+                vectorStore.insertBatch(vectorChunks)
+            }
 
-        val stored = vectorChunks.size
-        Log.i(TAG, "ingestDocument documentId=$documentId chunks=$stored failed=$failedCount title=$title")
-        return stored
-    }
+            val stored = vectorChunks.size
+            Log.i(TAG, "ingestDocument documentId=$documentId chunks=$stored failed=$failedCount")
+            IngestResult(storedCount = stored, failedCount = failedCount)
+        }
 
     /**
      * Query the vector store for chunks similar to [userPrompt].
@@ -100,20 +132,23 @@ class RagManager(
      * Encodes the [userPrompt], performs cosine similarity search,
      * and returns the top-K matching chunks with scores.
      */
-    suspend fun query(userPrompt: String, topK: Int = 5): List<Pair<VectorChunk, Float>> {
-        if (userPrompt.isBlank()) return emptyList()
+    suspend fun query(userPrompt: String, topK: Int = 5): List<Pair<VectorChunk, Float>> =
+        withContext(Dispatchers.IO) {
+            if (userPrompt.isBlank()) return@withContext emptyList()
 
-        val queryEmbedding = runCatching {
-            encode(userPrompt)
-        }.getOrNull()
+            val queryEmbedding = runCatching {
+                encode(userPrompt)
+            }.getOrNull()
 
-        if (queryEmbedding == null || queryEmbedding.isEmpty()) {
-            Log.w(TAG, "query failed: empty embedding for prompt=${userPrompt.take(80)}")
-            return emptyList()
+            if (queryEmbedding == null || queryEmbedding.isEmpty()) {
+                if (BuildConfig.DEBUG) {
+                    Log.w(TAG, "query failed: empty embedding for prompt=${userPrompt.take(80)}")
+                }
+                return@withContext emptyList()
+            }
+
+            vectorStore.search(queryEmbedding, topK = topK, minScore = DEFAULT_MIN_RAG_SCORE)
         }
-
-        return vectorStore.search(queryEmbedding, topK = topK, minScore = DEFAULT_MIN_RAG_SCORE)
-    }
 
     /**
      * Build a formatted context string from retrieved chunks for prompt injection.

@@ -58,7 +58,7 @@ Notes:
 
 - Do not add `kotlin.android` to Gradle plugins; parent Android policy forbids the AGP 9.x double-declaration.
 - Do not document or commit signing credential values, keystores, model binaries, or local SDK paths.
-- Treat `llm_host.cpp` as inactive unless CMake is changed; current CMake sources are `llmhost_jni.cpp` and `Engine.cpp`.
+- `llm_host.cpp` no longer exists in the tree; current CMake sources are `llmhost_jni.cpp` and `Engine.cpp`.
 - Real inference claims require current build/device evidence, not just dated evidence docs.
 - Network/model/tool actions exposed through `AgentTools.kt` require the app's confirmation path unless source proves otherwise.
 

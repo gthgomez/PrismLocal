@@ -228,7 +228,6 @@ class InferenceService : Service() {
     // Phase 7a — Background Agent Execution
     private lateinit var backgroundAgentManager: BackgroundAgentManager
     private var webSearchUsedThisSession = false
-    private val benchmarkQueue = ArrayDeque<BenchmarkPreset>()
     // Chat search index now lives in ChatSearchIndex (declared in Phase A section above).
 
     // ── Public StateFlow/SharedFlow exposures — delegated to extracted classes ──
@@ -393,6 +392,8 @@ class InferenceService : Service() {
             onRecordBenchmarkRun = { prompt, output, perf, reason, detail ->
                 benchmarkStore.record(prompt, output, perf, reason, detail)
             },
+            // Runner is constructed after the orchestrator; guard the lazy reference.
+            onBenchmarkComplete = { if (::benchmarkRunner.isInitialized) benchmarkRunner.runNextQueued() },
             onDeferredReload = { modelId -> switchModel(modelId) },
             getReloadPending = { reloadPending },
             setReloadPending = { v -> reloadPending = v },
@@ -995,7 +996,7 @@ class InferenceService : Service() {
             _isGenerating.value -> "generation"
             download is ModelDownloadState.Running -> "download"
             import is ImportState.Running -> "import"
-            benchmarkQueue.isNotEmpty() -> "benchmark"
+            ::benchmarkRunner.isInitialized && benchmarkRunner.queue.isNotEmpty() -> "benchmark"
             else -> "none"
         }
         val progress = when (download) {
@@ -1007,7 +1008,7 @@ class InferenceService : Service() {
             .put("can_cancel", operation != "none")
             .put("progress", progress ?: JSONObject.NULL)
             .put("is_generating", _isGenerating.value)
-            .put("benchmark_queue", benchmarkQueue.size)
+            .put("benchmark_queue", if (::benchmarkRunner.isInitialized) benchmarkRunner.queue.size else 0)
     }
 
     private fun refreshMemoriesList() {
@@ -1227,8 +1228,8 @@ class InferenceService : Service() {
         stopGenerationForeground()
         _isGenerating.value = false
         generationMetrics.clear()
-        if (clearQueuedBenchmarks) {
-            benchmarkQueue.clear()
+        if (clearQueuedBenchmarks && ::benchmarkRunner.isInitialized) {
+            benchmarkRunner.queue.clear()
         }
         _benchmarkStatus.value = BenchmarkStatus()
         chatManager.activeAssistantTranscriptId?.let { assistantMessageId ->
@@ -1329,6 +1330,7 @@ class InferenceService : Service() {
             }
         }
         memoryGovernor.unregister()
+        if (::backgroundAgentManager.isInitialized) backgroundAgentManager.shutdown()
         serviceScope.cancel()
         if (::voiceIoManager.isInitialized) voiceIoManager.shutdown()
         super.onDestroy()

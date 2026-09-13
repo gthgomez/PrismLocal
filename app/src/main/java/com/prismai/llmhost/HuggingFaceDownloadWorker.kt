@@ -109,6 +109,9 @@ class HuggingFaceDownloadWorker(
             val storage = ModelStorageManager(appContext)
             val importResult = partialFile.inputStream().use { input ->
                 storage.importModelFromStream(entry.fileName, partialFile.length(), input) { progress ->
+                    // importModelFromStream is synchronous, so the suspend progress call is
+                    // wrapped here. copyStream throttles emissions to ~500 ms (plus one final
+                    // 100% emission), keeping these runBlocking commits rare.
                     runBlocking {
                         setDownloadProgress(
                             entry = entry,

@@ -47,13 +47,15 @@ class HttpPrismatixClient(
 
         val url = URL(config.baseUrl)
         val connection = connectionFactory(url)
-        var isConnected = false
 
         try {
             connection.requestMethod = "POST"
             connection.doOutput = true
             connection.doInput = true
             connection.useCaches = false
+            // Never auto-follow redirects while carrying an Authorization header: a
+            // 3xx target could be an attacker-controlled host that would receive the JWT.
+            connection.instanceFollowRedirects = false
             connection.connectTimeout = config.connectTimeoutMs
             connection.readTimeout = config.readTimeoutMs
 
@@ -72,7 +74,6 @@ class HttpPrismatixClient(
                 }
             }
 
-            isConnected = true
             val responseCode = connection.responseCode
 
             if (responseCode == HttpURLConnection.HTTP_OK) {
@@ -96,48 +97,11 @@ class HttpPrismatixClient(
                     )
                 )
 
-                // Parse stream line-by-line with protocol error on malformed data
-                val reader = connection.inputStream.bufferedReader(StandardCharsets.UTF_8)
-                var line: String?
-                while (reader.readLine().also { line = it } != null) {
-                    val currentLine = line?.trim() ?: continue
-                    if (currentLine.isEmpty() || currentLine.startsWith(":")) continue
-
-                    if (currentLine.startsWith("data:")) {
-                        val dataContent = currentLine.substring(5).trim()
-                        if (dataContent == "[DONE]") {
-                            emit(PrismatixStreamEvent.Done)
-                            break
-                        }
-
-                        val json = try {
-                            JSONObject(dataContent)
-                        } catch (e: Exception) {
-                            emit(
-                                PrismatixStreamEvent.Error(
-                                    statusCode = -2,
-                                    message = "Protocol Error: Malformed SSE data frame '$dataContent'",
-                                )
-                            )
-                            break
-                        }
-
-                        val type = json.optString("type")
-                        if (type == "content_block_delta") {
-                            val delta = json.optJSONObject("delta")?.optString("text")
-                            if (!delta.isNullOrEmpty()) {
-                                emit(PrismatixStreamEvent.Delta(delta))
-                            }
-                        } else if (json.has("error")) {
-                            emit(
-                                PrismatixStreamEvent.Error(
-                                    statusCode = responseCode,
-                                    message = json.optString("error", "Server error"),
-                                )
-                            )
-                            break
-                        }
-                    }
+                // Delegate SSE decoding to the shared, unit-tested parser so the
+                // streaming and error semantics live in exactly one place. The parser
+                // is inline, so `emit` is called incrementally per frame without buffering.
+                PrismatixSseParser.parseStream(connection.inputStream) { event ->
+                    emit(event)
                 }
             } else {
                 // Non-200 HTTP response
@@ -169,12 +133,12 @@ class HttpPrismatixClient(
                 )
             )
         } finally {
-            if (isConnected) {
-                try {
-                    connection.disconnect()
-                } catch (_: Exception) {
-                    // Ignore disconnect cleanup errors
-                }
+            try {
+                // Always release the connection, even if the request body write or
+                // any setRequestProperty call threw before the connection was "used".
+                connection.disconnect()
+            } catch (_: Exception) {
+                // Ignore disconnect cleanup errors
             }
         }
     }.flowOn(Dispatchers.IO)

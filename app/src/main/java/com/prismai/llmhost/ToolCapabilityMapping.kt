@@ -15,13 +15,18 @@ import com.prismai.llmhost.model.*
  */
 object ToolCapabilityMapping {
 
+    /**
+     * Explicit statement that a tool needs no capability beyond being a registered tool.
+     * Used for navigation, preview, advisory, and cancellation tools that touch no user data.
+     */
+    private val noCapabilities: Set<Capability> = emptySet()
+
     private val map: Map<String, Set<Capability>> = mapOf(
         // Chat tools
         "summarize_current_chat" to setOf(Capability.CHAT_READ),
         "search_chats" to setOf(Capability.CHAT_READ),
         "rename_current_chat" to setOf(Capability.CHAT_MANAGE),
         "delete_chat" to setOf(Capability.CHAT_MANAGE),
-        "create_chat" to setOf(Capability.CHAT_MANAGE),
         "clear_chat" to setOf(Capability.CHAT_MANAGE),
         "delete_or_clear_chat" to setOf(Capability.CHAT_MANAGE),
         "export_chat" to setOf(Capability.FILE_WRITE),
@@ -33,14 +38,25 @@ object ToolCapabilityMapping {
         "download_model" to setOf(Capability.MODEL_DOWNLOAD),
         "delete_model" to setOf(Capability.MODEL_DELETE),
         "get_model_card" to setOf(Capability.SYSTEM_INFO),
-        "import_model" to setOf(Capability.MODEL_IMPORT),
+        "get_model_status" to setOf(Capability.SYSTEM_INFO),
+        "recommend_model" to setOf(Capability.SYSTEM_INFO),
+        "compare_models" to setOf(Capability.SYSTEM_INFO),
+        "get_download_status" to setOf(Capability.SYSTEM_INFO),
 
         // Generation tools
         "recommend_runtime_settings" to setOf(Capability.GENERATION_CONFIGURE),
         "set_runtime_settings" to setOf(Capability.GENERATION_CONFIGURE),
         "restore_previous_runtime_settings" to setOf(Capability.GENERATION_CONFIGURE),
+        "validate_runtime_settings" to setOf(Capability.SYSTEM_INFO),
+        "explain_runtime_settings" to setOf(Capability.SYSTEM_INFO),
+        "diagnose_performance" to setOf(Capability.SYSTEM_INFO),
         "run_benchmark" to setOf(Capability.BENCHMARK_RUN),
         "list_benchmark_runs" to setOf(Capability.SYSTEM_INFO),
+        "get_active_operation" to setOf(Capability.SYSTEM_INFO),
+        "continue_generation" to noCapabilities,
+        "cancel_generation" to noCapabilities,
+        "cancel_active_operation" to noCapabilities,
+        "cancel_active_job" to noCapabilities,
 
         // Memory tools
         "remember_fact" to setOf(Capability.MEMORY_WRITE),
@@ -50,6 +66,16 @@ object ToolCapabilityMapping {
 
         // Network tools
         "web_search" to setOf(Capability.NETWORK_SEARCH),
+
+        // System / UI tools
+        "get_tool_capabilities" to setOf(Capability.SYSTEM_INFO),
+        "get_app_version_info" to setOf(Capability.SYSTEM_INFO),
+        "get_storage_status" to setOf(Capability.SYSTEM_INFO),
+        "get_privacy_summary" to setOf(Capability.SYSTEM_INFO),
+        "open_app_panel" to noCapabilities,
+        "preview_action" to noCapabilities,
+        "use_guidance_skill" to noCapabilities,
+        "apply_agent_skill" to noCapabilities,
 
         // Future tools (voice, data connectors) — declared here for forward compat
         "voice_input" to setOf(Capability.VOICE_INPUT),
@@ -82,9 +108,26 @@ object ToolCapabilityMapping {
         "search_workspace_files" to setOf(Capability.FILE_READ),
     )
 
+    /**
+     * True when the tool has an explicit capability declaration.
+     * Every registered tool must be mapped; the execution gate denies unmapped tools.
+     */
+    fun isMapped(toolName: String): Boolean = map.containsKey(toolName)
+
     fun capabilitiesFor(toolName: String): Set<Capability> = map[toolName] ?: emptySet()
 
-    /** Check if a tool's capabilities are all granted */
-    fun check(toolName: String, registry: CapabilityRegistry): CapabilityCheck =
-        registry.check(capabilitiesFor(toolName))
+    /**
+     * Check if a tool's capabilities are all granted.
+     *
+     * Fails closed: a tool with no explicit mapping is denied rather than silently
+     * granted, so a registered-but-unmapped tool cannot bypass the policy.
+     */
+    fun check(toolName: String, registry: CapabilityRegistry): CapabilityCheck {
+        val required = map[toolName]
+            ?: return CapabilityCheck(
+                granted = false,
+                reason = "Tool '$toolName' has no declared capability mapping",
+            )
+        return registry.check(required)
+    }
 }

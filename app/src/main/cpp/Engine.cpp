@@ -275,7 +275,9 @@ struct ModelRuntime {
     bool single_batch_initialized = false;
     llama_batch single_batch;
 
-    llama_sampler* cached_sampler = nullptr;
+    // Owns the current generation's sampler chain solely for destruction.
+    // The chain is never reused across generations (see the rebuild site below).
+    llama_sampler* owned_sampler = nullptr;
 
     std::vector<llama_token> active_tokens;
 
@@ -288,9 +290,9 @@ struct ModelRuntime {
             llama_batch_free(single_batch);
             single_batch_initialized = false;
         }
-        if (cached_sampler != nullptr) {
-            llama_sampler_free(cached_sampler);
-            cached_sampler = nullptr;
+        if (owned_sampler != nullptr) {
+            llama_sampler_free(owned_sampler);
+            owned_sampler = nullptr;
         }
         if (ctx != nullptr) {
             if (!loaded_loras.empty()) {
@@ -1035,14 +1037,16 @@ struct Engine::Impl {
         }
 
         // Build a fresh sampler chain for every generation. llama_sampler_chain_add
-        // transfers ownership of each member into the chain (llama.h), so caching
+        // transfers ownership of each member into the chain (llama.h), so reusing
         // chain or grammar sampler objects across generations previously produced
-        // dangling cache entries and double-free/UAF paths. A fresh chain costs
-        // microseconds; the GBNF recompile below is logged and is sub-millisecond
-        // for the tool-call grammars this app uses.
-        if (runtime->cached_sampler != nullptr) {
-            llama_sampler_free(runtime->cached_sampler);
-            runtime->cached_sampler = nullptr;
+        // dangling cache entries and double-free/UAF paths. The chain is therefore
+        // rebuilt here on each generation; `owned_sampler` only carries ownership
+        // so the chain can be freed (on the next generation or at runtime teardown).
+        // A fresh chain costs microseconds; the GBNF recompile below is logged and
+        // is sub-millisecond for the tool-call grammars this app uses.
+        if (runtime->owned_sampler != nullptr) {
+            llama_sampler_free(runtime->owned_sampler);
+            runtime->owned_sampler = nullptr;
         }
         llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
         if (sampler == nullptr) {
@@ -1068,7 +1072,7 @@ struct Engine::Impl {
         }
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-        runtime->cached_sampler = sampler;
+        runtime->owned_sampler = sampler;
 
         const auto generation_start = std::chrono::steady_clock::now();
         int generated_tokens = 0;

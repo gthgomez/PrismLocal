@@ -6,6 +6,7 @@ import com.prismai.llmhost.storage.*
 import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
+import com.prismai.llmhost.agent.ToolInputSanitizer
 
 import android.content.Context
 import android.graphics.BitmapFactory
@@ -113,16 +114,35 @@ object AttachmentTextExtractor {
                 val perAttachmentLimit = baseLimit + if (remainder > 0) 1 else 0
                 if (remainder > 0) remainder--
                 appendLine()
-                appendLine("Attachment ${index + 1}: ${attachment.name}")
+                appendLine("Attachment ${index + 1}: ${sanitizeAttachmentText(attachment.name)}")
                 appendLine("MIME: ${attachment.mimeType ?: "unknown"}")
                 appendLine("Extraction status: ${attachment.extractionStatus.name.lowercase(Locale.US)}")
                 attachment.sizeBytes?.let { appendLine("Size: ${formatBytesForPrompt(it)}") }
                 val truncatedText = truncateAttachmentBody(attachment.promptText, perAttachmentLimit)
-                val safeText = truncatedText.replace("</untrusted_external_content>", "<\\/untrusted_external_content>")
-                appendLine(safeText)
+                appendLine(sanitizeAttachmentText(truncatedText))
             }
             appendLine("</untrusted_external_content>")
         }.trim()
+    }
+
+    /**
+     * Neutralizes attachment-provided text (display name or extracted body) with the shared
+     * [ToolInputSanitizer.sanitizeExternalInput] neutralizer, then strips the boundary tags that
+     * helper adds so callers can keep a single `<untrusted_external_content>` block around the
+     * whole attachment section. This prevents a crafted name/body from closing that block or
+     * smuggling model directives such as `[INST]`/`<system>`.
+     */
+    private fun sanitizeAttachmentText(text: String): String {
+        val wrapped = ToolInputSanitizer.sanitizeExternalInput(text, "attachment")
+        val prefix = "<untrusted_external_content source=\"attachment\">\n"
+        val suffix = "\n</untrusted_external_content>\n"
+        return if (wrapped.startsWith(prefix) && wrapped.endsWith(suffix)) {
+            wrapped.substring(prefix.length, wrapped.length - suffix.length)
+        } else {
+            // Blank inputs come back unwrapped; anything else stays wrapped rather than risk
+            // emitting text that was never neutralized.
+            wrapped
+        }
     }
 
     /**

@@ -61,6 +61,8 @@ class GenerationOrchestrator(
     private val onDeferredReload: suspend (String) -> Boolean,
     private val getReloadPending: () -> Boolean,
     private val setReloadPending: (Boolean) -> Unit,
+    /** Fired exactly once after a benchmark-preset generation fully completes/cleans up. */
+    private val onBenchmarkComplete: () -> Unit = {},
 ) {
     companion object {
         private const val TAG = "GenOrchestrator"
@@ -82,6 +84,7 @@ class GenerationOrchestrator(
         val checkReload: Boolean = false,
         val enableQualityGuard: Boolean = false,
         val isCodingPreset: Boolean = false,
+        val notifyBenchmarkComplete: Boolean = false,
     )
 
     data class GenerationFlowResult(
@@ -236,6 +239,7 @@ class GenerationOrchestrator(
                 baselineMemoryUsed = baselineMemoryUsed,
                 enableQualityGuard = benchmarkPreset?.enableQualityGuard == true,
                 isCodingPreset = benchmarkPreset?.id == "coding",
+                notifyBenchmarkComplete = benchmarkPreset != null,
             ),
         ) { result ->
             val agentToolCall = if (agentEnabled && result.finalReason == "EOF") {
@@ -683,6 +687,12 @@ class GenerationOrchestrator(
                         eventBus.publish("Reloading model for context/backend settings")
                         scope.launch { onDeferredReload(modelId) }
                     }
+                }
+                // Benchmark queue drain: invoke only from the preset path (never
+                // from agent follow-ups) and only after cleanup so the next
+                // queued preset cannot race this generation's teardown.
+                if (config.notifyBenchmarkComplete) {
+                    onBenchmarkComplete()
                 }
             }
             .launchIn(scope)

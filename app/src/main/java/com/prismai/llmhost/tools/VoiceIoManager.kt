@@ -6,6 +6,7 @@ import com.prismai.llmhost.storage.*
 import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
+import com.prismai.llmhost.BuildConfig
 
 import android.content.Context
 import android.os.Build
@@ -202,7 +203,9 @@ class VoiceIoManager(private val context: Context) {
             Log.w(TAG, "TTS speak returned: $result")
             return false
         }
-        Log.d(TAG, "speak: ${text.take(80)}")
+        if (BuildConfig.DEBUG) {
+            Log.d(TAG, "speak: ${text.take(80)}")
+        }
         return true
     }
 

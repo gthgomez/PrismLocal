@@ -113,6 +113,7 @@ object HuggingFaceSearchEngine {
             parameters = "Unknown",
             quantization = file.quantization,
             notes = "Dynamic Hugging Face import from $repoId",
+            curated = false,
         )
     }
 

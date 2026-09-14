@@ -18,6 +18,13 @@ data class HuggingFaceModelEntry(
     val parameters: String,
     val quantization: String,
     val notes: String,
+    /**
+     * True for entries shipped in the curated [HuggingFaceModelCatalog.entries] list, which
+     * must never be imported without a verified SHA-256. False for user-supplied/dynamic
+     * imports, which may proceed as explicitly unverified when no published hash is
+     * available.
+     */
+    val curated: Boolean = true,
 ) {
     val revision: String = "main"
     val downloadUrl: String
@@ -45,19 +52,27 @@ sealed class ModelDownloadState {
             IMPORTING,
         }
     }
-    data class Success(val modelId: String, val entryName: String) : ModelDownloadState()
+    data class Success(
+        val modelId: String,
+        val entryName: String,
+        val integrityVerified: Boolean = true,
+    ) : ModelDownloadState()
     data class Failure(val entryName: String, val message: String) : ModelDownloadState()
     data object Cancelled : ModelDownloadState()
 }
 
 object HuggingFaceModelCatalog {
     val entries: List<HuggingFaceModelEntry> = listOf(
+        // SHA-256 values retrieved from the HF API (`lfs.sha256`) and confirmed against the raw LFS
+        // pointer on 2026-09-14. Curated entries without a hash (gated repos or 404 file names as of
+        // that date) fail closed at download time rather than importing unverified.
         HuggingFaceModelEntry(
             id = "qwen25_05b_q4km",
             name = "Qwen2.5 0.5B Instruct",
             repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
             fileName = "qwen2.5-0.5b-instruct-q4_k_m.gguf",
             expectedBytes = 491L * 1024L * 1024L,
+            expectedSha256 = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
             license = "Apache-2.0",
             parameters = "0.5B",
             quantization = "Q4_K_M",
@@ -69,6 +84,7 @@ object HuggingFaceModelCatalog {
             repoId = "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
             fileName = "qwen2.5-1.5b-instruct-q4_k_m.gguf",
             expectedBytes = 1_120L * 1024L * 1024L,
+            expectedSha256 = "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
             license = "Apache-2.0",
             parameters = "1.5B",
             quantization = "Q4_K_M",
@@ -80,6 +96,7 @@ object HuggingFaceModelCatalog {
             repoId = "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF",
             fileName = "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
             expectedBytes = 491L * 1024L * 1024L,
+            expectedSha256 = "1d9614638d18024d0fbb36575a15f1302a3adf044df10345688ec4f6e1c4ff32",
             license = "Apache-2.0",
             parameters = "0.5B",
             quantization = "Q4_K_M",
@@ -91,6 +108,7 @@ object HuggingFaceModelCatalog {
             repoId = "QuantFactory/SmolLM2-360M-Instruct-GGUF",
             fileName = "SmolLM2-360M-Instruct.Q4_K_M.gguf",
             expectedBytes = 271L * 1024L * 1024L,
+            expectedSha256 = "75c4346ef9e855ed630f80078a2430cf63aaca599e340360998a313070fcdc47",
             license = "Apache-2.0",
             parameters = "360M",
             quantization = "Q4_K_M",
@@ -114,6 +132,7 @@ object HuggingFaceModelCatalog {
             repoId = "bartowski/Llama-3.2-1B-Instruct-GGUF",
             fileName = "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
             expectedBytes = 808L * 1024L * 1024L,
+            expectedSha256 = "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83",
             license = "Llama 3.2 Community",
             parameters = "1B",
             quantization = "Q4_K_M",
@@ -138,6 +157,7 @@ object HuggingFaceModelCatalog {
             repoId = "bartowski/Phi-3-mini-4k-instruct-GGUF",
             fileName = "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
             expectedBytes = 2_300L * 1024L * 1024L,
+            expectedSha256 = "28a89b4ddb5766355f24e362ae4078b4c35b9ca9568df5fc9e6d9aeee4dee834",
             license = "MIT",
             parameters = "3.8B",
             quantization = "Q4_K_M",
@@ -160,6 +180,7 @@ object HuggingFaceModelCatalog {
             repoId = "bartowski/Llama-3.2-3B-Instruct-GGUF",
             fileName = "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
             expectedBytes = 2_020L * 1024L * 1024L,
+            expectedSha256 = "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
             license = "Llama 3.2 Community",
             parameters = "3B",
             quantization = "Q4_K_M",
@@ -171,6 +192,7 @@ object HuggingFaceModelCatalog {
             repoId = "ggml-org/gemma-3-4b-it-GGUF",
             fileName = "gemma-3-4b-it-Q4_K_M.gguf",
             expectedBytes = 2_620L * 1024L * 1024L,
+            expectedSha256 = "882e8d2db44dc554fb0ea5077cb7e4bc49e7342a1f0da57901c0802ea21a0863",
             license = "Gemma terms",
             parameters = "4B",
             quantization = "Q4_K_M",
@@ -182,6 +204,7 @@ object HuggingFaceModelCatalog {
             repoId = "bartowski/Qwen2.5-3B-Instruct-GGUF",
             fileName = "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
             expectedBytes = 1_940L * 1024L * 1024L,
+            expectedSha256 = "9c9f56a391a3abbd5b89d0245bf6106081bcc3173119d4229235dd9d23253f94",
             license = "Apache-2.0",
             parameters = "3B",
             quantization = "Q4_K_M",
@@ -204,6 +227,7 @@ object HuggingFaceModelCatalog {
             repoId = "bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF",
             fileName = "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
             expectedBytes = 1_060L * 1024L * 1024L,
+            expectedSha256 = "1741e5b2d062b07acf048bf0d2c514dadf2a48f94e2b4aa0cfe069af3838ee2f",
             license = "MIT",
             parameters = "1.5B",
             quantization = "Q4_K_M",
@@ -215,6 +239,7 @@ object HuggingFaceModelCatalog {
             repoId = "bartowski/granite-3.1-2b-instruct-GGUF",
             fileName = "granite-3.1-2b-instruct-Q4_K_M.gguf",
             expectedBytes = 1_490L * 1024L * 1024L,
+            expectedSha256 = "774269c82fde2720ea18dcf457fb5bd028fe096139a0735f4ad59c0a270cfc9c",
             license = "Apache-2.0",
             parameters = "2B",
             quantization = "Q4_K_M",
@@ -226,6 +251,7 @@ object HuggingFaceModelCatalog {
             repoId = "bartowski/granite-3.1-3b-a800m-instruct-GGUF",
             fileName = "granite-3.1-3b-a800m-instruct-Q4_K_M.gguf",
             expectedBytes = 2_010L * 1024L * 1024L,
+            expectedSha256 = "48e0edcd578fd4462f26127f04c651d0e650741110185297741089aea01a82b3",
             license = "Apache-2.0",
             parameters = "3B",
             quantization = "Q4_K_M",
@@ -248,6 +274,7 @@ object HuggingFaceModelCatalog {
             repoId = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
             fileName = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
             expectedBytes = 700L * 1024L * 1024L,
+            expectedSha256 = "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0",
             license = "Apache-2.0",
             parameters = "1.1B",
             quantization = "Q4_K_M",
@@ -292,6 +319,7 @@ object HuggingFaceModelCatalog {
             repoId = "QuantFactory/SmolLM2-1.7B-Instruct-GGUF",
             fileName = "SmolLM2-1.7B-Instruct.Q4_K_M.gguf",
             expectedBytes = 1_110L * 1024L * 1024L,
+            expectedSha256 = "bc8986d129483f44768b5fcc2bd2f148d6af000282cdb9ec7a92122226fa7921",
             license = "Apache-2.0",
             parameters = "1.7B",
             quantization = "Q4_K_M",
@@ -330,6 +358,7 @@ object HuggingFaceModelCatalog {
             parameters = "Custom",
             quantization = "Auto",
             notes = "User-submitted custom Hugging Face GGUF repository",
+            curated = false,
         )
         customEntries[id] = entry
         return entry

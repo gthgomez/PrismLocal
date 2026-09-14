@@ -135,6 +135,7 @@ class ModelTools(
             ModelDownloadState.Idle -> JSONObject().put("status", "idle")
             ModelDownloadState.Cancelled -> JSONObject().put("status", "cancelled")
             is ModelDownloadState.Success -> JSONObject().put("status", "success").put("model_id", state.modelId).put("entry_name", state.entryName)
+                .put("integrity_verified", state.integrityVerified)
             is ModelDownloadState.Failure -> JSONObject().put("status", "failure").put("entry_name", state.entryName).put("message", state.message)
             is ModelDownloadState.Running -> JSONObject().put("status", "running")
                 .put("entry_id", state.entry.id).put("entry_name", state.entry.name)

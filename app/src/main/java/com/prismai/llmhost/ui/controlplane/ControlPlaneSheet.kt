@@ -628,7 +628,7 @@ private fun HuggingFaceDownloadPanel(
     DashboardCard {
         SectionHeader(
             title = "Hugging Face Text Models",
-            subtitle = "Curated GGUF downloads. Resumable. Size/hash verified when metadata is available.",
+            subtitle = "Curated GGUF downloads are SHA-256 verified. Resumable. Custom imports without a published hash are marked unverified.",
         )
         when (state) {
             ModelDownloadState.Idle -> Unit
@@ -655,9 +655,13 @@ private fun HuggingFaceDownloadPanel(
                 }
             }
             is ModelDownloadState.Success -> Text(
-                text = "Downloaded ${state.entryName}",
+                text = if (state.integrityVerified) {
+                    "Downloaded ${state.entryName}"
+                } else {
+                    "Downloaded ${state.entryName} (unverified: no SHA-256 available)"
+                },
                 style = MaterialTheme.typography.bodySmall,
-                color = PrismGreen,
+                color = if (state.integrityVerified) PrismGreen else PrismAmber,
             )
             is ModelDownloadState.Running -> {
                 Text(

@@ -51,6 +51,11 @@ object HuggingFaceDownloadWork {
     const val KEY_MODEL_BYTES = "model_bytes"
     const val KEY_MODEL_SHA256 = "model_sha256"
 
+    /** Download integrity outcome: [INTEGRITY_VERIFIED] or [INTEGRITY_UNVERIFIED]. */
+    const val KEY_INTEGRITY = "integrity"
+    const val INTEGRITY_VERIFIED = "verified"
+    const val INTEGRITY_UNVERIFIED = "unverified"
+
     fun request(entryId: String): OneTimeWorkRequest =
         OneTimeWorkRequestBuilder<HuggingFaceDownloadWorker>()
             .setInputData(workDataOf(KEY_ENTRY_ID to entryId))
@@ -94,19 +99,26 @@ class HuggingFaceDownloadWorker(
                 message = "Checking Hugging Face file metadata",
             )
             val remoteMetadata = fetchRemoteMetadata(entry)
-            val expectedSize = remoteMetadata.sizeBytes ?: entry.expectedBytes
+            val expectedSize = remoteMetadata.sizeBytes ?: entry.expectedBytes.takeIf { it > 0L }
             val expectedSha = remoteMetadata.sha256 ?: entry.expectedSha256
+            val integrityDecision = decideDownloadIntegrity(expectedSha, entry.curated)
+            if (integrityDecision == DownloadIntegrityDecision.FAIL_CLOSED) {
+                throw IllegalStateException(
+                    "No trusted SHA-256 available for ${entry.name}; refusing to import an unverified model."
+                )
+            }
+            val shaToVerify = if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) expectedSha else null
 
             downloadResumable(entry, partialFile, expectedSize)
 
-            verifyCompletedDownload(entry, partialFile, expectedSize, expectedSha)
+            verifyCompletedDownload(entry, partialFile, expectedSize, shaToVerify)
 
             setDownloadProgress(
                 entry = entry,
                 stage = ModelDownloadState.Running.Stage.IMPORTING,
                 bytesDone = 0L,
                 totalBytes = partialFile.length(),
-                message = "Installing verified GGUF",
+                message = if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) "Installing verified GGUF" else "Installing GGUF (unverified)",
             )
             val storage = ModelStorageManager(appContext)
             val importResult = partialFile.inputStream().use { input ->
@@ -120,7 +132,7 @@ class HuggingFaceDownloadWorker(
                             stage = ModelDownloadState.Running.Stage.IMPORTING,
                             bytesDone = progress.bytesCopied,
                             totalBytes = progress.totalBytes,
-                            message = "Installing verified GGUF",
+                            message = if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) "Installing verified GGUF" else "Installing GGUF (unverified)",
                         )
                     }
                 }
@@ -144,6 +156,11 @@ class HuggingFaceDownloadWorker(
                             HuggingFaceDownloadWork.KEY_MODEL_ID to importResult.model.id,
                             HuggingFaceDownloadWork.KEY_MODEL_BYTES to importResult.model.bytes,
                             HuggingFaceDownloadWork.KEY_MODEL_SHA256 to importResult.model.sha256,
+                            HuggingFaceDownloadWork.KEY_INTEGRITY to if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) {
+                                HuggingFaceDownloadWork.INTEGRITY_VERIFIED
+                            } else {
+                                HuggingFaceDownloadWork.INTEGRITY_UNVERIFIED
+                            },
                         )
                     )
                 }
@@ -184,9 +201,12 @@ class HuggingFaceDownloadWorker(
             val lfs = file.optJSONObject("lfs")
             val size = lfs?.optLong("size", -1L)?.takeIf { it > 0L }
                 ?: file.optLong("size", -1L).takeIf { it > 0L }
-            val oid = lfs?.optString("oid")?.takeIf { it.length == 64 }
+            // The HF API exposes the LFS SHA-256 as `lfs.sha256`; older payloads used `lfs.oid`.
+            val sha256 = lfs?.optString("sha256")?.takeIf { it.length == 64 }
+                ?: lfs?.optString("oid")?.takeIf { it.length == 64 }
+                ?: file.optString("sha256").takeIf { it.length == 64 }
                 ?: file.optString("oid").takeIf { it.length == 64 }
-            return RemoteFileMetadata(size, oid?.lowercase(Locale.US))
+            return RemoteFileMetadata(size, sha256?.lowercase(Locale.US))
         }
         return RemoteFileMetadata(null, null)
     }
@@ -304,7 +324,7 @@ class HuggingFaceDownloadWorker(
             stage = ModelDownloadState.Running.Stage.VERIFYING_FILE,
             bytesDone = 0L,
             totalBytes = size,
-            message = if (expectedSha256 == null) "Verifying file size" else "Verifying SHA-256",
+            message = if (expectedSha256 == null) "Verifying file size (no SHA-256 available)" else "Verifying SHA-256",
         )
         expectedSha256 ?: return
         val actual = sha256(file) { bytesDone ->

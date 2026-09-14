@@ -53,7 +53,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.ui.UiEventBus
@@ -101,6 +103,12 @@ class InferenceService : Service() {
         private const val MAX_BENCHMARK_RUNS = 250
         private const val KEY_AGENT_ENABLED = "agent_enabled"
         private const val KEY_PENDING_AGENT_ACTION_PREFIX = "pending_agent_action_"
+        // onDestroy() is a main-thread callback. Native teardown (freeing the
+        // loaded ggml/llama model, context and compute buffers) can block for
+        // seconds, which would trip an ANR. We therefore only wait this long
+        // for the off-main teardown to finish before returning; the teardown
+        // job itself keeps running if it overruns (see onDestroy).
+        private const val NATIVE_TEARDOWN_WAIT_MS = 2_000L
     }
 
     private fun pendingAgentActionKey(chatId: String): String = "$KEY_PENDING_AGENT_ACTION_PREFIX$chatId"
@@ -111,6 +119,16 @@ class InferenceService : Service() {
 
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    // Dedicated scope for native engine teardown. It is intentionally NOT a
+    // child of serviceScope: onDestroy() cancels serviceScope, which must not
+    // abort an in-flight native free. onDestroy() launches teardown here and
+    // waits a bounded budget on the main thread; if that budget expires the
+    // job continues to completion off-main.
+    private val teardownScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // Guards onDestroy() against a duplicate teardown launch (reentrancy /
+    // defensive double-destroy). destroySafely() is itself idempotent, but this
+    // avoids enqueuing redundant cancellation work.
+    private val teardownStarted = AtomicBoolean(false)
 
     private lateinit var engine: NativeLlmBridge
     private lateinit var memoryGovernor: MemoryGovernor
@@ -490,7 +508,7 @@ class InferenceService : Service() {
             importJobIsActive = { importJob?.isActive == true },
         )
         workspaceTools = com.prismai.llmhost.agent.tools.WorkspaceTools(
-            rootDir = filesDir,
+            rootDir = com.prismai.llmhost.agent.tools.WorkspaceTools.defaultRoot(filesDir),
         )
 
         // ── Phase E: benchmark classes ──────────────────────────────────
@@ -1323,12 +1341,34 @@ class InferenceService : Service() {
         saveTranscriptSafely()
         importJob?.cancel()
         importJob = null
-        runBlocking {
-            operationMutex.withLock {
-                cancelAndJoinGenerationLocked("service destroy")
-                engine.destroySafely()
+
+        // Run cancellation + native teardown off the main thread and wait only a
+        // bounded budget for it. If the budget expires the job is deliberately
+        // NOT cancelled: the native engine free must still run, and blocking the
+        // main thread until it finishes risks an ANR. destroySafely() is
+        // idempotent (isDestroyed guarded under modelMutex), so a late or
+        // duplicate call cannot free the native handle twice.
+        if (teardownStarted.compareAndSet(false, true)) {
+            val teardownJob = teardownScope.launch {
+                operationMutex.withLock {
+                    cancelAndJoinGenerationLocked("service destroy")
+                    engine.destroySafely()
+                }
             }
+            val finishedInTime = runBlocking {
+                withTimeoutOrNull(NATIVE_TEARDOWN_WAIT_MS) { teardownJob.join() } != null
+            }
+            if (!finishedInTime) {
+                Log.w(
+                    TAG,
+                    "Native engine teardown exceeded ${NATIVE_TEARDOWN_WAIT_MS}ms; " +
+                        "continuing off-main and returning from onDestroy",
+                )
+            }
+        } else {
+            Log.d(TAG, "Native engine teardown already started; skipping duplicate onDestroy request")
         }
+
         memoryGovernor.unregister()
         if (::backgroundAgentManager.isInitialized) backgroundAgentManager.shutdown()
         serviceScope.cancel()

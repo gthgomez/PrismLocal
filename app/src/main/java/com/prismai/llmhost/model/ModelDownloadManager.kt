@@ -143,8 +143,11 @@ class ModelDownloadManager(
                     ?: entryName
                 val modelBytes = data.getLong(HuggingFaceDownloadWork.KEY_MODEL_BYTES, 0L)
                 val modelSha256 = data.getString(HuggingFaceDownloadWork.KEY_MODEL_SHA256).orEmpty()
+                // Absent/unknown integrity means unverified: never present an unchecked import as verified.
+                val integrityVerified =
+                    data.getString(HuggingFaceDownloadWork.KEY_INTEGRITY) == HuggingFaceDownloadWork.INTEGRITY_VERIFIED
                 val previous = uiState._modelDownloadState.value
-                uiState._modelDownloadState.value = ModelDownloadState.Success(modelId, entryName)
+                uiState._modelDownloadState.value = ModelDownloadState.Success(modelId, entryName, integrityVerified)
                 uiState._importState.value = ImportState.Success(
                     modelId = modelId,
                     bytes = modelBytes,
@@ -152,16 +155,17 @@ class ModelDownloadManager(
                 )
                 uiState._runtimeStatus.value = RuntimeStatus.IDLE
                 onRefreshReadiness()
+                val verifiedSuffix = if (integrityVerified) "" else " (unverified: no SHA-256 available)"
                 if (uiState._currentModel.value == null) {
                     serviceScope.launch {
                         if (onAutoLoadModel(modelId)) {
-                            eventBus.publish("Downloaded and loaded $entryName")
+                            eventBus.publish("Downloaded and loaded $entryName$verifiedSuffix")
                         } else if (previous !is ModelDownloadState.Success) {
-                            eventBus.publish("Downloaded $entryName")
+                            eventBus.publish("Downloaded $entryName$verifiedSuffix")
                         }
                     }
                 } else {
-                    eventBus.publish("Downloaded $entryName. Select it in Model to load it.")
+                    eventBus.publish("Downloaded $entryName$verifiedSuffix. Select it in Model to load it.")
                 }
             }
             WorkInfo.State.FAILED -> {

@@ -4,27 +4,27 @@
 
 Input archive:
 
-`C:\Users\icbag\Downloads\drive-download-20260505T045523Z-3-001.zip`
+`<user-home>\Downloads\drive-download-20260505T045523Z-3-001.zip`
 
 Converted doc text:
 
-`C:\Workspace\artifacts\llm-host-docs-20260505-text\`
+`<workspace>\artifacts\llm-host-docs-20260505-text\`
 
 Build project created from those snippets:
 
-`C:\Workspace\artifacts\llm-host-apk-20260505\`
+`<workspace>\artifacts\llm-host-apk-20260505\`
 
 ## APK Outputs
 
 Main debug APK:
 
-`C:\Workspace\artifacts\llm-host-apk-20260505\app\build\outputs\apk\debug\app-debug.apk`
+`<workspace>\artifacts\llm-host-apk-20260505\app\build\outputs\apk\debug\app-debug.apk`
 
 - Size: `3,872,083` bytes
 
 Instrumentation APK:
 
-`C:\Workspace\artifacts\llm-host-apk-20260505\app\build\outputs\apk\androidTest\debug\app-debug-androidTest.apk`
+`<workspace>\artifacts\llm-host-apk-20260505\app\build\outputs\apk\androidTest\debug\app-debug-androidTest.apk`
 
 - Size: `446,328` bytes
 
@@ -33,9 +33,9 @@ Instrumentation APK:
 Command:
 
 ```powershell
-$env:GRADLE_USER_HOME='C:\Users\icbag\.gradle'
-$env:ANDROID_HOME='C:\Users\icbag\AppData\Local\Android\Sdk'
-C:\Workspace\Project_Android\gradlew.bat -p C:\Workspace\artifacts\llm-host-apk-20260505 assembleDebug assembleDebugAndroidTest
+$env:GRADLE_USER_HOME="$env:USERPROFILE\.gradle"
+$env:ANDROID_HOME="$env:LOCALAPPDATA\Android\Sdk"
+<workspace>\Project_Android\gradlew.bat -p <workspace>\artifacts\llm-host-apk-20260505 assembleDebug assembleDebugAndroidTest
 ```
 
 Result:
@@ -68,7 +68,7 @@ BUILD SUCCESSFUL in 13s
 APK alignment command:
 
 ```powershell
-C:\Users\icbag\AppData\Local\Android\Sdk\build-tools\36.0.0\zipalign.exe -c -P 16 -v 4 app-debug.apk
+"$env:ANDROID_HOME\build-tools\36.0.0\zipalign.exe" -c -P 16 -v 4 app-debug.apk
 ```
 
 Key output:

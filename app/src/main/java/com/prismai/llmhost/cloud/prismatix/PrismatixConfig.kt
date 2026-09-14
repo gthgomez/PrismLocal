@@ -25,11 +25,18 @@ data class PrismatixConfig(
 
         /**
          * Pinned exact hostnames permitted in production Play Store builds.
-         * NEVER use wildcard subdomains like `*.supabase.co`.
+         * Membership is exact string equality (`host !in PROD_ALLOWED_HOSTS`),
+         * so no suffix/pattern matching occurs. NEVER use wildcard subdomains
+         * like `*.supabase.co`.
          */
         val PROD_ALLOWED_HOSTS: Set<String> = setOf(
             "api.prismatix.ai",
             "router.prismatix.ai",
+            // Exact project subdomain owned by Prismatix. This is a literal
+            // hostname, NOT a `*.supabase.co` wildcard: sibling Supabase
+            // projects (e.g. attacker-project.supabase.co) still fail the
+            // exact-equality check above and are rejected. Kept pinned rather
+            // than removed because it is the project-scoped gateway endpoint.
             "prismatix-router.supabase.co",
         )
 

@@ -812,9 +812,13 @@ private fun ModelOnboardingCard(
                     )
                 }
                 is ModelDownloadState.Success -> Text(
-                    text = "Downloaded ${downloadState.entryName}",
+                    text = if (downloadState.integrityVerified) {
+                        "Downloaded ${downloadState.entryName}"
+                    } else {
+                        "Downloaded ${downloadState.entryName} (unverified: no SHA-256 available)"
+                    },
                     style = MaterialTheme.typography.bodySmall,
-                    color = PrismGreen,
+                    color = if (downloadState.integrityVerified) PrismGreen else PrismAmber,
                 )
                 is ModelDownloadState.Failure -> Text(
                     text = downloadState.message,

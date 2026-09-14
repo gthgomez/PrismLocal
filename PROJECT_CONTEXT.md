@@ -87,7 +87,7 @@ folder will fail with `project 'app' not found`.
 Trusted commands from this repo:
 
 ```powershell
-cd C:\Workspace\Project_Android\PrismLocal
+cd <workspace>\Project_Android\PrismLocal
 .\gradlew.bat --no-daemon :app:testDebugUnitTest
 .\gradlew.bat --no-daemon assembleDebug
 .\gradlew.bat --no-daemon assembleDebugAndroidTest

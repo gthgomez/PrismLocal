@@ -6,6 +6,7 @@ import com.prismai.llmhost.storage.*
 import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
+import com.prismai.llmhost.util.readTextBounded
 
 import org.json.JSONArray
 import org.json.JSONObject
@@ -46,7 +47,7 @@ class WebSearchTools(
             val html = try {
                 val code = connection.responseCode
                 if (code !in 200..299) throw java.io.IOException("HTTP $code from DuckDuckGo")
-                connection.inputStream.bufferedReader().use { it.readText() }
+                connection.inputStream.bufferedReader().use { it.readTextBounded() }
             } finally {
                 connection.disconnect()
             }

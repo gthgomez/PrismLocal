@@ -14,6 +14,7 @@ import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.util.Log
 import androidx.annotation.VisibleForTesting
+import com.prismai.llmhost.util.toHex
 import org.json.JSONException
 import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
@@ -898,16 +899,4 @@ class ModelStorageManager(private val context: Context) {
         const val MAX_MODEL_BYTES = 32L * 1024L * 1024L * 1024L
         const val MIN_FREE_SPACE_AFTER_IMPORT = 512L * 1024L * 1024L
     }
-}
-
-private val HEX_CHARS = "0123456789abcdef".toCharArray()
-
-private fun ByteArray.toHex(): String {
-    val result = CharArray(size * 2)
-    for (i in indices) {
-        val b = this[i].toInt() and 0xFF
-        result[i * 2] = HEX_CHARS[b ushr 4]
-        result[i * 2 + 1] = HEX_CHARS[b and 0x0F]
-    }
-    return String(result)
 }

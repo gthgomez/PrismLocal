@@ -4,6 +4,8 @@ import com.prismai.llmhost.cloud.prismatix.EndpointTrustException
 import com.prismai.llmhost.cloud.prismatix.PrismatixConfig
 import com.prismai.llmhost.work.DistributionConfig
 import com.prismai.llmhost.work.DistributionConfigProvider
+import com.prismai.llmhost.util.readTextBounded
+import com.prismai.llmhost.util.readTextTruncated
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -116,7 +118,7 @@ class HttpSupabaseAuthClient(
 
             val code = connection.responseCode
             if (code in 200..299) {
-                val responseText = connection.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+                val responseText = connection.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readTextBounded() }
                 val json = JSONObject(responseText)
                 return when (val outcome = SupabaseAuthSession.fromAuthResponse(json)) {
                     is SupabaseAuthOutcome.SessionCreated -> Result.success(outcome.session)
@@ -124,7 +126,7 @@ class HttpSupabaseAuthClient(
                         Result.failure(EmailConfirmationRequiredException(outcome.email))
                 }
             } else {
-                val errorText = connection.errorStream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() }
+                val errorText = connection.errorStream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readTextTruncated() }
                     ?: "HTTP $code ${connection.responseMessage}"
                 val errorMsg = try {
                     val errJson = JSONObject(errorText)

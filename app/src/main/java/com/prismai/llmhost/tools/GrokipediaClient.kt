@@ -7,6 +7,7 @@ import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 import com.prismai.llmhost.BuildConfig
+import com.prismai.llmhost.util.readTextBounded
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
@@ -154,7 +155,7 @@ class GrokipediaClient(
         return try {
             val code = connection.responseCode
             if (code in 200..299) {
-                connection.inputStream.bufferedReader().use { it.readText() }
+                connection.inputStream.bufferedReader().use { it.readTextBounded() }
             } else if (code == 404) {
                 throw IOException("Article not found (HTTP 404)")
             } else if (code == 403) {

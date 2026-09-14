@@ -133,4 +133,31 @@ class WorkspaceJailTest {
         val listResult = target.listFiles(path)
         assertTrue(listResult.isFailure)
     }
+
+    @Test
+    fun dedicatedAgentWorkspaceRootCannotReadSiblingChats() {
+        // D6: the agent workspace root is filesDir/agent-workspace, not filesDir.
+        // Sibling app data such as chats/ must stay outside the jailed subtree.
+        val appFiles = tempFolder.newFolder("app-files")
+        val chats = File(appFiles, "chats").apply { mkdirs() }
+        val secret = File(chats, "secret.json").apply { writeText("PRIVATE CHAT") }
+        val agentWorkspace = File(appFiles, "agent-workspace").apply { mkdirs() }
+        val jailedTarget = AndroidLocalExecutionTarget(agentWorkspace)
+
+        // Traversal syntax is rejected before resolution can happen.
+        assertFalse(WorkspacePath.isValid("../chats/secret.json"))
+
+        // A symlink placed inside the workspace cannot escape to sibling chats.
+        val link = File(agentWorkspace, "escape.json")
+        try {
+            Files.createSymbolicLink(link.toPath(), secret.toPath())
+        } catch (_: Exception) {
+            return // Symlinks unavailable in this environment.
+        }
+
+        assertNull(WorkspacePath.resolveSafely(agentWorkspace, WorkspacePath("escape.json")))
+        runBlocking {
+            assertTrue(jailedTarget.readFile(WorkspacePath("escape.json")).isFailure)
+        }
+    }
 }

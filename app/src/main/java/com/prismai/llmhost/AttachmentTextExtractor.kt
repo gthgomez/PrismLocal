@@ -7,6 +7,7 @@ import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 import com.prismai.llmhost.agent.ToolInputSanitizer
+import com.prismai.llmhost.util.formatByteSize
 
 import android.content.Context
 import android.graphics.BitmapFactory
@@ -117,7 +118,7 @@ object AttachmentTextExtractor {
                 appendLine("Attachment ${index + 1}: ${sanitizeAttachmentText(attachment.name)}")
                 appendLine("MIME: ${attachment.mimeType ?: "unknown"}")
                 appendLine("Extraction status: ${attachment.extractionStatus.name.lowercase(Locale.US)}")
-                attachment.sizeBytes?.let { appendLine("Size: ${formatBytesForPrompt(it)}") }
+                attachment.sizeBytes?.let { appendLine("Size: ${formatByteSize(it)}") }
                 val truncatedText = truncateAttachmentBody(attachment.promptText, perAttachmentLimit)
                 appendLine(sanitizeAttachmentText(truncatedText))
             }
@@ -415,12 +416,3 @@ private fun queryOpenableLong(context: Context, uri: Uri, column: String): Long?
     context.contentResolver.query(uri, arrayOf(column), null, null, null)?.use { cursor ->
         if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
     }?.takeIf { it >= 0L }
-
-private fun formatBytesForPrompt(bytes: Long): String {
-    val mb = bytes / (1024.0 * 1024.0)
-    return if (mb >= 1.0) {
-        "%.1f MB".format(mb)
-    } else {
-        "$bytes B"
-    }
-}

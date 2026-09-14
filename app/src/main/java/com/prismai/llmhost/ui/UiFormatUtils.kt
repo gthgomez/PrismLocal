@@ -13,6 +13,7 @@ import com.prismai.llmhost.ModelFitRating
 import com.prismai.llmhost.ModelPerformanceTier
 import com.prismai.llmhost.PerformancePrediction
 import com.prismai.llmhost.ui.theme.*
+import com.prismai.llmhost.util.formatByteSize
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -71,14 +72,7 @@ internal fun polishedChatTitle(title: String): String =
         .trim()
         .ifBlank { ChatTitles.DEFAULT_TITLE }
 
-internal fun formatBytes(bytes: Long): String {
-    val mb = bytes / (1024.0 * 1024.0)
-    return if (mb >= 1.0) {
-        "%.1f MB".format(mb)
-    } else {
-        "$bytes B"
-    }
-}
+internal fun formatBytes(bytes: Long): String = formatByteSize(bytes)
 
 internal fun formatTokensPerSecond(value: Double): String =
     String.format(Locale.US, "%.2f", value)

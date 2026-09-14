@@ -75,19 +75,18 @@ orchestrator/service.
 
 ---
 
-## 2. Remaining known issues
+## 2. Deferred items — all addressed
 
-These need a build/device turn, a product decision, or a larger, riskier refactor.
+The original deferred list (D1–D8) has now been fully worked through across two
+follow-up passes:
 
-| # | Issue | Why deferred |
-|---|-------|--------------|
-| D1 | Hugging Face integrity can be skipped: `expectedSha256 ?: return` with only 3/25 catalog entries pinning a hash, and dynamic imports pass `null` | Requiring a SHA would break legitimate dynamic downloads; needs a product decision (pin or reject). |
-| D3 | `InferenceService.onDestroy` runs `runBlocking { … engine.destroySafely() }` on the main thread | Moving native teardown off-main with a bounded wait is risky without a device. |
-| D6 | `WorkspaceTools` root is the whole `filesDir`, so SAFE reads can reach chats/traces/audit log | Changing the root would orphan existing data; needs migration + tests. |
-| D7 | Broad reuse refactors (path-containment helpers ×6, SHA-256/hex, atomic writes, byte formatters, tool registries) | High churn across many files; must be validated by the build. |
-| D8 | Babel public-export policy hits: Windows host paths in docs, `.supabase.co` in pinned hosts | Documentation/policy decision; cross-repo consistency. |
+- **D2, D4, D5** — first follow-up pass; see §5.
+- **D1, D3, D6, D7, D8** — second follow-up pass (parallel subagent team); see §6.
 
-> D2, D4, and D5 were addressed in a follow-up pass on the same day — see §5.
+Every follow-up change was static-review-only on a host without a JDK, Gradle, or
+Android SDK. CI (`.github/workflows/android-ci.yml`) remains the authoritative
+gate and must be green before merge; D3 in particular still needs on-device
+verification (see §6).
 
 ---
 
@@ -145,3 +144,41 @@ Notes / residual risk:
   `runCatching`.
 - Follow-up tests to run with the rest of the gate:
   `RemoteResponseTextTest`, `VectorStoreTopKTest`.
+
+---
+
+## 6. Second follow-up pass (2026-09-14): D1, D3, D6, D7, D8
+
+Executed as a parallel team of five subagents, one per issue, each in an isolated
+git worktree/branch (based on the first follow-up branch) to avoid collisions;
+the reviewed commits were then cherry-picked onto the same branch. Same host
+constraints as §1/§5 — static-review-only, no JDK/Gradle/Android SDK.
+
+| # | Issue | Fix | Files |
+|---|-------|-----|-------|
+| D1 | HF integrity could be silently skipped: `expectedSha256 ?: return`, only 3/25 curated entries pinned, and the reader looked for `lfs.oid` though the API now exposes `lfs.sha256` | New pure `decideDownloadIntegrity`: valid 64-hex → verify; curated + no hash → **fail closed** before download; dynamic + no hash → import but surface as unverified. Pinned 14 more curated SHA-256s (re-verified against the HF API), fixed the `lfs.sha256` read, and threaded `integrityVerified` through state/UI/tools | `DownloadIntegrityPolicy.kt`, `HuggingFaceDownloadWorker.kt`, `HuggingFaceModelCatalog.kt`, `model/ModelDownloadManager.kt`, `model/HuggingFaceSearchEngine.kt`, `agent/tools/ModelTools.kt`, `ui/ChatScreen.kt`, `ui/controlplane/ControlPlaneSheet.kt`, `app/src/test/.../DownloadIntegrityPolicyTest.kt` |
+| D3 | `onDestroy` ran `runBlocking { … engine.destroySafely() }` on the main thread (ANR risk) | Teardown moved to a dedicated, intentionally non-cancelled `Dispatchers.IO` scope; the main thread waits at most **2 s** and returns; the job keeps running on overrun so the native free still completes. `AtomicBoolean` reentrancy guard; `destroySafely()` remains idempotent | `service/InferenceService.kt` |
+| D6 | `WorkspaceTools` was rooted at all of `filesDir`, so SAFE reads reached chats/traces/audit log | Dedicated `filesDir/agent-workspace` root (created + boundary README). Tools are read-only and have never had a write tool, so no migration is needed; legacy data is simply no longer agent-reachable. Containment tests added | `agent/tools/WorkspaceTools.kt`, `service/InferenceService.kt`, `app/src/test/.../agent/tools/WorkspaceToolsTest.kt`, `app/src/test/.../work/WorkspaceJailTest.kt` |
+| D7 | Broad reuse duplication | Conservative subset only: one canonical byte-size formatter and one `ByteArray.toHex`. Non-equivalent atomic-write/SHA/registry patterns were deliberately **not** merged (documented) to avoid behavior changes without a build | `util/ByteUtils.kt`, `ui/UiFormatUtils.kt`, `AttachmentTextExtractor.kt`, `storage/ModelStorageManager.kt`, `app/src/test/.../util/ByteUtilsTest.kt` |
+| D8 | Babel public-export policy hits: Windows/machine-local host paths and `.supabase.co` | Sanitized host paths in docs to `<workspace>`/env-var placeholders and repaired a stale doc link; confirmed `prismatix-router.supabase.co` is an exact-string pin (not a wildcard) and documented why it stays | `AGENTS.md`, `CLAUDE.md`, `PROJECT_CONTEXT.md`, `SIGNING.md`, `ADVERSARIAL_CRITIQUE_PROMPT.md`, `UI_AUDIT_PROMPT.md`, `ROADMAP.md`, `STATUS.md`, `gradle.properties`, `docs/evidence/*`, `cloud/prismatix/PrismatixConfig.kt` |
+
+Notes / residual risk:
+
+- **D1:** the 14 new pins were independently re-verified against the HF API
+  (`lfs.sha256`, 14/14 matched). Six curated entries remain unpinned (three gated
+  repos return HTTP 401; three stale file names return 404) and now fail closed
+  instead of importing unverified. `createCustomEntry`/search-derived imports are
+  marked `curated = false`. An in-flight WorkManager job from a build lacking the
+  new `KEY_INTEGRITY` is treated as unverified (fail-safe).
+- **D3:** device verification **NOT RUN**. Must be checked on a device: no ANR
+  under active generation, the timeout path frees the handle, and rebinding a new
+  service after destroy is use-after-free-safe.
+- **D6:** intentional behavior change — anything previously reachable under
+  `filesDir` is no longer agent-readable; chats remain available via the dedicated
+  chat tools.
+- **D7:** a scoped subset by design; duplicated file/SHA/tool-registry patterns
+  were intentionally left in place as not provably equivalent.
+- **D8:** the `supabase.co` substring remains by design (exact host pin, never a
+  wildcard); if the policy scanner keys on the substring rather than wildcard
+  usage, removing the host is a product decision with runtime impact.
+- New tests: `DownloadIntegrityPolicyTest`, `WorkspaceToolsTest`, `ByteUtilsTest`.

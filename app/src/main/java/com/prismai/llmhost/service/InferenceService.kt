@@ -508,7 +508,7 @@ class InferenceService : Service() {
             importJobIsActive = { importJob?.isActive == true },
         )
         workspaceTools = com.prismai.llmhost.agent.tools.WorkspaceTools(
-            rootDir = filesDir,
+            rootDir = com.prismai.llmhost.agent.tools.WorkspaceTools.defaultRoot(filesDir),
         )
 
         // ── Phase E: benchmark classes ──────────────────────────────────

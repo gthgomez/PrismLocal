@@ -15,9 +15,66 @@ import java.util.Locale
 class WorkspaceTools(
     private val rootDir: File,
 ) {
+    init {
+        // The root must exist before any list/read/search call. The production
+        // root is created by [defaultRoot]; this also covers direct construction
+        // (e.g. unit tests) with a not-yet-created directory.
+        if (!rootDir.isDirectory) {
+            rootDir.mkdirs()
+        }
+    }
+
     companion object {
+        /** Dedicated subdirectory of `filesDir` that the agent workspace tools may read. */
+        const val WORKSPACE_DIR_NAME = "agent-workspace"
+
+        /** Boundary note written once into a freshly created workspace root. */
+        const val WORKSPACE_README_NAME = "README.md"
+
+        internal val WORKSPACE_README = """
+            # Agent workspace
+
+            This directory is the only file tree the agent workspace tools
+            (`list_workspace_files`, `read_workspace_file`, `search_workspace_files`)
+            are allowed to read. It is intentionally isolated from the rest of the
+            app's private storage.
+
+            Chats, agent traces, benchmark history, model files, exports, and the
+            security audit log live outside this directory and are not reachable
+            from here; dedicated chat/model/benchmark tools cover that data.
+
+            Only files inside this directory are visible to the agent workspace
+            tools.
+        """.trimIndent().trim()
+
         private const val MAX_READ_CHARS = 16_000
         private const val MAX_SEARCH_RESULTS = 25
+
+        /**
+         * Resolve the dedicated agent workspace root under [filesDir], creating it
+         * (and its boundary README) when absent.
+         *
+         * Migration (D6): the legacy workspace root was [filesDir] itself, which
+         * exposed `chats/`, `agent_traces/`, `agent_exports/`, `models/`,
+         * `hf-downloads/` and `security_audit.jsonl` to SAFE agent reads.
+         * [WorkspaceTools] is read-only and has never had a write tool, so no
+         * workspace-authored files exist to migrate. This method therefore does
+         * **not** move or copy existing files: app-internal data stays in place
+         * (still reachable through dedicated tools such as `search_chats`) and the
+         * new root starts empty apart from the README. Idempotent and safe to call
+         * on every service start.
+         */
+        fun defaultRoot(filesDir: File): File {
+            val root = File(filesDir, WORKSPACE_DIR_NAME)
+            if (!root.isDirectory) {
+                root.mkdirs()
+            }
+            val readme = File(root, WORKSPACE_README_NAME)
+            if (!readme.exists()) {
+                runCatching { readme.writeText(WORKSPACE_README, Charsets.UTF_8) }
+            }
+            return root
+        }
     }
 
     /**

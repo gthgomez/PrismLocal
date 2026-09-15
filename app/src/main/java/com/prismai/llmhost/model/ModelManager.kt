@@ -11,6 +11,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.prismai.llmhost.*
 import com.prismai.llmhost.chat.ChatManager
+import com.prismai.llmhost.engine.runtime.InferencePlan
 import com.prismai.llmhost.util.FormatUtils
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.ui.UiEventBus
@@ -32,6 +33,12 @@ class ModelManager(
 ) {
     private val TAG = "ModelManager"
 
+    /**
+     * Load key of the configuration that was last successfully applied to the native engine.
+     * Null whenever no model is loaded. Used to avoid silently skipping a settings change.
+     */
+    private var lastLoadedPlanKey: String? = null
+
     companion object {
         private const val PREFS_NAME = "llm_host_prefs"
         private const val KEY_ACTIVE_MODEL = "active_model"
@@ -47,6 +54,7 @@ class ModelManager(
         Log.d(TAG, "deleteModel requested modelId=$modelId")
         if (uiState._currentModel.value == modelId) {
             engine.unloadModel()
+            lastLoadedPlanKey = null
             uiState.streamState.clear()
             uiState._currentModel.value = null
             uiState._activeModelInfo.value = null
@@ -85,6 +93,7 @@ class ModelManager(
             is ModelStorageManager.ModelResolveResult.Failure -> {
                 if (uiState._currentModel.value == modelId) {
                     engine.unloadModel()
+                    lastLoadedPlanKey = null
                     uiState.streamState.clear()
                     uiState._currentModel.value = null
                     uiState._activeModelInfo.value = null
@@ -105,7 +114,21 @@ class ModelManager(
             }
             is ModelStorageManager.ModelResolveResult.Success -> {
                 val activeModel = resolved.model
-                if (uiState._currentModel.value == modelId && uiState._activeModelInfo.value?.sha256 == activeModel.sha256) {
+                val requestedSettings = uiState._generationSettings.value.clamped()
+                val requestedPlanKey = InferencePlan.loadKey(
+                    InferencePlan.fromSettings(
+                        requestedSettings,
+                        modelId = modelId,
+                        modelSha256 = activeModel.sha256,
+                    ),
+                )
+                val sameModelAlreadyLoaded =
+                    uiState._currentModel.value == modelId &&
+                        uiState._activeModelInfo.value?.sha256 == activeModel.sha256
+                // Only short-circuit when the *requested load configuration* also matches what was
+                // applied last. Otherwise fall through and reload so a settings change is never
+                // silently ignored.
+                if (sameModelAlreadyLoaded && lastLoadedPlanKey == requestedPlanKey) {
                     uiState._activeModelInfo.value = activeModel
                     uiState._runtimeStatus.value = RuntimeStatus.IDLE
                     val memory = deviceProfiler.deviceMemorySnapshot()
@@ -140,9 +163,10 @@ class ModelManager(
                 engine.unloadModel()
                 Log.d(TAG, "unloadModel complete modelId=$modelId")
                 uiState.streamState.clear()
-                val loaded = engine.loadModel(activeModel.file.absolutePath, uiState._generationSettings.value.clamped())
+                val loaded = engine.loadModel(activeModel.file.absolutePath, requestedSettings)
                 Log.d(TAG, "switchModel path=${activeModel.file.absolutePath} result=$loaded")
                 if (loaded) {
+                    lastLoadedPlanKey = requestedPlanKey
                     val memory = deviceProfiler.deviceMemorySnapshot()
                     val backendName = engine.getBackendName()
                     val gpuLayersOffloaded = engine.getGpuLayersOffloaded()
@@ -169,6 +193,7 @@ class ModelManager(
                         .apply()
                     onRefreshReadiness()
                 } else {
+                    lastLoadedPlanKey = null
                     val memory = deviceProfiler.deviceMemorySnapshot()
                     uiState._currentModel.value = null
                     uiState._activeModelInfo.value = null

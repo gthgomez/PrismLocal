@@ -321,6 +321,10 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         val jniTimingsUs = LongArray(2048)
         var jniTimingsCount = 0
         val reusableResult = NativeDrainResult()
+        // One incremental decoder per generation: carries a multi-byte UTF-8
+        // sequence split across drains instead of decoding each drain in
+        // isolation (which produced U+FFFD and lost the character).
+        val utf8 = Utf8TextPipeline()
         var pollDelay = 2L
         try {
             while (isActive && !isDestroyed) {
@@ -353,20 +357,21 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 if (tokenCount > 0) {
                     pollDelay = 2L // reset backoff on active token receipt
 
-                    // Decode text: prefer buffer path, fall back to overflow string
-                    val text = if (reusableResult.textOverflow.isNotEmpty()) {
-                        reusableResult.textOverflow
+                    // Decode text incrementally: prefer buffer bytes, fall back
+                    // to the already-decoded overflow string. Multi-byte code
+                    // points split across drains are carried until complete.
+                    val decodedText = if (reusableResult.textOverflow.isNotEmpty()) {
+                        utf8.append(reusableResult.textOverflow.toByteArray(Charsets.UTF_8))
                     } else if (reusableResult.textCount > 0) {
-                        String(reusableResult.textBuffer, 0, reusableResult.textCount, Charsets.UTF_8)
+                        utf8.append(reusableResult.textBuffer, reusableResult.textCount)
                     } else {
                         ""
                     }
 
-                    val normalizedText = Utf8TextPipeline.normalizeNativeText(text)
-                    if (normalizedText.isNotEmpty() || tokenCount > 0) {
+                    if (decodedText.isNotEmpty() || tokenCount > 0) {
                         emitChunk(
                             GenerationChunk(
-                                text = normalizedText,
+                                text = decodedText,
                                 tokenCount = tokenCount,
                                 generationId = genId,
                                 isTerminal = false,
@@ -389,6 +394,25 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                         else -> "UNKNOWN"
                     }
                     observedTerminal = true
+                    // Finalize the decoder: emit any buffered trailing text
+                    // (e.g. a truncated final multi-byte sequence) before the
+                    // terminal chunk so no decoded bytes are lost.
+                    val trailingText = utf8.flush()
+                    if (trailingText.isNotEmpty()) {
+                        emitChunk(
+                            GenerationChunk(
+                                text = trailingText,
+                                tokenCount = 0,
+                                generationId = genId,
+                                isTerminal = false,
+                                promptTokens = promptTokens,
+                                ttftMs = reusableResult.ttftMs,
+                                tokensPerSec = reusableResult.tokensPerSec,
+                                activeThreads = reusableResult.activeThreads,
+                                errorCode = reusableResult.errorCode,
+                            )
+                        )
+                    }
                     emitChunk(
                         GenerationChunk(
                             text = "",
@@ -500,7 +524,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     suspend fun debugDecodeTokensForTesting(generationId: Int, tokens: IntArray): String =
         modelMutex.withLock {
             if (isDestroyed) "" else nativeDecodeTokens(nativeHandle, generationId, tokens)
-        }.let(Utf8TextPipeline::normalizeNativeText)
+        }.let { Utf8TextPipeline.normalizeNativeText(it) }
 
     @VisibleForTesting
     suspend fun debugStartGenerationForTesting(prompt: String, generationId: Int): Boolean =

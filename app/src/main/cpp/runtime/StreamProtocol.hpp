@@ -22,10 +22,14 @@
 // still be lost.
 //
 // Every mutator is total. An invalid call is rejected (returns false and sets
-// an error flag) and leaves the counters untouched, so a caller bug can never
-// silently corrupt the sequence accounting. `validate()` re-checks the
-// invariants against the stored state; a rejected call is *not* corruption, so
-// `validate()` stays true and `had_error()` surfaces the rejected call.
+// an error flag) and leaves the counters untouched, so a rejected call is never
+// confused with a successful mutation. `validate()` re-checks the maintained
+// invariants against the stored state: `produced_ >= committed_ >= 0` and
+// `produced_ >= drained_ >= 0`. It deliberately does NOT require
+// `committed_ >= drained_`: a token may legitimately be delivered to the
+// consumer before its KV entry is committed, so delivery may precede commit.
+// A rejected call is *not* corruption, so `validate()` stays true and
+// `had_error()` surfaces the rejected call.
 
 #include <algorithm>
 #include <cstdint>
@@ -101,9 +105,11 @@ public:
 
     // Enter the terminal state exactly once and derive `pending` from the
     // committed/drained backlog. Returns false if a terminal was already set
-    // (the reason is left unchanged).
+    // (the reason is left unchanged) or if `reason` is `StreamTerminal::None`
+    // (which means "not terminal yet", not a valid terminal reason).
     bool mark_terminal(StreamTerminal reason) {
         if (terminal_) return false;
+        if (reason == StreamTerminal::None) return fail();
         terminal_ = true;
         terminal_reason_ = reason;
         refreshPending();

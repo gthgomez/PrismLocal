@@ -8,9 +8,16 @@
 //
 // Contract under test
 // -------------------
-//   reusable = min(commonPrefixLength(prompt, active), reusable_tokens)
+//   reusable = min(commonPrefixLength(prompt, active),
+//                  reusable_tokens,
+//                  current_position)
 //              iff (valid && cache_identity == current_identity)
 //            = 0 otherwise (full replay)
+//
+// `current_position` mirrors Engine.cpp, which clamps the common prefix to
+// min(reusable_tokens, current_position) before reuse: the live KV cache may
+// hold fewer positions than `active_tokens` records, so reuse beyond
+// `current_position` would evaluate a suffix against a stale prefix.
 //
 //   tokens_to_decode = prompt.size() - reusable
 //
@@ -97,7 +104,7 @@ Tokens randomTokens(std::mt19937& rng, int length) {
 // Policy mirrors of the engine decision points.
 //
 // `reuseCount` is the raw PIR-05 decision (Engine.cpp: identity_match gate +
-// commonPrefixLength + reusable_tokens clamp).
+// commonPrefixLength + min(reusable_tokens, current_position) clamp).
 //
 // `planReplay` additionally derives tokens_to_decode and applies the
 // "last logits" rule (Engine.cpp): an all-cached prompt whose last logits are
@@ -111,20 +118,26 @@ struct ReplayPlan {
 std::size_t reuseCount(const Tokens& prompt,
                        const Tokens& active,
                        const ConversationState& state,
-                       const std::string& current_identity) {
+                       const std::string& current_identity,
+                       std::size_t current_position) {
     if (!state.valid || state.cache_identity != current_identity) {
         return 0; // invalid, or produced under a different cache identity
     }
     const std::size_t common = commonPrefixLength(prompt, active);
-    return std::min(common, state.reusable_tokens);
+    // Engine.cpp clamps to min(reusable_tokens, current_position): the live KV
+    // cache may hold fewer positions than `active_tokens` records.
+    const std::size_t bound = std::min(state.reusable_tokens, current_position);
+    return std::min(common, bound);
 }
 
 ReplayPlan planReplay(const Tokens& prompt,
                       const Tokens& active,
                       const ConversationState& state,
                       const std::string& current_identity,
+                      std::size_t current_position,
                       bool need_logits_for_sampling) {
-    std::size_t reusable = reuseCount(prompt, active, state, current_identity);
+    std::size_t reusable =
+        reuseCount(prompt, active, state, current_identity, current_position);
     // Defensive: commonPrefixLength/reusable_tokens must never exceed the prompt.
     if (reusable > prompt.size()) {
         reusable = prompt.size();
@@ -152,7 +165,7 @@ void testFullReplayVsReuse() {
         ConversationState state;
         state.markCommitted(id, prompt.size(), /*logits_valid=*/true);
         const Tokens active = prompt;
-        const ReplayPlan plan = planReplay(prompt, active, state, id, false);
+        const ReplayPlan plan = planReplay(prompt, active, state, id, active.size(), false);
         CHECK(plan.reusable == prompt.size());
         CHECK(plan.tokens_to_decode == 0);
         std::printf("  identical:        reusable=%zu tokens_to_decode=%zu\n",
@@ -164,7 +177,7 @@ void testFullReplayVsReuse() {
         const Tokens active{1, 2, 3, 4};
         ConversationState state;
         state.markCommitted(id, active.size(), true);
-        const ReplayPlan plan = planReplay(prompt, active, state, id, false);
+        const ReplayPlan plan = planReplay(prompt, active, state, id, active.size(), false);
         CHECK(plan.reusable == active.size());
         CHECK(plan.tokens_to_decode == prompt.size() - active.size());
         std::printf("  extension:        reusable=%zu tokens_to_decode=%zu\n",
@@ -176,7 +189,7 @@ void testFullReplayVsReuse() {
         const Tokens active{1, 2, 3, 9, 9, 9};
         ConversationState state;
         state.markCommitted(id, active.size(), true);
-        const ReplayPlan plan = planReplay(prompt, active, state, id, false);
+        const ReplayPlan plan = planReplay(prompt, active, state, id, active.size(), false);
         CHECK(plan.reusable == 3);
         CHECK(plan.tokens_to_decode == 3);
         std::printf("  divergence_mid:   reusable=%zu tokens_to_decode=%zu\n",
@@ -188,7 +201,7 @@ void testFullReplayVsReuse() {
         const Tokens active = prompt;
         ConversationState state;
         state.markCommitted(id, 4, true); // only 4 tokens proven committed
-        const ReplayPlan plan = planReplay(prompt, active, state, id, false);
+        const ReplayPlan plan = planReplay(prompt, active, state, id, active.size(), false);
         CHECK(plan.reusable == 4);
         CHECK(plan.tokens_to_decode == prompt.size() - 4);
     }
@@ -197,12 +210,81 @@ void testFullReplayVsReuse() {
     {
         ConversationState state; // default: valid == false, reusable == 0
         const Tokens active;
-        const ReplayPlan plan = planReplay(prompt, active, state, id, false);
+        const ReplayPlan plan = planReplay(prompt, active, state, id, active.size(), false);
         CHECK(plan.reusable == 0);
         CHECK(plan.tokens_to_decode == prompt.size());
-        CHECK(reuseCount(prompt, active, state, id) == 0);
+        CHECK(reuseCount(prompt, active, state, id, active.size()) == 0);
         std::printf("  empty_cache:      reusable=%zu tokens_to_decode=%zu\n",
                     plan.reusable, plan.tokens_to_decode);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Engine's `current_position` clamp.
+//
+// Engine.cpp only reports a prefix reusable up to
+// min(reusable_tokens, current_position): `active_tokens` may be longer than the
+// live KV cache (bookkeeping retained across a reset/abort), so an otherwise
+// matching prefix must still be clamped and `tokens_to_decode` must stay correct.
+// ---------------------------------------------------------------------------
+void testCurrentPositionClamp() {
+    const std::string id = baseIdentity().key();
+
+    // Long active_tokens (exact match, 12 tokens) but the live cache only
+    // reaches current_position == 5.
+    {
+        const Tokens prompt = makeTokens(12, 100);
+        const Tokens active = prompt;
+        ConversationState state;
+        state.markCommitted(id, active.size(), true);
+        const std::size_t position = 5;
+        const ReplayPlan plan = planReplay(prompt, active, state, id, position, false);
+        CHECK(plan.reusable == position);
+        CHECK(plan.tokens_to_decode == prompt.size() - position);
+        CHECK(plan.tokens_to_decode <= prompt.size()); // never underflows
+        CHECK(reuseCount(prompt, active, state, id, position) == position);
+        std::printf("  position_clamp:   active=%zu position=%zu reusable=%zu "
+                    "tokens_to_decode=%zu\n",
+                    active.size(), position, plan.reusable, plan.tokens_to_decode);
+    }
+
+    // Both bounds apply: min(proven reusable_tokens, current_position) wins.
+    {
+        const Tokens prompt = makeTokens(16, 0);
+        const Tokens active = prompt;
+        ConversationState state;
+        state.markCommitted(id, 12, true); // proven prefix: 12 tokens
+        const std::size_t position = 7;    // live cache: 7 positions
+        const ReplayPlan plan = planReplay(prompt, active, state, id, position, false);
+        CHECK(plan.reusable == 7);
+        CHECK(plan.tokens_to_decode == prompt.size() - 7);
+    }
+
+    // A zero current_position (post-abort bookkeeping kept active_tokens) forbids
+    // all reuse even though active_tokens still matches the prompt exactly.
+    {
+        const Tokens prompt = makeTokens(9, 0);
+        const Tokens active = prompt;
+        ConversationState state;
+        state.markCommitted(id, active.size(), true);
+        const ReplayPlan plan =
+            planReplay(prompt, active, state, id, /*current_position=*/0, false);
+        CHECK(plan.reusable == 0);
+        CHECK(plan.tokens_to_decode == prompt.size());
+    }
+
+    // The last-logits rule still applies after the position clamp, and the
+    // resulting accounting must not underflow.
+    {
+        const Tokens prompt = makeTokens(6, 40);
+        const Tokens active = prompt;
+        ConversationState state;
+        state.markCommitted(id, active.size(), /*logits_valid=*/false);
+        const std::size_t position = 4;
+        const ReplayPlan plan = planReplay(prompt, active, state, id, position, true);
+        CHECK(plan.reusable == position);
+        CHECK(plan.tokens_to_decode == prompt.size() - position);
+        CHECK(plan.tokens_to_decode >= 1);
     }
 }
 
@@ -219,12 +301,12 @@ void testInvalidationForcesFullReplay() {
     for (const char* reason : reasons) {
         ConversationState state;
         state.markCommitted(id, prompt.size(), true);
-        CHECK(reuseCount(prompt, prompt, state, id) == prompt.size());
+        CHECK(reuseCount(prompt, prompt, state, id, prompt.size()) == prompt.size());
 
         state.invalidate();
 
-        CHECK(reuseCount(prompt, prompt, state, id) == 0);
-        const ReplayPlan plan = planReplay(prompt, prompt, state, id, false);
+        CHECK(reuseCount(prompt, prompt, state, id, prompt.size()) == 0);
+        const ReplayPlan plan = planReplay(prompt, prompt, state, id, prompt.size(), false);
         CHECK(plan.reusable == 0);
         CHECK(plan.tokens_to_decode == prompt.size()); // full replay, never suffix-only
         CHECK(!state.valid);
@@ -277,11 +359,11 @@ void testIdentityChangeInvalidates() {
     for (const auto& [name, changed] : variants) {
         ConversationState state;
         state.markCommitted(base.key(), prompt.size(), true);
-        CHECK(reuseCount(prompt, active, state, base.key()) == prompt.size());
+        CHECK(reuseCount(prompt, active, state, base.key(), active.size()) == prompt.size());
 
         // Same tokens, same proof — but a different identity makes them unusable.
-        CHECK(reuseCount(prompt, active, state, changed.key()) == 0);
-        const ReplayPlan plan = planReplay(prompt, active, state, changed.key(), false);
+        CHECK(reuseCount(prompt, active, state, changed.key(), active.size()) == 0);
+        const ReplayPlan plan = planReplay(prompt, active, state, changed.key(), active.size(), false);
         CHECK(plan.reusable == 0);
         CHECK(plan.tokens_to_decode == prompt.size());
         CHECK(changed.key() != base.key());
@@ -301,7 +383,7 @@ void testCommitAndAbort() {
         ConversationState state;
         state.markCommitted(id, 3, true);
         CHECK(state.valid == true);
-        CHECK(reuseCount(prompt, prompt, state, id) == 3);
+        CHECK(reuseCount(prompt, prompt, state, id, prompt.size()) == 3);
     }
 
     // n == 0 never enables reuse.
@@ -310,7 +392,7 @@ void testCommitAndAbort() {
         state.markCommitted(id, 0, true);
         CHECK(state.valid == false);
         CHECK(state.reusable_tokens == 0);
-        const ReplayPlan plan = planReplay(prompt, prompt, state, id, false);
+        const ReplayPlan plan = planReplay(prompt, prompt, state, id, prompt.size(), false);
         CHECK(plan.reusable == 0);
         CHECK(plan.tokens_to_decode == prompt.size());
     }
@@ -323,7 +405,7 @@ void testCommitAndAbort() {
         state.invalidate();
         CHECK(state.last_logits_valid == false);
 
-        const ReplayPlan plan = planReplay(prompt, prompt, state, id, true);
+        const ReplayPlan plan = planReplay(prompt, prompt, state, id, prompt.size(), true);
         CHECK(plan.reusable == 0);
         CHECK(plan.tokens_to_decode == prompt.size());
         CHECK(plan.tokens_to_decode >= 1);
@@ -335,13 +417,13 @@ void testCommitAndAbort() {
         ConversationState state;
         state.markCommitted(id, prompt.size(), /*logits_valid=*/false);
         CHECK(state.valid == true);
-        const ReplayPlan plan = planReplay(prompt, prompt, state, id, true);
+        const ReplayPlan plan = planReplay(prompt, prompt, state, id, prompt.size(), true);
         CHECK(plan.reusable == prompt.size() - 1);
         CHECK(plan.tokens_to_decode == 1);
         CHECK(plan.tokens_to_decode >= 1);
 
         // Without the sampling requirement the prefix stays fully reusable.
-        const ReplayPlan noLogits = planReplay(prompt, prompt, state, id, false);
+        const ReplayPlan noLogits = planReplay(prompt, prompt, state, id, prompt.size(), false);
         CHECK(noLogits.reusable == prompt.size());
         CHECK(noLogits.tokens_to_decode == 0);
     }
@@ -361,7 +443,7 @@ void testRepeatedShiftsKeepInvariants() {
         Tokens prompt = active;
         prompt.push_back(100 + turn);
 
-        const ReplayPlan plan = planReplay(prompt, active, state, id, false);
+        const ReplayPlan plan = planReplay(prompt, active, state, id, active.size(), false);
         CHECK(plan.reusable <= prompt.size());
         CHECK(plan.tokens_to_decode == prompt.size() - plan.reusable); // no underflow
         CHECK(plan.reusable <= state.reusable_tokens);
@@ -386,7 +468,8 @@ void testRepeatedShiftsKeepInvariants() {
 
         // A shorter prompt must still produce a non-negative decode count.
         Tokens shortPrompt(active.begin(), active.begin() + active.size() / 2);
-        const ReplayPlan shortPlan = planReplay(shortPrompt, active, state, id, false);
+        const ReplayPlan shortPlan =
+            planReplay(shortPrompt, active, state, id, active.size(), false);
         CHECK(shortPlan.reusable <= shortPrompt.size());
         CHECK(shortPlan.tokens_to_decode == shortPrompt.size() - shortPlan.reusable);
         CHECK(shortPlan.tokens_to_decode <= shortPrompt.size());
@@ -446,7 +529,8 @@ void testMonotonicReplayAccounting() {
             prompt.push_back(tokenDist(rng));
         }
 
-        const ReplayPlan plan = planReplay(prompt, committed, state, id, false);
+        const ReplayPlan plan =
+            planReplay(prompt, committed, state, id, committed.size(), false);
         CHECK(plan.reusable <= prompt.size());
         CHECK(plan.tokens_to_decode == prompt.size() - plan.reusable);
         CHECK(plan.reusable <= committed.size());
@@ -477,6 +561,7 @@ int main() {
     std::printf("context_replay_test: exercising runtime/ConversationState.hpp\n");
 
     testFullReplayVsReuse();
+    testCurrentPositionClamp();
     testInvalidationForcesFullReplay();
     testIdentityChangeInvalidates();
     testCommitAndAbort();

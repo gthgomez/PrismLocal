@@ -24,19 +24,23 @@ import java.io.File
  * skipped via [assumeTrue] — it never fakes a pass.
  *
  * What it exercises, through the real [NativeLlmBridge]:
+ *  - a clean-cache reference for a distinct continuation prompt;
  *  - a baseline full prefill from a clean KV cache;
  *  - an identical second turn, which the engine serves from the committed
  *    prefix (all-cached reuse);
  *  - [NativeLlmBridge.resetConversation], after which the engine must replay the
- *    whole prompt rather than evaluate a suffix against a stale prefix;
+ *    whole DISTINCT continuation prompt rather than evaluate a suffix against a
+ *    stale prefix;
  *  - a reset followed by an extended prompt.
  *
  * The native layer does not expose a reusable-token counter to Kotlin, so the
- * "no suffix-only evaluation after a reset" property is asserted behaviorally:
- * with greedy sampling the continuation is a pure function of the prompt
- * logits, so a correct full replay after a reset must reproduce the clean-cache
- * baseline exactly, while a buggy suffix-only evaluation would sample different
- * logits and diverge.
+ * "no suffix-only evaluation after a reset" property is asserted behaviorally as
+ * a proxy, not a proof: with greedy sampling the continuation is a pure function
+ * of the prompt logits, so generating the distinct continuation after a reset
+ * must reproduce the clean-cache reference. Unlike comparing an identical prompt
+ * (which a no-op reset would also pass), a stale prefix whose tail diverges from
+ * this continuation would make a suffix-only evaluation sample different logits
+ * and drift from the reference.
  */
 @RunWith(AndroidJUnit4::class)
 class ContextReplayTest {
@@ -75,7 +79,22 @@ class ContextReplayTest {
                     "Remember the sequence alpha beta gamma.<|im_end|>\n" +
                     "<|im_start|>assistant\n"
 
-            // Baseline: a genuine full prefill from a clean KV cache.
+            // A distinct continuation: it shares `basePrompt` but diverges in the
+            // suffix, so its clean-cache continuation is not the baseline's.
+            val continuationPrompt = basePrompt + "Now repeat alpha.\n"
+
+            // Clean-cache reference for the distinct continuation. It is produced
+            // first, while the KV cache is empty, so it is a genuine full replay.
+            val cleanContinuation = generate(engine, continuationPrompt)
+            assertTrue(
+                "clean continuation entered native error",
+                !cleanContinuation.sawTerminalError,
+            )
+            assertTrue("clean continuation emitted no tokens", cleanContinuation.tokenCount >= 1)
+
+            // Baseline: a genuine full prefill from a clean KV cache (the reset
+            // immediately below clears the reference's cache entries).
+            engine.resetConversation()
             val baseline = generate(engine, basePrompt)
             assertTrue("baseline entered native error", !baseline.sawTerminalError)
             assertTrue("baseline reported a native error code", baseline.errorCode == 0)
@@ -92,23 +111,36 @@ class ContextReplayTest {
                 reused.text,
             )
 
-            // Reset invalidates the cache: the next turn must replay the whole
-            // prompt. Suffix-only evaluation against the stale prefix would
-            // sample different logits and diverge from the clean baseline.
+            // Reset invalidates the cache: the next turn must replay the WHOLE
+            // DISTINCT continuation prompt, reproducing the clean-cache reference.
+            //
+            // Behavioural proxy: no native reuse counter is exposed, and a correct
+            // prefix reuse is logit-equivalent to a full replay, so this cannot
+            // literally prove the KV cache was cleared. It is discriminating
+            // where it matters: had a reset left a stale prefix whose tail
+            // diverges from this continuation, a suffix-only evaluation would
+            // sample different logits and drift from the reference (an identical
+            // prompt could not expose that, since even a no-op reset would pass).
             engine.resetConversation()
-            val afterReset = generate(engine, basePrompt)
+            val afterReset = generate(engine, continuationPrompt)
             assertTrue("post-reset generation entered native error", !afterReset.sawTerminalError)
             assertEquals(
-                "reset did not replay the full prompt from a clean KV cache",
-                baseline.text,
+                "reset did not replay the distinct prompt from a clean KV cache",
+                cleanContinuation.text,
                 afterReset.text,
             )
 
             // Reset + extended prompt must decode the whole new prompt cleanly.
             engine.resetConversation()
-            val extended = generate(engine, basePrompt + "Now repeat alpha.\n")
-            assertTrue("extended post-reset generation entered native error", !extended.sawTerminalError)
-            assertTrue("extended post-reset generation emitted no tokens", extended.tokenCount >= 1)
+            val extended = generate(engine, continuationPrompt + "Now repeat beta.\n")
+            assertTrue(
+                "extended post-reset generation entered native error",
+                !extended.sawTerminalError,
+            )
+            assertTrue(
+                "extended post-reset generation emitted no tokens",
+                extended.tokenCount >= 1,
+            )
         } finally {
             engine.destroySafely()
         }

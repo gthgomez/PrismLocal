@@ -183,4 +183,37 @@ class IncrementalUtf8Test {
 
         assertEquals(0xE2.toByte(), bytes[3]) // source array is not mutated
     }
+
+    @Test
+    fun crossCallInvalidBytesMatchJvmReplacementPolicy() {
+        // A sequence started in one append and invalidated by the next must
+        // still match String(bytes, UTF_8) exactly.
+        val cases = listOf(
+            byteArrayOf(0xE0.toByte(), 0x80.toByte()) to byteArrayOf(0x41),
+            byteArrayOf(0xE2.toByte(), 0x82.toByte()) to byteArrayOf(0x28),
+            byteArrayOf(0xED.toByte(), 0xA0.toByte()) to byteArrayOf(0x80.toByte()),
+            byteArrayOf(0xF0.toByte(), 0x90.toByte()) to byteArrayOf(0x28),
+            byteArrayOf(0xF4.toByte(), 0x90.toByte()) to byteArrayOf(0x80.toByte(), 0x80.toByte()),
+            byteArrayOf(0xC3.toByte()) to byteArrayOf(0xC3.toByte()),
+        )
+        for ((head, tail) in cases) {
+            val whole = head + tail
+            val expected = String(whole, StandardCharsets.UTF_8)
+            val pipeline = Utf8TextPipeline()
+            val actual = pipeline.append(head) + pipeline.append(tail) + pipeline.flush()
+            assertEquals(
+                "bytes=${whole.joinToString(" ") { "%02X".format(it) }}",
+                expected,
+                actual,
+            )
+        }
+    }
+
+    @Test
+    fun truncatedFourByteSequenceWithBadThirdByteAtEof() {
+        val bytes = byteArrayOf(0xF0.toByte(), 0x90.toByte(), 0x28)
+        val expected = String(bytes, StandardCharsets.UTF_8)
+        val pipeline = Utf8TextPipeline()
+        assertEquals(expected, pipeline.append(bytes) + pipeline.flush())
+    }
 }

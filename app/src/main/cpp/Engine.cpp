@@ -355,10 +355,13 @@ struct ModelRuntime {
 
     std::vector<llama_token> active_tokens;
 
-    // PIR-05: actual KV element types chosen at context init. These can differ
-    // from the requested config when the primary init fails and the loader falls
-    // back to F16 / defaults, so they are part of the cache identity: a prefix
-    // is never reused across an incompatible KV layout.
+    // PIR-05: KV layout recorded from the context params that succeeded (after
+    // any F16/defaults fallback). type_k/type_v are accurate for attention KV;
+    // recurrent/hybrid architectures keep a separate FP32 state regardless.
+    // flash_attn records the requested mode, not llama.cpp's internally resolved
+    // AUTO value. All three are constant for a runtime, so they cannot by
+    // themselves cause stale reuse; they only make the cache-identity log an
+    // under-report of the resolved FlashAttention setting.
     std::string kv_type_k = "f16";
     std::string kv_type_v = "f16";
     bool flash_attn = false;
@@ -590,9 +593,6 @@ int computeSystemPrefixLength(const std::vector<llama_token>& tokens, std::size_
         return 0;
     }
     const int detected = findSystemPrefixLength(tokens, vocab);
-    if (detected < 0) {
-        return 0;
-    }
     return static_cast<int>(std::min(static_cast<std::size_t>(detected), limit));
 }
 

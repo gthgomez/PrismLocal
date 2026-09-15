@@ -19,8 +19,19 @@ object InferencePlan {
      */
     const val SCHEMA_VERSION: Int = 1
 
-    /** No LoRA adapters are part of the load key today; the slot exists for future wiring. */
+    /** Canonical adapter key when no LoRA adapter is part of the load. */
     const val NO_ADAPTERS: String = "none"
+
+    /**
+     * Canonical key for the LoRA adapters that are part of the load. Native applies
+     * adapters at load time, so a change here must force a reload.
+     */
+    fun adapterKeyFor(settings: GenerationSettings): String =
+        if (settings.loraAdapters.isEmpty()) {
+            NO_ADAPTERS
+        } else {
+            settings.loraAdapters.joinToString(",") { (path, scale) -> "$path@$scale" }
+        }
 
     /**
      * Builds the requested plan from user-facing [GenerationSettings].
@@ -32,7 +43,7 @@ object InferencePlan {
         settings: GenerationSettings,
         modelId: String? = null,
         modelSha256: String? = null,
-        adapterKey: String = NO_ADAPTERS,
+        adapterKey: String = adapterKeyFor(settings),
     ): RequestedPlan = RequestedPlan(
         version = SCHEMA_VERSION,
         modelId = modelId,

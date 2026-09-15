@@ -132,6 +132,11 @@ class ModelManager(
                     uiState._activeModelInfo.value = activeModel
                     uiState._runtimeStatus.value = RuntimeStatus.IDLE
                     val memory = deviceProfiler.deviceMemorySnapshot()
+                    // Report the engine's actual backend, not a default: a loaded
+                    // Vulkan model must not be displayed as CPU.
+                    val backendName = engine.getBackendName()
+                    val gpuLayersOffloaded = engine.getGpuLayersOffloaded()
+                    val isKleidiAiEnabled = engine.isKleidiAiEnabled()
                     uiState._modelLoadDiagnostics.value = ModelLoadDiagnostics(
                         modelId = modelId,
                         state = "current",
@@ -139,7 +144,10 @@ class ModelManager(
                         modelBytes = activeModel.bytes,
                         availableMemoryMb = memory.availableMb,
                         lowMemory = memory.lowMemory,
-                        message = "Model already loaded",
+                        message = "Model already loaded ($backendName)",
+                        gpuLayersOffloaded = gpuLayersOffloaded,
+                        backendName = backendName,
+                        isKleidiAiEnabled = isKleidiAiEnabled,
                     )
                     return@withContext true
                 }
@@ -161,9 +169,22 @@ class ModelManager(
                 }
                 Log.d(TAG, "unloadModel before switch modelId=$modelId current=${uiState._currentModel.value}")
                 engine.unloadModel()
+                // Invalidate the applied-plan key immediately: from here until a
+                // successful load there is no model whose configuration this key
+                // describes, so a throw or failure can never leave a stale key
+                // that makes a later same-model switch short-circuit to
+                // "Model already loaded" against an unloaded engine.
+                lastLoadedPlanKey = null
                 Log.d(TAG, "unloadModel complete modelId=$modelId")
                 uiState.streamState.clear()
-                val loaded = engine.loadModel(activeModel.file.absolutePath, requestedSettings)
+                val loaded = try {
+                    engine.loadModel(activeModel.file.absolutePath, requestedSettings)
+                } catch (cancellation: kotlinx.coroutines.CancellationException) {
+                    throw cancellation
+                } catch (t: Exception) {
+                    Log.e(TAG, "model_load_threw modelId=$modelId", t)
+                    false
+                }
                 Log.d(TAG, "switchModel path=${activeModel.file.absolutePath} result=$loaded")
                 if (loaded) {
                     lastLoadedPlanKey = requestedPlanKey

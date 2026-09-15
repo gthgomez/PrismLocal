@@ -10,9 +10,13 @@
 // The engine owns a `ConversationState` alongside `active_tokens` /
 // `current_position`. The invariant it encodes is:
 //
-//   `valid == true`  <=>  `reusable_tokens == active_tokens.size()` and the live
-//                         KV cache provably holds positions [0, reusable_tokens)
-//                         for the main sequence, produced under `cache_identity`.
+//   `valid == true`  =>  the live KV cache provably holds positions
+//                        [0, reusable_tokens) for the main sequence, produced
+//                        under `cache_identity`.
+//
+// The converse does not hold: `invalidate()` clears `valid` without clearing the
+// engine's `active_tokens`, so `reusable_tokens == active_tokens.size()` with
+// `valid == false` is a legitimate "must replay" state.
 //
 // Any operation that cannot prove the KV mutation succeeded must clear `valid`
 // (invalidate), so no suffix is ever evaluated against a stale prefix.
@@ -47,10 +51,6 @@ struct CacheIdentity {
         appendField(out, kv_type_v);
         appendField(out, flash_attn ? "1" : "0");
         return out;
-    }
-
-    bool matches(const CacheIdentity& other) const {
-        return key() == other.key();
     }
 
 private:
@@ -92,8 +92,6 @@ struct ConversationState {
         last_logits_valid = logits_valid;
     }
 
-    void setLastLogitsValid(bool value) { last_logits_valid = value; }
-
     // Hot-path variant used inside the per-token decode loop. The cache identity
     // cannot change within a generation, so this updates only the counters and
     // avoids re-copying the (potentially multi-KB) identity key on every token.
@@ -103,19 +101,9 @@ struct ConversationState {
         valid = committed_tokens > 0;
         last_logits_valid = logits_valid;
     }
-
-    // (b) Decide whether the stored prefix is reusable for a new request: it must
-    // be valid, cover the requested common prefix, and have been produced under
-    // the same cache identity.
-    bool prefixReusable(const std::string& identity, std::size_t common_prefix) const {
-        return valid &&
-               common_prefix > 0 &&
-               common_prefix <= reusable_tokens &&
-               cache_identity == identity;
-    }
 };
 
-// (a) Length of the longest common prefix of two token vectors. Templated so it
+// Length of the longest common prefix of two token vectors. Templated so it
 // works for `std::vector<llama_token>` and `std::vector<int32_t>` without naming
 // a llama type here (llama_token is a typedef for int32_t).
 template <typename T>

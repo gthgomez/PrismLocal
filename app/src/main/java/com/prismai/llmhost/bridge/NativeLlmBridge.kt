@@ -394,28 +394,15 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                         else -> "UNKNOWN"
                     }
                     observedTerminal = true
-                    // Finalize the decoder: emit any buffered trailing text
-                    // (e.g. a truncated final multi-byte sequence) before the
-                    // terminal chunk so no decoded bytes are lost.
+                    // Finalize the decoder. Any buffered trailing bytes (e.g. a
+                    // truncated final multi-byte sequence) are delivered *inside*
+                    // the terminal chunk: terminal chunks are retried until sent
+                    // (see emitChunk), so the remainder cannot be dropped under
+                    // backpressure the way a separate non-terminal chunk could.
                     val trailingText = utf8.flush()
-                    if (trailingText.isNotEmpty()) {
-                        emitChunk(
-                            GenerationChunk(
-                                text = trailingText,
-                                tokenCount = 0,
-                                generationId = genId,
-                                isTerminal = false,
-                                promptTokens = promptTokens,
-                                ttftMs = reusableResult.ttftMs,
-                                tokensPerSec = reusableResult.tokensPerSec,
-                                activeThreads = reusableResult.activeThreads,
-                                errorCode = reusableResult.errorCode,
-                            )
-                        )
-                    }
                     emitChunk(
                         GenerationChunk(
-                            text = "",
+                            text = trailingText,
                             tokenCount = 0,
                             generationId = genId,
                             isTerminal = true,

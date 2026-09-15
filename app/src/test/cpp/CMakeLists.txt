@@ -74,3 +74,5 @@ endfunction()
 
 prism_add_native_test(harness_self_test harness_self_test.cpp)
 prism_add_native_test(conversation_state_test conversation_state_test.cpp)
+prism_add_native_test(stream_protocol_test stream/stream_protocol_test.cpp)
+prism_add_native_test(context_replay_test context/context_replay_test.cpp)

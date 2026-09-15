@@ -454,7 +454,8 @@ internal fun ControlPlaneSheet(
                         }
                     } else if (isTooLarge) {
                         Text(
-                            text = "This model requires significant RAM. You may proceed to load it, but background applications could be closed by Android if memory pressure increases.",
+                            text = "This model is projected to need more RAM than is currently free, or it exceeds this build's size cap. " +
+                                "Close other apps or reduce the context length and try again.",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }

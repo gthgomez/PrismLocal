@@ -28,8 +28,16 @@ class ModelReadinessAssessor(
 
     companion object {
         private const val MODEL_RUNTIME_MIN_OVERHEAD_BYTES = 640L * 1024L * 1024L
-        private const val MODEL_CONTEXT_ESTIMATE_BYTES = 256L * 1024L * 1024L
         private const val MODEL_THREAD_SCRATCH_BYTES = 24L * 1024L * 1024L
+
+        /**
+         * Used only when a GGUF exposes no layer/embedding metadata. Real models
+         * get a shape-derived KV estimate; this is a deliberately coarse fallback.
+         */
+        private const val FALLBACK_KV_BYTES_PER_TOKEN = 64L * 1024L
+
+        /** Fallback head dimension when `embedding_length / attention.head_count` is unavailable. */
+        private const val DEFAULT_HEAD_DIM = 128
 
         /**
          * Map GGUF `general.file_type` (llama_ftype) to a quant label.
@@ -95,8 +103,54 @@ class ModelReadinessAssessor(
         }
 
         /**
+         * Bytes per cached element for a llama.cpp KV-cache type. Block-quantized
+         * types store 32 elements per block plus a scale, so they are slightly
+         * larger than the nominal bit width.
+         */
+        internal fun kvBytesPerElement(kvType: String): Double = when (kvType.lowercase(Locale.US)) {
+            "f16" -> 2.0
+            "q8_0" -> 34.0 / 32.0
+            "q4_0" -> 18.0 / 32.0
+            else -> 2.0
+        }
+
+        /**
+         * Estimate KV-cache RAM from the model's actual attention shape:
+         *   layers × kv_heads × head_dim × (bytes/elem(K) + bytes/elem(V)) × context
+         * GQA/MQA is handled via `attention.head_count_kv`. Falls back to a coarse
+         * per-token constant only when the GGUF exposes no shape metadata.
+         */
+        internal fun estimateKvCacheBytes(
+            contextLength: Int,
+            blockCount: Int?,
+            embeddingLength: Int?,
+            attentionHeadCount: Int?,
+            attentionHeadCountKv: Int?,
+            kvTypeK: String,
+            kvTypeV: String,
+        ): Long {
+            val layers = blockCount ?: 0
+            val embd = embeddingLength ?: 0
+            if (layers <= 0 || embd <= 0) {
+                return contextLength.toLong() * FALLBACK_KV_BYTES_PER_TOKEN
+            }
+            val heads = (attentionHeadCount ?: 0).takeIf { it > 0 }
+            val headDim = if (heads != null) (embd / heads).coerceAtLeast(1) else DEFAULT_HEAD_DIM
+            val kvHeads = (attentionHeadCountKv ?: 0).takeIf { it > 0 } ?: heads ?: 1
+            val bytesPerToken = layers.toDouble() * kvHeads.toDouble() * headDim.toDouble() *
+                (kvBytesPerElement(kvTypeK) + kvBytesPerElement(kvTypeV))
+            return (contextLength.toDouble() * bytesPerToken).toLong().coerceAtLeast(0L)
+        }
+
+        /**
          * Pure fitness rating used by [estimateModelFit] and unit tests.
-         * Large-model tiers use available RAM after unload (not total device RAM).
+         *
+         * Semantics are deliberately fail-open: [ModelFitRating.TOO_LARGE] means the
+         * model cannot physically fit given the RAM available after unload (or it is
+         * over [ModelLoadLimits.HARD_CAP_BYTES]). Everything that fits is either SAFE
+         * or RISKY, and RISKY models are still allowed to load — a slow model is not
+         * a blocked model. Large models get a tighter SAFE fraction so they surface
+         * as RISKY more often, but that only changes the label, never admission.
          */
         internal fun rateModelFit(
             modelBytes: Long,
@@ -105,17 +159,13 @@ class ModelReadinessAssessor(
             lowMemory: Boolean,
         ): ModelFitRating {
             val isLargeModelClass = modelBytes > ModelLoadLimits.LARGE_MODEL_BYTES
-            val safeBudget = (availableAfterUnloadBytes * 0.78).toLong()
-            val riskyBudget = (availableAfterUnloadBytes * 0.98).toLong()
+            val safeFraction = if (isLargeModelClass) 0.60 else 0.75
+            val safeBudget = (availableAfterUnloadBytes * safeFraction).toLong()
             return when {
                 modelBytes > ModelLoadLimits.HARD_CAP_BYTES -> ModelFitRating.TOO_LARGE
-                isLargeModelClass && availableAfterUnloadBytes < ModelLoadLimits.LARGE_MODEL_AVAILABLE_TOO_LARGE ->
-                    ModelFitRating.TOO_LARGE
-                isLargeModelClass && availableAfterUnloadBytes < ModelLoadLimits.LARGE_MODEL_AVAILABLE_RISKY ->
-                    ModelFitRating.RISKY
+                requiredRamBytes > availableAfterUnloadBytes -> ModelFitRating.TOO_LARGE
                 requiredRamBytes <= safeBudget && !lowMemory -> ModelFitRating.SAFE
-                requiredRamBytes <= riskyBudget || modelBytes <= (availableAfterUnloadBytes * 0.90).toLong() -> ModelFitRating.RISKY
-                else -> ModelFitRating.TOO_LARGE
+                else -> ModelFitRating.RISKY
             }
         }
     }
@@ -189,16 +239,25 @@ class ModelReadinessAssessor(
         val lmkThresholdBytes = (profile.availableRamBytes / 8L).coerceAtLeast(256L * 1024L * 1024L)
         val usableRamBytes = maxOf(0L, availableAfterCurrentUnload - lmkThresholdBytes)
         val settings = uiState._generationSettings.value.clamped()
-        val quantization = ggufFileTypeHint(info.validation.metadata?.fileType)
+        val metadata = info.validation.metadata
+        val quantization = ggufFileTypeHint(metadata?.fileType)
             ?: quantizationHint(info.fileName)
             ?: quantizationHint(info.id)
         val runtimeOverhead = maxOf(
             MODEL_RUNTIME_MIN_OVERHEAD_BYTES,
             (info.bytes * quantizationOverheadMultiplier(quantization)).toLong(),
         )
-        val declaredContext = info.validation.metadata?.contextLength ?: GenerationSettings.DEFAULT_CONTEXT_LENGTH
+        val declaredContext = metadata?.contextLength ?: GenerationSettings.DEFAULT_CONTEXT_LENGTH
         val activeContext = minOf(settings.contextLength, declaredContext.coerceAtLeast(GenerationSettings.MIN_CONTEXT_LENGTH))
-        val kvCacheEstimateBytes = activeContext.toLong() * 256L * 1024L
+        val kvCacheEstimateBytes = estimateKvCacheBytes(
+            contextLength = activeContext,
+            blockCount = metadata?.blockCount,
+            embeddingLength = metadata?.embeddingLength,
+            attentionHeadCount = metadata?.attentionHeadCount,
+            attentionHeadCountKv = metadata?.attentionHeadCountKv,
+            kvTypeK = settings.kvCacheTypeK,
+            kvTypeV = settings.kvCacheTypeV,
+        )
         val requiredRam = info.bytes +
             runtimeOverhead +
             kvCacheEstimateBytes +
@@ -217,16 +276,19 @@ class ModelReadinessAssessor(
         val actualAverage = exactRuns.takeIf { it.isNotEmpty() }
             ?.map { it.tokensPerSecond }
             ?.average()
-        val hasProvenSuccess = actualAverage != null && actualAverage >= 1.0
+        // Empirical evidence override: a model that has already generated on this
+        // device is trusted over the memory projection. This is the explicit
+        // "if it can run, never stop it" path — only the hard size cap still applies.
+        val provenUsable = actualAverage != null && actualAverage >= 1.0 && info.bytes <= ModelLoadLimits.HARD_CAP_BYTES
 
-        val finalRating = if (hasProvenSuccess && info.bytes <= ModelLoadLimits.HARD_CAP_BYTES) {
+        val finalRating = if (provenUsable) {
             if (profile.lowMemory || actualAverage!! < 2.0) ModelFitRating.RISKY else ModelFitRating.SAFE
         } else {
             staticRating
         }
 
         val reason = when {
-            hasProvenSuccess -> "Proven usable on your device (avg ${FormatUtils.formatAgentTps(actualAverage!!)} tok/s across ${exactRuns.size} run${if (exactRuns.size > 1) "s" else ""})"
+            provenUsable -> "Proven usable on your device (avg ${FormatUtils.formatAgentTps(actualAverage!!)} tok/s across ${exactRuns.size} run${if (exactRuns.size > 1) "s" else ""})"
             finalRating == ModelFitRating.SAFE -> "Recommended"
             finalRating == ModelFitRating.RISKY -> if (profile.lowMemory) "May be slow; device reports low memory" else "May be slow; limited RAM headroom"
             else -> "Likely too large for current LMK-safe RAM headroom"
@@ -242,6 +304,7 @@ class ModelReadinessAssessor(
             storageFreeBytes = profile.storageFreeBytes,
             rating = finalRating,
             reason = reason,
+            provenUsable = provenUsable,
         )
     }
 

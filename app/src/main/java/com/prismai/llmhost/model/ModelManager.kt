@@ -193,46 +193,50 @@ class ModelManager(
     private fun nativeLoadRejection(model: ModelStorageManager.ActiveModelInfo): NativeLoadRejection? {
         val profile = deviceProfiler.captureProfile()
         val fit = modelReadinessAssessor.estimateModelFit(model, profile)
-        val availableAfterCurrentUnload = fit.availableRamAfterUnloadBytes
-        val reserve = minOf(ModelLoadLimits.MEMORY_RESERVE_BYTES, availableAfterCurrentUnload / 3L)
-        val budget = minOf(
-            ModelLoadLimits.HARD_CAP_BYTES,
-            (availableAfterCurrentUnload - reserve).coerceAtLeast(0L),
+        val overHardCap = model.bytes > ModelLoadLimits.HARD_CAP_BYTES
+        // Block only when the model physically cannot fit. A tight-but-fitting model
+        // (RISKY) still loads — slow is not blocked — and a model already proven on
+        // this device overrides even the physical projection.
+        val exceedsAvailableRam = fit.requiredRamBytes > fit.availableRamAfterUnloadBytes
+        val allowed = !overHardCap && (!exceedsAvailableRam || fit.provenUsable)
+        if (allowed) {
+            if (fit.rating == ModelFitRating.RISKY) {
+                Log.i(
+                    TAG,
+                    "model_load_advisory model=${model.id} reason=${fit.reason} " +
+                        "required=${fit.requiredRamBytes} avail=${fit.availableRamAfterUnloadBytes}",
+                )
+                eventBus.publish(
+                    "Loading ${model.id}: tight memory (needs ~${FormatUtils.formatBytesForMessage(fit.requiredRamBytes)}, " +
+                        "~${FormatUtils.formatBytesForMessage(fit.availableRamAfterUnloadBytes)} available). " +
+                        "It may be slow; proceeding.",
+                )
+            }
+            return null
+        }
+        Log.w(
+            TAG,
+            "model_load_rejected model=${model.id} bytes=${model.bytes} overHardCap=$overHardCap " +
+                "required=${fit.requiredRamBytes} avail=${fit.availableRamAfterUnloadBytes} " +
+                "proven=${fit.provenUsable} rating=${fit.rating} lowMemory=${profile.lowMemory}",
         )
-        val allowed = (fit.rating != ModelFitRating.TOO_LARGE || fit.reason.startsWith("Proven usable") || model.bytes <= (availableAfterCurrentUnload * 0.90).toLong()) && model.bytes <= ModelLoadLimits.HARD_CAP_BYTES
-        if (!allowed) {
-            Log.w(
-                TAG,
-                "model_load_rejected_too_large model=${model.id} bytes=${model.bytes} " +
-                    "required=${fit.requiredRamBytes} budget=$budget reserve=$reserve avail=${profile.availableRamBytes} " +
-                    "projectedAvail=$availableAfterCurrentUnload lowMemory=${profile.lowMemory} rating=${fit.rating}",
-            )
-        }
-        return if (allowed) {
-            null
-        } else {
-            NativeLoadRejection(
-                message = nativeLoadRejectionMessage(model, fit, budget),
-            )
-        }
+        return NativeLoadRejection(
+            message = nativeLoadRejectionMessage(model, fit),
+        )
     }
 
     private fun nativeLoadRejectionMessage(
         model: ModelStorageManager.ActiveModelInfo,
         fit: ModelFitEstimate,
-        budgetBytes: Long,
     ): String {
         val modelSize = FormatUtils.formatBytesForMessage(model.bytes)
         val estimatedNeed = FormatUtils.formatBytesForMessage(fit.requiredRamBytes)
         val available = FormatUtils.formatBytesForMessage(fit.availableRamAfterUnloadBytes)
-        val budget = FormatUtils.formatBytesForMessage(budgetBytes)
         return when {
             model.bytes > ModelLoadLimits.HARD_CAP_BYTES ->
                 "Model ${model.id} is $modelSize, above this build's ${FormatUtils.formatBytesForMessage(ModelLoadLimits.HARD_CAP_BYTES)} load cap."
-            fit.rating == ModelFitRating.TOO_LARGE ->
-                "Model ${model.id} needs about $estimatedNeed RAM, but only $available is available after unload ($budget load budget)."
             else ->
-                "Model ${model.id} is $modelSize, above the current $budget load budget."
+                "Model ${model.id} needs about $estimatedNeed RAM, but only $available is available after unload."
         }
     }
 

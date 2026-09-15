@@ -51,6 +51,13 @@ data class ModelFitEstimate(
     val storageFreeBytes: Long,
     val rating: ModelFitRating,
     val reason: String,
+    /**
+     * True when this device has already completed a real generation with this
+     * model at >= 1 tok/s. Admission trusts proven evidence over estimates: a
+     * model that has demonstrably run is never blocked on a pessimistic memory
+     * projection (only the hard size cap still applies).
+     */
+    val provenUsable: Boolean = false,
 )
 
 data class PerformancePrediction(

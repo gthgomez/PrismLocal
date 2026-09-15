@@ -24,6 +24,56 @@ class PromptBuilder(
 ) {
     companion object {
         private const val DEFAULT_TOKEN_BUDGET = 3_072
+        private const val SYSTEM_PROMPT =
+            "You are Assistant in a local Android chat. Use the recent conversation for context."
+
+        /**
+         * Pure, Android-free assembly of the structured (role-preserving) message
+         * list. Mirrors the recent-history token budgeting of
+         * [buildPromptWithRecentContext] so both paths select the same turns.
+         */
+        internal fun assembleChatMessages(
+            newPrompt: String,
+            transcript: List<TranscriptMessage>,
+            activeAssistantTranscriptId: Long?,
+            memoryContext: String,
+            tokenBudget: Int,
+        ): List<ChatMessage> {
+            val system = buildString {
+                append(SYSTEM_PROMPT)
+                if (memoryContext.isNotBlank()) {
+                    append("\n\n")
+                    append(memoryContext)
+                }
+            }
+            val history = transcript.filter { message ->
+                message.text.isNotBlank() && message.id != activeAssistantTranscriptId
+            }
+            val selected = ArrayDeque<TranscriptMessage>()
+            var estimatedTokens = (newPrompt.length + memoryContext.length) / 4
+            for (message in history.asReversed()) {
+                val tokens = message.toChatMessage().content.length / 4
+                if (estimatedTokens + tokens <= tokenBudget || selected.isEmpty()) {
+                    selected.addFirst(message)
+                    estimatedTokens += tokens
+                } else {
+                    break
+                }
+            }
+            val messages = ArrayList<ChatMessage>(selected.size + 2)
+            messages += ChatMessage(ChatMessage.ROLE_SYSTEM, system)
+            selected.forEach { message -> messages += message.toChatMessage() }
+            messages += ChatMessage(ChatMessage.ROLE_USER, newPrompt)
+            return messages
+        }
+
+        private fun TranscriptMessage.toChatMessage(): ChatMessage =
+            when (role) {
+                TranscriptRole.USER -> ChatMessage(ChatMessage.ROLE_USER, text)
+                TranscriptRole.ASSISTANT -> ChatMessage(ChatMessage.ROLE_ASSISTANT, text)
+                TranscriptRole.TOOL ->
+                    ChatMessage(ChatMessage.ROLE_USER, "[tool result] ${if (text.isBlank()) summary.orEmpty() else text}")
+            }
     }
 
     // ── Memory context ──────────────────────────────────────────────────
@@ -86,6 +136,27 @@ class PromptBuilder(
             append("Assistant:")
         }
     }
+
+    // ── Structured messages ─────────────────────────────────────────────
+
+    /**
+     * Role-preserving counterpart to [buildPromptWithRecentContext] for the
+     * structured generation path. Delegates the pure assembly to
+     * [assembleChatMessages] so it can be unit-tested without Android deps.
+     */
+    fun buildMessages(
+        newPrompt: String,
+        transcript: List<TranscriptMessage>,
+        activeAssistantTranscriptId: Long?,
+        memoryContext: String = "",
+        tokenBudget: Int = DEFAULT_TOKEN_BUDGET,
+    ): List<ChatMessage> = assembleChatMessages(
+        newPrompt = newPrompt,
+        transcript = transcript,
+        activeAssistantTranscriptId = activeAssistantTranscriptId,
+        memoryContext = memoryContext,
+        tokenBudget = tokenBudget,
+    )
 
     // ── Helpers ─────────────────────────────────────────────────────────
 

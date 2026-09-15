@@ -813,7 +813,13 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     const GenerationConfig config = sanitizeGenerationConfig(requested_config, kDefaultThreadCount);
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = config.gpu_layers;
+    // PIR-06: honour the explicit backend preference. A CPU request must not
+    // enable GPU layer offload. n_gpu_layers=0 is the documented way to keep
+    // the model resident on the CPU; the actually-applied backend is still
+    // verified below via llama_supports_gpu_offload() and reported as observed,
+    // never assumed from this request.
+    const bool gpu_requested = config.use_vulkan && config.gpu_layers > 0;
+    model_params.n_gpu_layers = gpu_requested ? config.gpu_layers : 0;
     model_params.use_mmap = use_mmap;
     model_params.use_mlock = false;
     model_params.check_tensors = true;
@@ -860,7 +866,7 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     // Verify whether GGML actually initialized a live GPU backend, regardless of what was requested.
     // llama_supports_gpu_offload() returns true only when the linked GGML build has a working
     // GPU backend available at runtime (OpenCL driver present, device enumerated, etc.).
-    const bool gpu_offload_live = (config.gpu_layers > 0) && llama_supports_gpu_offload();
+    const bool gpu_offload_live = gpu_requested && llama_supports_gpu_offload();
     const int verified_gpu_layers = gpu_offload_live ? config.gpu_layers : 0;
 
     auto runtime = std::make_shared<ModelRuntime>();

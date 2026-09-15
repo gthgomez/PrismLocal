@@ -15,8 +15,14 @@ data class ModelLoadDiagnostics(
     val availableMemoryMb: Long?,
     val lowMemory: Boolean,
     val message: String?,
-    val gpuLayersOffloaded: Int = 0,
-    val backendName: String = "CPU",
-    val isKleidiAiEnabled: Boolean = false,
+    /**
+     * PIR-06: observed values are nullable and default to unknown. Only a state
+     * that actually read them back from the native engine (e.g. "loaded"/
+     * "current") populates them; loading/failed/rejected must not present a
+     * default "CPU"/0 as if it were observed.
+     */
+    val gpuLayersOffloaded: Int? = null,
+    val backendName: String? = null,
+    val isKleidiAiEnabled: Boolean? = null,
     val createdAt: Long = System.currentTimeMillis(),
 )

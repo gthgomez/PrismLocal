@@ -80,6 +80,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         kvCacheTypeK: String,
         kvCacheTypeV: String,
         enableFlashAttn: Boolean,
+        useVulkan: Boolean,
     ): Boolean
     private external fun nativeUnloadModel(handle: Long)
     private external fun nativeResetConversation(handle: Long)
@@ -570,6 +571,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
             settings.kvCacheTypeK,
             settings.kvCacheTypeV,
             settings.enableFlashAttn,
+            settings.useVulkan,
         )
 
     private fun nativeRunBenchmark(

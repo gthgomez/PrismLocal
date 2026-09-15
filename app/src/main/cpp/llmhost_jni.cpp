@@ -236,7 +236,8 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeLoadModelWithSettings(
     jint gpu_layers,
     jstring kv_cache_type_k,
     jstring kv_cache_type_v,
-    jboolean enable_flash_attn) {
+    jboolean enable_flash_attn,
+    jboolean use_vulkan) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return JNI_FALSE;
@@ -259,6 +260,7 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeLoadModelWithSettings(
             config.kv_cache_type_v = toString(env, kv_cache_type_v);
         }
         config.enable_flash_attn = (enable_flash_attn == JNI_TRUE);
+        config.use_vulkan = (use_vulkan == JNI_TRUE);
         return engine->loadModel(toString(env, path), config) ? JNI_TRUE : JNI_FALSE;
     } catch (const std::exception&) {
         return JNI_FALSE;

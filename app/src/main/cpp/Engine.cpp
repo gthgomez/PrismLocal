@@ -820,6 +820,20 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     // never assumed from this request.
     const bool gpu_requested = config.use_vulkan && config.gpu_layers > 0;
     model_params.n_gpu_layers = gpu_requested ? config.gpu_layers : 0;
+    // PIR-06: pin the CPU backend device when Vulkan is not requested. Zero GPU
+    // layers alone does not guarantee every operation stays on the CPU, so the
+    // strict CPU baseline explicitly selects the CPU device(s). The array is
+    // static because llama keeps the pointer for the lifetime of the model.
+    static ggml_backend_dev_t s_cpu_only_devices[] = {nullptr, nullptr};
+    if (!config.use_vulkan) {
+        ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_device != nullptr) {
+            s_cpu_only_devices[0] = cpu_device;
+            model_params.devices = s_cpu_only_devices;
+        } else {
+            LOGW("cpu_only_device_unavailable; relying on n_gpu_layers=0");
+        }
+    }
     model_params.use_mmap = use_mmap;
     model_params.use_mlock = false;
     model_params.check_tensors = true;

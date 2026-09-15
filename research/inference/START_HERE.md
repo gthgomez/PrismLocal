@@ -2,6 +2,8 @@
 
 Read `PrismLocal_Inference_Roadmap.md` for the coherent 33-section report, or its HTML rendering. Read `program.json` for machine-readable dependencies and scopes. Individual agent packets are under `missions/`; the root packet is `missions/PIR-INT.md`.
 
+> **Package contents (landing note):** This landing intentionally contains only the report, its HTML rendering, the origin transcript, `README.md`, `START_HERE.md` and `SHA256SUMS`. `program.json`, `missions/`, `schemas/`, `tools/` and `fixtures/` are referenced by this document but were **not** included in the landing, so the helper commands below cannot run until those artifacts are supplied. Do not invent them.
+
 ## Evidence and authority
 
 Audited repository: `gthgomez/PrismLocal`, default branch `main`, commit `49ed799a3e633c5192c2c03317d1d50ffdc57c4c`. Actual llama.cpp gitlink: `bbeb89d76c41bc250f16e4a6fefcc9b530d6e3f3`.
@@ -19,6 +21,8 @@ Every worker must return code/report, full base/result SHAs, tests and exit code
 ## Package checks
 
 Python 3.10+; standard library only for the supplied helpers.
+
+Helper paths in this file are relative to this package root (`research/inference/`); the report's mission packets refer to the same files repo-root-relative as `research/inference/tools/...`.
 
 ```sh
 python3 tools/validate_program.py

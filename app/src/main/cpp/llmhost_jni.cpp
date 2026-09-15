@@ -324,6 +324,71 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeStartGeneration(
     }
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeStartGenerationChat(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jobjectArray roles,
+    jobjectArray contents,
+    jint gen_id,
+    jint max_tokens,
+    jint thread_count,
+    jint context_length,
+    jint batch_size,
+    jfloat temperature,
+    jint top_k,
+    jfloat top_p,
+    jfloat repeat_penalty,
+    jint gpu_layers,
+    jstring grammar) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) {
+        return -1;
+    }
+    if (roles == nullptr || contents == nullptr) {
+        return -1;
+    }
+    const jsize roles_len = env->GetArrayLength(roles);
+    const jsize contents_len = env->GetArrayLength(contents);
+    if (roles_len <= 0 || roles_len != contents_len) {
+        return -1;
+    }
+    try {
+        std::vector<llmhost::ChatMessage> messages;
+        messages.reserve(static_cast<size_t>(roles_len));
+        for (jsize i = 0; i < roles_len; ++i) {
+            auto role_jstr = static_cast<jstring>(env->GetObjectArrayElement(roles, i));
+            auto content_jstr = static_cast<jstring>(env->GetObjectArrayElement(contents, i));
+            llmhost::ChatMessage message;
+            message.role = toString(env, role_jstr);
+            message.content = toString(env, content_jstr);
+            if (role_jstr != nullptr) {
+                env->DeleteLocalRef(role_jstr);
+            }
+            if (content_jstr != nullptr) {
+                env->DeleteLocalRef(content_jstr);
+            }
+            messages.push_back(std::move(message));
+        }
+
+        llmhost::GenerationConfig config;
+        config.max_tokens = max_tokens;
+        config.thread_count = thread_count;
+        config.context_length = context_length;
+        config.batch_size = batch_size;
+        config.temperature = temperature;
+        config.top_k = top_k;
+        config.top_p = top_p;
+        config.repeat_penalty = repeat_penalty;
+        config.gpu_layers = gpu_layers;
+        config.grammar = toString(env, grammar);
+        return engine->startGenerationChat(messages, gen_id, config);
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeRunBenchmark(
     JNIEnv* env,

@@ -222,6 +222,79 @@ std::string formatPromptForGeneration(llama_model* model, const std::string& pro
     return prompt;
 }
 
+/**
+ * Generic role-tagged rendering used when a model has no usable chat template or
+ * the template fails to render. Keeps the conversation content available instead
+ * of returning an empty prompt (which would tokenize to zero tokens and error).
+ */
+std::string proseFallbackFromMessages(const std::vector<ChatMessage>& messages) {
+    std::string out;
+    for (const auto& message : messages) {
+        out += message.role;
+        out += ": ";
+        out += message.content;
+        out += '\n';
+    }
+    out += "assistant:";
+    return out;
+}
+
+std::string formatMessagesForGeneration(llama_model* model, const std::vector<ChatMessage>& messages, const std::string& fallback_prompt) {
+    if (messages.empty()) {
+        return fallback_prompt;
+    }
+    if (model == nullptr) {
+        return proseFallbackFromMessages(messages);
+    }
+
+    const char* tmpl = llama_model_chat_template(model, nullptr);
+    if (tmpl == nullptr || tmpl[0] == '\0') {
+        LOGW("chat_template_missing_for_messages messages=%zu; using prose fallback", messages.size());
+        return proseFallbackFromMessages(messages);
+    }
+
+    // llama_chat_message borrows role/content pointers; keep `messages` alive.
+    std::vector<llama_chat_message> chat;
+    chat.reserve(messages.size());
+    for (const auto& message : messages) {
+        chat.push_back({message.role.c_str(), message.content.c_str()});
+    }
+
+    const int32_t message_count = static_cast<int32_t>(chat.size());
+    int32_t required = llama_chat_apply_template(tmpl, chat.data(), message_count, true, nullptr, 0);
+    if (required <= 0) {
+        LOGW("chat_template_messages_apply_failed rc=%d messages=%zu", required, messages.size());
+        return proseFallbackFromMessages(messages);
+    }
+
+    std::string formatted(static_cast<size_t>(required) + 32, '\0');
+    int32_t actual = llama_chat_apply_template(
+        tmpl,
+        chat.data(),
+        message_count,
+        true,
+        formatted.data(),
+        static_cast<int32_t>(formatted.size()));
+    if (actual > static_cast<int32_t>(formatted.size())) {
+        formatted.resize(static_cast<size_t>(actual));
+        actual = llama_chat_apply_template(
+            tmpl,
+            chat.data(),
+            message_count,
+            true,
+            formatted.data(),
+            static_cast<int32_t>(formatted.size()));
+    }
+    if (actual <= 0 || actual > static_cast<int32_t>(formatted.size())) {
+        LOGW("chat_template_messages_apply_failed rc=%d messages=%zu", actual, messages.size());
+        return proseFallbackFromMessages(messages);
+    }
+
+    formatted.resize(static_cast<size_t>(actual));
+    LOGI("chat_template_messages_applied messages=%zu bytes=%zu", messages.size(), formatted.size());
+    return formatted;
+}
+
 struct StaticBuffers {
     void* ctrl_ptr = nullptr;
     void* token_ptr = nullptr;
@@ -389,6 +462,7 @@ struct ModelRuntime {
 struct GenerationSession {
     uint32_t generation_id = 0;
     GenerationConfig config;
+    std::vector<ChatMessage> messages;
     std::thread worker;
     std::atomic<bool> cancel_requested{false};
     std::atomic<bool> eof_acknowledged{false};
@@ -854,7 +928,9 @@ struct Engine::Impl {
                  session->generation_id,
                  static_cast<int>(runtime->current_position));
         } else {
-            const std::string formatted_prompt = formatPromptForGeneration(runtime->model, prompt);
+            const std::string formatted_prompt = !session->messages.empty()
+                ? formatMessagesForGeneration(runtime->model, session->messages, prompt)
+                : formatPromptForGeneration(runtime->model, prompt);
             LOGI("prompt_formatted generation_id=%u raw_bytes=%zu formatted_bytes=%zu",
                  session->generation_id,
                  prompt.size(),
@@ -1067,7 +1143,15 @@ struct Engine::Impl {
             if (grammar_sampler != nullptr) {
                 llama_sampler_chain_add(sampler, grammar_sampler);
             } else {
-                LOGW("Failed to compile grammar. Proceeding unconstrained.");
+                // PIR-03: structured output was explicitly requested. A grammar that
+                // fails to compile is a hard error, not a reason to silently emit
+                // unconstrained text that violates the requested contract.
+                LOGE("grammar_compile_failed generation_id=%u; failing closed",
+                     session->generation_id);
+                llama_sampler_free(sampler);
+                ctrl->error_code.store(426, std::memory_order_release);
+                finishSession(session, StreamState::Error);
+                return;
             }
         }
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
@@ -1097,25 +1181,22 @@ struct Engine::Impl {
             }
             session->active_threads.store(runtime->thread_count, std::memory_order_relaxed);
 
-            llama_token token = llama_sampler_sample(sampler, runtime->ctx, -1);
-            if (token == LLAMA_TOKEN_NULL && !session->config.grammar.empty()) {
-                LOGW("grammar_sampler_rejected_tokens; falling back to unconstrained sampler");
-                // Rebuild unconstrained fallback sampler
-                llama_sampler* fallback_sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                if (fallback_sampler != nullptr) {
-                    llama_sampler_chain_add(fallback_sampler, llama_sampler_init_temp(session->config.temperature));
-                    llama_sampler_chain_add(fallback_sampler, llama_sampler_init_top_p(session->config.top_p, 1));
-                    token = llama_sampler_sample(fallback_sampler, runtime->ctx, -1);
-                    llama_sampler_free(fallback_sampler);
-                }
-            }
+            // PIR-03: llama_sampler_sample(idx == -1) is documented and implemented
+            // as "Sample and accept a token" (it calls llama_sampler_accept itself).
+            // The explicit accept that used to follow double-counted every token in
+            // the penalty/history state, so the chain is now advanced exactly once.
+            const llama_token token = llama_sampler_sample(sampler, runtime->ctx, -1);
             if (token == LLAMA_TOKEN_NULL) {
+                // No unconstrained fallback: when a required grammar rejects every
+                // candidate, fail with a typed error instead of emitting output that
+                // violates the requested structure.
                 ctrl->error_code.store(425, std::memory_order_release);
-                LOGE("sample_failed token=null");
+                LOGE("sample_failed token=null grammar=%d generation_id=%u",
+                     session->config.grammar.empty() ? 0 : 1,
+                     session->generation_id);
                 finishSession(session, StreamState::Error);
                 return;
             }
-            llama_sampler_accept(sampler, token);
 
             if (llama_vocab_is_eog(runtime->vocab, token)) {
                 LOGI("token_eog id=%d generation_id=%u", static_cast<int>(token), session->generation_id);
@@ -1123,22 +1204,9 @@ struct Engine::Impl {
                 break;
             }
 
-            // Autoregressive repetition loop trap: detect if last 4 tokens repeat identically
-            const size_t act_size = runtime->active_tokens.size();
-            if (act_size >= 8) {
-                bool loop_detected = true;
-                for (size_t k = 0; k < 4; k++) {
-                    if (runtime->active_tokens[act_size - 4 + k] != runtime->active_tokens[act_size - 8 + k]) {
-                        loop_detected = false;
-                        break;
-                    }
-                }
-                if (loop_detected) {
-                    LOGW("repetition_loop_detected generation_id=%u; cleanly breaking inference", session->generation_id);
-                    stopped_by_eog = true;
-                    break;
-                }
-            }
+            // PIR-03: the previous heuristic treated four repeating tokens as an EOG
+            // and ended generation. That fabricated stops on valid repeated code/JSON;
+            // stopping is now owned solely by the model's real EOG token.
 
             if (writeToken(ctrl, buffers.tokens, static_cast<int32_t>(token), session->cancel_requested)) {
                 generated_tokens++;
@@ -1213,6 +1281,46 @@ struct Engine::Impl {
         } else {
             runRealGeneration(session, prompt);
         }
+    }
+
+    int startSessionInternal(std::string prompt, std::vector<ChatMessage> messages, int generation_id, GenerationConfig config) {
+        std::shared_ptr<GenerationSession> old_session;
+        std::shared_ptr<ModelRuntime> runtime;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            runtime = active_runtime;
+            old_session = active_session;
+            if (old_session) {
+                old_session->cancel_requested.store(true, std::memory_order_release);
+            }
+            active_session.reset();
+        }
+        if (old_session && old_session->worker.joinable()) {
+            old_session->worker.join();
+        }
+        if (!runtime) {
+            return -1;
+        }
+
+        auto session = std::make_shared<GenerationSession>();
+        session->generation_id = static_cast<uint32_t>(generation_id);
+        session->runtime = runtime;
+        session->config = sanitizeGenerationConfig(config, runtime->thread_count);
+        session->messages = std::move(messages);
+
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            active_session = session;
+            auto* ctrl = buffers.control;
+            ctrl->generation_id.store(static_cast<uint32_t>(generation_id), std::memory_order_release);
+            clearRing(ctrl);
+            ctrl->state.store(static_cast<uint32_t>(StreamState::Generating), std::memory_order_release);
+        }
+
+        session->worker = std::thread([impl = this, session, prompt]() {
+            impl->runGeneration(session, prompt);
+        });
+        return generation_id;
     }
 
     std::mutex mu;
@@ -1315,43 +1423,19 @@ int Engine::startGeneration(const std::string& prompt, int generation_id, Genera
     if (!impl_ || (prompt.empty() && !config.continue_from_context)) {
         return -1;
     }
+    return impl_->startSessionInternal(prompt, {}, generation_id, config);
+}
 
-    std::shared_ptr<GenerationSession> old_session;
-    std::shared_ptr<ModelRuntime> runtime;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mu);
-        runtime = impl_->active_runtime;
-        old_session = impl_->active_session;
-        if (old_session) {
-            old_session->cancel_requested.store(true, std::memory_order_release);
-        }
-        impl_->active_session.reset();
-    }
-    if (old_session && old_session->worker.joinable()) {
-        old_session->worker.join();
-    }
-    if (!runtime) {
+int Engine::startGenerationChat(const std::vector<ChatMessage>& messages, int generation_id, GenerationConfig config) {
+    if (!impl_ || messages.empty()) {
         return -1;
     }
-
-    auto session = std::make_shared<GenerationSession>();
-    session->generation_id = static_cast<uint32_t>(generation_id);
-    session->runtime = runtime;
-    session->config = sanitizeGenerationConfig(config, runtime->thread_count);
-
-    {
-        std::lock_guard<std::mutex> lock(impl_->mu);
-        impl_->active_session = session;
-        auto* ctrl = impl_->buffers.control;
-        ctrl->generation_id.store(static_cast<uint32_t>(generation_id), std::memory_order_release);
-        clearRing(ctrl);
-        ctrl->state.store(static_cast<uint32_t>(StreamState::Generating), std::memory_order_release);
+    for (const auto& message : messages) {
+        if (message.role.empty()) {
+            return -1;
+        }
     }
-
-    session->worker = std::thread([impl = impl_.get(), session, prompt]() {
-        impl->runGeneration(session, prompt);
-    });
-    return generation_id;
+    return impl_->startSessionInternal("", messages, generation_id, config);
 }
 
 std::string Engine::runBenchmark(GenerationConfig config, int prompt_tokens, int generation_tokens, int repetitions) {

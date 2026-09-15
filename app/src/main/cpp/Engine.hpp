@@ -23,6 +23,11 @@ struct LoraAdapterSpec {
     float scale = 1.0f;
 };
 
+struct ChatMessage {
+    std::string role;
+    std::string content;
+};
+
 struct GenerationConfig {
     int max_tokens = 128;
     int thread_count = 4;
@@ -53,6 +58,7 @@ public:
     void unloadModel();
     void resetConversation();
     int startGeneration(const std::string& prompt, int generation_id, GenerationConfig config);
+    int startGenerationChat(const std::vector<ChatMessage>& messages, int generation_id, GenerationConfig config = {});
     std::string runBenchmark(GenerationConfig config, int prompt_tokens, int generation_tokens, int repetitions);
     void cancelGeneration(int generation_id);
     std::vector<int32_t> drainTokens(int generation_id, int max_tokens);

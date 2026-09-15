@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -96,6 +97,22 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         repeatPenalty: Float,
         gpuLayers: Int,
         continueFromContext: Boolean,
+        grammar: String?,
+    ): Int
+    private external fun nativeStartGenerationChat(
+        handle: Long,
+        roles: Array<String>,
+        contents: Array<String>,
+        genId: Int,
+        maxTokens: Int,
+        threadCount: Int,
+        contextLength: Int,
+        batchSize: Int,
+        temperature: Float,
+        topK: Int,
+        topP: Float,
+        repeatPenalty: Float,
+        gpuLayers: Int,
         grammar: String?,
     ): Int
     private external fun nativeRunBenchmark(
@@ -278,34 +295,19 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         }
     }
 
-    fun generate(
-        prompt: String,
-        settings: GenerationSettings = GenerationSettings(),
-        continueFromContext: Boolean = false,
-        grammar: String? = null,
-    ): Flow<GenerationChunk> = callbackFlow {
+    /**
+     * Shared drain/emit/finally body for the string path ([generate]) and the
+     * structured chat path ([generateChat]). [start] performs the native start
+     * call under [genMutex] and reports whether the generation was accepted.
+     */
+    private fun streamGeneration(start: (Int) -> Boolean): Flow<GenerationChunk> = callbackFlow {
         val genId = sessionCounter.getAndIncrement()
 
         val startSuccess = genMutex.withLock {
             if (isDestroyed) {
                 false
             } else {
-                nativeStartGeneration(
-                    nativeHandle,
-                    prompt,
-                    genId,
-                    settings.maxTokens,
-                    settings.threadCount,
-                    settings.contextLength,
-                    settings.batchSize,
-                    settings.temperature,
-                    settings.topK,
-                    settings.topP,
-                    settings.repeatPenalty,
-                    settings.gpuLayers,
-                    continueFromContext,
-                    grammar,
-                ) != -1
+                start(genId)
             }
         }
         if (!startSuccess) {
@@ -428,7 +430,65 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
             }
         }
         close()
+    }
+
+    fun generate(
+        prompt: String,
+        settings: GenerationSettings = GenerationSettings(),
+        continueFromContext: Boolean = false,
+        grammar: String? = null,
+    ): Flow<GenerationChunk> = streamGeneration { genId ->
+        nativeStartGeneration(
+            nativeHandle,
+            prompt,
+            genId,
+            settings.maxTokens,
+            settings.threadCount,
+            settings.contextLength,
+            settings.batchSize,
+            settings.temperature,
+            settings.topK,
+            settings.topP,
+            settings.repeatPenalty,
+            settings.gpuLayers,
+            continueFromContext,
+            grammar,
+        ) != -1
     }.flowOn(Dispatchers.IO)
+
+    /**
+     * Structured chat generation that preserves system/user/assistant roles so
+     * native code can apply the model's real chat template. The legacy string
+     * path ([generate]) is unaffected and remains the path for agent tool turns,
+     * benchmark presets, and continuation.
+     */
+    fun generateChat(
+        messages: List<ChatMessage>,
+        settings: GenerationSettings = GenerationSettings(),
+        grammar: String? = null,
+    ): Flow<GenerationChunk> {
+        if (messages.isEmpty()) return emptyFlow()
+        val roles = messages.map { it.role }.toTypedArray()
+        val contents = messages.map { it.content }.toTypedArray()
+        return streamGeneration { genId ->
+            nativeStartGenerationChat(
+                nativeHandle,
+                roles,
+                contents,
+                genId,
+                settings.maxTokens,
+                settings.threadCount,
+                settings.contextLength,
+                settings.batchSize,
+                settings.temperature,
+                settings.topK,
+                settings.topP,
+                settings.repeatPenalty,
+                settings.gpuLayers,
+                grammar,
+            ) != -1
+        }.flowOn(Dispatchers.IO)
+    }
 
     @VisibleForTesting
     suspend fun debugDrainTokensForTesting(generationId: Int, maxTokens: Int): IntArray =

@@ -158,6 +158,23 @@ class GenerationOrchestrator(
         }
 
         val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
+        // Structured, role-preserving messages for normal chat. The legacy string
+        // path stays for agent turns and benchmark presets, which build their own
+        // protocol prompts and must keep byte-identical behavior.
+        val chatMessages: List<ChatMessage>? = if (benchmarkPreset == null && !agentEnabled) {
+            promptBuilder.buildMessages(
+                newPrompt = prompt,
+                transcript = uiState.transcript.value,
+                activeAssistantTranscriptId = null,
+                memoryContext = memoryContext,
+                tokenBudget = GenerationBudget.calculateNonAgentTokenBudget(
+                    contextLength = settings.contextLength,
+                    maxTokens = settings.maxTokens,
+                ),
+            )
+        } else {
+            null
+        }
         val enginePrompt = if (benchmarkPreset == null) {
             if (agentEnabled) {
                 val maxHistoryChars = GenerationBudget.calculateAgentHistoryCharBudget(
@@ -177,16 +194,8 @@ class GenerationOrchestrator(
                 }
                 AgentToolProtocol.buildPrompt(prompt, historyWithMemory)
             } else {
-                val tokenBudget = GenerationBudget.calculateNonAgentTokenBudget(
-                    contextLength = settings.contextLength,
-                    maxTokens = settings.maxTokens,
-                )
-                promptBuilder.buildPromptWithRecentContext(
-                    newPrompt = prompt,
-                    transcript = uiState.transcript.value,
-                    activeAssistantTranscriptId = null,
-                    tokenBudget = tokenBudget,
-                )
+                // Telemetry/label for the structured path; roles are carried by chatMessages.
+                chatMessages.orEmpty().joinToString("\n") { "${it.role}: ${it.content}" }
             }
         } else {
             prompt
@@ -232,6 +241,7 @@ class GenerationOrchestrator(
             assistantMessageId = assistantMessageId,
             grammar = if (agentEnabled) AgentToolProtocol.toolGrammar else null,
             startedAt = startedAt,
+            messages = chatMessages,
             config = GenerationFlowConfig(
                 errorLabel = "generation",
                 checkReload = true,
@@ -477,6 +487,7 @@ class GenerationOrchestrator(
         grammar: String?,
         startedAt: Long,
         config: GenerationFlowConfig,
+        messages: List<ChatMessage>? = null,
         continueFromContext: Boolean = false,
         onComplete: (GenerationFlowResult) -> Unit,
     ): Job {
@@ -489,7 +500,13 @@ class GenerationOrchestrator(
         var lastTranscriptUpdateAt = 0L
         var lastQualityCheckAt = 0L
 
-        return engine.generate(enginePrompt, settings, continueFromContext = continueFromContext, grammar = grammar)
+        val generationStream = if (messages != null) {
+            engine.generateChat(messages, settings, grammar = grammar)
+        } else {
+            engine.generate(enginePrompt, settings, continueFromContext = continueFromContext, grammar = grammar)
+        }
+
+        return generationStream
             .onEach { chunk ->
                 if (session != getActiveSession()) {
                     Log.d(TAG, "ignored stale ${config.errorLabel} chunk session=$session active=${getActiveSession()}")

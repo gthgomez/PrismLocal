@@ -43,6 +43,10 @@ struct GenerationConfig {
     std::string kv_cache_type_k = "q8_0";
     std::string kv_cache_type_v = "q8_0";
     bool enable_flash_attn = true;
+    // PIR-06: explicit backend preference. When false, GPU layer offload is
+    // disabled for this load (CPU-only). Native readback still reports the
+    // actually-applied backend; this is only the request.
+    bool use_vulkan = true;
     std::vector<LoraAdapterSpec> lora_adapters;
 };
 

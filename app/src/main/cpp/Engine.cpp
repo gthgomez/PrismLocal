@@ -1827,7 +1827,6 @@ void Engine::cancelGeneration(int generation_id) {
         return;
     }
     std::shared_ptr<GenerationSession> session_to_join;
-    bool cancelled_matching_session = false;
     {
         std::lock_guard<std::mutex> lock(impl_->mu);
         if (impl_->active_session && impl_->active_session->generation_id == static_cast<uint32_t>(generation_id)) {
@@ -1835,20 +1834,18 @@ void Engine::cancelGeneration(int generation_id) {
             impl_->active_session->cancel_requested.store(true, std::memory_order_release);
             session_to_join = impl_->active_session;
             impl_->active_session.reset();
-            cancelled_matching_session = true;
         }
     }
     if (session_to_join && session_to_join->worker.joinable()) {
         session_to_join->worker.join();
     }
-    // PIR-02: clear the ring only AFTER the producer thread has stopped. Clearing
-    // while a writer could still run let a late `produced_tokens` increment land
-    // after the reset, leaving `produced > drained` forever on an empty ring
-    // (ack could never tombstone).
-    if (cancelled_matching_session) {
-        std::lock_guard<std::mutex> lock(impl_->mu);
-        clearRing(impl_->buffers.control);
-    }
+    // PIR-02: deliberately do NOT clearRing here. The cancelled session is already
+    // detached above and any leftover ring tokens are discarded by the next
+    // startSessionInternal(), which calls clearRing at the session boundary.
+    // Clearing after releasing `mu` to join would race a newer generation that
+    // started in that window (wiping its ring/counters) and could race a
+    // concurrent drainTokens. An empty ring is treated as no-pending by
+    // ackEof/drainDecodeAndState, so no ack can get stuck either way.
 }
 
 std::vector<int32_t> Engine::drainTokens(int generation_id, int max_tokens) {

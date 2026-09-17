@@ -337,12 +337,18 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     reusableResult.tokensCount = 0
                     reusableResult.textCount = 0
                     reusableResult.textOverflow = ""
+                    reusableResult.produced = 0L
+                    reusableResult.drained = 0L
+                    reusableResult.pending = false
                     reusableResult.state = STATE_TOMBSTONED
                     reusableResult.errorCode = 0
                 } else {
                     reusableResult.tokensCount = 0
                     reusableResult.textCount = 0
                     reusableResult.textOverflow = ""
+                    reusableResult.produced = 0L
+                    reusableResult.drained = 0L
+                    reusableResult.pending = false
                     reusableResult.state = 0
                     reusableResult.errorCode = 0
                     nativeDrainDecodeAndState(nativeHandle, genId, 128, reusableResult)
@@ -386,7 +392,9 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     }
                 }
 
-                if (state == STATE_EOF || state == STATE_CANCELLED || state == STATE_ERROR || state == STATE_MAX_TOKENS) {
+                val terminal = state == STATE_EOF || state == STATE_CANCELLED ||
+                    state == STATE_ERROR || state == STATE_MAX_TOKENS
+                if (terminal && !reusableResult.pending) {
                     val reason = when (state) {
                         STATE_EOF -> "EOF"
                         STATE_CANCELLED -> "CANCELLED"
@@ -418,6 +426,11 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     break
                 }
 
+                // PIR-02: a terminal with `pending == true` means the native ring
+                // still holds produced-but-undrained tokens. Do NOT emit the
+                // terminal yet — loop to drain further 128-token batches until
+                // pending clears, then the terminal is emitted above and the
+                // `finally` ackEof tombstones the session.
                 if (tokenCount == 0) {
                     delay(pollDelay)
                     pollDelay = (pollDelay * 2).coerceAtMost(64L) // backoff up to 64ms

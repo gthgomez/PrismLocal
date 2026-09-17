@@ -7,6 +7,7 @@
 #include "common.h"
 #include "sampling.h"
 #include "runtime/ConversationState.hpp" // PIR-05
+#include "runtime/StreamProtocol.hpp" // PIR-02
 
 #include <algorithm>
 #include <atomic>
@@ -65,6 +66,12 @@ struct ControlBlock {
     std::atomic<uint32_t> capacity{kTokenCapacity};
     std::atomic<uint32_t> overflow{0};
     std::atomic<uint32_t> error_code{0};
+    // PIR-02: monotonic per-session token accounting. `produced_tokens` is
+    // incremented after a successful ring write, `drained_tokens` after the
+    // consumer advances the tail. A terminal state with produced > drained has
+    // output still pending and must not be tombstoned yet.
+    std::atomic<uint64_t> produced_tokens{0};
+    std::atomic<uint64_t> drained_tokens{0};
 };
 
 size_t pageSize() {
@@ -107,6 +114,10 @@ void clearRing(ControlBlock* ctrl) {
     ctrl->tail.store(0, std::memory_order_release);
     ctrl->overflow.store(0, std::memory_order_release);
     ctrl->error_code.store(0, std::memory_order_release);
+    // PIR-02: a cleared ring has no produced/drained backlog. Reset the
+    // accounting so a subsequent terminal cannot inherit stale pending output.
+    ctrl->produced_tokens.store(0, std::memory_order_release);
+    ctrl->drained_tokens.store(0, std::memory_order_release);
 }
 
 bool writeToken(ControlBlock* ctrl, int32_t* tokens, int32_t token, const std::atomic<bool>& cancel_requested) {
@@ -126,6 +137,9 @@ bool writeToken(ControlBlock* ctrl, int32_t* tokens, int32_t token, const std::a
         }
         tokens[h] = token;
         ctrl->head.store(next, std::memory_order_release);
+        // PIR-02: account for the token only after it is visible in the ring,
+        // so `drained` can never observe a token that was not produced.
+        ctrl->produced_tokens.fetch_add(1, std::memory_order_acq_rel);
         return true;
     }
     return false;
@@ -503,6 +517,28 @@ bool isTerminal(uint32_t state) {
            state == static_cast<uint32_t>(StreamState::Cancelled) ||
            state == static_cast<uint32_t>(StreamState::Error) ||
            state == static_cast<uint32_t>(StreamState::MaxTokens);
+}
+
+// PIR-02: project the native StreamState onto the portable stream protocol's
+// terminal reason. Non-terminal states map to StreamTerminal::None.
+StreamTerminal toStreamTerminal(StreamState state) {
+    switch (state) {
+        case StreamState::Eof: return StreamTerminal::Eof;
+        case StreamState::Cancelled: return StreamTerminal::Cancelled;
+        case StreamState::Error: return StreamTerminal::Error;
+        case StreamState::MaxTokens: return StreamTerminal::MaxTokens;
+        default: return StreamTerminal::None;
+    }
+}
+
+const char* streamTerminalName(StreamTerminal terminal) {
+    switch (terminal) {
+        case StreamTerminal::Eof: return "EOF";
+        case StreamTerminal::Cancelled: return "CANCELLED";
+        case StreamTerminal::Error: return "ERROR";
+        case StreamTerminal::MaxTokens: return "MAX_TOKENS";
+        default: return "UNKNOWN";
+    }
 }
 
 int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_vocab* vocab) {
@@ -977,11 +1013,13 @@ struct Engine::Impl {
 
     void finishSession(const std::shared_ptr<GenerationSession>& session, StreamState final_state) {
         buffers.control->state.store(static_cast<uint32_t>(final_state), std::memory_order_release);
-        const char* terminal = final_state == StreamState::Cancelled ? "CANCELLED" :
-            final_state == StreamState::Error ? "ERROR" :
-            final_state == StreamState::MaxTokens ? "MAX_TOKENS" :
-            final_state == StreamState::Eof ? "EOF" : "UNKNOWN";
-        LOGI("terminal=%s generation_id=%u", terminal, session->generation_id);
+        // PIR-02: derive the terminal reason from the frozen StreamState via the
+        // portable protocol mapping (values are unchanged) for the log line.
+        const StreamTerminal terminal = toStreamTerminal(final_state);
+        LOGI("terminal=%s terminal_code=%u generation_id=%u",
+             streamTerminalName(terminal),
+             static_cast<unsigned>(terminal),
+             session->generation_id);
     }
 
     void runDebugGeneration(const std::shared_ptr<GenerationSession>& session, const std::string& prompt) {
@@ -1825,6 +1863,9 @@ std::vector<int32_t> Engine::drainTokens(int generation_id, int max_tokens) {
         result.push_back(impl_->buffers.tokens[(t + i) % cap]);
     }
     ctrl->tail.store((t + count) % cap, std::memory_order_release);
+    // PIR-02: count tokens actually handed to the consumer after the tail
+    // advances, so `pending = produced > drained` reflects ring backlog only.
+    ctrl->drained_tokens.fetch_add(count, std::memory_order_acq_rel);
     return result;
 }
 
@@ -1838,10 +1879,21 @@ void Engine::ackEof(int generation_id) {
         if (impl_->active_session && impl_->active_session->generation_id == static_cast<uint32_t>(generation_id)) {
             impl_->active_session->eof_acknowledged.store(true, std::memory_order_release);
             const uint32_t state = impl_->buffers.control->state.load(std::memory_order_acquire);
-            if (isTerminal(state)) {
-                impl_->buffers.control->state.store(static_cast<uint32_t>(StreamState::Tombstoned), std::memory_order_release);
+            auto* ctrl = impl_->buffers.control;
+            const uint64_t produced = ctrl->produced_tokens.load(std::memory_order_acquire);
+            const uint64_t drained = ctrl->drained_tokens.load(std::memory_order_acquire);
+            if (isTerminal(state) && produced <= drained) {
+                ctrl->state.store(static_cast<uint32_t>(StreamState::Tombstoned), std::memory_order_release);
                 session_to_join = impl_->active_session;
                 impl_->active_session.reset();
+            } else if (isTerminal(state)) {
+                // PIR-02: a terminal was observed before the ring was fully
+                // drained. Keep the session and tombstone deferred so the
+                // caller can drain the backlog and re-ack without losing tokens.
+                LOGI("eof_ack_deferred generation_id=%u produced=%llu drained=%llu",
+                     generation_id,
+                     static_cast<unsigned long long>(produced),
+                     static_cast<unsigned long long>(drained));
             }
         }
     }
@@ -2003,6 +2055,7 @@ std::vector<float> Engine::encode(const std::string& text) {
 
 Engine::DrainResult Engine::drainDecodeAndState(int generation_id, int max_tokens) {
     DrainResult result;
+    result.schema_version = llmhost::kStreamProtocolVersion;
     if (!impl_) {
         return result;
     }
@@ -2022,6 +2075,13 @@ Engine::DrainResult Engine::drainDecodeAndState(int generation_id, int max_token
         }
         if (impl_->buffers.control != nullptr) {
             result.error_code = impl_->buffers.control->error_code.load(std::memory_order_acquire);
+            // PIR-02: expose the produced/drained backlog so the consumer keeps
+            // draining while a terminal is observed but output is still pending.
+            const uint64_t produced = impl_->buffers.control->produced_tokens.load(std::memory_order_acquire);
+            const uint64_t drained = impl_->buffers.control->drained_tokens.load(std::memory_order_acquire);
+            result.produced = static_cast<int64_t>(produced);
+            result.drained = static_cast<int64_t>(drained);
+            result.pending = produced > drained;
         }
     }
 

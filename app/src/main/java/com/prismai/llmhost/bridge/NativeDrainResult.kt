@@ -35,6 +35,14 @@ class NativeDrainResult {
     @JvmField var activeThreads: Int = 0
     @JvmField var errorCode: Int = 0
 
+    // PIR-02: stream terminal/drain accounting. `produced` is the number of
+    // tokens written into the native ring; `drained` is the number read back.
+    // `pending` is true while a terminal state has been reached but produced
+    // output has not been fully drained — the terminal must be deferred.
+    @JvmField var produced: Long = 0L
+    @JvmField var drained: Long = 0L
+    @JvmField var pending: Boolean = false
+
     companion object {
         // Matches kTokenCapacity (2048) in Engine.cpp.
         // Drain call passes maxTokens=128, but this buffer must accommodate

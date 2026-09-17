@@ -50,6 +50,9 @@ jfieldID g_drain_result_ttft_ms_field = nullptr;
 jfieldID g_drain_result_tokens_per_sec_field = nullptr;
 jfieldID g_drain_result_active_threads_field = nullptr;
 jfieldID g_drain_result_error_code_field = nullptr;
+jfieldID g_drain_result_produced_field = nullptr;
+jfieldID g_drain_result_drained_field = nullptr;
+jfieldID g_drain_result_pending_field = nullptr;
 std::once_flag g_drain_result_cache_flag;
 
 bool drainResultFieldsReady() {
@@ -64,7 +67,10 @@ bool drainResultFieldsReady() {
         && g_drain_result_ttft_ms_field != nullptr
         && g_drain_result_tokens_per_sec_field != nullptr
         && g_drain_result_active_threads_field != nullptr
-        && g_drain_result_error_code_field != nullptr;
+        && g_drain_result_error_code_field != nullptr
+        && g_drain_result_produced_field != nullptr
+        && g_drain_result_drained_field != nullptr
+        && g_drain_result_pending_field != nullptr;
 }
 
 void ensureDrainResultCache(JNIEnv* env) {
@@ -83,6 +89,9 @@ void ensureDrainResultCache(JNIEnv* env) {
             g_drain_result_tokens_per_sec_field = env->GetFieldID(g_drain_result_class, "tokensPerSec", "F");
             g_drain_result_active_threads_field = env->GetFieldID(g_drain_result_class, "activeThreads", "I");
             g_drain_result_error_code_field = env->GetFieldID(g_drain_result_class, "errorCode", "I");
+            g_drain_result_produced_field = env->GetFieldID(g_drain_result_class, "produced", "J");
+            g_drain_result_drained_field = env->GetFieldID(g_drain_result_class, "drained", "J");
+            g_drain_result_pending_field = env->GetFieldID(g_drain_result_class, "pending", "Z");
             env->DeleteLocalRef(local_class);
             if (!drainResultFieldsReady()) {
                 LOGE("ensureDrainResultCache: incomplete field IDs (Kotlin/native layout mismatch)");
@@ -236,7 +245,8 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeLoadModelWithSettings(
     jint gpu_layers,
     jstring kv_cache_type_k,
     jstring kv_cache_type_v,
-    jboolean enable_flash_attn) {
+    jboolean enable_flash_attn,
+    jboolean use_vulkan) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) {
         return JNI_FALSE;
@@ -259,6 +269,7 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeLoadModelWithSettings(
             config.kv_cache_type_v = toString(env, kv_cache_type_v);
         }
         config.enable_flash_attn = (enable_flash_attn == JNI_TRUE);
+        config.use_vulkan = (use_vulkan == JNI_TRUE);
         return engine->loadModel(toString(env, path), config) ? JNI_TRUE : JNI_FALSE;
     } catch (const std::exception&) {
         return JNI_FALSE;
@@ -607,6 +618,11 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
         env->SetFloatField(result, g_drain_result_tokens_per_sec_field, static_cast<jfloat>(drain_result.tokens_per_sec));
         env->SetIntField(result, g_drain_result_active_threads_field, static_cast<jint>(drain_result.active_threads));
         env->SetIntField(result, g_drain_result_error_code_field, static_cast<jint>(drain_result.error_code));
+        // PIR-02: stream accounting so Kotlin can defer the terminal until the
+        // ring backlog is fully drained (produced == drained, pending == false).
+        env->SetLongField(result, g_drain_result_produced_field, static_cast<jlong>(drain_result.produced));
+        env->SetLongField(result, g_drain_result_drained_field, static_cast<jlong>(drain_result.drained));
+        env->SetBooleanField(result, g_drain_result_pending_field, drain_result.pending ? JNI_TRUE : JNI_FALSE);
     } catch (const std::exception&) {
         env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Error));
         env->SetIntField(result, g_drain_result_error_code_field, 500);

@@ -6,6 +6,8 @@
 #include "llama.h"
 #include "common.h"
 #include "sampling.h"
+#include "runtime/ConversationState.hpp" // PIR-05
+#include "runtime/StreamProtocol.hpp" // PIR-02
 
 #include <algorithm>
 #include <atomic>
@@ -64,6 +66,12 @@ struct ControlBlock {
     std::atomic<uint32_t> capacity{kTokenCapacity};
     std::atomic<uint32_t> overflow{0};
     std::atomic<uint32_t> error_code{0};
+    // PIR-02: monotonic per-session token accounting. `produced_tokens` is
+    // incremented after a successful ring write, `drained_tokens` after the
+    // consumer advances the tail. A terminal state with produced > drained has
+    // output still pending and must not be tombstoned yet.
+    std::atomic<uint64_t> produced_tokens{0};
+    std::atomic<uint64_t> drained_tokens{0};
 };
 
 size_t pageSize() {
@@ -106,6 +114,10 @@ void clearRing(ControlBlock* ctrl) {
     ctrl->tail.store(0, std::memory_order_release);
     ctrl->overflow.store(0, std::memory_order_release);
     ctrl->error_code.store(0, std::memory_order_release);
+    // PIR-02: a cleared ring has no produced/drained backlog. Reset the
+    // accounting so a subsequent terminal cannot inherit stale pending output.
+    ctrl->produced_tokens.store(0, std::memory_order_release);
+    ctrl->drained_tokens.store(0, std::memory_order_release);
 }
 
 bool writeToken(ControlBlock* ctrl, int32_t* tokens, int32_t token, const std::atomic<bool>& cancel_requested) {
@@ -125,6 +137,9 @@ bool writeToken(ControlBlock* ctrl, int32_t* tokens, int32_t token, const std::a
         }
         tokens[h] = token;
         ctrl->head.store(next, std::memory_order_release);
+        // PIR-02: account for the token only after it is visible in the ring,
+        // so `drained` can never observe a token that was not produced.
+        ctrl->produced_tokens.fetch_add(1, std::memory_order_acq_rel);
         return true;
     }
     return false;
@@ -354,6 +369,20 @@ struct ModelRuntime {
 
     std::vector<llama_token> active_tokens;
 
+    // PIR-05: KV layout recorded from the context params that succeeded (after
+    // any F16/defaults fallback). type_k/type_v are accurate for attention KV;
+    // recurrent/hybrid architectures keep a separate FP32 state regardless.
+    // flash_attn records the requested mode, not llama.cpp's internally resolved
+    // AUTO value. All three are constant for a runtime, so they cannot by
+    // themselves cause stale reuse; they only make the cache-identity log an
+    // under-report of the resolved FlashAttention setting.
+    std::string kv_type_k = "f16";
+    std::string kv_type_v = "f16";
+    bool flash_attn = false;
+
+    // PIR-05: transactional prefix-cache bookkeeping (see ConversationState.hpp).
+    ConversationState conversation;
+
     // Dynamic LoRA Adapters
     std::vector<llama_adapter_lora*> loaded_loras;
 
@@ -490,6 +519,28 @@ bool isTerminal(uint32_t state) {
            state == static_cast<uint32_t>(StreamState::MaxTokens);
 }
 
+// PIR-02: project the native StreamState onto the portable stream protocol's
+// terminal reason. Non-terminal states map to StreamTerminal::None.
+StreamTerminal toStreamTerminal(StreamState state) {
+    switch (state) {
+        case StreamState::Eof: return StreamTerminal::Eof;
+        case StreamState::Cancelled: return StreamTerminal::Cancelled;
+        case StreamState::Error: return StreamTerminal::Error;
+        case StreamState::MaxTokens: return StreamTerminal::MaxTokens;
+        default: return StreamTerminal::None;
+    }
+}
+
+const char* streamTerminalName(StreamTerminal terminal) {
+    switch (terminal) {
+        case StreamTerminal::Eof: return "EOF";
+        case StreamTerminal::Cancelled: return "CANCELLED";
+        case StreamTerminal::Error: return "ERROR";
+        case StreamTerminal::MaxTokens: return "MAX_TOKENS";
+        default: return "UNKNOWN";
+    }
+}
+
 int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_vocab* vocab) {
     if (vocab == nullptr || tokens.empty()) return 0;
 
@@ -547,6 +598,58 @@ int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_v
     return 0;
 }
 
+// PIR-05: build the identity under which the current cache was produced. The
+// chat template participates because a template change alters every rendered
+// token; the actual KV element types/FlashAttn participate because they alter
+// the cached key/value representation.
+CacheIdentity makeCacheIdentity(const ModelRuntime& runtime) {
+    CacheIdentity identity;
+    identity.model_path = runtime.model_path;
+    if (runtime.model != nullptr) {
+        const char* tmpl = llama_model_chat_template(runtime.model, nullptr);
+        if (tmpl != nullptr) {
+            identity.chat_template = tmpl;
+        }
+    }
+    identity.context_length = runtime.context_length;
+    identity.kv_type_k = runtime.kv_type_k;
+    identity.kv_type_v = runtime.kv_type_v;
+    identity.flash_attn = runtime.flash_attn;
+    return identity;
+}
+
+// PIR-05: explicit, clamped system-prefix boundary. The detection heuristic is
+// unchanged, but it is only ever applied to a prompt that is about to be fully
+// evaluated, and the result is clamped to the token count that will actually be
+// committed so a partial decode can never leave an out-of-range prefix that a
+// later shift would trust.
+int computeSystemPrefixLength(const std::vector<llama_token>& tokens, std::size_t limit,
+                              const llama_vocab* vocab) {
+    if (limit == 0) {
+        return 0;
+    }
+    const int detected = findSystemPrefixLength(tokens, vocab);
+    return static_cast<int>(std::min(static_cast<std::size_t>(detected), limit));
+}
+
+// PIR-05: single cache-identity log line. Intentionally omits the raw template
+// body (it is long and may contain user content); its byte length is enough to
+// tell identities apart in logs.
+void logCacheIdentity(const char* event, const CacheIdentity& identity,
+                      const ConversationState& state) {
+    LOGI("cache_identity event=%s model=%s ctx=%d kv_k=%s kv_v=%s fa=%d template_bytes=%zu valid=%s reusable=%zu last_logits=%s",
+         event,
+         identity.model_path.c_str(),
+         identity.context_length,
+         identity.kv_type_k.c_str(),
+         identity.kv_type_v.c_str(),
+         identity.flash_attn ? 1 : 0,
+         identity.chat_template.size(),
+         state.valid ? "true" : "false",
+         state.reusable_tokens,
+         state.last_logits_valid ? "true" : "false");
+}
+
 void resetRuntimeContext(ModelRuntime& runtime, bool clear_data) {
     if (runtime.ctx != nullptr) {
         llama_memory_clear(llama_get_memory(runtime.ctx), clear_data);
@@ -554,12 +657,69 @@ void resetRuntimeContext(ModelRuntime& runtime, bool clear_data) {
     runtime.current_position = 0;
     runtime.active_tokens.clear();
     runtime.system_prefix_length = 0;
+    // PIR-05: a cleared KV cache can never back a reusable prefix.
+    runtime.conversation.invalidate();
 }
 
-bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, bool allow_full_reset) {
+// PIR-05: transactionally reduce the committed state to `common_prefix` tokens
+// (an index into active_tokens). On entry the conversation must be valid, i.e.
+// the KV cache provably holds [0, active_tokens.size()).
+//
+// - `common_prefix >= active_tokens.size()`: no sequence operation is needed and
+//   the existing logits are left intact.
+// - a tail must be dropped: llama_memory_seq_rm is return-checked BEFORE the
+//   token/position state is mutated. On rejection the cache is reset and
+//   `common_prefix` is set to 0 so the caller replays the whole prompt.
+//
+// Removing a tail invalidates the logits that used to match active_tokens.back().
+void shrinkCommittedPrefix(ModelRuntime& runtime, const std::string& identity,
+                           std::size_t& common_prefix) {
+    if (common_prefix == 0) {
+        resetRuntimeContext(runtime, false);
+        return;
+    }
+
+    const std::size_t committed = runtime.active_tokens.size();
+    if (common_prefix >= committed) {
+        common_prefix = committed;
+        runtime.current_position = static_cast<llama_pos>(committed);
+        runtime.conversation.markCommitted(identity, committed, runtime.conversation.last_logits_valid);
+        return;
+    }
+
+    llama_memory_t memory = llama_get_memory(runtime.ctx);
+    const bool rm_ok = llama_memory_seq_rm(memory, kMainSequence, static_cast<llama_pos>(common_prefix), -1);
+    if (!rm_ok) {
+        // Do not evaluate a suffix against a stale prefix: invalidate + replay.
+        resetRuntimeContext(runtime, false);
+        common_prefix = 0;
+        return;
+    }
+    runtime.active_tokens.resize(common_prefix);
+    runtime.current_position = static_cast<llama_pos>(common_prefix);
+    runtime.conversation.markCommitted(identity, common_prefix, /*logits_valid=*/false);
+}
+
+bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, bool allow_full_reset,
+                                 const CacheIdentity& cache_identity) {
     if (runtime.ctx == nullptr) {
         return false;
     }
+
+    // PIR-05: never compact a prefix whose KV/token correspondence has not been
+    // proven (e.g. after an aborted decode). Compacting a stale prefix would
+    // silently shift positions that no longer match `active_tokens`.
+    if (!runtime.conversation.valid && runtime.current_position > 0) {
+        if (allow_full_reset) {
+            LOGW("kv_shift_unverified_state; forcing full reset");
+            logCacheIdentity("shift_unverified_reset", cache_identity, runtime.conversation);
+            resetRuntimeContext(runtime, false);
+            return required_tokens < static_cast<llama_pos>(runtime.context_length - kContextHeadroom);
+        }
+        LOGW("kv_shift_unverified_state; refusing to shift uncommitted context");
+        return false;
+    }
+
     const llama_pos limit = static_cast<llama_pos>(runtime.context_length - kContextHeadroom);
     if (runtime.current_position + required_tokens < limit) {
         return true;
@@ -584,10 +744,13 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
     const llama_pos seq_start = static_cast<llama_pos>(system_prefix_tokens);
     const llama_pos seq_end = seq_start + static_cast<llama_pos>(drop_count);
 
-    // Remove old entries from sequence
+    // PIR-05: the sequence remove must succeed before any token/position state is
+    // mutated. On failure we invalidate and replay from a clean cache.
     bool rm_ok = llama_memory_seq_rm(memory, kMainSequence, seq_start, seq_end);
     if (rm_ok) {
-        // Compact remaining sequence positions
+        // Compact remaining sequence positions. llama_memory_seq_add returns void,
+        // so correctness is verified below against the token/position invariant
+        // (current_position == active_tokens.size()) rather than trusted blindly.
         llama_memory_seq_add(memory, kMainSequence, seq_end, runtime.current_position, -static_cast<llama_pos>(drop_count));
         if (static_cast<size_t>(system_prefix_tokens + drop_count) > runtime.active_tokens.size()) {
             LOGW("KV compaction token range mismatch: prefix=%d drop=%d active=%zu",
@@ -605,8 +768,14 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
             return allow_full_reset && required_tokens < limit;
         }
         assert(runtime.current_position == static_cast<llama_pos>(runtime.active_tokens.size()));
+        // PIR-05: the compacted remainder is a proven committed prefix. The tail
+        // (and therefore the previously decoded logits) is preserved by the shift.
+        runtime.conversation.markCommitted(cache_identity.key(),
+                                          runtime.active_tokens.size(),
+                                          runtime.conversation.last_logits_valid);
         LOGI("kv_cache_sliding_window_shift dropped=%d prefix=%d new_pos=%d limit=%d",
              drop_count, system_prefix_tokens, static_cast<int>(runtime.current_position), static_cast<int>(limit));
+        logCacheIdentity("shift_committed", cache_identity, runtime.conversation);
     } else {
         LOGW("llama_memory_seq_rm failed; allow_full_reset=%s", allow_full_reset ? "true" : "false");
         if (allow_full_reset) {
@@ -680,7 +849,27 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     const GenerationConfig config = sanitizeGenerationConfig(requested_config, kDefaultThreadCount);
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = config.gpu_layers;
+    // PIR-06: honour the explicit backend preference. A CPU request must not
+    // enable GPU layer offload. n_gpu_layers=0 is the documented way to keep
+    // the model resident on the CPU; the actually-applied backend is still
+    // verified below via llama_supports_gpu_offload() and reported as observed,
+    // never assumed from this request.
+    const bool gpu_requested = config.use_vulkan && config.gpu_layers > 0;
+    model_params.n_gpu_layers = gpu_requested ? config.gpu_layers : 0;
+    // PIR-06: pin the CPU backend device when Vulkan is not requested. Zero GPU
+    // layers alone does not guarantee every operation stays on the CPU, so the
+    // strict CPU baseline explicitly selects the CPU device(s). The array is
+    // static because llama keeps the pointer for the lifetime of the model.
+    static ggml_backend_dev_t s_cpu_only_devices[] = {nullptr, nullptr};
+    if (!config.use_vulkan) {
+        ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_device != nullptr) {
+            s_cpu_only_devices[0] = cpu_device;
+            model_params.devices = s_cpu_only_devices;
+        } else {
+            LOGW("cpu_only_device_unavailable; relying on n_gpu_layers=0");
+        }
+    }
     model_params.use_mmap = use_mmap;
     model_params.use_mlock = false;
     model_params.check_tensors = true;
@@ -727,7 +916,7 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     // Verify whether GGML actually initialized a live GPU backend, regardless of what was requested.
     // llama_supports_gpu_offload() returns true only when the linked GGML build has a working
     // GPU backend available at runtime (OpenCL driver present, device enumerated, etc.).
-    const bool gpu_offload_live = (config.gpu_layers > 0) && llama_supports_gpu_offload();
+    const bool gpu_offload_live = gpu_requested && llama_supports_gpu_offload();
     const int verified_gpu_layers = gpu_offload_live ? config.gpu_layers : 0;
 
     auto runtime = std::make_shared<ModelRuntime>();
@@ -741,6 +930,11 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     runtime->context_length = ctx_params.n_ctx;
     runtime->batch_size = ctx_params.n_batch;
     runtime->gpu_layers = verified_gpu_layers;
+    // PIR-05: record the KV layout actually selected (post-fallback) so it can be
+    // part of the cache identity.
+    runtime->kv_type_k = ggml_type_name(ctx_params.type_k);
+    runtime->kv_type_v = ggml_type_name(ctx_params.type_v);
+    runtime->flash_attn = (ctx_params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED);
 
     // Derive backend name from verified runtime state, not compile-time macros alone.
 #if defined(LLMHOST_VULKAN_ENABLED)
@@ -819,11 +1013,13 @@ struct Engine::Impl {
 
     void finishSession(const std::shared_ptr<GenerationSession>& session, StreamState final_state) {
         buffers.control->state.store(static_cast<uint32_t>(final_state), std::memory_order_release);
-        const char* terminal = final_state == StreamState::Cancelled ? "CANCELLED" :
-            final_state == StreamState::Error ? "ERROR" :
-            final_state == StreamState::MaxTokens ? "MAX_TOKENS" :
-            final_state == StreamState::Eof ? "EOF" : "UNKNOWN";
-        LOGI("terminal=%s generation_id=%u", terminal, session->generation_id);
+        // PIR-02: derive the terminal reason from the frozen StreamState via the
+        // portable protocol mapping (values are unchanged) for the log line.
+        const StreamTerminal terminal = toStreamTerminal(final_state);
+        LOGI("terminal=%s terminal_code=%u generation_id=%u",
+             streamTerminalName(terminal),
+             static_cast<unsigned>(terminal),
+             session->generation_id);
     }
 
     void runDebugGeneration(const std::shared_ptr<GenerationSession>& session, const std::string& prompt) {
@@ -908,14 +1104,31 @@ struct Engine::Impl {
              static_cast<int>(runtime->current_position));
 
         llama_perf_context_reset(runtime->ctx);
+
+        // PIR-05: identity of the cache this generation will read/write. Any
+        // change to model/template/context/KV/FA forces a clean replay.
+        const CacheIdentity cache_identity = makeCacheIdentity(*runtime);
+        const std::string cache_identity_key = cache_identity.key();
+        logCacheIdentity("generation_begin", cache_identity, runtime->conversation);
+
         if (session->config.continue_from_context) {
-            if (runtime->current_position <= 0) {
+            // PIR-05: continuing means sampling from the *current* last logits, so
+            // both a committed prefix and valid last logits must have been proven.
+            // A cancelled/failed previous decode leaves `valid == false`.
+            if (runtime->current_position <= 0 ||
+                !runtime->conversation.valid ||
+                !runtime->conversation.last_logits_valid) {
                 ctrl->error_code.store(427, std::memory_order_release);
-                LOGE("continue_failed_no_context generation_id=%u", session->generation_id);
+                LOGE("continue_failed_no_committed_context generation_id=%u pos=%d valid=%s logits=%s",
+                     session->generation_id,
+                     static_cast<int>(runtime->current_position),
+                     runtime->conversation.valid ? "true" : "false",
+                     runtime->conversation.last_logits_valid ? "true" : "false");
                 finishSession(session, StreamState::Error);
                 return;
             }
-            if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens + kContextHeadroom, false)) {
+            if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens + kContextHeadroom, false,
+                                             cache_identity)) {
                 ctrl->error_code.store(426, std::memory_order_release);
                 LOGE("continue_context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
@@ -936,7 +1149,11 @@ struct Engine::Impl {
                  prompt.size(),
                 formatted_prompt.size());
 
-            bool add_special = (runtime->current_position == 0);
+            // PIR-05: tokenize as a continuation only when a *proven* prefix is
+            // present. After an aborted decode current_position may be > 0 while
+            // the cache is invalid; a full replay starts at position 0, so the
+            // prompt must regain its BOS/special tokens.
+            bool add_special = (runtime->current_position == 0) || !runtime->conversation.valid;
             if (formatted_prompt.rfind("<s>", 0) == 0 ||
                 formatted_prompt.rfind("<|im_start|>", 0) == 0 ||
                 formatted_prompt.rfind("<|start_header_id|>", 0) == 0 ||
@@ -1001,33 +1218,45 @@ struct Engine::Impl {
                      usable_prompt_tokens);
             }
             session->prompt_tokens.store(usable_prompt_tokens, std::memory_order_relaxed);
-            size_t common_prefix = 0;
-            while (common_prefix < static_cast<size_t>(usable_prompt_tokens) &&
-                   common_prefix < runtime->active_tokens.size() &&
-                   prompt_tokens[common_prefix] == runtime->active_tokens[common_prefix]) {
-                common_prefix++;
+
+            // PIR-05: only trust the stored prefix when it was proven committed
+            // under the current cache identity. Otherwise the cache is invalid and
+            // the request must be replayed from scratch.
+            const bool identity_match = runtime->conversation.valid &&
+                runtime->conversation.cache_identity == cache_identity_key;
+            std::size_t common_prefix = 0;
+            if (identity_match) {
+                common_prefix = commonPrefixLength(prompt_tokens, runtime->active_tokens);
+                const std::size_t reusable_bound = std::min(
+                    runtime->conversation.reusable_tokens,
+                    static_cast<std::size_t>(runtime->current_position));
+                if (common_prefix > reusable_bound) {
+                    common_prefix = reusable_bound;
+                }
             }
 
             if (common_prefix > 0) {
-                if (common_prefix < static_cast<size_t>(runtime->current_position)) {
-                    llama_memory_t memory = llama_get_memory(runtime->ctx);
-                    llama_memory_seq_rm(memory, kMainSequence, static_cast<llama_pos>(common_prefix), -1);
+                shrinkCommittedPrefix(*runtime, cache_identity_key, common_prefix);
+                if (common_prefix > 0) {
+                    LOGI("prefix_cache_hit common_prefix=%zu identity_match=true", common_prefix);
+                } else {
+                    // PIR-05: do not evaluate a suffix against a stale prefix.
+                    LOGE("prefix_cache_truncate_failed; replaying full prompt");
                 }
-                runtime->current_position = static_cast<llama_pos>(common_prefix);
-                runtime->active_tokens.resize(common_prefix);
-                LOGI("prefix_cache_hit common_prefix=%zu", common_prefix);
             } else {
                 resetRuntimeContext(*runtime, false);
-                LOGI("prefix_cache_miss; fully cleared kv");
+                LOGI("prefix_cache_miss identity_match=%s; fully cleared kv", identity_match ? "true" : "false");
             }
+            // PIR-05: explicit post-reset/post-truncation cache identity line.
+            logCacheIdentity("prefix_decision", cache_identity, runtime->conversation);
 
-            runtime->system_prefix_length = std::min(
-                findSystemPrefixLength(prompt_tokens, runtime->vocab),
-                usable_prompt_tokens);
+            runtime->system_prefix_length = computeSystemPrefixLength(
+                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab);
 
-            const int32_t tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
+            int32_t tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
 
-            if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens + kContextHeadroom, true)) {
+            if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens + kContextHeadroom, true,
+                                             cache_identity)) {
                 ctrl->error_code.store(426, std::memory_order_release);
                 LOGE("context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
@@ -1037,13 +1266,47 @@ struct Engine::Impl {
                 return;
             }
 
-            // A full-reset fallback is allowed for new prompts. Restore the
-            // current prompt's prefix metadata before decoding it again.
-            runtime->system_prefix_length = std::min(
-                findSystemPrefixLength(prompt_tokens, runtime->vocab),
-                usable_prompt_tokens);
+            // PIR-05: a shift may have compacted (or reset) the cache, so the
+            // reusable prefix and suffix must be recomputed against the post-shift
+            // active_tokens. If the cache was cleared, common_prefix becomes 0 and
+            // the full prompt is replayed - never a suffix-only evaluation.
+            if (runtime->conversation.valid) {
+                common_prefix = commonPrefixLength(prompt_tokens, runtime->active_tokens);
+                const std::size_t post_shift_bound = std::min(
+                    runtime->conversation.reusable_tokens,
+                    static_cast<std::size_t>(runtime->current_position));
+                if (common_prefix > post_shift_bound) {
+                    common_prefix = post_shift_bound;
+                }
+                // The shift may have left a compacted prefix that only partially
+                // matches the new prompt; drop the divergent tail transactionally
+                // so no stale positions remain in the KV cache.
+                shrinkCommittedPrefix(*runtime, cache_identity_key, common_prefix);
+            } else {
+                common_prefix = 0;
+            }
+            tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
+            // PIR-05: explicit post-shift cache identity line (recomputed suffix).
+            logCacheIdentity("post_shift_decision", cache_identity, runtime->conversation);
+
+            // Restore the current prompt's prefix metadata after any reset/shift.
+            runtime->system_prefix_length = computeSystemPrefixLength(
+                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab);
+
+            // PIR-05: an all-cached request samples from logits left by a prior
+            // decode. If the prefix was truncated (a tail was removed) those logits
+            // no longer match active_tokens.back(), so re-evaluate the final prompt
+            // token to restore last-logit availability before sampling.
+            if (tokens_to_decode == 0 && common_prefix > 0 && !runtime->conversation.last_logits_valid) {
+                common_prefix -= 1;
+                shrinkCommittedPrefix(*runtime, cache_identity_key, common_prefix);
+                tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
+                LOGI("last_logits_recompute common_prefix=%zu tokens_to_decode=%d",
+                     common_prefix, tokens_to_decode);
+            }
 
             if (session->cancel_requested.load(std::memory_order_acquire)) {
+                runtime->conversation.invalidate(); // PIR-05: invalidate-on-abort
                 finishSession(session, StreamState::Cancelled);
                 return;
             }
@@ -1054,6 +1317,11 @@ struct Engine::Impl {
                 const int decode_result = decodeTokensAt(*runtime, prompt_tokens.data() + common_prefix,
                     tokens_to_decode, prompt_start, &session->cancel_requested);
                 if (decode_result != 0) {
+                    // PIR-05: a failed/aborted prefill may have written only part
+                    // of the suffix into the KV cache, so the token/position
+                    // bookkeeping can no longer be trusted. Default to
+                    // invalidate-on-abort so the next request replays cleanly.
+                    runtime->conversation.invalidate();
                     if (decode_result == -999) {
                         LOGI("prompt_eval_cancelled generation_id=%u",
                              session->generation_id);
@@ -1067,11 +1335,12 @@ struct Engine::Impl {
                         if (retry_rc == 0) {
                             runtime->current_position = usable_prompt_tokens;
                             runtime->active_tokens = prompt_tokens;
-                            runtime->system_prefix_length = std::min(
-                                findSystemPrefixLength(prompt_tokens, runtime->vocab),
-                                usable_prompt_tokens);
+                            runtime->system_prefix_length = computeSystemPrefixLength(
+                                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab);
+                            runtime->conversation.markCommitted(cache_identity_key, runtime->current_position, true);
                             LOGI("prefix_cache_retry_success prompt_tokens=%d", usable_prompt_tokens);
                         } else {
+                            runtime->conversation.invalidate(); // PIR-05: invalidate-on-abort
                             ctrl->error_code.store(static_cast<uint32_t>(5000 + std::abs(retry_rc)), std::memory_order_release);
                             LOGE("prompt_eval_failed rc=%d", retry_rc);
                             finishSession(session, StreamState::Error);
@@ -1086,6 +1355,8 @@ struct Engine::Impl {
                 } else {
                     runtime->current_position += tokens_to_decode;
                     runtime->active_tokens.insert(runtime->active_tokens.end(), prompt_tokens.begin() + common_prefix, prompt_tokens.begin() + usable_prompt_tokens);
+                    // PIR-05: commit only after the decode actually succeeded.
+                    runtime->conversation.markCommitted(cache_identity_key, runtime->current_position, true);
                 }
             }
             const auto prompt_end_time = std::chrono::steady_clock::now();
@@ -1108,6 +1379,7 @@ struct Engine::Impl {
 
         if (session->cancel_requested.load(std::memory_order_acquire) ||
             memory_pressure_level.load(std::memory_order_acquire) >= 3) {
+            runtime->conversation.invalidate(); // PIR-05: invalidate-on-abort
             finishSession(session, StreamState::Cancelled);
             return;
         }
@@ -1168,6 +1440,7 @@ struct Engine::Impl {
                 session->cancel_requested.store(true, std::memory_order_release);
             }
             if (session->cancel_requested.load(std::memory_order_acquire)) {
+                runtime->conversation.invalidate(); // PIR-05: invalidate-on-abort
                 finishSession(session, StreamState::Cancelled);
                 return;
             }
@@ -1210,7 +1483,6 @@ struct Engine::Impl {
 
             if (writeToken(ctrl, buffers.tokens, static_cast<int32_t>(token), session->cancel_requested)) {
                 generated_tokens++;
-                runtime->active_tokens.push_back(token);
                 const auto now = std::chrono::steady_clock::now();
                 const auto current_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - generation_start).count();
                 if (current_ms > 0) {
@@ -1219,6 +1491,9 @@ struct Engine::Impl {
                 }
             }
             if (session->cancel_requested.load(std::memory_order_acquire)) {
+                // PIR-05: the token was emitted but not yet committed to the KV
+                // cache; invalidate so no prefix the cache may not hold is reused.
+                runtime->conversation.invalidate();
                 finishSession(session, StreamState::Cancelled);
                 return;
             }
@@ -1229,12 +1504,18 @@ struct Engine::Impl {
                 std::chrono::steady_clock::now() - token_decode_start).count();
             decode_times_us.push_back(token_decode_us);
             if (next_decode_result != 0) {
+                runtime->conversation.invalidate(); // PIR-05: invalidate-on-abort
                 ctrl->error_code.store(static_cast<uint32_t>(5100 + std::abs(next_decode_result)), std::memory_order_release);
                 LOGE("token_eval_failed rc=%d", next_decode_result);
                 finishSession(session, StreamState::Error);
                 return;
             }
+            // PIR-05: commit the token only after its KV entry was successfully
+            // written, so current_position == active_tokens.size() and the last
+            // logits always correspond to active_tokens.back().
+            runtime->active_tokens.push_back(token);
             runtime->current_position += 1;
+            runtime->conversation.noteProgress(runtime->current_position, true);
         }
 
         const auto generation_end = std::chrono::steady_clock::now();
@@ -1551,7 +1832,6 @@ void Engine::cancelGeneration(int generation_id) {
         if (impl_->active_session && impl_->active_session->generation_id == static_cast<uint32_t>(generation_id)) {
             impl_->buffers.control->state.store(static_cast<uint32_t>(StreamState::CancelRequested), std::memory_order_release);
             impl_->active_session->cancel_requested.store(true, std::memory_order_release);
-            clearRing(impl_->buffers.control);
             session_to_join = impl_->active_session;
             impl_->active_session.reset();
         }
@@ -1559,6 +1839,13 @@ void Engine::cancelGeneration(int generation_id) {
     if (session_to_join && session_to_join->worker.joinable()) {
         session_to_join->worker.join();
     }
+    // PIR-02: deliberately do NOT clearRing here. The cancelled session is already
+    // detached above and any leftover ring tokens are discarded by the next
+    // startSessionInternal(), which calls clearRing at the session boundary.
+    // Clearing after releasing `mu` to join would race a newer generation that
+    // started in that window (wiping its ring/counters) and could race a
+    // concurrent drainTokens. An empty ring is treated as no-pending by
+    // ackEof/drainDecodeAndState, so no ack can get stuck either way.
 }
 
 std::vector<int32_t> Engine::drainTokens(int generation_id, int max_tokens) {
@@ -1582,6 +1869,9 @@ std::vector<int32_t> Engine::drainTokens(int generation_id, int max_tokens) {
         result.push_back(impl_->buffers.tokens[(t + i) % cap]);
     }
     ctrl->tail.store((t + count) % cap, std::memory_order_release);
+    // PIR-02: count tokens actually handed to the consumer after the tail
+    // advances, so `pending = produced > drained` reflects ring backlog only.
+    ctrl->drained_tokens.fetch_add(count, std::memory_order_acq_rel);
     return result;
 }
 
@@ -1595,10 +1885,26 @@ void Engine::ackEof(int generation_id) {
         if (impl_->active_session && impl_->active_session->generation_id == static_cast<uint32_t>(generation_id)) {
             impl_->active_session->eof_acknowledged.store(true, std::memory_order_release);
             const uint32_t state = impl_->buffers.control->state.load(std::memory_order_acquire);
-            if (isTerminal(state)) {
-                impl_->buffers.control->state.store(static_cast<uint32_t>(StreamState::Tombstoned), std::memory_order_release);
+            auto* ctrl = impl_->buffers.control;
+            const uint64_t produced = ctrl->produced_tokens.load(std::memory_order_acquire);
+            const uint64_t drained = ctrl->drained_tokens.load(std::memory_order_acquire);
+            // A ring with head == tail holds no pending output, which also guards
+            // against a counter/clear race leaving produced > drained on an empty
+            // ring (otherwise the ack could never tombstone).
+            const bool ring_empty =
+                ctrl->head.load(std::memory_order_acquire) == ctrl->tail.load(std::memory_order_acquire);
+            if (isTerminal(state) && (produced <= drained || ring_empty)) {
+                ctrl->state.store(static_cast<uint32_t>(StreamState::Tombstoned), std::memory_order_release);
                 session_to_join = impl_->active_session;
                 impl_->active_session.reset();
+            } else if (isTerminal(state)) {
+                // PIR-02: a terminal was observed before the ring was fully
+                // drained. Keep the session and tombstone deferred so the
+                // caller can drain the backlog and re-ack without losing tokens.
+                LOGI("eof_ack_deferred generation_id=%u produced=%llu drained=%llu",
+                     generation_id,
+                     static_cast<unsigned long long>(produced),
+                     static_cast<unsigned long long>(drained));
             }
         }
     }
@@ -1760,6 +2066,7 @@ std::vector<float> Engine::encode(const std::string& text) {
 
 Engine::DrainResult Engine::drainDecodeAndState(int generation_id, int max_tokens) {
     DrainResult result;
+    result.schema_version = llmhost::kStreamProtocolVersion;
     if (!impl_) {
         return result;
     }
@@ -1779,6 +2086,18 @@ Engine::DrainResult Engine::drainDecodeAndState(int generation_id, int max_token
         }
         if (impl_->buffers.control != nullptr) {
             result.error_code = impl_->buffers.control->error_code.load(std::memory_order_acquire);
+            // PIR-02: expose the produced/drained backlog so the consumer keeps
+            // draining while a terminal is observed but output is still pending.
+            const uint64_t produced = impl_->buffers.control->produced_tokens.load(std::memory_order_acquire);
+            const uint64_t drained = impl_->buffers.control->drained_tokens.load(std::memory_order_acquire);
+            const bool ring_nonempty =
+                impl_->buffers.control->head.load(std::memory_order_acquire) !=
+                impl_->buffers.control->tail.load(std::memory_order_acquire);
+            result.produced = static_cast<int64_t>(produced);
+            result.drained = static_cast<int64_t>(drained);
+            // Only report pending when the ring actually still holds output, so a
+            // counter/clear race can never strand the consumer in a pending loop.
+            result.pending = (produced > drained) && ring_nonempty;
         }
     }
 

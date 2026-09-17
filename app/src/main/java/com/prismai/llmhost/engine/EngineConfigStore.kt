@@ -9,6 +9,7 @@ import com.prismai.llmhost.model.*
 
 import android.content.SharedPreferences
 import com.prismai.llmhost.GenerationSettings
+import com.prismai.llmhost.engine.runtime.InferencePlan
 
 /**
  * Pure SharedPreferences wrapper for persisting and loading generation settings.
@@ -26,6 +27,7 @@ class EngineConfigStore(private val prefs: SharedPreferences) {
         topP = prefs.getFloat(KEY_TOP_P, GenerationSettings.DEFAULT_TOP_P),
         repeatPenalty = prefs.getFloat(KEY_REPEAT_PENALTY, GenerationSettings.DEFAULT_REPEAT_PENALTY),
         gpuLayers = prefs.getInt(KEY_GPU_LAYERS, GenerationSettings.DEFAULT_GPU_LAYERS),
+        useVulkan = prefs.getBoolean(KEY_USE_VULKAN, true),
         agentEnabled = prefs.getBoolean(KEY_AGENT_ENABLED, false),
         kvCacheTypeK = prefs.getString(KEY_KV_CACHE_TYPE_K, "q8_0") ?: "q8_0",
         kvCacheTypeV = prefs.getString(KEY_KV_CACHE_TYPE_V, "q8_0") ?: "q8_0",
@@ -43,6 +45,7 @@ class EngineConfigStore(private val prefs: SharedPreferences) {
             .putFloat(KEY_TOP_P, settings.topP)
             .putFloat(KEY_REPEAT_PENALTY, settings.repeatPenalty)
             .putInt(KEY_GPU_LAYERS, settings.gpuLayers)
+            .putBoolean(KEY_USE_VULKAN, settings.useVulkan)
             .putBoolean(KEY_AGENT_ENABLED, settings.agentEnabled)
             .putString(KEY_KV_CACHE_TYPE_K, settings.kvCacheTypeK)
             .putString(KEY_KV_CACHE_TYPE_V, settings.kvCacheTypeV)
@@ -60,17 +63,17 @@ class EngineConfigStore(private val prefs: SharedPreferences) {
         const val KEY_TOP_P = "top_p"
         const val KEY_REPEAT_PENALTY = "repeat_penalty"
         const val KEY_GPU_LAYERS = "gpu_layers"
+        const val KEY_USE_VULKAN = "use_vulkan"
         const val KEY_AGENT_ENABLED = "agent_enabled"
         const val KEY_KV_CACHE_TYPE_K = "kv_cache_type_k"
         const val KEY_KV_CACHE_TYPE_V = "kv_cache_type_v"
         const val KEY_ENABLE_FLASH_ATTN = "enable_flash_attn"
 
+        /**
+         * True when the change touches any field that affects how the native model is loaded.
+         * Uses [InferencePlan.settingsLoadKey] so the field list lives in exactly one place.
+         */
         fun requiresReload(previous: GenerationSettings, next: GenerationSettings): Boolean =
-            previous.contextLength != next.contextLength ||
-                previous.batchSize != next.batchSize ||
-            previous.gpuLayers != next.gpuLayers ||
-                previous.kvCacheTypeK != next.kvCacheTypeK ||
-                previous.kvCacheTypeV != next.kvCacheTypeV ||
-                previous.enableFlashAttn != next.enableFlashAttn
+            InferencePlan.settingsLoadKey(previous) != InferencePlan.settingsLoadKey(next)
     }
 }

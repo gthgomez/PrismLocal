@@ -43,6 +43,10 @@ struct GenerationConfig {
     std::string kv_cache_type_k = "q8_0";
     std::string kv_cache_type_v = "q8_0";
     bool enable_flash_attn = true;
+    // PIR-06: explicit backend preference. When false, GPU layer offload is
+    // disabled for this load (CPU-only). Native readback still reports the
+    // actually-applied backend; this is only the request.
+    bool use_vulkan = true;
     std::vector<LoraAdapterSpec> lora_adapters;
 };
 
@@ -76,6 +80,13 @@ public:
         float tokens_per_sec = 0.0f;
         int active_threads = 0;
         int error_code = 0;
+        // PIR-02: stream terminal/drain accounting. `produced` counts tokens
+        // written into the ring; `drained` counts tokens handed to the consumer.
+        // While `produced > drained` a terminal state must not be acknowledged.
+        int schema_version = 1;
+        int64_t produced = 0;
+        int64_t drained = 0;
+        bool pending = false;
     };
     DrainResult drainDecodeAndState(int generation_id, int max_tokens);
 

@@ -19,6 +19,13 @@
 // once every produced token has actually been drained (`drained == produced`)
 // and nothing is pending.
 //
+// Scope: this validates the protocol contract plus the SpscRing/tracker logic.
+// The production Engine does NOT instantiate `StreamSequenceTracker`; it enforces
+// the same invariant with its own atomic produced/drained counters and a
+// ring-empty-aware ack gate (see Engine.cpp). Those native paths are covered by
+// compilation/CI and need a device for runtime evidence; this host test does not
+// execute them.
+//
 // No gtest, no llama.cpp, no Android, no Gradle. The only randomness uses a
 // fixed seed so every run is reproducible. Exits non-zero if any check fails.
 

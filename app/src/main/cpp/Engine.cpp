@@ -1827,18 +1827,27 @@ void Engine::cancelGeneration(int generation_id) {
         return;
     }
     std::shared_ptr<GenerationSession> session_to_join;
+    bool cancelled_matching_session = false;
     {
         std::lock_guard<std::mutex> lock(impl_->mu);
         if (impl_->active_session && impl_->active_session->generation_id == static_cast<uint32_t>(generation_id)) {
             impl_->buffers.control->state.store(static_cast<uint32_t>(StreamState::CancelRequested), std::memory_order_release);
             impl_->active_session->cancel_requested.store(true, std::memory_order_release);
-            clearRing(impl_->buffers.control);
             session_to_join = impl_->active_session;
             impl_->active_session.reset();
+            cancelled_matching_session = true;
         }
     }
     if (session_to_join && session_to_join->worker.joinable()) {
         session_to_join->worker.join();
+    }
+    // PIR-02: clear the ring only AFTER the producer thread has stopped. Clearing
+    // while a writer could still run let a late `produced_tokens` increment land
+    // after the reset, leaving `produced > drained` forever on an empty ring
+    // (ack could never tombstone).
+    if (cancelled_matching_session) {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        clearRing(impl_->buffers.control);
     }
 }
 
@@ -1882,7 +1891,12 @@ void Engine::ackEof(int generation_id) {
             auto* ctrl = impl_->buffers.control;
             const uint64_t produced = ctrl->produced_tokens.load(std::memory_order_acquire);
             const uint64_t drained = ctrl->drained_tokens.load(std::memory_order_acquire);
-            if (isTerminal(state) && produced <= drained) {
+            // A ring with head == tail holds no pending output, which also guards
+            // against a counter/clear race leaving produced > drained on an empty
+            // ring (otherwise the ack could never tombstone).
+            const bool ring_empty =
+                ctrl->head.load(std::memory_order_acquire) == ctrl->tail.load(std::memory_order_acquire);
+            if (isTerminal(state) && (produced <= drained || ring_empty)) {
                 ctrl->state.store(static_cast<uint32_t>(StreamState::Tombstoned), std::memory_order_release);
                 session_to_join = impl_->active_session;
                 impl_->active_session.reset();
@@ -2079,9 +2093,14 @@ Engine::DrainResult Engine::drainDecodeAndState(int generation_id, int max_token
             // draining while a terminal is observed but output is still pending.
             const uint64_t produced = impl_->buffers.control->produced_tokens.load(std::memory_order_acquire);
             const uint64_t drained = impl_->buffers.control->drained_tokens.load(std::memory_order_acquire);
+            const bool ring_nonempty =
+                impl_->buffers.control->head.load(std::memory_order_acquire) !=
+                impl_->buffers.control->tail.load(std::memory_order_acquire);
             result.produced = static_cast<int64_t>(produced);
             result.drained = static_cast<int64_t>(drained);
-            result.pending = produced > drained;
+            // Only report pending when the ring actually still holds output, so a
+            // counter/clear race can never strand the consumer in a pending loop.
+            result.pending = (produced > drained) && ring_nonempty;
         }
     }
 

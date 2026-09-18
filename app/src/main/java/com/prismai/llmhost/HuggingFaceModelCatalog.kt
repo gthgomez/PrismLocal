@@ -338,6 +338,44 @@ object HuggingFaceModelCatalog {
             quantization = "Q1_0 (1.125 bpw)",
             notes = "Flagship devices only (prefer 12–16 GB total RAM; need ~6+ GiB free after unload). Peak memory exceeds file size (~5 GiB class at short context). Text-only in this build. Device load not yet smoke-verified on this project.",
         ),
+        // --- Abliterated (uncensored) test pair: matched size/quant against the aligned
+        //     llama32_1b_q4km and qwen25_15b_q4km entries for A/B refusal testing. ---
+        HuggingFaceModelEntry(
+            id = "llama32_1b_abliterated_q4km",
+            name = "Llama 3.2 1B Instruct (abliterated)",
+            repoId = "mradermacher/Llama-3.2-1B-Instruct-abliterated-GGUF",
+            fileName = "Llama-3.2-1B-Instruct-abliterated.Q4_K_M.gguf",
+            expectedBytes = 955_445_792L,
+            expectedSha256 = "68336c25367576f49b29f01ee9034658b51bbded6a7f215e934d997de96301e0",
+            license = "Llama 3.2 Community",
+            parameters = "1B",
+            quantization = "Q4_K_M",
+            notes = "Uncensored (abliterated) Llama 3.2 1B. Same size/quant as llama32_1b_q4km for abliteration A/B testing. Text-only.",
+        ),
+        HuggingFaceModelEntry(
+            id = "qwen25_15b_abliterated_q4km",
+            name = "Qwen2.5 1.5B Instruct (abliterated)",
+            repoId = "mradermacher/Qwen2.5-1.5B-Instruct-abliterated-GGUF",
+            fileName = "Qwen2.5-1.5B-Instruct-abliterated.Q4_K_M.gguf",
+            expectedBytes = 986_049_088L,
+            expectedSha256 = "59aa9f44bde5349dbe292d7024d197db605f422b8baf65f3246a59abbde4e8e9",
+            license = "Apache-2.0",
+            parameters = "1.5B",
+            quantization = "Q4_K_M",
+            notes = "Uncensored (abliterated) Qwen2.5 1.5B. Same size/quant as qwen25_15b_q4km. Exercises the ChatML template branch.",
+        ),
+        HuggingFaceModelEntry(
+            id = "llama32_3b_abliterated_q4km",
+            name = "Llama 3.2 3B Instruct (abliterated, i1)",
+            repoId = "mradermacher/Llama-3.2-3B-Instruct-abliterated-i1-GGUF",
+            fileName = "Llama-3.2-3B-Instruct-abliterated.i1-Q4_K_M.gguf",
+            expectedBytes = 2_241_004_736L,
+            expectedSha256 = "bb4c67ad696baa379bf572ebf753d48591fdc26035f4d19c5e60a4d570785b0c",
+            license = "Llama 3.2 Community",
+            parameters = "3B",
+            quantization = "Q4_K_M (i1)",
+            notes = "Uncensored (abliterated) Llama 3.2 3B, imatrix quant. Larger tier for quality vs the 1B on flagship phones. Text-only.",
+        ),
     )
 
     private val customEntries = mutableMapOf<String, HuggingFaceModelEntry>()

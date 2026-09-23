@@ -266,7 +266,7 @@ class GenerationOrchestrator(
                 )
                 if (agentEnabled) {
                     agentTrace.addChainTokens(result.generatedTokens)
-                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF" || result.finalReason == "MAX_TOKENS"))
+                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
                 }
             } else if (result.finalReason == "ERROR" && agentEnabled) {
                 agentTrace.addChainTokens(result.generatedTokens)
@@ -354,6 +354,13 @@ class GenerationOrchestrator(
                     result.finalReason,
                     result.terminalDetail,
                 )
+                if (agentEnabled) {
+                    agentTrace.addChainTokens(result.generatedTokens)
+                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
+                }
+            } else if (result.finalReason == "ERROR" && agentEnabled) {
+                agentTrace.addChainTokens(result.generatedTokens)
+                agentTrace.finalizeTrace(success = false)
             }
             val reasoningPrefix = if (agentToolCall != null) {
                 AgentToolProtocol.extractReasoningPrefix(result.finalOutput)
@@ -449,7 +456,7 @@ class GenerationOrchestrator(
             val nextToolCall = if (result.finalReason == "EOF") AgentToolProtocol.parseToolCall(result.finalOutput) else null
             agentTrace.addChainTokens(result.generatedTokens)
             if (nextToolCall == null) {
-                agentTrace.finalizeTrace(success = (result.finalReason == "EOF" || result.finalReason == "MAX_TOKENS"))
+                agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
             } else if (result.finalReason == "ERROR") {
                 agentTrace.finalizeTrace(success = false)
             }

@@ -46,20 +46,25 @@ internal data class DrainStateDecision(
 )
 
 /**
- * Classifies one native drain state. Tombstoned and Idle are stale-session
- * states: a native error code becomes an immediate ERROR terminal, while a
- * clean stale state stops the producer for normal cleanup.
+ * Classifies one native drain state. Tombstoned is a clean stopped session
+ * when it has no error; Idle during an accepted generation is an unexpected
+ * cancellation boundary, so it emits a terminal rather than looking like EOF.
  */
 internal fun decideDrainState(state: Int, errorCode: Int): DrainStateDecision = when (state) {
     NATIVE_STATE_EOF -> DrainStateDecision(DrainStateAction.TERMINAL, "EOF")
     NATIVE_STATE_CANCELLED -> DrainStateDecision(DrainStateAction.TERMINAL, "CANCELLED")
     NATIVE_STATE_ERROR -> DrainStateDecision(DrainStateAction.TERMINAL, "ERROR")
     NATIVE_STATE_MAX_TOKENS -> DrainStateDecision(DrainStateAction.TERMINAL, "MAX_TOKENS")
-    NATIVE_STATE_TOMBSTONED, NATIVE_STATE_IDLE -> if (errorCode != 0) {
+    NATIVE_STATE_TOMBSTONED -> if (errorCode != 0) {
         DrainStateDecision(DrainStateAction.TERMINAL, "ERROR", waitForPending = false)
     } else {
         DrainStateDecision(DrainStateAction.STOP)
     }
+    NATIVE_STATE_IDLE -> DrainStateDecision(
+        action = DrainStateAction.TERMINAL,
+        terminalReason = if (errorCode != 0) "ERROR" else "CANCELLED",
+        waitForPending = false,
+    )
     else -> DrainStateDecision(DrainStateAction.CONTINUE)
 }
 

@@ -63,11 +63,30 @@ class NativeBridgeBackpressureTest {
     }
 
     @Test
-    fun staleIdleWithoutErrorStopsForCleanup() {
+    fun partialStreamIdleEmitsCancellationTerminal() = runBlocking {
         val decision = decideDrainState(NATIVE_STATE_IDLE, errorCode = 0)
+        val flow = callbackFlow {
+            sendChunk(chunk(1))
+            if (decision.action == DrainStateAction.TERMINAL) {
+                sendChunk(
+                    GenerationChunk(
+                        text = "",
+                        tokenCount = 0,
+                        generationId = 42,
+                        isTerminal = true,
+                        terminalReason = decision.terminalReason.orEmpty(),
+                    ),
+                )
+            }
+            close()
+        }.buffer(generationStreamBufferCapacity(1))
 
-        assertEquals(DrainStateAction.STOP, decision.action)
-        assertEquals(null, decision.terminalReason)
+        val received = withTimeout(5_000) { flow.toList() }
+
+        assertEquals(2, received.size)
+        assertEquals("t1", received.first().text)
+        assertTrue(received.last().isTerminal)
+        assertEquals("CANCELLED", received.last().terminalReason)
     }
 
     @Test

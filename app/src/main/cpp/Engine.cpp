@@ -66,7 +66,7 @@ struct ControlBlock {
     std::atomic<uint32_t> tail{0};
     std::atomic<uint32_t> capacity{kTokenCapacity};
     std::atomic<uint32_t> overflow{0};
-    std::atomic<uint32_t> error_code{0};
+    std::atomic<uint32_t> error_code{static_cast<uint32_t>(NativeErrorCode::OK)};
     // PIR-02: monotonic per-session token accounting. `produced_tokens` is
     // incremented after a successful ring write, `drained_tokens` after the
     // consumer advances the tail. A terminal state with produced > drained has
@@ -114,7 +114,7 @@ void clearRing(ControlBlock* ctrl) {
     ctrl->head.store(0, std::memory_order_release);
     ctrl->tail.store(0, std::memory_order_release);
     ctrl->overflow.store(0, std::memory_order_release);
-    ctrl->error_code.store(0, std::memory_order_release);
+    ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::OK), std::memory_order_release);
     // PIR-02: a cleared ring has no produced/drained backlog. Reset the
     // accounting so a subsequent terminal cannot inherit stale pending output.
     ctrl->produced_tokens.store(0, std::memory_order_release);
@@ -1029,7 +1029,7 @@ struct Engine::Impl {
         int32_t* token_buffer = buffers.tokens;
         if (prompt == "DEBUG_SIMULATE_RING") {
             if (!debugHooksAllowed()) {
-                ctrl->error_code.store(403, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::DEBUG_HOOKS_REJECTED), std::memory_order_release);
                 finishSession(session, StreamState::Error);
                 return;
             }
@@ -1051,7 +1051,7 @@ struct Engine::Impl {
         (void) session;
         (void) prompt;
 #endif
-        buffers.control->error_code.store(501, std::memory_order_release);
+        buffers.control->error_code.store(static_cast<uint32_t>(NativeErrorCode::DEBUG_GENERATION_REJECTED), std::memory_order_release);
         LOGW("debug_generation_rejected prompt=%s", prompt.c_str());
         finishSession(session, StreamState::Error);
     }
@@ -1061,7 +1061,7 @@ struct Engine::Impl {
         auto* ctrl = buffers.control;
 
         if (!runtime || runtime->model == nullptr || runtime->ctx == nullptr || runtime->vocab == nullptr) {
-            ctrl->error_code.store(404, std::memory_order_release);
+            ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::HANDLE_INVALID_OR_CLOSED), std::memory_order_release);
             finishSession(session, StreamState::Error);
             return;
         }
@@ -1130,7 +1130,7 @@ struct Engine::Impl {
             }
             if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens + kContextHeadroom, false,
                                              cache_identity)) {
-                ctrl->error_code.store(426, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::CONTEXT_SHIFT_FAILED), std::memory_order_release);
                 LOGE("continue_context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
                      static_cast<int>(runtime->current_position),
@@ -1261,7 +1261,7 @@ struct Engine::Impl {
 
             if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens + kContextHeadroom, true,
                                              cache_identity)) {
-                ctrl->error_code.store(426, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::CONTEXT_SHIFT_FAILED), std::memory_order_release);
                 LOGE("context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
                      static_cast<int>(runtime->current_position),
@@ -1402,7 +1402,7 @@ struct Engine::Impl {
         }
         llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
         if (sampler == nullptr) {
-            ctrl->error_code.store(424, std::memory_order_release);
+            ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::SAMPLER_INIT_FAILED), std::memory_order_release);
             finishSession(session, StreamState::Error);
             return;
         }
@@ -1467,7 +1467,7 @@ struct Engine::Impl {
                 // No unconstrained fallback: when a required grammar rejects every
                 // candidate, fail with a typed error instead of emitting output that
                 // violates the requested structure.
-                ctrl->error_code.store(425, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::NULL_TOKEN_PRODUCED), std::memory_order_release);
                 LOGE("sample_failed token=null grammar=%d generation_id=%u",
                      session->config.grammar.empty() ? 0 : 1,
                      session->generation_id);

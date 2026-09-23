@@ -44,6 +44,20 @@ class EngineStressTest {
     }
 
     @Test
+    fun unsupportedDebugPromptReportsDedicatedRejectionCode() = runBlocking {
+        val engine = NativeLlmBridge.create()
+        try {
+            assertTrue(engine.loadModel("DEBUG_MOCK_MODEL"))
+
+            val terminal = engine.generate("UNSUPPORTED_DEBUG_PROMPT").toList().last { it.isTerminal }
+            assertEquals("ERROR", terminal.terminalReason)
+            assertEquals(405, terminal.errorCode)
+        } finally {
+            engine.destroySafely()
+        }
+    }
+
+    @Test
     fun cancellationDoesNotRequireTerminalAfterCollectorCancel() = runBlocking {
         val engine = NativeLlmBridge.create()
         assertTrue(engine.loadModel("DEBUG_MOCK_MODEL"))

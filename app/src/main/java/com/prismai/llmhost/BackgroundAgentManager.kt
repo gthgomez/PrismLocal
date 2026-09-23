@@ -20,7 +20,10 @@ import android.os.Build
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.io.File
 import java.util.concurrent.atomic.AtomicLong
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -72,6 +75,7 @@ class BackgroundAgentManager(
     private val executeTask: (suspend (BackgroundTask) -> String)? = null,
     private val cancelNativeGeneration: (suspend () -> Unit)? = null,
     private val isDeviceBusyWithUserGeneration: () -> Boolean = { false },
+    private val storageDir: File? = runCatching { context.filesDir }.getOrNull(),
 ) {
     companion object {
         private const val TAG = "BackgroundAgentManager"
@@ -79,8 +83,10 @@ class BackgroundAgentManager(
         private const val CHANNEL_BG_PROGRESS = "prism_bg_progress"
         private const val NOTIFICATION_ID_BASE = 3000
         private const val MAX_QUEUED_TASKS = 5
+        private const val MAX_COMPLETED_TASKS_SAVED = 20
         private const val LOW_BATTERY_THRESHOLD = 15
         private const val DEVICE_BUSY_RETRY_INTERVAL_MS = 2_000L
+        const val TASKS_FILE_NAME = "background_tasks.json"
     }
 
     // Guards every BackgroundAgentState read-modify-write and task promotion;
@@ -120,6 +126,127 @@ class BackgroundAgentManager(
             null
         }
         runCatching { createNotificationChannels() }
+        synchronized(stateLock) {
+            loadPersistedTasksLocked()
+        }
+    }
+
+    private fun taskToJson(task: BackgroundTask): JSONObject = JSONObject().apply {
+        put("id", task.id)
+        put("prompt", task.prompt)
+        put("createdAt", task.createdAt)
+        put("status", task.status.name)
+        if (task.resultSummary != null) {
+            put("resultSummary", task.resultSummary)
+        }
+    }
+
+    private fun parseTask(json: JSONObject): BackgroundTask? {
+        val id = json.optString("id").takeIf { it.isNotBlank() } ?: return null
+        val prompt = json.optString("prompt").takeIf { it.isNotBlank() } ?: return null
+        val createdAt = json.optLong("createdAt", System.currentTimeMillis())
+        val statusStr = json.optString("status", BackgroundTaskStatus.QUEUED.name)
+        val status = runCatching { BackgroundTaskStatus.valueOf(statusStr) }.getOrDefault(BackgroundTaskStatus.QUEUED)
+        val resultSummary = json.optString("resultSummary").takeIf { it.isNotBlank() && it != "null" }
+        return BackgroundTask(
+            id = id,
+            prompt = prompt,
+            createdAt = createdAt,
+            status = status,
+            resultSummary = resultSummary,
+        )
+    }
+
+    private fun loadPersistedTasksLocked() {
+        val dir = storageDir ?: return
+        val file = File(dir, TASKS_FILE_NAME)
+        if (!file.exists()) return
+        runCatching {
+            val root = JSONObject(file.readText())
+            val queued = mutableListOf<BackgroundTask>()
+            val completed = mutableListOf<BackgroundTask>()
+            var highestId = 0L
+
+            fun trackId(id: String) {
+                val num = id.removePrefix("bg_task_").toLongOrNull()
+                if (num != null && num > highestId) {
+                    highestId = num
+                }
+            }
+
+            // If an active task was running when the process died, return it to the queue
+            if (root.has("activeTask") && !root.isNull("activeTask")) {
+                val activeObj = root.optJSONObject("activeTask")
+                if (activeObj != null) {
+                    val recovered = parseTask(activeObj)
+                    if (recovered != null) {
+                        trackId(recovered.id)
+                        queued.add(recovered.copy(status = BackgroundTaskStatus.QUEUED))
+                    }
+                }
+            }
+
+            val queuedArray = root.optJSONArray("queuedTasks")
+            if (queuedArray != null) {
+                for (i in 0 until queuedArray.length()) {
+                    val obj = queuedArray.optJSONObject(i) ?: continue
+                    val task = parseTask(obj) ?: continue
+                    trackId(task.id)
+                    queued.add(task.copy(status = BackgroundTaskStatus.QUEUED))
+                }
+            }
+
+            val completedArray = root.optJSONArray("completedTasks")
+            if (completedArray != null) {
+                for (i in 0 until completedArray.length()) {
+                    val obj = completedArray.optJSONObject(i) ?: continue
+                    val task = parseTask(obj) ?: continue
+                    trackId(task.id)
+                    completed.add(task)
+                }
+            }
+
+            taskIdCounter.set(highestId)
+            _state.value = _state.value.copy(
+                queuedTasks = queued.take(MAX_QUEUED_TASKS),
+                completedTasks = completed.takeLast(MAX_COMPLETED_TASKS_SAVED),
+            )
+            logD(TAG, "Restored ${queued.size} queued tasks, ${completed.size} completed tasks from disk")
+        }.onFailure { e ->
+            logW(TAG, "Failed to load persisted background tasks: ${e.message}")
+        }
+    }
+
+    private fun persistTasksLocked() {
+        val dir = storageDir ?: return
+        runCatching {
+            val current = _state.value
+            val root = JSONObject().apply {
+                put("version", 1)
+                val queuedArr = JSONArray()
+                current.queuedTasks.forEach { queuedArr.put(taskToJson(it)) }
+                put("queuedTasks", queuedArr)
+
+                if (current.activeTask != null) {
+                    put("activeTask", taskToJson(current.activeTask))
+                } else {
+                    put("activeTask", JSONObject.NULL)
+                }
+
+                val completedArr = JSONArray()
+                current.completedTasks.takeLast(MAX_COMPLETED_TASKS_SAVED).forEach { completedArr.put(taskToJson(it)) }
+                put("completedTasks", completedArr)
+            }
+
+            if (!dir.exists()) dir.mkdirs()
+            val temp = File(dir, "$TASKS_FILE_NAME.tmp")
+            val target = File(dir, TASKS_FILE_NAME)
+            temp.writeText(root.toString())
+            if (target.exists()) target.delete()
+            temp.renameTo(target)
+        }.onFailure { e ->
+            logW(TAG, "Failed to persist background tasks: ${e.message}")
+        }
     }
 
     /**
@@ -136,6 +263,7 @@ class BackgroundAgentManager(
             val id = "bg_task_${taskIdCounter.incrementAndGet()}"
             val task = BackgroundTask(id = id, prompt = prompt)
             _state.value = current.copy(queuedTasks = current.queuedTasks + task)
+            persistTasksLocked()
             task
         }
 
@@ -172,6 +300,7 @@ class BackgroundAgentManager(
             activeTask = head,
             queuedTasks = current.queuedTasks.drop(1),
         )
+        persistTasksLocked()
         return head
     }
 
@@ -326,6 +455,7 @@ class BackgroundAgentManager(
                     latest.completedTasks
                 },
             )
+            persistTasksLocked()
         }
         releaseWakeLockSafely()
         cancelProgressNotification()
@@ -349,6 +479,7 @@ class BackgroundAgentManager(
                             status = BackgroundTaskStatus.CANCELLED
                         ),
                     )
+                    persistTasksLocked()
                     queuedCancelled = true
                 }
             }
@@ -376,6 +507,7 @@ class BackgroundAgentManager(
                             status = BackgroundTaskStatus.CANCELLED
                         ),
                     )
+                    persistTasksLocked()
                 }
                 releaseWakeLockSafely()
             } finally {
@@ -399,6 +531,7 @@ class BackgroundAgentManager(
                 activeTask = null,
                 completedTasks = current.completedTasks + done,
             )
+            persistTasksLocked()
             done
         }
         notifyTaskComplete(completed)
@@ -418,6 +551,7 @@ class BackgroundAgentManager(
                 activeTask = null,
                 completedTasks = current.completedTasks + done,
             )
+            persistTasksLocked()
             done
         }
         notifyTaskComplete(failed)
@@ -476,6 +610,14 @@ class BackgroundAgentManager(
             val current = _state.value
             if (current.queuedTasks.isEmpty() || current.activeTask != null) return null
             return promoteHeadLocked(current)
+        }
+    }
+
+    /** Clear history of completed/failed/cancelled tasks. */
+    fun clearCompletedTasks() {
+        synchronized(stateLock) {
+            _state.value = _state.value.copy(completedTasks = emptyList())
+            persistTasksLocked()
         }
     }
 

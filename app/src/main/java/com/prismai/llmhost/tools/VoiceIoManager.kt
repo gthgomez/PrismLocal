@@ -57,7 +57,9 @@ class VoiceIoManager(private val context: Context) {
             ttsInitialized = success
             if (success) {
                 tts?.language = Locale.US
-                Log.d(TAG, "TTS initialized, language=${tts?.language}")
+                @Suppress("DEPRECATION")
+                val activeLocale = tts?.voice?.locale ?: tts?.language
+                Log.d(TAG, "TTS initialized, locale=$activeLocale")
             } else {
                 Log.w(TAG, "TTS initialization failed: status=$status")
             }

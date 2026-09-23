@@ -81,7 +81,7 @@ class GenerationOrchestrator(
     private val setReloadPending: (Boolean) -> Unit,
     /** Fired exactly once after a benchmark-preset generation fully completes/cleans up. */
     private val onBenchmarkComplete: () -> Unit = {},
-    private val onBeforeChatIdentityChange: (String) -> Unit = {},
+    private val onBeforeChatIdentityChange: suspend (String, suspend () -> Unit) -> Unit = { _, mutation -> mutation() },
 ) {
     companion object {
         private const val TAG = "GenOrchestrator"
@@ -864,9 +864,10 @@ class GenerationOrchestrator(
         }
 
     private suspend fun startBenchmarkChat(name: String) {
-        onBeforeChatIdentityChange("Benchmark chat changed")
-        chatManager.createChatInternal("Benchmark - $name", publishEvent = false)
-        runCatching { engine.resetConversation() }
+        onBeforeChatIdentityChange("Benchmark chat changed") {
+            chatManager.createChatInternal("Benchmark - $name", publishEvent = false)
+            runCatching { engine.resetConversation() }
+        }
     }
 
     // ── Tool result truncation ──────────────────────────────────────────

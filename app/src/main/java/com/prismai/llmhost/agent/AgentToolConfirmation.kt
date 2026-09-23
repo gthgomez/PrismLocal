@@ -365,14 +365,10 @@ class AgentToolConfirmation(
                 .put("depth", authorization.depth)
 
             val key = pendingActionKey(chatId)
-            val success = prefs.edit()
+            prefs.edit()
                 .putString(key, json.toString())
-                .commit()
-            if (success) {
-                logDebug("Persisted pending agent tool call: ${authorization.call.name} for chat $chatId")
-            } else {
-                logWarning("Failed to commit pending agent tool call: ${authorization.call.name} for chat $chatId")
-            }
+                .apply()
+            logDebug("Scheduled pending agent tool persistence: ${authorization.call.name} for chat $chatId")
         } catch (e: Exception) {
             logError("Failed to persist pending agent tool call", e)
         }
@@ -437,14 +433,10 @@ class AgentToolConfirmation(
     private fun removePersisted(chatId: String?) {
         if (chatId.isNullOrBlank()) return
         val key = pendingActionKey(chatId)
-        val success = prefs.edit()
+        prefs.edit()
             .remove(key)
-            .commit()
-        if (success) {
-            logDebug("Cleared pending agent tool SharedPreferences for chat $chatId")
-        } else {
-            logWarning("Failed to commit clearing pending agent tool SharedPreferences for chat $chatId")
-        }
+            .apply()
+        logDebug("Scheduled pending agent tool preference cleanup for chat $chatId")
     }
 
     private fun resolveToolChatSession(chatIdArg: String): ChatSession? {
@@ -464,10 +456,6 @@ class AgentToolConfirmation(
 
     private fun logDebug(message: String) {
         runCatching { Log.d(TAG, message) }
-    }
-
-    private fun logWarning(message: String) {
-        runCatching { Log.w(TAG, message) }
     }
 
     private fun logError(message: String, error: Throwable) {

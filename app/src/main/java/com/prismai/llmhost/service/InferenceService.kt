@@ -80,6 +80,7 @@ import com.prismai.llmhost.generation.PromptBuilder
 import com.prismai.llmhost.agent.AgentTrace
 import com.prismai.llmhost.agent.AgentToolConfirmation
 import com.prismai.llmhost.agent.AgentToolRouter
+import com.prismai.llmhost.agent.ChatTransitionGate
 import com.prismai.llmhost.util.FormatUtils
 
 class InferenceService : Service() {
@@ -108,6 +109,7 @@ class InferenceService : Service() {
         private val CHAT_IDENTITY_TOOLS = setOf("clear_chat", "delete_chat", "delete_or_clear_chat")
         private const val KEY_AGENT_ENABLED = "agent_enabled"
         private const val KEY_PENDING_AGENT_ACTION_PREFIX = "pending_agent_action_"
+        private const val AGENT_CHAT_CLEANUP_TIMEOUT_MS = 1_000L
         // onDestroy() is a main-thread callback. Native teardown (freeing the
         // loaded ggml/llama model, context and compute buffers) can block for
         // seconds, which would trip an ANR. We therefore only wait this long
@@ -130,6 +132,7 @@ class InferenceService : Service() {
     // waits a bounded budget on the main thread; if that budget expires the
     // job continues to completion off-main.
     private val teardownScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val chatTransitionGate = ChatTransitionGate(teardownScope)
     // Guards onDestroy() against a duplicate teardown launch (reentrancy /
     // defensive double-destroy). destroySafely() is itself idempotent, but this
     // avoids enqueuing redundant cancellation work.
@@ -427,7 +430,9 @@ class InferenceService : Service() {
             },
             // Runner is constructed after the orchestrator; guard the lazy reference.
             onBenchmarkComplete = { if (::benchmarkRunner.isInitialized) benchmarkRunner.runNextQueued() },
-            onBeforeChatIdentityChange = { reason -> abandonPendingAgentTool(reason) },
+            onBeforeChatIdentityChange = { reason, mutation ->
+                prepareAgentChatTransition(reason, afterCleanup = mutation)
+            },
             onDeferredReload = { modelId -> switchModel(modelId) },
             getReloadPending = { reloadPending },
             setReloadPending = { v -> reloadPending = v },
@@ -719,22 +724,40 @@ class InferenceService : Service() {
             publishUiEvent("Cancel generation before creating a new chat")
             return _currentChatId.value.orEmpty()
         }
-        abandonPendingAgentTool("Chat changed before tool confirmation")
-        agentToolConfirmation.clearMemory()
-        val id = chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
-        resetNativeConversationAsync("new chat")
-        return id
+        abandonPendingAgentTool(
+            reason = "Chat changed before tool confirmation",
+            afterCleanup = {
+                chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+                resetNativeConversationAsync("new chat")
+            },
+        )
+        // The UI does not use this value; identity mutation is intentionally
+        // completed by the transition worker after cleanup.
+        return _currentChatId.value.orEmpty()
     }
 
-    private fun createChatInternal(
-        title: String,
-        publishEvent: Boolean = false,
-    ): String {
-        abandonPendingAgentTool("Chat changed before tool confirmation")
-        agentToolConfirmation.clearMemory()
-        val id = chatManager.createChatInternal(title, publishEvent)
-        resetNativeConversationAsync("new chat")
-        return id
+    private suspend fun ensureChatForGeneration() {
+        if (_currentChatId.value != null) return
+        val prepared = prepareAgentChatTransition(
+            reason = "Preparing generation chat",
+            afterCleanup = {
+                if (_currentChatId.value == null) {
+                    chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+                    resetNativeConversationAsync("new chat")
+                }
+            },
+        )
+        if (!prepared && _currentChatId.value == null) {
+            chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+            resetNativeConversationAsync("new chat")
+        }
+    }
+
+    private fun ensureChatForGenerationBlocking() {
+        if (_currentChatId.value == null) {
+            chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+            resetNativeConversationAsync("new chat")
+        }
     }
 
     fun switchChat(chatId: String): Boolean {
@@ -746,12 +769,15 @@ class InferenceService : Service() {
             publishUiEvent("Chat no longer exists")
             return false
         }
-        abandonPendingAgentTool("Chat changed before tool confirmation")
-        agentToolConfirmation.clearMemory()
-        if (!chatManager.switchChat(chatId)) return false
-        agentToolConfirmation.restore()
-        resetNativeConversationAsync("chat switch")
-        return true
+        return abandonPendingAgentTool(
+            reason = "Chat changed before tool confirmation",
+            afterCleanup = {
+                if (chatManager.switchChat(chatId)) {
+                    agentToolConfirmation.restore()
+                    resetNativeConversationAsync("chat switch")
+                }
+            },
+        )
     }
 
     fun renameChat(chatId: String, title: String) {
@@ -763,9 +789,12 @@ class InferenceService : Service() {
             publishUiEvent("Cancel generation before deleting a chat")
             return
         }
-        abandonPendingAgentTool("Chat deleted before tool confirmation")
-        agentToolConfirmation.clearPrefs(chatId)
-        chatManager.deleteChat(chatId)
+        abandonPendingAgentTool(
+            reason = "Chat deleted before tool confirmation",
+            afterCleanup = {
+                chatManager.deleteChat(chatId)
+            },
+        )
     }
 
     fun clearTranscript() {
@@ -773,10 +802,13 @@ class InferenceService : Service() {
             publishUiEvent("Cancel generation before clearing chat")
             return
         }
-        abandonPendingAgentTool("Transcript cleared before tool confirmation")
-        chatManager.clearTranscript()
-        agentToolConfirmation.clearPrefs()
-        resetNativeConversationAsync("clear transcript")
+        abandonPendingAgentTool(
+            reason = "Transcript cleared before tool confirmation",
+            afterCleanup = {
+                chatManager.clearTranscript()
+                resetNativeConversationAsync("clear transcript")
+            },
+        )
     }
 
     fun updateGenerationSettings(settings: GenerationSettings) {
@@ -857,7 +889,7 @@ class InferenceService : Service() {
                 clearQueuedBenchmarks = !preserveBenchmarkQueue,
             )
             if (benchmarkPreset == null && _currentChatId.value == null) {
-                createChat()
+                ensureChatForGeneration()
             }
             generationOrchestrator.generate(prompt, benchmarkPreset)
             activeJob = generationJob
@@ -910,50 +942,101 @@ class InferenceService : Service() {
         }
     }
 
-    /**
-     * Invalidates the active chain and drains its owned jobs before a chat
-     * identity transition. The persisted confirmation is removed as part of
-     * the same boundary so it cannot be restored into the next chat.
-     */
-    private fun abandonPendingAgentTool(
+    private data class AgentChatTransition(
+        val claim: AgentToolRouter.ChatTransitionClaim,
+        val sourceChatId: String?,
+        val currentChatId: String?,
+    )
+
+    private fun claimAgentChatTransition(
         reason: String,
         expectedToken: String? = null,
-    ): Boolean {
+    ): AgentChatTransition? {
         val claim = agentToolRouter.claimChatTransition(
             expectedToken = expectedToken,
             abortReason = reason,
-        ) ?: return false
+        ) ?: return null
         claim.pending?.let { pending ->
             agentToolRouter.removeFromHistory(pending.call)
         }
-        runBlocking {
-            claim.chainIds.forEach { chainId ->
-                agentToolRouter.joinInvalidatedChain(chainId)
+        val transition = AgentChatTransition(
+            claim = claim,
+            sourceChatId = claim.pending?.sourceChatId ?: _currentChatId.value,
+            currentChatId = _currentChatId.value,
+        )
+        // Remove the in-memory card immediately; persistence cleanup is
+        // deferred to the lifecycle transition worker.
+        agentToolConfirmation.clearMemory()
+        return transition
+    }
+
+    private suspend fun cleanupAgentChatTransition(transition: AgentChatTransition) {
+        transition.claim.chainIds.forEach { chainId ->
+            val joined = agentToolRouter.joinInvalidatedChainBounded(
+                chainId = chainId,
+                timeoutMs = AGENT_CHAT_CLEANUP_TIMEOUT_MS,
+            )
+            if (!joined) {
+                Log.w(TAG, "Timed out joining invalidated agent chain $chainId")
             }
         }
-        val sourceChatId = claim.pending?.sourceChatId ?: _currentChatId.value
-        agentToolConfirmation.clearMemory()
-        agentToolConfirmation.clearPersistedForChat(sourceChatId)
-        if (_currentChatId.value != null && _currentChatId.value != sourceChatId) {
-            agentToolConfirmation.clearPersistedForChat(_currentChatId.value)
+        // Do not touch SharedPreferences when there was no authorization to
+        // remove. For a real pending card, apply() schedules disk cleanup.
+        if (transition.claim.pending != null) {
+            agentToolConfirmation.clearPersistedForChat(transition.sourceChatId)
+            if (transition.currentChatId != null && transition.currentChatId != transition.sourceChatId) {
+                agentToolConfirmation.clearPersistedForChat(transition.currentChatId)
+            }
         }
+    }
+
+    /** Claims synchronously, then performs bounded cleanup and mutation off-main. */
+    private fun abandonPendingAgentTool(
+        reason: String,
+        expectedToken: String? = null,
+        afterCleanup: (suspend () -> Unit)? = null,
+    ): Boolean {
+        val transition = claimAgentChatTransition(reason, expectedToken) ?: return false
+        chatTransitionGate.enqueue(
+            cleanup = { cleanupAgentChatTransition(transition) },
+            mutation = { afterCleanup?.invoke() },
+        )
+        return true
+    }
+
+    /** Suspending variant for lifecycle paths that must await cleanup. */
+    private suspend fun prepareAgentChatTransition(
+        reason: String,
+        expectedToken: String? = null,
+        afterCleanup: (suspend () -> Unit)? = null,
+    ): Boolean {
+        val transition = claimAgentChatTransition(reason, expectedToken) ?: return false
+        chatTransitionGate.enqueueAndAwait(
+            cleanup = { cleanupAgentChatTransition(transition) },
+            mutation = { afterCleanup?.invoke() },
+        )
         return true
     }
 
     fun cancelPendingAgentTool(actionToken: String) {
         val action = _pendingAgentToolAction.value ?: return
         if (actionToken != action.id) return
-        if (!abandonPendingAgentTool("Tool confirmation cancelled", actionToken)) return
-        CapabilityRegistryHolder.auditLog.record("CONFIRM_CANCELLED", action.name, "")
-        appendTranscriptMessage(
-            TranscriptRole.TOOL,
-            AgentToolProtocol.toolEventJson(
-                status = "cancelled",
-                toolName = action.name,
-                summary = "Tool cancelled",
-            ),
+        abandonPendingAgentTool(
+            reason = "Tool confirmation cancelled",
+            expectedToken = actionToken,
+            afterCleanup = {
+                CapabilityRegistryHolder.auditLog.record("CONFIRM_CANCELLED", action.name, "")
+                appendTranscriptMessage(
+                    TranscriptRole.TOOL,
+                    AgentToolProtocol.toolEventJson(
+                        status = "cancelled",
+                        toolName = action.name,
+                        summary = "Tool cancelled",
+                    ),
+                )
+                publishUiEvent("Tool cancelled: ${action.name}")
+            },
         )
-        publishUiEvent("Tool cancelled: ${action.name}")
     }
 
     fun confirmPendingAgentTool(actionToken: String) {
@@ -1055,7 +1138,7 @@ class InferenceService : Service() {
 
     private fun appendTranscriptMessage(role: TranscriptRole, text: String): Long {
         if (_currentChatId.value == null) {
-            createChat()
+            ensureChatForGenerationBlocking()
         }
         val id = synchronized(transcriptLock) {
             val id = nextTranscriptId++

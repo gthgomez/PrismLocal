@@ -19,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Routes validated agent tool calls through safety gates, loop guards, and
@@ -189,6 +190,25 @@ class AgentToolRouter(
                 invalidatedChains.remove(chainId)
             }
         }
+    }
+
+    /**
+     * Bounded best-effort join used by asynchronous chat transitions. A
+     * non-cooperative job is already owner-invalidated, so timing out does
+     * not permit a stale callback to mutate the new chat.
+     */
+    suspend fun joinInvalidatedChainBounded(chainId: Long?, timeoutMs: Long): Boolean {
+        val joined = withTimeoutOrNull(timeoutMs) {
+            joinInvalidatedChain(chainId)
+            true
+        } ?: false
+        if (!joined && chainId != null) {
+            synchronized(toolJobsLock) {
+                toolJobsByChain.remove(chainId)
+                invalidatedChains.remove(chainId)
+            }
+        }
+        return joined
     }
 
     fun stageConfirmation(

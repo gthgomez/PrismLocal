@@ -10,11 +10,13 @@ import com.prismai.llmhost.ui.ServiceUiState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import org.junit.After
@@ -216,6 +218,26 @@ class AgentToolRouterTraceTest {
         gate.complete(Unit)
         job.join()
         assertFalse(harness.router.hasActiveToolJobs(chainId))
+    }
+
+    @Test
+    fun boundedCleanupDoesNotWaitForeverForNonCooperativeJob() = runBlocking {
+        val release = CompletableDeferred<Unit>()
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("prompt")
+        val job = harness.router.launchOwnedToolJob(chainId) {
+            withContext(NonCancellable) {
+                release.await()
+            }
+        }
+        assertNotNull(harness.router.claimChatTransition(abortReason = "chat switched"))
+
+        val joined = withTimeout(500) {
+            harness.router.joinInvalidatedChainBounded(chainId, timeoutMs = 50L)
+        }
+        assertFalse(joined)
+        release.complete(Unit)
+        withTimeout(500) { job.join() }
     }
 
     @Test
@@ -492,6 +514,24 @@ class AgentToolRouterTraceTest {
     }
 
     @Test
+    fun clearingPreferenceWithoutPendingDoesNotCommitOnCallerThread() {
+        val prefs = FakeSharedPreferences()
+        prefs.edit().putString("pending_chat-1", "stale").commit()
+        prefs.resetCommitCount()
+        val confirmation = AgentToolConfirmation(
+            uiState = ServiceUiState(),
+            prefs = prefs,
+            currentChatId = { "chat-1" },
+            pendingActionKey = { "pending_$it" },
+            getDeviceProfile = { safeProfile() },
+        )
+
+        confirmation.clearPersistedForChat("chat-1")
+
+        assertEquals(0, prefs.commitCount)
+    }
+
+    @Test
     fun staleAsyncToolCallbackCannotContaminateNewChain() = runBlocking {
         val gate = CompletableDeferred<Unit>()
         val followUps = AtomicInteger(0)
@@ -614,6 +654,12 @@ class AgentToolRouterTraceTest {
 
 private class FakeSharedPreferences : SharedPreferences {
     private val values = mutableMapOf<String, Any?>()
+    var commitCount: Int = 0
+        private set
+
+    fun resetCommitCount() {
+        commitCount = 0
+    }
 
     override fun getAll(): MutableMap<String, *> = values.toMutableMap()
     override fun getString(key: String, defValue: String?): String? = values[key] as? String ?: defValue
@@ -675,14 +721,19 @@ private class FakeSharedPreferences : SharedPreferences {
         }
 
         override fun commit(): Boolean {
-            if (clearAll) values.clear()
-            removals.forEach(values::remove)
-            values.putAll(pending)
+            commitCount++
+            applyPending()
             return true
         }
 
         override fun apply() {
-            commit()
+            applyPending()
+        }
+
+        private fun applyPending() {
+            if (clearAll) values.clear()
+            removals.forEach(values::remove)
+            values.putAll(pending)
         }
     }
 }

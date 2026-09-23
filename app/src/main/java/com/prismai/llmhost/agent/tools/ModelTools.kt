@@ -9,7 +9,6 @@ import com.prismai.llmhost.model.*
 import com.prismai.llmhost.*
 import com.prismai.llmhost.model.ModelDownloadManager
 import com.prismai.llmhost.model.ModelImportManager
-import com.prismai.llmhost.model.ModelManager
 import com.prismai.llmhost.model.ModelReadinessAssessor
 import com.prismai.llmhost.util.FormatUtils
 import kotlinx.coroutines.Dispatchers
@@ -19,8 +18,8 @@ import org.json.JSONObject
 import java.util.Locale
 
 class ModelTools(
-    private val modelManager: ModelManager,
-    private val modelStorageManager: ModelStorageManager,
+    private val listInstalledModelInfos: () -> List<ModelStorageManager.ActiveModelInfo>,
+    private val deleteModelDirectly: suspend (String) -> Boolean,
     private val modelReadinessAssessor: ModelReadinessAssessor,
     private val modelImportManager: ModelImportManager,
     private val modelDownloadManager: ModelDownloadManager,
@@ -203,12 +202,12 @@ class ModelTools(
         val modelId = call.arguments.optString("model_id").trim()
         if (modelId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Missing model_id parameter")
         val installedModel = withContext(Dispatchers.IO) {
-            modelStorageManager.listInstalledModelInfos().firstOrNull { it.id == modelId }
+            listInstalledModelInfos().firstOrNull { it.id == modelId }
         } ?: return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Unknown installed model_id: $modelId")
         val deleted = if (deleteModelSafely != null) {
             deleteModelSafely.invoke(modelId)
         } else {
-            modelManager.deleteModel(modelId)
+            deleteModelDirectly(modelId)
         }
         return if (deleted) {
             onRefreshReadiness()

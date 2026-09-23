@@ -3,6 +3,36 @@ package com.prismai.llmhost.generation
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 
+data class GenerationIdleInputs(
+    val generationRunning: Boolean,
+    val generationJobActive: Boolean,
+    val agentToolActive: Boolean,
+    val confirmationPending: Boolean,
+    val agentChainActive: Boolean,
+    val continuationAvailable: Boolean,
+)
+
+object GenerationIdlePolicy {
+    /**
+     * A completed MAX_TOKENS turn with a resumable trace is idle for background
+     * queue purposes, but remains available for an explicit user continuation.
+     */
+    fun shouldWait(inputs: GenerationIdleInputs): Boolean =
+        inputs.generationRunning ||
+            inputs.generationJobActive ||
+            inputs.agentToolActive ||
+            inputs.confirmationPending ||
+            (inputs.agentChainActive && !inputs.continuationAvailable)
+
+    fun shouldAbortUnresumableChain(inputs: GenerationIdleInputs): Boolean =
+        inputs.agentChainActive &&
+            !inputs.generationRunning &&
+            !inputs.generationJobActive &&
+            !inputs.agentToolActive &&
+            !inputs.confirmationPending &&
+            !inputs.continuationAvailable
+}
+
 object GenerationSessionWait {
     /**
      * Waits until no generation job is active and isGenerating returns false.

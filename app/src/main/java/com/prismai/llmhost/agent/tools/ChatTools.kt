@@ -29,8 +29,8 @@ class ChatTools(
     private val filesDir: File,
     private val onPersistTranscript: () -> Unit,
     private val onSwitchChat: (String) -> Boolean,
-    private val onClearTranscript: () -> Unit,
-    private val onDeleteChat: (String) -> Unit,
+    private val onClearTranscript: () -> Boolean,
+    private val onDeleteChat: (String) -> Boolean,
     private val onRenameChat: (String, String) -> Unit,
     private val onResetNativeConversation: (String) -> Unit,
 ) {
@@ -149,26 +149,26 @@ class ChatTools(
     fun clearChat(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Chat clear requires confirmation")
         if (isGenerating()) return toolFailure(call, AgentToolErrorCode.BUSY, "Cancel generation before changing chats")
-        val chatIdArg = call.arguments.optString("chat_id", "current")
-        val chatId = if (chatIdArg == "current" || chatIdArg.isBlank()) currentChatId() else chatIdArg
-        val session = chatSessions().firstOrNull { it.id == chatId }
-            ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "Chat not found")
-        if (session.id != currentChatId()) onSwitchChat(session.id)
-        onClearTranscript()
-        return toolSuccess(call, "Cleared ${session.title}",
-            JSONObject().put("chat_id", session.id).put("title", session.title).put("action", "clear_messages"))
+        return ChatIdentityOperations.clear(
+            call = call,
+            confirmed = confirmed,
+            currentChatId = currentChatId,
+            chatSessions = chatSessions,
+            switchChat = onSwitchChat,
+            clearTranscript = onClearTranscript,
+        )
     }
 
     fun deleteChat(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Chat delete requires confirmation")
         if (isGenerating()) return toolFailure(call, AgentToolErrorCode.BUSY, "Cancel generation before changing chats")
-        val chatIdArg = call.arguments.optString("chat_id", "current")
-        val chatId = if (chatIdArg == "current" || chatIdArg.isBlank()) currentChatId() else chatIdArg
-        val session = chatSessions().firstOrNull { it.id == chatId }
-            ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "Chat not found")
-        onDeleteChat(session.id)
-        return toolSuccess(call, "Deleted ${session.title}",
-            JSONObject().put("chat_id", session.id).put("title", session.title).put("action", "delete_chat"))
+        return ChatIdentityOperations.delete(
+            call = call,
+            confirmed = confirmed,
+            currentChatId = currentChatId,
+            chatSessions = chatSessions,
+            deleteChat = onDeleteChat,
+        )
     }
 
     fun deleteOrClearChat(call: AgentToolCall, confirmed: Boolean): AgentToolResult {

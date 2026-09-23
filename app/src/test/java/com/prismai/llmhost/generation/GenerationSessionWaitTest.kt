@@ -5,6 +5,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicBoolean
@@ -59,6 +60,36 @@ class GenerationSessionWaitTest {
 
         assertTrue("Follow up generation turn should have completed before await finished", followUpRan.get())
         assertEquals(false, isGenerating.get())
+    }
+
+    @Test
+    fun resumableMaxTokensTraceIsIdleWhileRemainingAvailableForUserContinuation() {
+        val inputs = GenerationIdleInputs(
+            generationRunning = false,
+            generationJobActive = false,
+            agentToolActive = false,
+            confirmationPending = false,
+            agentChainActive = true,
+            continuationAvailable = true,
+        )
+
+        assertFalse(GenerationIdlePolicy.shouldWait(inputs))
+        assertFalse(GenerationIdlePolicy.shouldAbortUnresumableChain(inputs))
+    }
+
+    @Test
+    fun agentDisabledTraceRequestsAbortInsteadOfWaitingForContinuation() {
+        val inputs = GenerationIdleInputs(
+            generationRunning = false,
+            generationJobActive = false,
+            agentToolActive = false,
+            confirmationPending = false,
+            agentChainActive = true,
+            continuationAvailable = false,
+        )
+
+        assertTrue(GenerationIdlePolicy.shouldAbortUnresumableChain(inputs))
+        assertTrue(GenerationIdlePolicy.shouldWait(inputs))
     }
 
     @Test

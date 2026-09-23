@@ -253,6 +253,23 @@ class AgentToolRouter(
         ),
     )
 
+    fun appendAuthorizedTransitionToolResult(
+        chainId: Long,
+        result: AgentToolResult,
+    ): Boolean = synchronized(toolJobsLock) {
+        if (!agentTrace.isCurrentChain(chainId)) return@synchronized false
+        onAppendTranscriptMessage(
+            TranscriptRole.TOOL,
+            AgentToolProtocol.toolEventJson(
+                status = if (result.success) "done" else "failed",
+                toolName = result.call.name,
+                summary = result.summary,
+                details = result.details,
+            ),
+        )
+        true
+    }
+
     fun appendOwnedAssistantMessage(
         chainId: Long?,
         sourceChatId: String?,

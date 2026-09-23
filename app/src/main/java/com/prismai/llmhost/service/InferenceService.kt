@@ -30,6 +30,7 @@ import androidx.core.app.NotificationCompat
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -58,6 +59,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import org.json.JSONObject
@@ -74,6 +76,8 @@ import com.prismai.llmhost.model.ModelDownloadManager
 import com.prismai.llmhost.model.ModelImportManager
 import com.prismai.llmhost.model.ModelManager
 import com.prismai.llmhost.model.ModelReadinessAssessor
+import com.prismai.llmhost.generation.GenerationIdleInputs
+import com.prismai.llmhost.generation.GenerationIdlePolicy
 import com.prismai.llmhost.generation.GenerationMetrics
 import com.prismai.llmhost.generation.GenerationOrchestrator
 import com.prismai.llmhost.generation.PromptBuilder
@@ -81,6 +85,7 @@ import com.prismai.llmhost.agent.AgentTrace
 import com.prismai.llmhost.agent.AgentToolConfirmation
 import com.prismai.llmhost.agent.AgentToolRouter
 import com.prismai.llmhost.agent.ChatTransitionGate
+import com.prismai.llmhost.agent.tools.toolFailure
 import com.prismai.llmhost.util.FormatUtils
 
 class InferenceService : Service() {
@@ -110,6 +115,7 @@ class InferenceService : Service() {
         private const val KEY_AGENT_ENABLED = "agent_enabled"
         private const val KEY_PENDING_AGENT_ACTION_PREFIX = "pending_agent_action_"
         private const val AGENT_CHAT_CLEANUP_TIMEOUT_MS = 1_000L
+        private const val CHAT_IDENTITY_RESULT_APPLIED = "agent_chat_identity_applied"
         // onDestroy() is a main-thread callback. Native teardown (freeing the
         // loaded ggml/llama model, context and compute buffers) can block for
         // seconds, which would trip an ANR. We therefore only wait this long
@@ -150,6 +156,10 @@ class InferenceService : Service() {
     private val operationMutex = Mutex()
     @Volatile
     private var activeGenerationSource: String = "user"
+    @Volatile
+    private var agentFollowUpScheduled = false
+    private val confirmedChatTransitionChain = AtomicReference<Long?>(null)
+    private val confirmedChatTransitionThread = ThreadLocal.withInitial { false }
     private val transcriptLock = Any()
     private var generationSession = 0L
 
@@ -760,7 +770,31 @@ class InferenceService : Service() {
         }
     }
 
+    private fun performSwitchChat(chatId: String): Boolean {
+        if (_isGenerating.value) return false
+        if (_chatSessions.value.none { it.id == chatId }) return false
+        val switched = chatManager.switchChat(chatId)
+        if (switched) {
+            agentToolConfirmation.restore()
+            resetNativeConversationAsync("chat switch")
+        }
+        return switched
+    }
+
+    private fun performClearTranscript(): Boolean {
+        if (_isGenerating.value) return false
+        chatManager.clearTranscript()
+        resetNativeConversationAsync("clear transcript")
+        return true
+    }
+
+    private fun performDeleteChat(chatId: String): Boolean {
+        if (_isGenerating.value) return false
+        return chatManager.deleteChat(chatId)
+    }
+
     fun switchChat(chatId: String): Boolean {
+        if (confirmedChatTransitionThread.get() == true) return performSwitchChat(chatId)
         if (_isGenerating.value) {
             publishUiEvent("Cancel generation before switching chats")
             return false
@@ -772,10 +806,8 @@ class InferenceService : Service() {
         return abandonPendingAgentTool(
             reason = "Chat changed before tool confirmation",
             afterCleanup = {
-                if (chatManager.switchChat(chatId)) {
-                    agentToolConfirmation.restore()
-                    resetNativeConversationAsync("chat switch")
-                }
+                performSwitchChat(chatId)
+                Unit
             },
         )
     }
@@ -784,29 +816,32 @@ class InferenceService : Service() {
         chatManager.renameChat(chatId, title)
     }
 
-    fun deleteChat(chatId: String) {
+    fun deleteChat(chatId: String): Boolean {
+        if (confirmedChatTransitionThread.get() == true) return performDeleteChat(chatId)
         if (_isGenerating.value) {
             publishUiEvent("Cancel generation before deleting a chat")
-            return
+            return false
         }
-        abandonPendingAgentTool(
+        return abandonPendingAgentTool(
             reason = "Chat deleted before tool confirmation",
             afterCleanup = {
-                chatManager.deleteChat(chatId)
+                performDeleteChat(chatId)
+                Unit
             },
         )
     }
 
-    fun clearTranscript() {
+    fun clearTranscript(): Boolean {
+        if (confirmedChatTransitionThread.get() == true) return performClearTranscript()
         if (_isGenerating.value) {
             publishUiEvent("Cancel generation before clearing chat")
-            return
+            return false
         }
-        abandonPendingAgentTool(
+        return abandonPendingAgentTool(
             reason = "Transcript cleared before tool confirmation",
             afterCleanup = {
-                chatManager.clearTranscript()
-                resetNativeConversationAsync("clear transcript")
+                performClearTranscript()
+                Unit
             },
         )
     }
@@ -816,6 +851,12 @@ class InferenceService : Service() {
         val safeSettings = settings.clamped()
         _generationSettings.value = safeSettings
         syncCapabilities(safeSettings)
+        if (previous.agentEnabled && !safeSettings.agentEnabled && ::agentTrace.isInitialized) {
+            agentTrace.activeChainId?.let { chainId ->
+                agentTrace.abortTrace(chainId, "Agent mode disabled")
+            }
+            agentToolConfirmation.clearMemory()
+        }
         refreshDeviceAndModelReadiness()
         persistGenerationSettings(safeSettings)
         if (settingsRequireReload(previous, safeSettings)) {
@@ -876,6 +917,9 @@ class InferenceService : Service() {
         preserveBenchmarkQueue: Boolean = false,
         initiatedByBackground: Boolean = false,
     ): String {
+        if (confirmedChatTransitionChain.get() != null) {
+            return "Chat transition in progress"
+        }
         var activeJob: Job? = null
         operationMutex.withLock {
             if (initiatedByBackground &&
@@ -899,16 +943,55 @@ class InferenceService : Service() {
         return streamState.snapshotText().takeIf { it.isNotBlank() } ?: "Background task completed"
     }
 
+    private fun agentContinuationAvailable(chainId: Long): Boolean {
+        if (chainId <= 0L || !_generationSettings.value.agentEnabled || _currentModel.value == null) return false
+        if (_generationPerformance.value?.terminalReason != "MAX_TOKENS") return false
+        return _transcript.value.any { message ->
+            message.role == TranscriptRole.ASSISTANT && message.text.isNotBlank()
+        }
+    }
+
+    private fun generationIdleInputs(): GenerationIdleInputs {
+        val chainId = if (::agentTrace.isInitialized) agentTrace.activeChainId else null
+        val toolActive = chainId != null && ::agentToolRouter.isInitialized &&
+            agentToolRouter.hasActiveToolJobs(chainId)
+        val pendingConfirmation = _pendingAgentToolAction.value != null || agentFollowUpScheduled
+        val continuationAvailable = chainId != null && agentContinuationAvailable(chainId)
+        return GenerationIdleInputs(
+            generationRunning = _isGenerating.value,
+            generationJobActive = generationJob?.isActive == true,
+            agentToolActive = toolActive,
+            confirmationPending = pendingConfirmation,
+            agentChainActive = chainId != null,
+            continuationAvailable = continuationAvailable,
+        )
+    }
+
+    private fun shouldWaitForGenerationSession(): Boolean {
+        val inputs = generationIdleInputs()
+        if (GenerationIdlePolicy.shouldAbortUnresumableChain(inputs)) {
+            val chainId = if (::agentTrace.isInitialized) agentTrace.activeChainId else null
+            val aborted = chainId != null && agentTrace.abortTrace(
+                chainId,
+                "Continuation unavailable: agent mode or response cannot continue",
+            )
+            return if (aborted) {
+                GenerationIdlePolicy.shouldWait(
+                    inputs.copy(agentChainActive = false, continuationAvailable = false),
+                )
+            } else {
+                GenerationIdlePolicy.shouldWait(inputs)
+            }
+        }
+        return GenerationIdlePolicy.shouldWait(inputs)
+    }
+
     private suspend fun awaitGenerationSessionIdle(
         pollMs: Long = 20L,
         maxWaitMs: Long = 30 * 60 * 1000L,
     ) {
         com.prismai.llmhost.generation.GenerationSessionWait.awaitSessionIdle(
-            isGenerating = {
-                _isGenerating.value ||
-                (::agentTrace.isInitialized && agentTrace.activeAgentChainStartTime != 0L) ||
-                _pendingAgentToolAction.value != null
-            },
+            isGenerating = { shouldWaitForGenerationSession() },
             getJob = { generationJob },
             pollMs = pollMs,
             maxWaitMs = maxWaitMs,
@@ -952,6 +1035,7 @@ class InferenceService : Service() {
         reason: String,
         expectedToken: String? = null,
     ): AgentChatTransition? {
+        if (confirmedChatTransitionChain.get() != null) return null
         val claim = agentToolRouter.claimChatTransition(
             expectedToken = expectedToken,
             abortReason = reason,
@@ -1054,7 +1138,7 @@ class InferenceService : Service() {
             publishUiEvent("Tool confirmation is no longer active")
             return
         }
-        agentToolRouter.launchConfirmedToolJob(
+        val confirmedJob = agentToolRouter.launchConfirmedToolJob(
             chainId = authorization.chainId,
             sourceChatId = authorization.sourceChatId,
         ) confirmedJob@{
@@ -1087,7 +1171,9 @@ class InferenceService : Service() {
                     errorCode = AgentToolErrorCode.FAILED,
                 )
             }
-            if (!agentToolConfirmation.isAuthorizationCurrent(
+            val transitionApplied = result.details.optBoolean(CHAT_IDENTITY_RESULT_APPLIED, false)
+            result.details.remove(CHAT_IDENTITY_RESULT_APPLIED)
+            if (!transitionApplied && !agentToolConfirmation.isAuthorizationCurrent(
                     authorization = authorization,
                     activeChainId = agentTrace.activeChainId,
                     activeChatId = _currentChatId.value,
@@ -1099,12 +1185,19 @@ class InferenceService : Service() {
             val latency = SystemClock.elapsedRealtime() - stepStart
             val sanitizedResult = com.prismai.llmhost.agent.ToolInputSanitizer.sanitizeResult(result)
             agentTrace.recordStep(authorization.call, sanitizedResult, latency, authorization.chainId)
-            if (!agentToolRouter.appendOwnedToolResult(
+            val appended = if (transitionApplied) {
+                agentToolRouter.appendAuthorizedTransitionToolResult(
+                    chainId = authorization.chainId,
+                    result = sanitizedResult,
+                )
+            } else {
+                agentToolRouter.appendOwnedToolResult(
                     chainId = authorization.chainId,
                     sourceChatId = authorization.sourceChatId,
                     result = sanitizedResult,
                 )
-            ) {
+            }
+            if (!appended) {
                 agentToolRouter.failTrace(authorization.chainId, "Tool result arrived after chat transition")
                 return@confirmedJob
             }
@@ -1120,10 +1213,13 @@ class InferenceService : Service() {
                 maxIterations = _generationSettings.value.maxAgentIterations,
                 chainId = authorization.chainId,
             )
-            if (shouldContinue && agentToolRouter.isCurrentOwner(
-                    authorization.chainId,
-                    authorization.sourceChatId,
-                )
+            if (shouldContinue && (
+                    transitionApplied ||
+                        agentToolRouter.isCurrentOwner(
+                            authorization.chainId,
+                            authorization.sourceChatId,
+                        )
+                    )
             ) {
                 startAgentFollowUpGeneration(
                     authorization.originalPrompt,
@@ -1131,6 +1227,12 @@ class InferenceService : Service() {
                     authorization.depth + 1,
                     authorization.chainId,
                 )
+            }
+        }
+        if (authorization.call.name in CHAT_IDENTITY_TOOLS) {
+            confirmedJob.invokeOnCompletion {
+                confirmedChatTransitionChain.compareAndSet(authorization.chainId, null)
+                confirmedChatTransitionThread.remove()
             }
         }
         agentToolConfirmation.clearConsumedAuthorization(authorization)
@@ -1169,6 +1271,87 @@ class InferenceService : Service() {
         )
     }
 
+    private suspend fun executeConfirmedChatIdentityTool(
+        call: AgentToolCall,
+        authorization: AgentToolConfirmation.PendingToolAuthorization,
+    ): AgentToolResult {
+        if (!_generationSettings.value.agentEnabled) {
+            return toolFailure(
+                call,
+                AgentToolErrorCode.CONFIRMATION_REQUIRED,
+                "Agent mode is disabled",
+            )
+        }
+        if (!confirmedChatTransitionChain.compareAndSet(null, authorization.chainId)) {
+            return toolFailure(
+                call,
+                AgentToolErrorCode.BUSY,
+                "Another confirmed chat transition is already running",
+            )
+        }
+        val outcome = CompletableDeferred<AgentToolResult>()
+        try {
+            chatTransitionGate.enqueueAndAwait(
+                cleanup = {},
+                mutation = {
+                    if (!agentToolConfirmation.isAuthorizationCurrent(
+                            authorization = authorization,
+                            activeChainId = agentTrace.activeChainId,
+                            activeChatId = _currentChatId.value,
+                        )
+                    ) {
+                        outcome.complete(
+                            toolFailure(
+                                call,
+                                AgentToolErrorCode.CONFIRMATION_REQUIRED,
+                                "Chat transition authorization is stale",
+                            ),
+                        )
+                    } else {
+                        confirmedChatTransitionThread.set(true)
+                        try {
+                            val result = when (call.name) {
+                                "clear_chat" -> chatTools.clearChat(call, confirmed = true)
+                                "delete_chat" -> chatTools.deleteChat(call, confirmed = true)
+                                "delete_or_clear_chat" -> chatTools.deleteOrClearChat(call, confirmed = true)
+                                else -> toolFailure(call, AgentToolErrorCode.FAILED, "Unsupported chat transition")
+                            }
+                            result.details.put(
+                                CHAT_IDENTITY_RESULT_APPLIED,
+                                _currentChatId.value != authorization.sourceChatId,
+                            )
+                            outcome.complete(result)
+                        } catch (error: Exception) {
+                            outcome.complete(
+                                toolFailure(
+                                    call,
+                                    AgentToolErrorCode.FAILED,
+                                    "Chat transition failed: ${error.message ?: "unknown error"}",
+                                ),
+                            )
+                        } finally {
+                            confirmedChatTransitionThread.remove()
+                        }
+                    }
+                },
+            )
+        } catch (error: CancellationException) {
+            if (!outcome.isCompleted) {
+                outcome.complete(
+                    toolFailure(call, AgentToolErrorCode.FAILED, "Chat transition cancelled"),
+                )
+            }
+            throw error
+        } catch (error: Exception) {
+            if (!outcome.isCompleted) {
+                outcome.complete(
+                    toolFailure(call, AgentToolErrorCode.FAILED, "Chat transition failed"),
+                )
+            }
+        }
+        return outcome.await()
+    }
+
     private suspend fun executeAgentTool(
         call: AgentToolCall,
         confirmed: Boolean,
@@ -1189,12 +1372,7 @@ class InferenceService : Service() {
             )
         }
         if (confirmed && authorization != null && call.name in CHAT_IDENTITY_TOOLS) {
-            return AgentToolResult(
-                call = call,
-                success = false,
-                summary = "Chat identity changes are blocked while an agent confirmation is executing",
-                errorCode = AgentToolErrorCode.BUSY,
-            )
+            return executeConfirmedChatIdentityTool(call, authorization)
         }
         return when (call.name) {
             // ── System tools ────────────────────────────────────────────────
@@ -1386,9 +1564,14 @@ class InferenceService : Service() {
         depth: Int,
         chainId: Long? = null,
     ) {
+        agentFollowUpScheduled = true
         serviceScope.launch {
-            operationMutex.withLock {
-                generationOrchestrator.startFollowUp(originalPrompt, toolResult, depth, chainId)
+            try {
+                operationMutex.withLock {
+                    generationOrchestrator.startFollowUp(originalPrompt, toolResult, depth, chainId)
+                }
+            } finally {
+                agentFollowUpScheduled = false
             }
         }
     }

@@ -14,6 +14,7 @@ import com.prismai.llmhost.ui.ServiceUiState
 import org.json.JSONObject
 import java.io.File
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
@@ -28,9 +29,10 @@ class AgentToolRouter(
     private val uiState: ServiceUiState,
     private val agentTrace: AgentTrace,
     private val confirmation: AgentToolConfirmation,
-    private val deviceProfiler: DeviceProfiler,
+    private val getCachedProfile: () -> DeviceCapabilityProfile,
+    private val clock: () -> Long = { SystemClock.elapsedRealtime() },
     private val executeTool: suspend (AgentToolCall, Boolean) -> AgentToolResult,
-    private val onFollowUp: (String, AgentToolResult, Int) -> Unit,
+    private val onFollowUp: (String, AgentToolResult, Int, Long?) -> Unit,
     private val onAppendTranscriptMessage: (TranscriptRole, String) -> Long,
     private val onPublishUiEvent: (String) -> Unit,
     private val scope: CoroutineScope,
@@ -59,24 +61,37 @@ class AgentToolRouter(
 
     // ── Main routing entry point ────────────────────────────────────────
 
-    fun handleToolCall(call: AgentToolCall, originalPrompt: String, depth: Int) {
+    fun handleToolCall(
+        call: AgentToolCall,
+        originalPrompt: String,
+        depth: Int,
+        chainId: Long? = null,
+    ) {
+        if (!agentTrace.isCurrentChain(chainId)) return
         val validation = AgentToolRegistry.validate(call)
         val validatedCall = validation.call
         val definition = validation.definition
         if (!validation.valid || definition == null) {
+            val reason = validation.message.ifBlank { "Tool request rejected: ${validatedCall.name}" }
             appendToolResult(
                 AgentToolResult(
                     call = validatedCall,
                     success = false,
-                    summary = validation.message.ifBlank { "Tool request rejected: ${validatedCall.name}" },
+                    summary = reason,
                     errorCode = validation.errorCode,
                 ),
             )
+            val abortReason = if (validation.errorCode == AgentToolErrorCode.RESTRICTED_TOOL) {
+                "Restricted tool rejected: $reason"
+            } else {
+                "Tool request rejected: $reason"
+            }
+            failTrace(chainId, abortReason)
             return
         }
 
         // ── Battery & Thermal Safety Gates ──────────────────────────────
-        val profile = deviceProfiler.getCachedProfile()
+        val profile = getCachedProfile()
         val thermalStatus = profile.thermalStatus?.lowercase()
         val isHot = thermalStatus in setOf("severe", "critical", "emergency", "shutdown")
         if (isHot) {
@@ -94,7 +109,7 @@ class AgentToolRouter(
                     detail = "Device thermal state is $thermalStatus".take(160),
                 ),
             )
-            agentTrace.finalizeTrace(success = false, abortReason = "Device thermal state is $thermalStatus")
+            failTrace(chainId, "Device thermal state is $thermalStatus")
             onAppendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
                 "⚠️ Agent execution paused: Device is too hot (thermal state: $thermalStatus). Stopping tool execution to protect device hardware.",
@@ -116,7 +131,7 @@ class AgentToolRouter(
                     detail = "Battery is low (${profile.batteryPercent}%)".take(160),
                 ),
             )
-            agentTrace.finalizeTrace(success = false, abortReason = "Battery is low (${profile.batteryPercent}%)")
+            failTrace(chainId, "Battery is low (${profile.batteryPercent}%)")
             onAppendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
                 "⚠️ Agent execution paused: Battery level is low (${profile.batteryPercent}%). Stopping tool execution to preserve battery life.",
@@ -141,7 +156,7 @@ class AgentToolRouter(
                     detail = "Reached maximum tool depth of $maxIterations".take(160),
                 ),
             )
-            agentTrace.finalizeTrace(success = false, abortReason = "Reached maximum tool depth of $maxIterations")
+            failTrace(chainId, "Reached maximum tool depth of $maxIterations")
             onAppendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
                 "⚠️ Agent loop stopped: Reached the maximum execution depth limit of $maxIterations operations.",
@@ -189,7 +204,7 @@ class AgentToolRouter(
                     detail = reason.take(160),
                 ),
             )
-            agentTrace.finalizeTrace(success = false, abortReason = reason)
+            failTrace(chainId, reason)
             onAppendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
                 "⚠️ Agent execution aborted: $reason. Stopping loop execution to protect device battery and CPU resources.",
@@ -215,9 +230,9 @@ class AgentToolRouter(
                     detail = "Token budget exceeded: ${agentTrace.activeAgentChainTokens} tokens".take(160),
                 ),
             )
-            agentTrace.finalizeTrace(
-                success = false,
-                abortReason = "Token budget exceeded: ${agentTrace.activeAgentChainTokens} tokens",
+            failTrace(
+                chainId,
+                "Token budget exceeded: ${agentTrace.activeAgentChainTokens} tokens",
             )
             onAppendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
@@ -243,9 +258,12 @@ class AgentToolRouter(
         when (definition.risk) {
             AgentToolRisk.SAFE -> {
                 scope.launch {
-                    val stepStart = SystemClock.elapsedRealtime()
+                    val stepStart = clock()
                     val result = try {
                         executeTool(validatedCall, false)
+                    } catch (e: CancellationException) {
+                        failTrace(chainId, "Tool execution cancelled")
+                        throw e
                     } catch (e: Exception) {
                         AgentToolResult(
                             call = validatedCall,
@@ -254,21 +272,26 @@ class AgentToolRouter(
                             errorCode = AgentToolErrorCode.FAILED,
                         )
                     }
-                    val latency = SystemClock.elapsedRealtime() - stepStart
+                    if (!agentTrace.isCurrentChain(chainId)) return@launch
+                    val latency = clock() - stepStart
                     val sanitizedResult = ToolInputSanitizer.sanitizeResult(result)
-                    agentTrace.recordStep(validatedCall, sanitizedResult, latency)
+                    agentTrace.recordStep(validatedCall, sanitizedResult, latency, chainId)
+                    if (!agentTrace.isCurrentChain(chainId)) return@launch
                     appendToolResult(sanitizedResult)
                     val maxIter = uiState.generationSettings.value.maxAgentIterations
                     if (depth + 1 < maxIter) {
-                        onFollowUp(originalPrompt, result, depth + 1)
+                        onFollowUp(originalPrompt, result, depth + 1, chainId)
+                    } else {
+                        failTrace(chainId, "Tool loop stopped after $maxIter steps")
                     }
                 }
             }
             AgentToolRisk.CONFIRM -> {
-                val id = "agent_tool_${SystemClock.uptimeMillis()}"
+                val id = "agent_tool_${clock()}"
                 confirmation.pendingCall = validatedCall
                 confirmation.pendingOriginalPrompt = originalPrompt
                 confirmation.pendingDepth = depth
+                confirmation.pendingChainId = chainId
                 confirmation.persist(validatedCall, originalPrompt, depth)
                 uiState._pendingAgentToolAction.value = confirmation.build(id, validatedCall, definition)
                 onPublishUiEvent("Confirm tool: ${validatedCall.name}")
@@ -281,9 +304,47 @@ class AgentToolRouter(
                     errorCode = AgentToolErrorCode.RESTRICTED_TOOL,
                 )
                 appendToolResult(restrictedResult)
-                agentTrace.recordStep(validatedCall, restrictedResult, 0L)
+                agentTrace.recordStep(validatedCall, restrictedResult, 0L, chainId)
+                failTrace(chainId, "Restricted tool blocked: ${validatedCall.name}")
             }
         }
+    }
+
+    /** Fails the chain only when the supplied owner token is still current. */
+    fun failTrace(chainId: Long?, abortReason: String): Boolean =
+        agentTrace.abortTrace(chainId, abortReason.take(220))
+
+    /** Cancels a pending confirmation and closes its chain if it is still owned. */
+    fun cancelPendingTool(call: AgentToolCall, chainId: Long?, abortReason: String) {
+        if (chainId == null || !agentTrace.isCurrentChain(chainId)) return
+        removeFromHistory(call)
+        failTrace(chainId, abortReason)
+    }
+
+    /**
+     * Applies the post-confirmation continuation policy. A confirmation that
+     * cannot produce a follow-up closes the chain explicitly as a failure.
+     */
+    fun completeConfirmedTool(
+        call: AgentToolCall,
+        result: AgentToolResult,
+        depth: Int,
+        maxIterations: Int,
+        chainId: Long?,
+    ): Boolean {
+        if (chainId == null || !agentTrace.isCurrentChain(chainId)) return false
+        val shouldContinue = result.success &&
+            shouldContinueAfterTool(call) &&
+            depth + 1 < maxIterations
+        if (!shouldContinue) {
+            val reason = when {
+                !result.success -> "Tool confirmation failed: ${result.summary}"
+                depth + 1 >= maxIterations -> "Tool loop stopped after $maxIterations steps"
+                else -> "Tool confirmation did not dispatch a follow-up"
+            }
+            failTrace(chainId, reason)
+        }
+        return shouldContinue
     }
 
     // ── History maintenance ─────────────────────────────────────────────

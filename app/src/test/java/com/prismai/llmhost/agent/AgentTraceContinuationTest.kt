@@ -5,9 +5,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -26,25 +32,29 @@ class AgentTraceContinuationTest {
 
     @Test
     fun maxTokensKeepsTraceActiveAndAccumulatesContinuationTokens() {
-        val (trace, uiState) = newActiveTrace()
-        val startTime = trace.activeAgentChainStartTime
-        trace.addChainTokens(4)
+        val harness = newActiveTrace()
+        val chainId = harness.trace.beginChain("original prompt")
+        val startTime = harness.trace.activeAgentChainStartTime
+        harness.trace.addChainTokens(4)
 
-        trace.recordGenerationTurn(
+        harness.trace.recordGenerationTurn(
             terminalReason = "MAX_TOKENS",
             generatedTokens = 11,
             hasToolCall = false,
+            chainId = chainId,
         )
-        trace.recordGenerationTurn(
+        harness.trace.recordGenerationTurn(
             terminalReason = "MAX_TOKENS",
             generatedTokens = 7,
             hasToolCall = false,
+            chainId = chainId,
         )
 
-        assertEquals("original prompt", trace.activeAgentChainPrompt)
-        assertEquals(startTime, trace.activeAgentChainStartTime)
-        assertEquals(22, trace.activeAgentChainTokens)
-        assertNull(uiState.lastAgentTracePath.value)
+        assertEquals("original prompt", harness.trace.activeAgentChainPrompt)
+        assertEquals(startTime, harness.trace.activeAgentChainStartTime)
+        assertEquals(chainId, harness.trace.activeChainId)
+        assertEquals(22, harness.trace.activeAgentChainTokens)
+        assertTrue(harness.artifacts.tryReceive().isFailure)
     }
 
     @Test
@@ -72,29 +82,89 @@ class AgentTraceContinuationTest {
 
     @Test
     fun toolCallTurnAccumulatesTokensWithoutFinalizing() {
-        val (trace, uiState) = newActiveTrace()
-        val startTime = trace.activeAgentChainStartTime
+        val harness = newActiveTrace()
+        val chainId = harness.trace.beginChain("original prompt")
+        val startTime = harness.trace.activeAgentChainStartTime
 
-        trace.recordGenerationTurn(
+        harness.trace.recordGenerationTurn(
             terminalReason = "EOF",
             generatedTokens = 9,
             hasToolCall = true,
+            chainId = chainId,
         )
 
-        assertEquals(startTime, trace.activeAgentChainStartTime)
-        assertEquals(9, trace.activeAgentChainTokens)
-        assertNull(uiState.lastAgentTracePath.value)
+        assertEquals(startTime, harness.trace.activeAgentChainStartTime)
+        assertEquals(chainId, harness.trace.activeChainId)
+        assertEquals(9, harness.trace.activeAgentChainTokens)
+        assertTrue(harness.artifacts.tryReceive().isFailure)
     }
 
-    private fun newActiveTrace(
-        startTime: Long = System.currentTimeMillis(),
-    ): Pair<AgentTrace, ServiceUiState> {
+    @Test
+    fun staleCancellationCannotFinalizeNewChain() = runBlocking {
+        val harness = newActiveTrace()
+        val oldChainId = harness.trace.beginChain("old prompt", startTime = 1L)
+        val newChainId = harness.trace.beginChain("new prompt", startTime = 2L)
+
+        assertFalse(harness.trace.finalizeOwnedTrace(oldChainId, abortReason = "cancelled"))
+        assertEquals(newChainId, harness.trace.activeChainId)
+
+        assertTrue(harness.trace.finalizeOwnedTrace(newChainId, abortReason = "cancelled"))
+        val artifact = withTimeout(2_000) { harness.artifacts.receive() }
+        assertEquals("new prompt", artifact.getString("prompt"))
+        assertFalse(artifact.getBoolean("success"))
+        assertEquals("cancelled", artifact.getString("abort_reason"))
+    }
+
+    @Test
+    fun persistedArtifactIncludesTotalChainTokens() = runBlocking {
+        val harness = newActiveTrace()
+        val chainId = harness.trace.beginChain("prompt")
+        harness.trace.addChainTokens(12)
+
+        assertTrue(harness.trace.finalizeOwnedTrace(chainId, success = true))
+        val artifact = withTimeout(2_000) { harness.artifacts.receive() }
+
+        assertEquals(12, artifact.getInt("total_tokens"))
+        assertTrue(artifact.getBoolean("success"))
+    }
+
+    @Test
+    fun canceledPersistenceScopeStillWritesArtifact() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        scopes += scope
+        scope.cancel()
+        val artifacts = Channel<JSONObject>(Channel.UNLIMITED)
+        val trace = AgentTrace(
+            uiState = ServiceUiState(),
+            filesDir = tempFolder.newFolder(),
+            scope = scope,
+            writeArtifact = { _, json -> artifacts.trySend(json) },
+        )
+        val chainId = trace.beginChain("cancelled chain")
+
+        assertTrue(trace.finalizeOwnedTrace(chainId, abortReason = "service destroy"))
+        val artifact = withTimeout(2_000) { artifacts.receive() }
+        assertEquals("service destroy", artifact.getString("abort_reason"))
+        assertFalse(artifact.getBoolean("success"))
+    }
+
+    private fun newActiveTrace(): TraceHarness {
         val uiState = ServiceUiState()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         scopes += scope
-        val trace = AgentTrace(uiState, tempFolder.newFolder(), scope)
-        trace.activeAgentChainPrompt = "original prompt"
-        trace.activeAgentChainStartTime = startTime
-        return trace to uiState
+        val artifacts = Channel<JSONObject>(Channel.UNLIMITED)
+        val trace = AgentTrace(
+            uiState = uiState,
+            filesDir = tempFolder.newFolder(),
+            scope = scope,
+            writeArtifact = { _, json -> artifacts.trySend(json) },
+        )
+        return TraceHarness(trace, uiState, artifacts)
     }
+
+    private data class TraceHarness(
+        val trace: AgentTrace,
+        val uiState: ServiceUiState,
+        val artifacts: Channel<JSONObject>,
+    )
 }

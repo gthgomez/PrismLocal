@@ -44,6 +44,8 @@ class AgentToolConfirmation(
     var pendingOriginalPrompt: String? = null
     @Volatile
     var pendingDepth: Int = 0
+    @Volatile
+    var pendingChainId: Long? = null
 
     // ── Confirmation builder ────────────────────────────────────────────
 
@@ -262,6 +264,7 @@ class AgentToolConfirmation(
                 pendingCall = call
                 pendingOriginalPrompt = originalPrompt
                 pendingDepth = depth.coerceIn(0, uiState.generationSettings.value.maxAgentIterations - 1)
+                pendingChainId = null
                 val actionId = "agent_tool_${SystemClock.uptimeMillis()}"
                 uiState._pendingAgentToolAction.value = build(actionId, call, definition)
                 Log.d(TAG, "Restored pending agent tool call: $toolName for chat $chatId")
@@ -282,6 +285,7 @@ class AgentToolConfirmation(
         pendingCall = null
         pendingOriginalPrompt = null
         pendingDepth = 0
+        pendingChainId = null
         uiState._pendingAgentToolAction.value = null
     }
 

@@ -155,11 +155,9 @@ class GenerationOrchestrator(
             val directToolCall = agentToolRouter.directToolCall(prompt)
             if (directToolCall != null) {
                 chatManager.appendTranscriptMessage(TranscriptRole.USER, prompt)
-                agentTrace.reset()
-                agentTrace.activeAgentChainPrompt = prompt
-                agentTrace.activeAgentChainStartTime = System.currentTimeMillis()
+                val chainId = agentTrace.beginChain(prompt)
                 agentToolRouter.activeAgentToolHistory.clear()
-                agentToolRouter.handleToolCall(directToolCall, prompt, depth = 0)
+                agentToolRouter.handleToolCall(directToolCall, prompt, depth = 0, chainId = chainId)
                 return
             }
         }
@@ -196,10 +194,12 @@ class GenerationOrchestrator(
         }
 
         val agentEnabled = settings.agentEnabled
+        val agentChainId = if (agentEnabled) {
+            agentTrace.beginChain(prompt)
+        } else {
+            null
+        }
         if (agentEnabled) {
-            agentTrace.reset()
-            agentTrace.activeAgentChainPrompt = prompt
-            agentTrace.activeAgentChainStartTime = System.currentTimeMillis()
             agentToolRouter.activeAgentToolHistory.clear()
         }
 
@@ -288,6 +288,7 @@ class GenerationOrchestrator(
             grammar = if (agentEnabled) AgentToolProtocol.toolGrammar else null,
             startedAt = startedAt,
             messages = chatMessages,
+            agentChainId = agentChainId,
             config = GenerationFlowConfig(
                 errorLabel = "generation",
                 checkReload = true,
@@ -316,6 +317,7 @@ class GenerationOrchestrator(
                     terminalReason = result.finalReason,
                     generatedTokens = result.generatedTokens,
                     hasToolCall = agentToolCall != null,
+                    chainId = agentChainId,
                 )
             }
 
@@ -331,7 +333,12 @@ class GenerationOrchestrator(
             // Benchmark queue drain handled by InferenceService
 
             if (agentToolCall != null) {
-                agentToolRouter.handleToolCall(agentToolCall, prompt, depth = 0)
+                agentToolRouter.handleToolCall(
+                    agentToolCall,
+                    prompt,
+                    depth = 0,
+                    chainId = agentChainId,
+                )
             }
         }
 
@@ -378,6 +385,7 @@ class GenerationOrchestrator(
         metrics.activeSettings = settings
 
         val agentEnabled = settings.agentEnabled
+        val agentChainId = agentTrace.activeChainId
         val job = runGenerationFlow(
             session = session,
             enginePrompt = "",
@@ -385,6 +393,7 @@ class GenerationOrchestrator(
             assistantMessageId = assistantMessage.id,
             continueFromContext = true,
             grammar = if (agentEnabled) AgentToolProtocol.toolGrammar else null,
+            agentChainId = agentChainId,
             startedAt = startedAt,
             config = GenerationFlowConfig(errorLabel = "continuation"),
         ) { result ->
@@ -406,6 +415,7 @@ class GenerationOrchestrator(
                     terminalReason = result.finalReason,
                     generatedTokens = result.generatedTokens,
                     hasToolCall = agentToolCall != null,
+                    chainId = agentChainId,
                 )
             }
             val reasoningPrefix = if (agentToolCall != null) {
@@ -416,7 +426,12 @@ class GenerationOrchestrator(
             chatManager.updateTranscriptMessage(assistantMessage.id, if (agentToolCall == null) result.finalOutput else reasoningPrefix)
 
             if (agentToolCall != null) {
-                agentToolRouter.handleToolCall(agentToolCall, "[continue]", depth = 0)
+                agentToolRouter.handleToolCall(
+                    agentToolCall,
+                    "[continue]",
+                    depth = 0,
+                    chainId = agentChainId,
+                )
             }
         }
 
@@ -428,8 +443,11 @@ class GenerationOrchestrator(
         originalPrompt: String,
         toolResult: AgentToolResult,
         depth: Int,
+        chainId: Long? = null,
     ) {
         if (uiState.currentModel.value == null) return
+        val agentChainId = chainId ?: agentTrace.activeChainId
+        if (agentChainId != null && !agentTrace.isCurrentChain(agentChainId)) return
         val session = incrementSession()
         val settings = uiState.generationSettings.value.clamped()
 
@@ -446,7 +464,7 @@ class GenerationOrchestrator(
                 isHot -> "Device is too hot (thermal state: $thermalStatus)"
                 else -> "Battery level is low (${profile.batteryPercent}%)"
             }
-            agentTrace.finalizeTrace(success = false, abortReason = "Follow-up aborted: $reason")
+            agentTrace.abortTrace(agentChainId, "Follow-up aborted: $reason")
             chatManager.appendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
                 "⚠️ Agent follow-up aborted: $reason. Stopping execution to protect device resources.",
@@ -492,6 +510,7 @@ class GenerationOrchestrator(
             assistantMessageId = assistantMessageId,
             grammar = if (settings.agentEnabled) AgentToolProtocol.toolGrammar else null,
             startedAt = startedAt,
+            agentChainId = agentChainId,
             config = GenerationFlowConfig(
                 errorLabel = "agent follow-up",
                 hasTerminalErrorEvent = false,
@@ -504,6 +523,7 @@ class GenerationOrchestrator(
                 terminalReason = result.finalReason,
                 generatedTokens = result.generatedTokens,
                 hasToolCall = nextToolCall != null,
+                chainId = agentChainId,
             )
             metrics.clear()
             val reasoningPrefix = if (nextToolCall != null) {
@@ -513,7 +533,12 @@ class GenerationOrchestrator(
             chatManager.updateTranscriptMessage(assistantMessageId, if (nextToolCall == null) result.finalOutput else reasoningPrefix)
 
             if (nextToolCall != null) {
-                agentToolRouter.handleToolCall(nextToolCall, originalPrompt, depth)
+                agentToolRouter.handleToolCall(
+                    nextToolCall,
+                    originalPrompt,
+                    depth,
+                    chainId = agentChainId,
+                )
             }
         }
 
@@ -541,6 +566,7 @@ class GenerationOrchestrator(
         config: GenerationFlowConfig,
         messages: List<ChatMessage>? = null,
         continueFromContext: Boolean = false,
+        agentChainId: Long? = null,
         onComplete: (GenerationFlowResult) -> Unit,
     ): Job {
         var firstTokenAt: Long? = null
@@ -688,7 +714,21 @@ class GenerationOrchestrator(
                 }
             }
             .onCompletion { cause ->
-                if (session != getActiveSession()) {
+                val ownsAgentChain = agentChainId == null || agentTrace.isCurrentChain(agentChainId)
+                if (session != getActiveSession() || !ownsAgentChain) {
+                    if (agentChainId != null && agentTrace.isCurrentChain(agentChainId)) {
+                        agentTrace.addChainTokens(generatedTokens)
+                        val abortReason = if (cause is CancellationException) {
+                            "Generation cancelled"
+                        } else {
+                            "Generation superseded"
+                        }
+                        agentTrace.finalizeOwnedTrace(
+                            chainId = agentChainId,
+                            success = false,
+                            abortReason = abortReason,
+                        )
+                    }
                     Log.d(TAG, "ignored stale ${config.errorLabel} completion session=$session active=${getActiveSession()}")
                     return@onCompletion
                 }

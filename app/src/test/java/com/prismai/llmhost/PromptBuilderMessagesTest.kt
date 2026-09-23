@@ -134,4 +134,20 @@ class PromptBuilderMessagesTest {
         assertEquals(newest, result[1].content)
         assertEquals("q", result.last().content)
     }
+
+    @Test
+    fun budgetExceededDropsHistoryWithoutViolatingBudget() {
+        val largeMessage = "x".repeat(400) // ~100 estimated tokens
+        val transcript = listOf(
+            message(1, TranscriptRole.USER, largeMessage),
+        )
+
+        // Budget is 50, but largeMessage is ~100 tokens. It must NOT be forced in.
+        val result = PromptBuilder.assembleChatMessages("q", transcript, null, "", 50)
+
+        assertEquals(2, result.size)
+        assertEquals(ChatMessage.ROLE_SYSTEM, result.first().role)
+        assertEquals(ChatMessage.ROLE_USER, result.last().role)
+        assertEquals("q", result.last().content)
+    }
 }

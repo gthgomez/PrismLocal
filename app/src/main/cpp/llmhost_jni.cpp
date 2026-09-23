@@ -2,6 +2,7 @@
 
 #include "Engine.hpp"
 #include "runtime/HandleRegistry.hpp"
+#include "runtime/NativeErrorCode.hpp"
 
 #include <android/log.h>
 
@@ -540,11 +541,17 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
         return;
     }
 
-    env->SetIntField(result, g_drain_result_error_code_field, 0);
+    env->SetIntField(
+        result,
+        g_drain_result_error_code_field,
+        static_cast<jint>(llmhost::NativeErrorCode::OK));
 
     if (!lease) {
         env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Tombstoned));
-        env->SetIntField(result, g_drain_result_error_code_field, 404);
+        env->SetIntField(
+            result,
+            g_drain_result_error_code_field,
+            static_cast<jint>(llmhost::NativeErrorCode::HANDLE_INVALID_OR_CLOSED));
         return;
     }
 
@@ -625,7 +632,10 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
         env->SetBooleanField(result, g_drain_result_pending_field, drain_result.pending ? JNI_TRUE : JNI_FALSE);
     } catch (const std::exception&) {
         env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Error));
-        env->SetIntField(result, g_drain_result_error_code_field, 500);
+        env->SetIntField(
+            result,
+            g_drain_result_error_code_field,
+            static_cast<jint>(llmhost::NativeErrorCode::NATIVE_EXCEPTION));
     }
 }
 

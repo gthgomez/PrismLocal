@@ -73,22 +73,30 @@ class GenerationOrchestrator(
         private const val TRUNCATED_ARRAY_LIMIT = 5
 
         internal fun mapErrorCodeToUserMessage(errorCode: Int, detail: String?): String {
-            return when (errorCode) {
-                403 -> "Debug hooks rejected operation"
-                404 -> "Model is not loaded"
-                405 -> "Debug generation rejected"
-                420 -> "Prompt exceeds context window limit"
-                421 -> "Prompt token count estimation failed"
-                422 -> "Context window too small for prompt"
-                423 -> "Tokenization failed"
-                424 -> "Sampler initialization failed"
-                425 -> "Null token produced"
-                426 -> "Context shift operation failed"
-                427 -> "Grammar compilation failed"
-                428 -> "Cannot continue without prior context"
-                501 -> "Failed to load model"
-                in 5000..5999 -> "Native decode error (code $errorCode)"
-                else -> if (errorCode > 0) "Error code $errorCode ($detail)" else detail ?: "native runtime error"
+            return when (NativeErrorCode.fromValue(errorCode)) {
+                NativeErrorCode.OK -> detail ?: "native runtime error"
+                NativeErrorCode.DEBUG_HOOKS_REJECTED -> "Debug hooks rejected operation"
+                NativeErrorCode.HANDLE_INVALID_OR_CLOSED -> "Model is not loaded"
+                NativeErrorCode.DEBUG_GENERATION_REJECTED -> "Debug generation rejected"
+                NativeErrorCode.PROMPT_DOES_NOT_FIT -> "Prompt exceeds context window limit"
+                NativeErrorCode.TOKENIZE_SIZE_FAILED -> "Prompt token count estimation failed"
+                NativeErrorCode.CONTEXT_WINDOW_TOO_SMALL -> "Context window too small for prompt"
+                NativeErrorCode.TOKENIZE_FAILED -> "Tokenization failed"
+                NativeErrorCode.SAMPLER_INIT_FAILED -> "Sampler initialization failed"
+                NativeErrorCode.NULL_TOKEN_PRODUCED -> "Null token produced"
+                NativeErrorCode.CONTEXT_SHIFT_FAILED -> "Context shift operation failed"
+                NativeErrorCode.GRAMMAR_COMPILE_FAILED -> "Grammar compilation failed"
+                NativeErrorCode.NO_CONTINUATION_CONTEXT -> "Cannot continue without prior context"
+                NativeErrorCode.NATIVE_EXCEPTION -> "Native exception"
+                NativeErrorCode.MODEL_LOAD_FAILED -> "Failed to load model"
+                null -> when {
+                    errorCode in 5000..5999 -> "Native decode error (code $errorCode)"
+                    else -> if (errorCode > 0) {
+                        "Error code $errorCode ($detail)"
+                    } else {
+                        detail ?: "native runtime error"
+                    }
+                }
             }
         }
     }

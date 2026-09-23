@@ -22,6 +22,8 @@ enum class NativeErrorCode : uint32_t {
     CONTEXT_SHIFT_FAILED = 426,
     GRAMMAR_COMPILE_FAILED = 427,
     NO_CONTINUATION_CONTEXT = 428,
+    // Generic JNI/native exception; kept typed so it cannot drift from Kotlin.
+    NATIVE_EXCEPTION = 500,
     MODEL_LOAD_FAILED = 501,
 };
 

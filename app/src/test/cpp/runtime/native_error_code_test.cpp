@@ -15,7 +15,7 @@ constexpr uint32_t value(NativeErrorCode code) {
     return static_cast<uint32_t>(code);
 }
 
-constexpr std::array<NativeErrorCode, 14> kDefinedCodes = {
+constexpr std::array<NativeErrorCode, 15> kDefinedCodes = {
     NativeErrorCode::OK,
     NativeErrorCode::DEBUG_HOOKS_REJECTED,
     NativeErrorCode::HANDLE_INVALID_OR_CLOSED,
@@ -29,9 +29,29 @@ constexpr std::array<NativeErrorCode, 14> kDefinedCodes = {
     NativeErrorCode::CONTEXT_SHIFT_FAILED,
     NativeErrorCode::GRAMMAR_COMPILE_FAILED,
     NativeErrorCode::NO_CONTINUATION_CONTEXT,
+    NativeErrorCode::NATIVE_EXCEPTION,
     NativeErrorCode::MODEL_LOAD_FAILED,
 };
 
+constexpr std::array<uint32_t, 15> kExpectedValues = {
+    0,
+    403,
+    404,
+    405,
+    420,
+    421,
+    422,
+    423,
+    424,
+    425,
+    426,
+    427,
+    428,
+    500,
+    501,
+};
+
+static_assert(value(NativeErrorCode::NATIVE_EXCEPTION) == 500);
 static_assert(value(NativeErrorCode::DEBUG_GENERATION_REJECTED) == 405);
 static_assert(value(NativeErrorCode::MODEL_LOAD_FAILED) == 501);
 static_assert(value(NativeErrorCode::DEBUG_GENERATION_REJECTED) !=
@@ -43,6 +63,15 @@ static_assert(value(NativeErrorCode::DEBUG_GENERATION_REJECTED) < 5000 ||
 
 int main() {
     for (std::size_t i = 0; i < kDefinedCodes.size(); ++i) {
+        if (value(kDefinedCodes[i]) != kExpectedValues[i]) {
+            std::fprintf(
+                stderr,
+                "native error code mismatch at index %zu: got %u, expected %u\n",
+                i,
+                value(kDefinedCodes[i]),
+                kExpectedValues[i]);
+            return 1;
+        }
         for (std::size_t j = i + 1; j < kDefinedCodes.size(); ++j) {
             if (value(kDefinedCodes[i]) == value(kDefinedCodes[j])) {
                 std::fprintf(

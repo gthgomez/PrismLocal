@@ -46,6 +46,40 @@ class NativeBridgeBackpressureTest {
     }
 
     @Test
+    fun tombstonedWithErrorRequestsImmediateErrorTerminal() {
+        val decision = decideDrainState(NATIVE_STATE_TOMBSTONED, errorCode = 404)
+
+        assertEquals(DrainStateAction.TERMINAL, decision.action)
+        assertEquals("ERROR", decision.terminalReason)
+        assertFalse(decision.waitForPending)
+    }
+
+    @Test
+    fun tombstonedWithoutErrorStopsForCleanup() {
+        val decision = decideDrainState(NATIVE_STATE_TOMBSTONED, errorCode = 0)
+
+        assertEquals(DrainStateAction.STOP, decision.action)
+        assertEquals(null, decision.terminalReason)
+    }
+
+    @Test
+    fun staleIdleWithoutErrorStopsForCleanup() {
+        val decision = decideDrainState(NATIVE_STATE_IDLE, errorCode = 0)
+
+        assertEquals(DrainStateAction.STOP, decision.action)
+        assertEquals(null, decision.terminalReason)
+    }
+
+    @Test
+    fun staleIdleWithErrorRequestsErrorTerminal() {
+        val decision = decideDrainState(NATIVE_STATE_IDLE, errorCode = 404)
+
+        assertEquals(DrainStateAction.TERMINAL, decision.action)
+        assertEquals("ERROR", decision.terminalReason)
+        assertFalse(decision.waitForPending)
+    }
+
+    @Test
     fun losslessDeliveryAndTerminalWithSlowConsumer() = runBlocking {
         val maxTokens = GenerationSettings.MAX_MAX_TOKENS
         val flow = callbackFlow {

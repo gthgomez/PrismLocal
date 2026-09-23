@@ -30,6 +30,24 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
+ * Cancels the exact native generation that produced the active chunk. A retry
+ * repeats the same ID; cancelling generation 0 would leave the active session
+ * running.
+ */
+internal suspend fun cancelActiveGeneration(
+    generationId: Int,
+    cancel: suspend (Int) -> Unit,
+    onRetry: (Throwable) -> Unit = {},
+    onFailure: (Throwable) -> Unit = {},
+): Boolean = runCatching { cancel(generationId) }
+    .recoverCatching { error ->
+        onRetry(error)
+        cancel(generationId)
+    }
+    .onFailure(onFailure)
+    .isSuccess
+
+/**
  * Orchestrates the prompt → token-stream generation lifecycle for chat,
  * continuation, and agent follow-up paths.
  *
@@ -615,13 +633,12 @@ class GenerationOrchestrator(
                         )
                         Log.w(TAG, "quality_abort session=$session detail=$baseDetail")
                         eventBus.publish("Benchmark stopped: quality abort (${verdict.reasonCode})")
-                        val cancelOk = runCatching { engine.cancelGeneration() }
-                            .recoverCatching { first ->
-                                Log.w(TAG, "quality abort cancel retry", first)
-                                engine.cancelGeneration()
-                            }
-                            .onFailure { error -> Log.w(TAG, "quality abort cancel failed", error) }
-                            .isSuccess
+                        val cancelOk = cancelActiveGeneration(
+                            generationId = uiChunk.generationId,
+                            cancel = { generationId -> engine.cancelGeneration(generationId) },
+                            onRetry = { error -> Log.w(TAG, "quality abort cancel retry", error) },
+                            onFailure = { error -> Log.w(TAG, "quality abort cancel failed", error) },
+                        )
                         if (!cancelOk) {
                             // Keep QUALITY_ABORT; annotate that native cancel failed.
                             terminalState = terminalState.copy(

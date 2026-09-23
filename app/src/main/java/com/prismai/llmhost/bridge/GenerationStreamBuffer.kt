@@ -9,6 +9,15 @@ import kotlinx.coroutines.withContext
 
 private const val STREAM_BUFFER_HEADROOM = 64
 
+internal const val NATIVE_STATE_IDLE = 0
+internal const val NATIVE_STATE_GENERATING = 1
+internal const val NATIVE_STATE_CANCEL_REQUESTED = 2
+internal const val NATIVE_STATE_EOF = 3
+internal const val NATIVE_STATE_CANCELLED = 4
+internal const val NATIVE_STATE_ERROR = 5
+internal const val NATIVE_STATE_TOMBSTONED = 6
+internal const val NATIVE_STATE_MAX_TOKENS = 7
+
 private fun ClosedSendChannelException.unexpectedCloseCause(): Throwable? {
     val nested = cause ?: return null
     if (nested === this) return null
@@ -22,6 +31,36 @@ private fun ClosedSendChannelException.rethrowUnexpectedCause() {
 internal enum class StreamSendResult {
     SENT,
     CLOSED,
+}
+
+internal enum class DrainStateAction {
+    CONTINUE,
+    TERMINAL,
+    STOP,
+}
+
+internal data class DrainStateDecision(
+    val action: DrainStateAction,
+    val terminalReason: String? = null,
+    val waitForPending: Boolean = true,
+)
+
+/**
+ * Classifies one native drain state. Tombstoned and Idle are stale-session
+ * states: a native error code becomes an immediate ERROR terminal, while a
+ * clean stale state stops the producer for normal cleanup.
+ */
+internal fun decideDrainState(state: Int, errorCode: Int): DrainStateDecision = when (state) {
+    NATIVE_STATE_EOF -> DrainStateDecision(DrainStateAction.TERMINAL, "EOF")
+    NATIVE_STATE_CANCELLED -> DrainStateDecision(DrainStateAction.TERMINAL, "CANCELLED")
+    NATIVE_STATE_ERROR -> DrainStateDecision(DrainStateAction.TERMINAL, "ERROR")
+    NATIVE_STATE_MAX_TOKENS -> DrainStateDecision(DrainStateAction.TERMINAL, "MAX_TOKENS")
+    NATIVE_STATE_TOMBSTONED, NATIVE_STATE_IDLE -> if (errorCode != 0) {
+        DrainStateDecision(DrainStateAction.TERMINAL, "ERROR", waitForPending = false)
+    } else {
+        DrainStateDecision(DrainStateAction.STOP)
+    }
+    else -> DrainStateDecision(DrainStateAction.CONTINUE)
 }
 
 /** Bounds the stream by the native token limit while reserving terminal headroom. */

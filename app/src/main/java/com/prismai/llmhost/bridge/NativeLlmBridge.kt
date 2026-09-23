@@ -26,11 +26,6 @@ import java.util.concurrent.atomic.AtomicInteger
 class NativeLlmBridge private constructor(handle: Long, private val instanceId: Int) {
     companion object {
         private const val TAG = "NativeLlmBridge"
-        private const val STATE_EOF = 3
-        private const val STATE_CANCELLED = 4
-        private const val STATE_ERROR = 5
-        private const val STATE_TOMBSTONED = 6
-        private const val STATE_MAX_TOKENS = 7
         private val bridgeInstanceCounter = AtomicInteger(0)
 
         init {
@@ -322,7 +317,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     reusableResult.produced = 0L
                     reusableResult.drained = 0L
                     reusableResult.pending = false
-                    reusableResult.state = STATE_TOMBSTONED
+                    reusableResult.state = NATIVE_STATE_TOMBSTONED
                     reusableResult.errorCode = 0
                 } else {
                     reusableResult.tokensCount = 0
@@ -331,7 +326,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     reusableResult.produced = 0L
                     reusableResult.drained = 0L
                     reusableResult.pending = false
-                    reusableResult.state = 0
+                    reusableResult.state = NATIVE_STATE_IDLE
                     reusableResult.errorCode = 0
                     nativeDrainDecodeAndState(nativeHandle, genId, 128, reusableResult)
                 }
@@ -375,16 +370,12 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     }
                 }
 
-                val terminal = state == STATE_EOF || state == STATE_CANCELLED ||
-                    state == STATE_ERROR || state == STATE_MAX_TOKENS
-                if (terminal && !reusableResult.pending) {
-                    val reason = when (state) {
-                        STATE_EOF -> "EOF"
-                        STATE_CANCELLED -> "CANCELLED"
-                        STATE_ERROR -> "ERROR"
-                        STATE_MAX_TOKENS -> "MAX_TOKENS"
-                        else -> "UNKNOWN"
-                    }
+                val decision = decideDrainState(state, reusableResult.errorCode)
+                if (decision.action == DrainStateAction.STOP) break
+                if (
+                    decision.action == DrainStateAction.TERMINAL &&
+                    (!reusableResult.pending || !decision.waitForPending)
+                ) {
                     // Finalize the decoder. Any buffered trailing bytes (e.g. a
                     // truncated final multi-byte sequence) are delivered *inside*
                     // the terminal chunk. The production sender applies
@@ -397,7 +388,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             tokenCount = 0,
                             generationId = genId,
                             isTerminal = true,
-                            terminalReason = reason,
+                            terminalReason = decision.terminalReason ?: "ERROR",
                             promptTokens = promptTokens,
                             ttftMs = reusableResult.ttftMs,
                             tokensPerSec = reusableResult.tokensPerSec,
@@ -549,7 +540,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     @VisibleForTesting
     suspend fun debugStateForTesting(generationId: Int): Int =
         modelMutex.withLock {
-            if (isDestroyed) STATE_TOMBSTONED else nativeGetState(nativeHandle, generationId)
+            if (isDestroyed) NATIVE_STATE_TOMBSTONED else nativeGetState(nativeHandle, generationId)
         }
 
     private fun nativeLoadModelWithSettings(handle: Long, path: String, settings: GenerationSettings): Boolean =

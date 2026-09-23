@@ -5,6 +5,10 @@
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath (Join-Path $PSScriptRoot "..")
 
+if (-not $env:LLMHOST_SUPABASE_ANON_KEY) {
+    $env:LLMHOST_SUPABASE_ANON_KEY = "placeholder-for-local-verification"
+}
+
 & .\gradlew.bat --no-daemon :app:testDevDebugUnitTest :app:testPlayDebugUnitTest
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

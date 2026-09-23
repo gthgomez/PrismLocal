@@ -81,6 +81,49 @@ class ModelToolsDeletionTest {
     }
 
     @Test
+    fun nullSerializedCallbackUsesDirectDeletionAndRefreshesAfterSuccess() = runBlocking {
+        val directModelIds = mutableListOf<String>()
+        var refreshCalls = 0
+        val tools = newModelTools(
+            directDelete = { modelId ->
+                directModelIds += modelId
+                true
+            },
+            serializedDelete = null,
+            onRefreshReadiness = { refreshCalls += 1 },
+        )
+
+        val result = tools.deleteModel(deleteCall(), confirmed = true)
+
+        assertTrue(result.success)
+        assertEquals(AgentToolErrorCode.OK, result.errorCode)
+        assertEquals(listOf("model-a"), directModelIds)
+        assertEquals(1, refreshCalls)
+        assertEquals(4096L, result.details.getLong("bytes_freed"))
+    }
+
+    @Test
+    fun nullSerializedCallbackUsesDirectDeletionAndDoesNotRefreshAfterFailure() = runBlocking {
+        val directModelIds = mutableListOf<String>()
+        var refreshCalls = 0
+        val tools = newModelTools(
+            directDelete = { modelId ->
+                directModelIds += modelId
+                false
+            },
+            serializedDelete = null,
+            onRefreshReadiness = { refreshCalls += 1 },
+        )
+
+        val result = tools.deleteModel(deleteCall(), confirmed = true)
+
+        assertFalse(result.success)
+        assertEquals(AgentToolErrorCode.FAILED, result.errorCode)
+        assertEquals(listOf("model-a"), directModelIds)
+        assertEquals(0, refreshCalls)
+    }
+
+    @Test
     fun rejectedConfirmationDoesNotInvokeEitherDeletionRoute() = runBlocking {
         var directDeletionCalls = 0
         var serializedDeletionCalls = 0
@@ -101,19 +144,6 @@ class ModelToolsDeletionTest {
         assertEquals(AgentToolErrorCode.CONFIRMATION_REQUIRED, result.errorCode)
         assertEquals(0, directDeletionCalls)
         assertEquals(0, serializedDeletionCalls)
-    }
-
-    @Test
-    fun serializedCallbackIsPreferredOverDirectModelManagerDeletion() = runBlocking {
-        // InferenceService supplies modelManager::deleteModel through this seam.
-        val tools = newModelTools(
-            directDelete = { error("direct ModelManager.deleteModel was called") },
-            serializedDelete = { true },
-        )
-
-        val result = tools.deleteModel(deleteCall(), confirmed = true)
-
-        assertTrue(result.success)
     }
 
     private fun newModelTools(

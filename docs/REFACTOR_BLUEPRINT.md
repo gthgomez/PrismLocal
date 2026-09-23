@@ -314,7 +314,21 @@ override fun onCreate() {
     // ── Layer 5: Agent Tools ──
     val toolRegistry = AgentToolRegistry.build(
         chatTools = ChatTools(chatManager, chatExporter, chatSearch),
-        modelTools = ModelTools(modelManager, modelStorage, modelReadiness, modelImport, modelDownload),
+        modelTools = ModelTools(
+            listInstalledModelInfos = modelStorage::listInstalledModelInfos,
+            deleteModelDirectly = modelManager::deleteModel,
+            modelReadinessAssessor = modelReadiness,
+            modelImportManager = modelImport,
+            modelDownloadManager = modelDownload,
+            uiState = uiState,
+            onRefreshReadiness = { refreshDeviceAndModelReadiness() },
+            filesDir = filesDir,
+            chatDirectory = { chatDirectory() },
+            benchmarkFileSize = { benchmarkRunsFile().sizeRecursive() },
+            chatIndexFile = { chatIndexFile() },
+            // Routes destructive deletion through InferenceService.deleteModel and its operationMutex.
+            deleteModelSafely = { modelId -> deleteModel(modelId) },
+        ),
         runtimeTools = RuntimeTools(engine, engineConfig, benchmarkStore),
         memoryTools = MemoryTools(memoryStore),
         ragTools = RagTools(ragManager, vectorStore),
@@ -383,6 +397,8 @@ override fun onCreate() {
     }
 }
 ```
+
+`deleteModelSafely` is the service-owned serialized deletion callback: `InferenceService.deleteModel` acquires `operationMutex` before delegating to `ModelManager.deleteModel`.
 
 ### 4.2 Tool Registration Pattern
 

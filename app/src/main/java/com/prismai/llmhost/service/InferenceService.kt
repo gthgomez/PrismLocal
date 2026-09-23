@@ -451,8 +451,8 @@ class InferenceService : Service() {
             onResetNativeConversation = { reason -> resetNativeConversationAsync(reason) },
         )
         modelTools = com.prismai.llmhost.agent.tools.ModelTools(
-            modelManager = modelManager,
-            modelStorageManager = modelStorageManager,
+            listInstalledModelInfos = modelStorageManager::listInstalledModelInfos,
+            deleteModelDirectly = modelManager::deleteModel,
             modelReadinessAssessor = modelReadinessAssessor,
             modelImportManager = modelImportManager,
             modelDownloadManager = modelDownloadManager,

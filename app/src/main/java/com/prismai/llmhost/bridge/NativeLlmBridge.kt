@@ -358,7 +358,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     }
 
                     if (decodedText.isNotEmpty() || tokenCount > 0) {
-                        sendChunk(
+                        val dataSent = sendChunk(
                             GenerationChunk(
                                 text = decodedText,
                                 tokenCount = tokenCount,
@@ -371,6 +371,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                                 errorCode = reusableResult.errorCode,
                             )
                         )
+                        if (dataSent == StreamSendResult.CLOSED) break
                     }
                 }
 
@@ -384,14 +385,13 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                         STATE_MAX_TOKENS -> "MAX_TOKENS"
                         else -> "UNKNOWN"
                     }
-                    observedTerminal = true
                     // Finalize the decoder. Any buffered trailing bytes (e.g. a
                     // truncated final multi-byte sequence) are delivered *inside*
                     // the terminal chunk. The production sender applies
                     // backpressure, so the remainder cannot be dropped while a
                     // slow consumer drains the stream.
                     val trailingText = utf8.flush()
-                    sendChunk(
+                    observedTerminal = sendChunk(
                         GenerationChunk(
                             text = trailingText,
                             tokenCount = 0,
@@ -404,7 +404,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             activeThreads = reusableResult.activeThreads,
                             errorCode = reusableResult.errorCode,
                         )
-                    )
+                    ) == StreamSendResult.SENT
                     break
                 }
 
@@ -419,12 +419,14 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 }
             }
         } finally {
-            genMutex.withLock {
-                if (!isDestroyed) {
-                    if (!observedTerminal) {
-                        nativeCancelGeneration(nativeHandle, genId)
+            withStreamCleanup {
+                genMutex.withLock {
+                    if (!isDestroyed) {
+                        if (!observedTerminal) {
+                            nativeCancelGeneration(nativeHandle, genId)
+                        }
+                        nativeAckEof(nativeHandle, genId)
                     }
-                    nativeAckEof(nativeHandle, genId)
                 }
             }
             if (jniTimingsCount > 0) {

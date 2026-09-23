@@ -57,7 +57,7 @@ firstline() {
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 HEAD_SHA="$(git rev-parse HEAD)"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-PORCELAIN="$(git status --porcelain=v1 2>/dev/null || true)"
+PORCELAIN="$(git status --porcelain=v1 --ignore-submodules=dirty 2>/dev/null | grep -v "$OUT" || true)"
 SUBMODULES="$(git submodule status --recursive 2>/dev/null || true)"
 GITLINK="$(git ls-tree HEAD app/src/main/cpp/third_party/llama.cpp 2>/dev/null || true)"
 

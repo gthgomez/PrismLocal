@@ -266,7 +266,7 @@ class GenerationOrchestrator(
                 )
                 if (agentEnabled) {
                     agentTrace.addChainTokens(result.generatedTokens)
-                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF" || result.finalReason == "MAX_TOKENS"))
+                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
                 }
             } else if (result.finalReason == "ERROR" && agentEnabled) {
                 agentTrace.addChainTokens(result.generatedTokens)
@@ -354,6 +354,13 @@ class GenerationOrchestrator(
                     result.finalReason,
                     result.terminalDetail,
                 )
+                if (agentEnabled) {
+                    agentTrace.addChainTokens(result.generatedTokens)
+                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
+                }
+            } else if (result.finalReason == "ERROR" && agentEnabled) {
+                agentTrace.addChainTokens(result.generatedTokens)
+                agentTrace.finalizeTrace(success = false)
             }
             val reasoningPrefix = if (agentToolCall != null) {
                 AgentToolProtocol.extractReasoningPrefix(result.finalOutput)
@@ -449,7 +456,7 @@ class GenerationOrchestrator(
             val nextToolCall = if (result.finalReason == "EOF") AgentToolProtocol.parseToolCall(result.finalOutput) else null
             agentTrace.addChainTokens(result.generatedTokens)
             if (nextToolCall == null) {
-                agentTrace.finalizeTrace(success = (result.finalReason == "EOF" || result.finalReason == "MAX_TOKENS"))
+                agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
             } else if (result.finalReason == "ERROR") {
                 agentTrace.finalizeTrace(success = false)
             }
@@ -886,12 +893,16 @@ class GenerationOrchestrator(
         return when (errorCode) {
             403 -> "Debug hooks rejected operation"
             404 -> "Model is not loaded"
+            420 -> "Prompt exceeds context window limit"
+            421 -> "Prompt token count estimation failed"
             422 -> "Context window too small for prompt"
             423 -> "Tokenization failed"
             424 -> "Sampler initialization failed"
             425 -> "Null token produced"
             426 -> "Context shift operation failed"
-            427 -> "Cannot continue without prior context"
+            427 -> "Grammar compilation failed"
+            428 -> "Cannot continue without prior context"
+            501 -> "Failed to load model"
             in 5000..5999 -> "Native decode error (code $errorCode)"
             else -> if (errorCode > 0) "Error code $errorCode ($detail)" else detail ?: "native runtime error"
         }

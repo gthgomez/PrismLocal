@@ -8,6 +8,7 @@
 #include "sampling.h"
 #include "runtime/ConversationState.hpp" // PIR-05
 #include "runtime/StreamProtocol.hpp" // PIR-02
+#include "runtime/NativeErrorCode.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1118,7 +1119,7 @@ struct Engine::Impl {
             if (runtime->current_position <= 0 ||
                 !runtime->conversation.valid ||
                 !runtime->conversation.last_logits_valid) {
-                ctrl->error_code.store(427, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::NO_CONTINUATION_CONTEXT), std::memory_order_release);
                 LOGE("continue_failed_no_committed_context generation_id=%u pos=%d valid=%s logits=%s",
                      session->generation_id,
                      static_cast<int>(runtime->current_position),
@@ -1171,7 +1172,7 @@ struct Engine::Impl {
                 add_special,
                 true);
             if (token_count <= 0) {
-                ctrl->error_code.store(422, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::TOKENIZE_SIZE_FAILED), std::memory_order_release);
                 LOGE("tokenize_size_failed count=%d", token_count);
                 finishSession(session, StreamState::Error);
                 return;
@@ -1187,7 +1188,7 @@ struct Engine::Impl {
                 add_special,
                 true);
             if (actual_tokens < 0) {
-                ctrl->error_code.store(423, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::TOKENIZE_FAILED), std::memory_order_release);
                 LOGE("tokenize_failed rc=%d", actual_tokens);
                 finishSession(session, StreamState::Error);
                 return;
@@ -1195,7 +1196,7 @@ struct Engine::Impl {
 
             int32_t usable_prompt_tokens = actual_tokens;
             if (actual_tokens > static_cast<int32_t>(prompt_tokens.size())) {
-                ctrl->error_code.store(423, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::TOKENIZE_FAILED), std::memory_order_release);
                 LOGE("tokenize_count_mismatch actual=%d capacity=%zu", actual_tokens, prompt_tokens.size());
                 finishSession(session, StreamState::Error);
                 return;
@@ -1204,18 +1205,21 @@ struct Engine::Impl {
             const int max_prompt_tokens = runtime->context_length - session->config.max_tokens - kContextHeadroom;
             if (usable_prompt_tokens > max_prompt_tokens) {
                 if (max_prompt_tokens <= 0) {
-                    ctrl->error_code.store(422, std::memory_order_release);
+                    ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::CONTEXT_WINDOW_TOO_SMALL), std::memory_order_release);
                     LOGE("context_too_small n_ctx=%d max_tokens=%d", runtime->context_length, session->config.max_tokens);
                     finishSession(session, StreamState::Error);
                     return;
                 }
-                const int32_t dropped = usable_prompt_tokens - max_prompt_tokens;
-                prompt_tokens.erase(prompt_tokens.begin(), prompt_tokens.begin() + dropped);
-                usable_prompt_tokens = static_cast<int32_t>(prompt_tokens.size());
-                LOGW("prompt_truncated generation_id=%u dropped_tokens=%d kept_tokens=%d",
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::PROMPT_DOES_NOT_FIT), std::memory_order_release);
+                LOGE("prompt_does_not_fit generation_id=%u prompt_tokens=%d max_prompt_tokens=%d n_ctx=%d max_tokens=%d headroom=%d",
                      session->generation_id,
-                     dropped,
-                     usable_prompt_tokens);
+                     usable_prompt_tokens,
+                     max_prompt_tokens,
+                     runtime->context_length,
+                     session->config.max_tokens,
+                     kContextHeadroom);
+                finishSession(session, StreamState::Error);
+                return;
             }
             session->prompt_tokens.store(usable_prompt_tokens, std::memory_order_relaxed);
 
@@ -1421,7 +1425,7 @@ struct Engine::Impl {
                 LOGE("grammar_compile_failed generation_id=%u; failing closed",
                      session->generation_id);
                 llama_sampler_free(sampler);
-                ctrl->error_code.store(426, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::GRAMMAR_COMPILE_FAILED), std::memory_order_release);
                 finishSession(session, StreamState::Error);
                 return;
             }

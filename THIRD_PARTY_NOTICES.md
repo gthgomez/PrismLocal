@@ -56,7 +56,6 @@ Licensed under the Apache License, Version 2.0 or the MIT License.
   - `androidx.compose.*` (BOM `2026.04.01`)
   - `androidx.lifecycle:lifecycle-runtime-compose:2.10.0`
   - `androidx.navigation:navigation-compose:2.9.7`
-  - `androidx.room:room-runtime:2.8.4`
   - `androidx.work:work-runtime-ktx:2.10.0`
   - `androidx.security:security-crypto:1.1.0-alpha06`
 - **Copyright:** Copyright (C) 2005-2026 The Android Open Source Project

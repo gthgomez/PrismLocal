@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOn
@@ -26,6 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class NativeLlmBridge private constructor(handle: Long, private val instanceId: Int) {
     companion object {
         private const val TAG = "NativeLlmBridge"
+        private const val STREAM_BUFFER_HEADROOM = 64
         private const val STATE_EOF = 3
         private const val STATE_CANCELLED = 4
         private const val STATE_ERROR = 5
@@ -276,23 +278,16 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     }
 
     /**
-     * Backpressure-aware emission. Silently dropped chunks previously corrupted
-     * transcripts and could lose the terminal event entirely, degrading real
-     * ERROR/CANCELLED outcomes into the EOF heuristic. Terminal chunks retry
-     * until delivered; data chunks cap retries at ~100 ms, then drop with a
-     * logged warning rather than stalling the drain loop forever.
+     * Non-blocking chunk emission into the bounded-but-sufficiently-buffered channel.
+     * With channel capacity >= maxTokens + headroom, trySend() cannot fail due to
+     * buffer exhaustion during active generation. Failure indicates flow closure
+     * or cancellation by the consumer.
      */
-    private suspend fun ProducerScope<GenerationChunk>.emitChunk(chunk: GenerationChunk) {
-        var attempt = 0
-        while (true) {
-            if (trySend(chunk).isSuccess) return
+    private fun ProducerScope<GenerationChunk>.emitChunk(chunk: GenerationChunk) {
+        val result = trySend(chunk)
+        if (!result.isSuccess) {
             if (!isActive) return
-            if (!chunk.isTerminal && attempt >= 50) {
-                Log.w(TAG, "chunk_dropped_backpressure genId=${chunk.generationId} tokens=${chunk.tokenCount}")
-                return
-            }
-            attempt++
-            delay(2)
+            Log.e(TAG, "chunk_send_failed genId=${chunk.generationId} terminal=${chunk.isTerminal}")
         }
     }
 
@@ -301,7 +296,10 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
      * structured chat path ([generateChat]). [start] performs the native start
      * call under [genMutex] and reports whether the generation was accepted.
      */
-    private fun streamGeneration(start: (Int) -> Boolean): Flow<GenerationChunk> = callbackFlow {
+    private fun streamGeneration(
+        maxTokens: Int = GenerationSettings.MAX_MAX_TOKENS,
+        start: (Int) -> Boolean,
+    ): Flow<GenerationChunk> = callbackFlow {
         val genId = sessionCounter.getAndIncrement()
 
         val startSuccess = genMutex.withLock {
@@ -455,14 +453,14 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
             }
         }
         close()
-    }
+    }.buffer(maxTokens.coerceIn(GenerationSettings.MIN_MAX_TOKENS, GenerationSettings.MAX_MAX_TOKENS) + STREAM_BUFFER_HEADROOM)
 
     fun generate(
         prompt: String,
         settings: GenerationSettings = GenerationSettings(),
         continueFromContext: Boolean = false,
         grammar: String? = null,
-    ): Flow<GenerationChunk> = streamGeneration { genId ->
+    ): Flow<GenerationChunk> = streamGeneration(settings.maxTokens) { genId ->
         nativeStartGeneration(
             nativeHandle,
             prompt,
@@ -495,7 +493,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         if (messages.isEmpty()) return emptyFlow()
         val roles = messages.map { it.role }.toTypedArray()
         val contents = messages.map { it.content }.toTypedArray()
-        return streamGeneration { genId ->
+        return streamGeneration(settings.maxTokens) { genId ->
             nativeStartGenerationChat(
                 nativeHandle,
                 roles,

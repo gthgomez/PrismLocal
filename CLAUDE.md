@@ -27,12 +27,14 @@ Project-local routing only. Root `<workspace>\ENGINEERING.md` and
 Run from this repo unless a task explicitly routes elsewhere.
 
 ```powershell
-.\gradlew.bat --no-daemon :app:testDebugUnitTest
-.\gradlew.bat --no-daemon assembleDebug
-.\gradlew.bat --no-daemon assembleDebugAndroidTest
-.\gradlew.bat --no-daemon connectedDebugAndroidTest
-.\gradlew.bat --no-daemon assembleBenchmark
-.\gradlew.bat --no-daemon assembleRelease
+.\gradlew.bat --no-daemon :app:testDevDebugUnitTest :app:testPlayDebugUnitTest
+.\gradlew.bat --no-daemon :app:assembleDevDebug
+.\gradlew.bat --no-daemon :app:assembleDevDebugAndroidTest
+.\gradlew.bat --no-daemon :app:connectedDevDebugAndroidTest
+# Full canonical verification gate:
+.\scripts\verify.ps1
+.\gradlew.bat --no-daemon :app:assembleDevBenchmark
+.\gradlew.bat --no-daemon :app:assemblePlayRelease
 ```
 
 Notes:
@@ -64,7 +66,7 @@ Notes:
 
 ## Done Criteria
 
-- Source changes: run the narrowest relevant Gradle task, plus `assembleDebug` for Android/native changes.
+- Source changes: run the narrowest relevant Gradle task, plus `assembleDevDebug` or `.\scripts\verify.ps1` for Android/native changes.
 - Native/JNI changes: also verify connected tests or clearly mark device verification as not run.
 - Manifest, signing, or release changes: include APK/build evidence and 16 KB/native alignment checks when packaging is affected.
 - Model import/download changes: verify hash/manifest behavior and failure cleanup.

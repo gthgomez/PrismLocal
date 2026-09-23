@@ -26,7 +26,7 @@ graph TD
         ThermalGov[ThermalBatteryGovernor]
         MemGov[MemoryGovernor]
         ModelStorage[ModelStorageManager / WorkManager]
-        VectorStore[SQLite / Room Cosine VectorStore]
+        VectorStore[Direct SQLite Cosine VectorStore]
     end
 
     subgraph Native ["Native Engine Layer (libllmhost.so)"]
@@ -68,7 +68,7 @@ graph TD
 
 5. **Local Storage & Offline Vector Store**:
    - Resumable, SHA-256 verified Hugging Face GGUF model downloads managed via Android `WorkManager`.
-   - Local SQLite/Room conversation persistence and offline document chunking with cosine similarity vector indexing.
+   - Direct SQLite conversation persistence and offline document chunking with cosine similarity vector indexing.
 
 ---
 

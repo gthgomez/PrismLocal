@@ -1,6 +1,6 @@
 # PrismLocal Status
 
-**Last verified:** 2026-08-01
+**Last verified:** 2026-09-23
 **Status:** active development
 **Confidence:** high
 
@@ -10,7 +10,7 @@ Android host application for local GGUF inference using a JNI C++ bridge to llam
 
 ## Current State
 
-The app features a complete C++/NDK JNI bridge to `llama.cpp`. Native memory limits, background agent execution with thermal/battery safeguards, and vector-store RAG are implemented. Active development focuses on Bonsai-27B integration planning.
+The app features a complete C++/NDK JNI bridge to `llama.cpp`. Native memory limits, background agent execution with thermal/battery safeguards, and direct-SQLite vector-store RAG are implemented. Active development focuses on the P0 correctness and reliability merge train (handle leases, lossless streaming, fail-closed prompt admission).
 
 ## Verified Capabilities
 
@@ -23,11 +23,11 @@ The app features a complete C++/NDK JNI bridge to `llama.cpp`. Native memory lim
 ## Recent Evidence
 
 - `FINDINGS_REPORT_2026-07-31.md` documents JNI memory bounds, model switch hashing fixes, and bounds-checked memory indexing audits.
-- `ROADMAP.md` confirms Tier 1 (Memory, RAG, Knowledge Pack) and Tier 2 (Voice, Connectors, Background) completed.
+- `ROADMAP.md` confirms capability roadmap status and P0 merge train tracking.
 
 ## In Progress
 
-- **Bonsai-27B Q1_0 GGUF integration plan** (`docs/BONSAI_27B_INTEGRATION_PLAN.md`).
+- **P0 Correctness Merge Train** (NativeHandleRegistry, lossless stream buffering, fail-closed prompt admission, agent terminal truth, serialized model deletion).
 
 ## Blockers
 
@@ -43,9 +43,9 @@ The app features a complete C++/NDK JNI bridge to `llama.cpp`. Native memory lim
 
 ## Next Actions
 
-1. Execute Bonsai-27B integration plan Phase 0 spike tests.
-2. Verify JNI mutex cancellation and MemoryGovernor allocation under RAM pressure.
-3. Run `.\gradlew.bat --no-daemon :app:testDebugUnitTest`.
+1. Complete P0 correctness merge train (P0A–P1B).
+2. Execute physical-device qualification campaign (`QUAL`).
+3. Run `.\scripts\verify.ps1` and `.\gradlew.bat --no-daemon :app:testDevDebugUnitTest :app:testPlayDebugUnitTest`.
 
 ## Evidence Sources
 

@@ -53,7 +53,7 @@ class PromptBuilder(
             var estimatedTokens = (newPrompt.length + memoryContext.length) / 4
             for (message in history.asReversed()) {
                 val tokens = message.toChatMessage().content.length / 4
-                if (estimatedTokens + tokens <= tokenBudget || selected.isEmpty()) {
+                if (estimatedTokens + tokens <= tokenBudget) {
                     selected.addFirst(message)
                     estimatedTokens += tokens
                 } else {
@@ -114,7 +114,7 @@ class PromptBuilder(
         for (message in history.asReversed()) {
             val formatted = message.asPromptLine()
             val tokens = (formatted.length / 4) + 1
-            if (estimatedTokens + tokens <= tokenBudget || selected.isEmpty()) {
+            if (estimatedTokens + tokens <= tokenBudget) {
                 selected.addFirst(message)
                 estimatedTokens += tokens
             } else {

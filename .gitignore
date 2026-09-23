@@ -50,6 +50,7 @@ llm_host_prefs.xml
 commitPlan.json
 walkthrough.md
 runs/
+handoffs/
 *.png
 !docs/assets/*.png
 

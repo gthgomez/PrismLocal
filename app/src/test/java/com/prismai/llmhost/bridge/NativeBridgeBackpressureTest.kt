@@ -1,116 +1,131 @@
 package com.prismai.llmhost.bridge
 
 import com.prismai.llmhost.GenerationChunk
+import com.prismai.llmhost.GenerationSettings
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * JVM unit tests verifying the lossless flow buffering invariant for [NativeLlmBridge].
- *
- * Ensures that with a bounded channel capacity >= maxTokens + headroom, rapid non-blocking
- * emissions via trySend() never drop chunks under backpressure from a slow consumer.
+ * JVM coverage for the bridge's production stream-buffer seam. The native
+ * engine is intentionally not mocked: the channel, producer, and slow consumer
+ * are real coroutine components, while only the JNI boundary is omitted.
  */
 class NativeBridgeBackpressureTest {
 
-    private fun ProducerScope<GenerationChunk>.emitChunk(chunk: GenerationChunk): Boolean {
-        val result = trySend(chunk)
-        return result.isSuccess
+    private fun chunk(index: Int, terminal: Boolean = false): GenerationChunk =
+        GenerationChunk(
+            text = if (terminal) "terminal" else "t$index",
+            tokenCount = if (terminal) 0 else 1,
+            generationId = 42,
+            isTerminal = terminal,
+            terminalReason = if (terminal) "EOF" else "NONE",
+        )
+
+    @Test
+    fun productionCapacityIsClampedAndLeavesTerminalHeadroom() {
+        assertEquals(65, generationStreamBufferCapacity(0))
+        assertEquals(65, generationStreamBufferCapacity(1))
+        assertEquals(1088, generationStreamBufferCapacity(1024))
+        assertEquals(1088, generationStreamBufferCapacity(2048))
     }
 
     @Test
-    fun testLosslessBufferingUnderSlowConsumer() = runBlocking(Dispatchers.Default) {
-        val totalTokens = 1024
-        val headroom = 64
-        val capacity = totalTokens + headroom
-
+    fun losslessDeliveryAndTerminalWithSlowConsumer() = runBlocking {
+        val maxTokens = GenerationSettings.MAX_MAX_TOKENS
         val flow = callbackFlow {
-            // Rapidly emit 1,024 non-terminal chunks + 1 terminal chunk
-            for (i in 1..totalTokens) {
-                val ok = emitChunk(
-                    GenerationChunk(
-                        text = "t$i ",
-                        tokenCount = 1,
-                        generationId = 1,
-                        isTerminal = false,
-                    )
-                )
-                assertTrue("Emission $i failed unexpectedly on buffered channel", ok)
+            for (index in 1..maxTokens) {
+                sendChunk(chunk(index))
             }
-            val termOk = emitChunk(
-                GenerationChunk(
-                    text = "",
-                    tokenCount = 0,
-                    generationId = 1,
-                    isTerminal = true,
-                    terminalReason = "EOF",
-                )
-            )
-            assertTrue("Terminal emission failed unexpectedly", termOk)
+            sendChunk(chunk(0, terminal = true))
             close()
-        }.buffer(capacity)
+        }.buffer(generationStreamBufferCapacity(maxTokens))
 
         val received = mutableListOf<GenerationChunk>()
-        flow.collect { chunk ->
-            received.add(chunk)
-            // Simulate slow consumer (e.g. UI rendering or transcript formatting delay)
-            if (received.size % 100 == 0) {
-                delay(2)
-            }
+        withTimeout(10_000) {
+            flow.collect { received += it; delay(1) }
         }
 
-        assertEquals("All chunks must be delivered without loss", totalTokens + 1, received.size)
-        for (i in 1..totalTokens) {
-            assertEquals("Chunk $i text mismatch", "t$i ", received[i - 1].text)
-            assertEquals("Chunk $i token count mismatch", 1, received[i - 1].tokenCount)
-            assertFalse("Chunk $i should not be terminal", received[i - 1].isTerminal)
-        }
+        assertEquals(maxTokens + 1, received.size)
+        assertEquals(
+            (1..maxTokens).map { "t$it" },
+            received.take(maxTokens).map { it.text },
+        )
+        assertEquals(1, received.count { it.isTerminal })
         val terminal = received.last()
-        assertTrue("Last chunk must be terminal", terminal.isTerminal)
-        assertEquals("Terminal reason must be EOF", "EOF", terminal.terminalReason)
+        assertTrue(terminal.isTerminal)
+        assertEquals("EOF", terminal.terminalReason)
+        assertEquals("terminal", terminal.text)
     }
 
     @Test
-    fun testCancellationHandlesTrySendGracefully() = runBlocking(Dispatchers.Default) {
-        val capacity = 16
+    fun fullBufferAppliesBackpressureWithoutDroppingChunks() = runBlocking {
+        val totalDataChunks = 32
         val flow = callbackFlow {
-            val ok1 = emitChunk(
-                GenerationChunk(
-                    text = "start",
-                    tokenCount = 1,
-                    generationId = 1,
-                    isTerminal = false,
-                )
-            )
-            assertTrue("Initial emission should succeed", ok1)
+            for (index in 1..totalDataChunks) {
+                sendChunk(chunk(index))
+            }
+            sendChunk(chunk(0, terminal = true))
             close()
-            // After close(), trySend must return failure (isSuccess == false) without throwing
-            val ok2 = emitChunk(
-                GenerationChunk(
-                    text = "after_close",
-                    tokenCount = 1,
-                    generationId = 1,
-                    isTerminal = false,
-                )
-            )
-            assertFalse("trySend must report failure on closed channel", ok2)
-        }.buffer(capacity)
+        }.buffer(1)
 
-        val list = flow.toList()
-        assertEquals(1, list.size)
-        assertEquals("start", list[0].text)
+        val received = withTimeout(5_000) {
+            flow.toList()
+        }
+
+        assertEquals(totalDataChunks + 1, received.size)
+        assertEquals(
+            (1..totalDataChunks).map { "t$it" },
+            received.take(totalDataChunks).map { it.text },
+        )
+        assertTrue(received.last().isTerminal)
+        assertEquals("EOF", received.last().terminalReason)
+    }
+
+    @Test
+    fun emissionAfterCloseCompletesGracefully() = runBlocking {
+        val producerFinished = CompletableDeferred<Unit>()
+        val flow = callbackFlow {
+            sendChunk(chunk(1))
+            close()
+            sendChunk(chunk(2))
+            producerFinished.complete(Unit)
+        }.buffer(generationStreamBufferCapacity(1))
+
+        val received = withTimeout(5_000) { flow.toList() }
+        assertEquals(listOf("t1"), received.map { it.text })
+        withTimeout(5_000) { producerFinished.await() }
+    }
+
+    @Test
+    fun consumerCancellationStopsBackpressuredProducer() = runBlocking {
+        val firstReceived = CompletableDeferred<Unit>()
+        val flow = callbackFlow {
+            repeat(10_000) { index -> sendChunk(chunk(index + 1)) }
+            close()
+        }.buffer(1)
+
+        val collector = launch(Dispatchers.Default) {
+            flow.collect {
+                firstReceived.complete(Unit)
+                awaitCancellation()
+            }
+        }
+
+        withTimeout(5_000) { firstReceived.await() }
+        collector.cancelAndJoin()
+        assertTrue("collector should finish after cancellation", collector.isCompleted)
     }
 }

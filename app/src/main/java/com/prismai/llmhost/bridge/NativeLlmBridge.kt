@@ -12,7 +12,6 @@ import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
@@ -27,7 +26,6 @@ import java.util.concurrent.atomic.AtomicInteger
 class NativeLlmBridge private constructor(handle: Long, private val instanceId: Int) {
     companion object {
         private const val TAG = "NativeLlmBridge"
-        private const val STREAM_BUFFER_HEADROOM = 64
         private const val STATE_EOF = 3
         private const val STATE_CANCELLED = 4
         private const val STATE_ERROR = 5
@@ -278,20 +276,6 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     }
 
     /**
-     * Non-blocking chunk emission into the bounded-but-sufficiently-buffered channel.
-     * With channel capacity >= maxTokens + headroom, trySend() cannot fail due to
-     * buffer exhaustion during active generation. Failure indicates flow closure
-     * or cancellation by the consumer.
-     */
-    private fun ProducerScope<GenerationChunk>.emitChunk(chunk: GenerationChunk) {
-        val result = trySend(chunk)
-        if (!result.isSuccess) {
-            if (!isActive) return
-            Log.e(TAG, "chunk_send_failed genId=${chunk.generationId} terminal=${chunk.isTerminal}")
-        }
-    }
-
-    /**
      * Shared drain/emit/finally body for the string path ([generate]) and the
      * structured chat path ([generateChat]). [start] performs the native start
      * call under [genMutex] and reports whether the generation was accepted.
@@ -374,7 +358,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     }
 
                     if (decodedText.isNotEmpty() || tokenCount > 0) {
-                        emitChunk(
+                        sendChunk(
                             GenerationChunk(
                                 text = decodedText,
                                 tokenCount = tokenCount,
@@ -403,11 +387,11 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     observedTerminal = true
                     // Finalize the decoder. Any buffered trailing bytes (e.g. a
                     // truncated final multi-byte sequence) are delivered *inside*
-                    // the terminal chunk: terminal chunks are retried until sent
-                    // (see emitChunk), so the remainder cannot be dropped under
-                    // backpressure the way a separate non-terminal chunk could.
+                    // the terminal chunk. The production sender applies
+                    // backpressure, so the remainder cannot be dropped while a
+                    // slow consumer drains the stream.
                     val trailingText = utf8.flush()
-                    emitChunk(
+                    sendChunk(
                         GenerationChunk(
                             text = trailingText,
                             tokenCount = 0,
@@ -453,7 +437,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
             }
         }
         close()
-    }.buffer(maxTokens.coerceIn(GenerationSettings.MIN_MAX_TOKENS, GenerationSettings.MAX_MAX_TOKENS) + STREAM_BUFFER_HEADROOM)
+    }.buffer(generationStreamBufferCapacity(maxTokens))
 
     fun generate(
         prompt: String,

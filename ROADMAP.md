@@ -52,10 +52,10 @@ Read-only access to contacts, calendar, SMS, notifications — with strict priva
 
 ---
 
-### 6. Background Agent Execution 🟡 PARTIAL
+### 6. Background Agent Execution 🟢 COMPLETED
 Agent continues working after app switch / screen lock. Results as notification.
-**Files**: `BackgroundAgentManager.kt`, `BackgroundAgentToolDefinitions.kt`
-**Completed**: In-memory queue with PARTIAL_WAKE_LOCK foreground service runner, battery (pause <15%) and thermal (pause SEVERE+) guards. Non-durable across process death.
+**Files**: `BackgroundAgentManager.kt`, `BackgroundAgentToolDefinitions.kt`, `BackgroundAgentPersistenceTest.kt`
+**Completed**: In-memory queue with PARTIAL_WAKE_LOCK foreground service runner, battery (pause <15%) and thermal (pause SEVERE+) guards, and atomic JSON task ledger persistence across process termination.
 
 ---
 
@@ -112,17 +112,22 @@ All local storage (Memory, Document RAG), offline STT/TTS, and data connectors c
 ### Milestone 2: Monolith Refactor & De-duplication — 🟢 COMPLETED
 InferenceService was refactored from a 5,391-line monolith into a 1,044-line orchestrator. All code extracted into focused, testable packages under `agent/`, `benchmark/`, `chat/`, `engine/`, `export/`, `generation/`, `model/`, `ui/`, and `util/`.
 
-### Milestone 3: JNI Performance & Safety Upgrades — 🟡 IN PROGRESS (2026-09-23)
+### Milestone 3: JNI Performance & Safety Upgrades — 🟢 COMPLETED (2026-09-23)
 - Reduced-allocation JNI fast path via pre-allocated carrier buffers in `NativeDrainResult`.
 - Eliminated JNI heap allocations for the empty/fast path.
 - Non-blocking intra-batch cancellation checks in `decodeTokensAt` reducing cancel latency to ~100ms.
 - Throw JVM `NoSuchFieldError` on cached class field mismatch instead of silent early loops.
 - `jniTimingsUs` primitive `LongArray` replacing boxed list allocations.
 - Pre-allocated C++ vector capacity (`decode_times_us.reserve`).
-- Handle lifetime leases, lossless stream buffering, and fail-closed prompt admission actively being closed in P0 merge train.
+- Handle lifetime leases (`NativeHandleRegistry`), lossless stream buffering, fail-closed prompt admission, truthful agent terminal outcomes, and serialized model deletion merged via PR #10.
 
 ### Milestone 4: Modularize UI Components — 🟢 COMPLETED (2026-07-19)
 Decomposed `ChatScreen.kt` (4,194 lines -> 691 lines) into 11 modular components across `ui/theme`, `ui/components`, `ui/composer`, `ui/memory`, `ui/chat`, `ui/benchmark`, and `ui/controlplane`. Verified with `assembleDevDebug` and `testDevDebugUnitTest`.
 
+### Milestone 5: Background Agent Task Durability & QUAL Readiness — 🟢 COMPLETED (2026-09-23)
+- Background agent task ledger persistence across process restarts (`BackgroundAgentManager.kt`).
+- Comprehensive persistence unit tests (`BackgroundAgentPersistenceTest.kt`).
+- On-device qualification runbook established (`docs/evidence/QUAL_RUNBOOK.md`).
+
 ---
-*Last updated: 2026-09-23 — Capability phases, JNI optimizations, and UI modularization complete; P0 correctness train in progress*
+*Last updated: 2026-09-23 — Capability phases, JNI safety upgrades, UI modularization, and background agent durability complete*

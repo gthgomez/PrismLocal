@@ -446,6 +446,7 @@ class InferenceService : Service() {
             chatDirectory = { chatDirectory() },
             benchmarkFileSize = { benchmarkRunsFile().sizeRecursive() },
             chatIndexFile = { chatIndexFile() },
+            deleteModelSafely = { modelId -> deleteModel(modelId) },
         )
         runtimeTools = com.prismai.llmhost.agent.tools.RuntimeTools(
             uiState = uiState,

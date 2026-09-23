@@ -30,6 +30,7 @@ class ModelTools(
     private val chatDirectory: () -> java.io.File,
     private val benchmarkFileSize: () -> Long,
     private val chatIndexFile: () -> java.io.File,
+    private val deleteModelSafely: (suspend (String) -> Boolean)? = null,
 ) {
     fun listInstalledModels(call: AgentToolCall): AgentToolResult {
         onRefreshReadiness()
@@ -204,7 +205,11 @@ class ModelTools(
         val installedModel = withContext(Dispatchers.IO) {
             modelStorageManager.listInstalledModelInfos().firstOrNull { it.id == modelId }
         } ?: return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Unknown installed model_id: $modelId")
-        val deleted = modelManager.deleteModel(modelId)
+        val deleted = if (deleteModelSafely != null) {
+            deleteModelSafely.invoke(modelId)
+        } else {
+            modelManager.deleteModel(modelId)
+        }
         return if (deleted) {
             onRefreshReadiness()
             toolSuccess(call, "Deleted model $modelId",

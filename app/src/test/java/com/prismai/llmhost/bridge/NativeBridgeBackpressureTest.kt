@@ -99,6 +99,29 @@ class NativeBridgeBackpressureTest {
     }
 
     @Test
+    fun syntheticIdleTerminalRequiresExplicitNativeCancellation() {
+        val decision = decideDrainState(NATIVE_STATE_IDLE, errorCode = 0)
+
+        assertTrue(decision.requiresNativeCancellation)
+        assertTrue(shouldCancelNative(observedTerminal = true, decision = decision))
+    }
+
+    @Test
+    fun deliveredTrueTerminalsDoNotRequestSyntheticCancellation() {
+        val trueTerminalStates = listOf(
+            NATIVE_STATE_EOF,
+            NATIVE_STATE_CANCELLED,
+            NATIVE_STATE_ERROR,
+            NATIVE_STATE_MAX_TOKENS,
+        )
+
+        for (state in trueTerminalStates) {
+            val decision = decideDrainState(state, errorCode = 0)
+            assertFalse(shouldCancelNative(observedTerminal = true, decision = decision))
+        }
+    }
+
+    @Test
     fun losslessDeliveryAndTerminalWithSlowConsumer() = runBlocking {
         val maxTokens = GenerationSettings.MAX_MAX_TOKENS
         val flow = callbackFlow {

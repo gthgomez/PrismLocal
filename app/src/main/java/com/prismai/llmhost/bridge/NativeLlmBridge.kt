@@ -294,6 +294,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         }
 
         var observedTerminal = false
+        var terminalDecision: DrainStateDecision? = null
         // Pre-sized primitive array avoids Long boxing and list growth.
         // Max drains ≈ max_tokens (1024) + overhead polls.
         val jniTimingsUs = LongArray(2048)
@@ -382,6 +383,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     // backpressure, so the remainder cannot be dropped while a
                     // slow consumer drains the stream.
                     val trailingText = utf8.flush()
+                    terminalDecision = decision
                     observedTerminal = sendChunk(
                         GenerationChunk(
                             text = trailingText,
@@ -413,7 +415,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
             withStreamCleanup {
                 genMutex.withLock {
                     if (!isDestroyed) {
-                        if (!observedTerminal) {
+                        if (shouldCancelNative(observedTerminal, terminalDecision)) {
                             nativeCancelGeneration(nativeHandle, genId)
                         }
                         nativeAckEof(nativeHandle, genId)

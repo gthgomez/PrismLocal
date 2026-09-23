@@ -43,6 +43,7 @@ internal data class DrainStateDecision(
     val action: DrainStateAction,
     val terminalReason: String? = null,
     val waitForPending: Boolean = true,
+    val requiresNativeCancellation: Boolean = false,
 )
 
 /**
@@ -64,9 +65,15 @@ internal fun decideDrainState(state: Int, errorCode: Int): DrainStateDecision = 
         action = DrainStateAction.TERMINAL,
         terminalReason = if (errorCode != 0) "ERROR" else "CANCELLED",
         waitForPending = false,
+        requiresNativeCancellation = true,
     )
     else -> DrainStateDecision(DrainStateAction.CONTINUE)
 }
+
+internal fun shouldCancelNative(
+    observedTerminal: Boolean,
+    decision: DrainStateDecision?,
+): Boolean = !observedTerminal || decision?.requiresNativeCancellation == true
 
 /** Bounds the stream by the native token limit while reserving terminal headroom. */
 internal fun generationStreamBufferCapacity(maxTokens: Int): Int =

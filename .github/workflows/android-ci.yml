@@ -68,5 +68,28 @@ jobs:
           LLMHOST_SUPABASE_ANON_KEY: "ci-public-build-placeholder"
         run: ./gradlew :app:assembleDevBenchmark :app:assemblePlayRelease --no-daemon --stacktrace
 
+  native-host-tests:
+    name: Native Host Tests (CTest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code with Submodules
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      - name: Configure CMake with Sanitizers
+        run: |
+          cmake -S app/src/test/cpp -B build/prism-native-tests \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DPRISM_ENABLE_SANITIZERS=ON \
+            -DPRISM_REQUIRE_SANITIZERS=ON
+
+      - name: Build Native Host Tests
+        run: cmake --build build/prism-native-tests --parallel
+
+      - name: Run CTest
+        run: ctest --test-dir build/prism-native-tests --output-on-failure
+
 
 

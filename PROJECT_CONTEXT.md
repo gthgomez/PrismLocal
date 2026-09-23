@@ -88,14 +88,16 @@ Trusted commands from this repo:
 
 ```powershell
 cd <workspace>\Project_Android\PrismLocal
-.\gradlew.bat --no-daemon :app:testDebugUnitTest
-.\gradlew.bat --no-daemon assembleDebug
-.\gradlew.bat --no-daemon assembleDebugAndroidTest
-.\gradlew.bat --no-daemon connectedDebugAndroidTest
+.\gradlew.bat --no-daemon :app:testDevDebugUnitTest :app:testPlayDebugUnitTest
+.\gradlew.bat --no-daemon :app:assembleDevDebug
+.\gradlew.bat --no-daemon :app:assembleDevDebugAndroidTest
+.\gradlew.bat --no-daemon :app:connectedDevDebugAndroidTest
+# Full canonical verification gate (unit tests + DevBenchmark + PlayRelease):
+.\scripts\verify.ps1
 # Minified variants: build ONE at a time on ~16 GB hosts (parallel R8 OOM'd daemon).
-.\gradlew.bat --no-daemon --max-workers=2 assembleBenchmark
-.\gradlew.bat --no-daemon --max-workers=2 assembleRelease
-# Optional: assembleProfile, assembleAdreno (Adreno needs OpenCL include/lib props)
+.\gradlew.bat --no-daemon --max-workers=2 :app:assembleDevBenchmark
+.\gradlew.bat --no-daemon --max-workers=2 :app:assemblePlayRelease
+# Optional: assembleDevProfile, assembleDevAdreno (Adreno needs OpenCL include/lib props)
 ```
 
 Package IDs by variant: `com.prismai.llmhost` (release), `.debug`, `.benchmark`,
@@ -105,7 +107,7 @@ Package IDs by variant: `com.prismai.llmhost` (release), `.debug`, `.benchmark`,
 From composite root only (uses this project’s wrapper + `-p`):
 
 ```powershell
-.\PrismLocal\gradlew.bat -p PrismLocal --no-daemon :app:assembleDebug
+.\PrismLocal\gradlew.bat -p PrismLocal --no-daemon :app:assembleDevDebug
 ```
 
 Use `connectedDebugAndroidTest` only when an emulator/device is available. The
@@ -178,7 +180,7 @@ an older artifact path; adapt commands to this repo path before use.
 
 ## Current Limitations And Gaps
 
-- Build compilation (`assembleDebug`, `assembleBenchmark`, `assembleRelease`) and unit tests (`:app:testDebugUnitTest`) verified 2026-07-24 after JNI/ProGuard package rename fix.
+- Build compilation (`assembleDevBenchmark`, `assemblePlayRelease`) and unit tests (`:app:testDevDebugUnitTest`, `:app:testPlayDebugUnitTest`) verified. P0 correctness train in progress.
 - Do not assemble multiple minified variants in one Gradle invocation on low-RAM hosts.
 - `RUNTIME_LIMITS.md` is updated to document the configurable context length (512 to 16,384), prompt batch sizes, max generated tokens (up to 1,024), and agent iterations (up to 12).
 - The local JNI layer is performance-hardened with zero heap allocations on the polling fast path, and cancel latency has been optimized via C++ intra-batch cancellation checks in `decodeTokensAt`.
@@ -194,4 +196,4 @@ which commands are trusted, what paths are risky, which evidence is dated, what
 is unverified, and what done means by reading `AGENTS.md` plus this file.
 
 ---
-*Last updated: 2026-07-19 — Decomposed refactoring & JNI performance updates mapped*
+*Last updated: 2026-09-23 — P0 correctness train in progress*

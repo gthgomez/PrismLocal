@@ -17,6 +17,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(PRISM_ENABLE_SANITIZERS
        "Build the native tests with ASan/UBSan when the compiler supports them"
        OFF)
+option(PRISM_REQUIRE_SANITIZERS
+       "Fail CMake configuration if sanitizers are requested but unsupported"
+       OFF)
 
 # Directory that contains the production header-only helpers, so that
 # `#include "runtime/ConversationState.hpp"` resolves.
@@ -53,9 +56,15 @@ if(PRISM_ENABLE_SANITIZERS)
         list(JOIN PRISM_SANITIZERS_FOUND ", " PRISM_SANITIZERS_FOUND_STR)
         message(STATUS "PRISM: sanitizers enabled for native tests: ${PRISM_SANITIZERS_FOUND_STR}")
     else()
-        message(WARNING
-            "PRISM_ENABLE_SANITIZERS=ON but this compiler supports neither "
-            "-fsanitize=address nor -fsanitize=undefined; building without sanitizers.")
+        if(PRISM_REQUIRE_SANITIZERS)
+            message(FATAL_ERROR
+                "PRISM_REQUIRE_SANITIZERS=ON but this compiler supports neither "
+                "-fsanitize=address nor -fsanitize=undefined.")
+        else()
+            message(WARNING
+                "PRISM_ENABLE_SANITIZERS=ON but this compiler supports neither "
+                "-fsanitize=address nor -fsanitize=undefined; building without sanitizers.")
+        endif()
     endif()
 endif()
 

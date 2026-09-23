@@ -284,13 +284,13 @@ class GenerationOrchestrator(
                     result.finalReason,
                     result.terminalDetail,
                 )
-                if (agentEnabled) {
-                    agentTrace.addChainTokens(result.generatedTokens)
-                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
-                }
-            } else if (result.finalReason == "ERROR" && agentEnabled) {
-                agentTrace.addChainTokens(result.generatedTokens)
-                agentTrace.finalizeTrace(success = false)
+            }
+            if (agentEnabled) {
+                agentTrace.recordGenerationTurn(
+                    terminalReason = result.finalReason,
+                    generatedTokens = result.generatedTokens,
+                    hasToolCall = agentToolCall != null,
+                )
             }
 
             val completedPreset = metrics.activeBenchmarkPreset
@@ -374,13 +374,13 @@ class GenerationOrchestrator(
                     result.finalReason,
                     result.terminalDetail,
                 )
-                if (agentEnabled) {
-                    agentTrace.addChainTokens(result.generatedTokens)
-                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
-                }
-            } else if (result.finalReason == "ERROR" && agentEnabled) {
-                agentTrace.addChainTokens(result.generatedTokens)
-                agentTrace.finalizeTrace(success = false)
+            }
+            if (agentEnabled) {
+                agentTrace.recordGenerationTurn(
+                    terminalReason = result.finalReason,
+                    generatedTokens = result.generatedTokens,
+                    hasToolCall = agentToolCall != null,
+                )
             }
             val reasoningPrefix = if (agentToolCall != null) {
                 AgentToolProtocol.extractReasoningPrefix(result.finalOutput)
@@ -474,12 +474,11 @@ class GenerationOrchestrator(
             ),
         ) { result ->
             val nextToolCall = if (result.finalReason == "EOF") AgentToolProtocol.parseToolCall(result.finalOutput) else null
-            agentTrace.addChainTokens(result.generatedTokens)
-            if (nextToolCall == null) {
-                agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
-            } else if (result.finalReason == "ERROR") {
-                agentTrace.finalizeTrace(success = false)
-            }
+            agentTrace.recordGenerationTurn(
+                terminalReason = result.finalReason,
+                generatedTokens = result.generatedTokens,
+                hasToolCall = nextToolCall != null,
+            )
             metrics.clear()
             val reasoningPrefix = if (nextToolCall != null) {
                 AgentToolProtocol.extractReasoningPrefix(result.finalOutput)

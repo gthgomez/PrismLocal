@@ -29,8 +29,24 @@ class AgentTrace(
     private val filesDir: File,
     private val scope: CoroutineScope,
 ) {
+    enum class TerminationAction {
+        RESUMABLE,
+        FINALIZE_SUCCESS,
+        FINALIZE_FAILURE,
+    }
+
     companion object {
         private const val TAG = "AgentTrace"
+
+        fun terminationAction(
+            terminalReason: String,
+            hasToolCall: Boolean,
+        ): TerminationAction = when {
+            terminalReason == "MAX_TOKENS" -> TerminationAction.RESUMABLE
+            terminalReason == "EOF" && !hasToolCall -> TerminationAction.FINALIZE_SUCCESS
+            terminalReason == "EOF" -> TerminationAction.RESUMABLE
+            else -> TerminationAction.FINALIZE_FAILURE
+        }
     }
 
     val activeAgentSteps = mutableListOf<AgentStep>()
@@ -44,6 +60,29 @@ class AgentTrace(
     /** Atomically accumulates generated tokens into the chain budget (thread-safe). */
     fun addChainTokens(delta: Int) {
         chainTokens.addAndGet(delta)
+    }
+
+    /**
+     * Accounts for one generation turn and applies the agent-chain termination policy.
+     *
+     * MAX_TOKENS leaves the chain active so a continuation can finish it. EOF is
+     * successful only when the turn is not an intermediate tool call. All other
+     * terminal reasons, including cancellation and unknown future reasons, fail
+     * the chain closed.
+     */
+    @Synchronized
+    fun recordGenerationTurn(
+        terminalReason: String,
+        generatedTokens: Int,
+        hasToolCall: Boolean,
+        abortReason: String? = null,
+    ) {
+        addChainTokens(generatedTokens)
+        when (terminationAction(terminalReason, hasToolCall)) {
+            TerminationAction.RESUMABLE -> Unit
+            TerminationAction.FINALIZE_SUCCESS -> finalizeTrace(success = true, abortReason = abortReason)
+            TerminationAction.FINALIZE_FAILURE -> finalizeTrace(success = false, abortReason = abortReason)
+        }
     }
 
     @Synchronized

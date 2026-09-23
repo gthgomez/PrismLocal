@@ -21,12 +21,14 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 class AgentToolRouterTraceTest {
 
@@ -91,7 +93,11 @@ class AgentToolRouterTraceTest {
         val call = AgentToolCall("restore_previous_runtime_settings")
 
         harness.router.handleToolCall(call, "prompt", depth = 0, chainId = chainId)
-        assertNotNull(harness.confirmation.pendingCall)
+        assertNotNull(harness.confirmation.pendingAuthorization)
+        assertEquals(
+            harness.confirmation.pendingAuthorization?.token,
+            harness.uiState.pendingAgentToolAction.value?.id,
+        )
         harness.router.cancelPendingTool(call, chainId, "Tool confirmation cancelled")
         val artifact = harness.awaitArtifact()
 
@@ -169,6 +175,323 @@ class AgentToolRouterTraceTest {
     }
 
     @Test
+    fun safeToolJobIsTrackedUntilItFinishes() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val harness = newHarness(
+            executeTool = { _, _ ->
+                gate.await()
+                AgentToolResult(
+                    call = AgentToolCall("get_model_status"),
+                    success = true,
+                    summary = "done",
+                )
+            },
+        )
+        val chainId = harness.trace.beginChain("prompt")
+        harness.router.handleToolCall(
+            AgentToolCall("get_model_status"),
+            "prompt",
+            depth = 0,
+            chainId = chainId,
+        )
+
+        assertTrue(harness.router.hasActiveToolJobs(chainId))
+        gate.complete(Unit)
+        withTimeout(2_000) {
+            while (harness.router.hasActiveToolJobs(chainId)) delay(1)
+        }
+        assertFalse(harness.router.hasActiveToolJobs(chainId))
+    }
+
+    @Test
+    fun confirmedOwnedJobIsTrackedPerChain() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("confirmed prompt")
+        val job = harness.router.launchOwnedToolJob(chainId) {
+            gate.await()
+        }
+
+        assertTrue(harness.router.hasActiveToolJobs(chainId))
+        gate.complete(Unit)
+        job.join()
+        assertFalse(harness.router.hasActiveToolJobs(chainId))
+    }
+
+    @Test
+    fun safeCallbackRacingChatSwitchIsDiscardedAfterChainInvalidation() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val followUps = AtomicInteger(0)
+        val harness = newHarness(
+            followUps = followUps,
+            executeTool = { _, _ ->
+                gate.await()
+                AgentToolResult(
+                    call = AgentToolCall("get_model_status"),
+                    success = true,
+                    summary = "late safe result",
+                )
+            },
+        )
+        val chainId = harness.trace.beginChain("old chat")
+        harness.router.handleToolCall(
+            AgentToolCall("get_model_status"),
+            "old prompt",
+            depth = 0,
+            chainId = chainId,
+        )
+        assertTrue(harness.router.hasActiveToolJobs(chainId))
+
+        val claim = harness.router.claimChatTransition(abortReason = "chat switched")
+        assertNotNull(claim)
+        harness.switchChat("chat-2")
+        gate.complete(Unit)
+        withTimeout(2_000) {
+            while (harness.router.hasActiveToolJobs(chainId)) delay(1)
+        }
+        harness.router.joinInvalidatedChain(chainId)
+
+        assertEquals("chat-2", harness.currentChatId())
+        assertEquals(0, harness.resultAppends.get())
+        assertEquals(0, followUps.get())
+        val artifact = harness.awaitArtifact()
+        assertEquals("old chat", artifact.getString("prompt"))
+    }
+
+    @Test
+    fun confirmedCallbackRacingChatSwitchIsDiscardedAfterChainInvalidation() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val followUps = AtomicInteger(0)
+        val harness = newHarness(followUps = followUps)
+        val chainId = harness.trace.beginChain("old chat")
+        val job = harness.router.launchConfirmedToolJob(
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        ) {
+            gate.await()
+            if (harness.router.isCurrentOwner(chainId, "chat-1")) {
+                harness.router.appendOwnedToolResult(
+                    chainId = chainId,
+                    sourceChatId = "chat-1",
+                    result = AgentToolResult(
+                        call = AgentToolCall("rename_current_chat"),
+                        success = true,
+                        summary = "late confirmed result",
+                    ),
+                )
+                followUps.incrementAndGet()
+            }
+        }
+        assertTrue(harness.router.hasActiveToolJobs(chainId))
+
+        val claim = harness.router.claimChatTransition(abortReason = "chat switched")
+        assertNotNull(claim)
+        harness.switchChat("chat-2")
+        gate.complete(Unit)
+        harness.router.joinInvalidatedChain(chainId)
+        job.join()
+
+        assertEquals("chat-2", harness.currentChatId())
+        assertEquals(0, harness.resultAppends.get())
+        assertEquals(0, followUps.get())
+    }
+
+    @Test
+    fun pendingConfirmationUsesOpaqueTokenAndRejectsStaleConsumption() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("prompt")
+        val call = AgentToolCall("switch_model", JSONObject().put("model_id", "next-model"))
+
+        val authorization = harness.confirmation.stagePending(
+            call = call,
+            originalPrompt = "prompt",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )
+
+        assertNotNull(authorization)
+        assertTrue(authorization!!.token.isNotBlank())
+        assertNull(harness.confirmation.consumePending("stale-token"))
+        assertNotNull(harness.confirmation.consumePending(authorization.token))
+        assertNull(harness.confirmation.consumePending(authorization.token))
+        harness.confirmation.clearConsumedAuthorization(authorization)
+        val newer = harness.confirmation.stagePending(
+            call = call,
+            originalPrompt = "new prompt",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )
+        assertNotNull(newer)
+        assertEquals(newer!!.token, harness.confirmation.pendingAuthorization?.token)
+        harness.confirmation.clearMemory()
+        assertFalse(
+            harness.confirmation.isAuthorizationCurrent(
+                authorization,
+                activeChainId = chainId,
+                activeChatId = "chat-2",
+            ),
+        )
+
+        val staleAuthorization = harness.confirmation.stagePending(
+            call = call,
+            originalPrompt = "prompt",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )
+        assertNotNull(staleAuthorization)
+        harness.switchChat("chat-2")
+        assertNull(
+            harness.confirmation.consumePendingAndRevalidate(
+                token = staleAuthorization!!.token,
+                activeChainId = chainId,
+                activeChatId = "chat-2",
+            ),
+        )
+        assertNull(harness.confirmation.pendingAuthorization)
+    }
+
+    @Test
+    fun pendingConfirmationRejectsNullChainOwner() = runBlocking {
+        val harness = newHarness()
+        val call = AgentToolCall("switch_model", JSONObject().put("model_id", "next-model"))
+
+        assertNull(
+            harness.confirmation.stagePending(
+                call = call,
+                originalPrompt = "prompt",
+                depth = 0,
+                chainId = null,
+                sourceChatId = "chat-1",
+            ),
+        )
+        assertNull(harness.confirmation.pendingAuthorization)
+    }
+
+    @Test
+    fun staleTransitionTokenCannotClaimNewConfirmation() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("prompt")
+        val call = AgentToolCall("restore_previous_runtime_settings")
+        harness.router.handleToolCall(call, "prompt", depth = 0, chainId = chainId)
+        val token = harness.confirmation.pendingAuthorization?.token
+
+        assertNotNull(token)
+        assertNull(
+            harness.router.claimChatTransition(
+                expectedToken = "stale-token",
+                abortReason = "chat switched",
+            ),
+        )
+        assertEquals(chainId, harness.trace.activeChainId)
+
+        val claim = harness.router.claimChatTransition(
+            expectedToken = token,
+            abortReason = "chat switched",
+        )
+        assertNotNull(claim)
+        harness.router.joinInvalidatedChain(chainId)
+        val artifact = harness.awaitArtifact()
+        assertEquals("chat switched", artifact.getString("abort_reason"))
+    }
+
+    @Test
+    fun successfulConfirmedModelOperationLeavesChainForFollowUp() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("model switch")
+        assertTrue(harness.trace.preserveChainForCancellation(chainId))
+        assertFalse(harness.trace.finalizeStaleOwnedTrace(chainId, "model switch setup"))
+        assertTrue(harness.trace.releaseChainPreservation(chainId))
+
+        val call = AgentToolCall(
+            name = "switch_model",
+            arguments = JSONObject().put("model_id", "next-model"),
+        )
+        val result = AgentToolResult(call = call, success = true, summary = "switched")
+        assertTrue(
+            harness.router.completeConfirmedTool(
+                call = call,
+                result = result,
+                depth = 0,
+                maxIterations = 5,
+                chainId = chainId,
+            ),
+        )
+        assertEquals(chainId, harness.trace.activeChainId)
+        assertTrue(harness.artifacts.tryReceive().isFailure)
+    }
+
+    @Test
+    fun failedConfirmedModelOperationFinalizesAfterPreservation() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("model delete")
+        assertTrue(harness.trace.preserveChainForCancellation(chainId))
+        assertTrue(harness.trace.releaseChainPreservation(chainId))
+
+        val call = AgentToolCall(
+            name = "delete_model",
+            arguments = JSONObject().put("model_id", "old-model"),
+        )
+        val result = AgentToolResult(call = call, success = false, summary = "delete failed")
+        assertFalse(
+            harness.router.completeConfirmedTool(
+                call = call,
+                result = result,
+                depth = 0,
+                maxIterations = 5,
+                chainId = chainId,
+            ),
+        )
+        val artifact = harness.awaitArtifact()
+        assertFalse(artifact.getBoolean("success"))
+    }
+
+    @Test
+    fun successfulNonContinuingConfirmationFinalizesWithTerminalReason() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("prompt")
+        val call = AgentToolCall(
+            name = "run_benchmark",
+            arguments = JSONObject().put("preset_id", "coding"),
+        )
+        val result = AgentToolResult(call = call, success = true, summary = "queued")
+        assertFalse(
+            harness.router.completeConfirmedTool(
+                call = call,
+                result = result,
+                depth = 0,
+                maxIterations = 5,
+                chainId = chainId,
+            ),
+        )
+        val artifact = harness.awaitArtifact()
+        assertTrue(artifact.getBoolean("success"))
+        assertTrue(artifact.getString("abort_reason").contains("follow-up", ignoreCase = true))
+    }
+
+    @Test
+    fun restoreDiscardsPersistedConfirmationWithoutChainOwnership() {
+        val prefs = FakeSharedPreferences()
+        val confirmation = AgentToolConfirmation(
+            uiState = ServiceUiState(),
+            prefs = prefs,
+            currentChatId = { "chat-1" },
+            pendingActionKey = { "pending_$it" },
+            getDeviceProfile = { safeProfile() },
+        )
+        prefs.edit().putString(
+            "pending_chat-1",
+            """{"chatId":"chat-1","toolName":"restore_previous_runtime_settings","arguments":"{}","originalPrompt":"prompt","depth":0}""",
+        ).commit()
+
+        assertFalse(confirmation.restore())
+        assertNull(prefs.getString("pending_chat-1", null))
+        assertNull(confirmation.pendingAuthorization)
+    }
+
+    @Test
     fun staleAsyncToolCallbackCannotContaminateNewChain() = runBlocking {
         val gate = CompletableDeferred<Unit>()
         val followUps = AtomicInteger(0)
@@ -211,6 +534,8 @@ class AgentToolRouterTraceTest {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         scopes += scope
         val artifacts = Channel<JSONObject>(Channel.UNLIMITED)
+        val currentChatId = AtomicReference("chat-1")
+        val resultAppends = AtomicInteger(0)
         val trace = AgentTrace(
             uiState = uiState,
             filesDir = tempFolder.newFolder(),
@@ -220,7 +545,7 @@ class AgentToolRouterTraceTest {
         val confirmation = AgentToolConfirmation(
             uiState = uiState,
             prefs = FakeSharedPreferences(),
-            currentChatId = { null },
+            currentChatId = { currentChatId.get() },
             pendingActionKey = { "pending_$it" },
             getDeviceProfile = { safeProfile() },
         )
@@ -233,11 +558,27 @@ class AgentToolRouterTraceTest {
             clock = { 0L },
             executeTool = executeTool,
             onFollowUp = { _, _, _, _ -> followUps.incrementAndGet() },
-            onAppendTranscriptMessage = { _: TranscriptRole, _: String -> transcriptIds.incrementAndGet() },
+            onAppendTranscriptMessage = { role: TranscriptRole, text: String ->
+                transcriptIds.incrementAndGet()
+                if (role == TranscriptRole.TOOL && text.contains("status\":\"done\"")) {
+                    resultAppends.incrementAndGet()
+                }
+                transcriptIds.get()
+            },
             onPublishUiEvent = {},
             scope = scope,
+            currentChatId = { currentChatId.get() },
         )
-        return RouterHarness(trace, confirmation, router, artifacts)
+        return RouterHarness(
+            uiState = uiState,
+            trace = trace,
+            confirmation = confirmation,
+            router = router,
+            artifacts = artifacts,
+            currentChatId = { currentChatId.get() },
+            switchChat = { chatId -> currentChatId.set(chatId) },
+            resultAppends = resultAppends,
+        )
     }
 
     private suspend fun RouterHarness.awaitArtifact(): JSONObject =
@@ -260,10 +601,14 @@ class AgentToolRouterTraceTest {
     )
 
     private data class RouterHarness(
+        val uiState: ServiceUiState,
         val trace: AgentTrace,
         val confirmation: AgentToolConfirmation,
         val router: AgentToolRouter,
         val artifacts: Channel<JSONObject>,
+        val currentChatId: () -> String?,
+        val switchChat: (String) -> Unit,
+        val resultAppends: AtomicInteger,
     )
 }
 

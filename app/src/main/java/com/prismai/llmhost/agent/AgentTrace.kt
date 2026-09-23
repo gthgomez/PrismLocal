@@ -59,6 +59,7 @@ class AgentTrace(
     private val chainTokens = java.util.concurrent.atomic.AtomicInteger(0)
     private var nextChainId = 0L
     private var currentChainId: Long? = null
+    private val preservedChainIds = mutableSetOf<Long>()
 
     /** Monotonic owner token for the currently active agent chain, if any. */
     val activeChainId: Long? get() = synchronized(this) { currentChainId }
@@ -71,6 +72,7 @@ class AgentTrace(
         activeAgentChainPrompt = prompt
         activeAgentChainStartTime = startTime
         chainTokens.set(0)
+        preservedChainIds.clear()
         currentChainId = chainId
         return chainId
     }
@@ -79,6 +81,28 @@ class AgentTrace(
     @Synchronized
     fun isCurrentChain(chainId: Long?): Boolean =
         chainId == null || currentChainId == chainId
+
+    /** Holds a chain across an operation that must not turn native cancellation into chain failure. */
+    @Synchronized
+    fun preserveChainForCancellation(chainId: Long): Boolean {
+        if (currentChainId != chainId) return false
+        preservedChainIds += chainId
+        return true
+    }
+
+    @Synchronized
+    fun releaseChainPreservation(chainId: Long): Boolean =
+        preservedChainIds.remove(chainId)
+
+    /** Stale completion finalization that honors an active preservation hold. */
+    @Synchronized
+    fun finalizeStaleOwnedTrace(
+        chainId: Long,
+        abortReason: String? = null,
+    ): Boolean {
+        if (!isCurrentChain(chainId) || chainId in preservedChainIds) return false
+        return finalizeOwnedTrace(chainId, success = false, abortReason = abortReason)
+    }
 
     /** Live token count for the active agent chain; mutate only via [addChainTokens]. */
     val activeAgentChainTokens: Int get() = chainTokens.get()
@@ -122,6 +146,7 @@ class AgentTrace(
         abortReason: String? = null,
     ): Boolean {
         if (!isCurrentChain(chainId)) return false
+        preservedChainIds.remove(chainId)
         finalizeTrace(success = success, abortReason = abortReason)
         return true
     }
@@ -215,6 +240,7 @@ class AgentTrace(
         }
         activeAgentChainStartTime = 0L
         chainTokens.set(0)
+        currentChainId?.let(preservedChainIds::remove)
         currentChainId = null
     }
 
@@ -238,5 +264,6 @@ class AgentTrace(
         activeAgentChainStartTime = 0L
         chainTokens.set(0)
         currentChainId = null
+        preservedChainIds.clear()
     }
 }

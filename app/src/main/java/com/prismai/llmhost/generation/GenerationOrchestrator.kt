@@ -81,6 +81,7 @@ class GenerationOrchestrator(
     private val setReloadPending: (Boolean) -> Unit,
     /** Fired exactly once after a benchmark-preset generation fully completes/cleans up. */
     private val onBenchmarkComplete: () -> Unit = {},
+    private val onBeforeChatIdentityChange: (String) -> Unit = {},
 ) {
     companion object {
         private const val TAG = "GenOrchestrator"
@@ -116,6 +117,20 @@ class GenerationOrchestrator(
                     }
                 }
             }
+        }
+
+        internal fun resolveFollowUpChainOrAbort(
+            agentTrace: AgentTrace,
+            suppliedChainId: Long?,
+            modelAvailable: Boolean,
+        ): Long? {
+            val resolved = suppliedChainId ?: agentTrace.activeChainId
+            if (!modelAvailable) {
+                agentTrace.abortTrace(resolved, "Follow-up aborted: no model selected")
+                return null
+            }
+            return resolved
+        }
         }
     }
 
@@ -347,6 +362,8 @@ class GenerationOrchestrator(
 
     /** Continuation generation. Acquires [InferenceService]'s operation mutex via [com.prismai.llmhost.InferenceService.continueGenerationSafely]. */
     fun continueGeneration() {
+        val agentChainId = agentTrace.activeChainId
+        agentChainId?.let { agentTrace.releaseChainPreservation(it) }
         if (uiState.currentModel.value == null) {
             eventBus.publish("Select a model before continuing")
             return
@@ -385,7 +402,6 @@ class GenerationOrchestrator(
         metrics.activeSettings = settings
 
         val agentEnabled = settings.agentEnabled
-        val agentChainId = agentTrace.activeChainId
         val job = runGenerationFlow(
             session = session,
             enginePrompt = "",
@@ -445,9 +461,25 @@ class GenerationOrchestrator(
         depth: Int,
         chainId: Long? = null,
     ) {
-        if (uiState.currentModel.value == null) return
+        val modelAvailable = uiState.currentModel.value != null
+        if (!modelAvailable) {
+            resolveFollowUpChainOrAbort(
+                agentTrace = agentTrace,
+                suppliedChainId = chainId,
+                modelAvailable = false,
+            )
+            return
+        }
         val agentChainId = chainId ?: agentTrace.activeChainId
         if (agentChainId != null && !agentTrace.isCurrentChain(agentChainId)) return
+        // Reserve the chat identity before any follow-up setup or transcript
+        // append. Chat transitions must either see this reservation or make
+        // the chain owner check fail before the append below.
+        uiState._isGenerating.value = true
+        if (agentChainId != null && !agentTrace.isCurrentChain(agentChainId)) {
+            uiState._isGenerating.value = false
+            return
+        }
         val session = incrementSession()
         val settings = uiState.generationSettings.value.clamped()
 
@@ -469,6 +501,7 @@ class GenerationOrchestrator(
                 TranscriptRole.ASSISTANT,
                 "⚠️ Agent follow-up aborted: $reason. Stopping execution to protect device resources.",
             )
+            uiState._isGenerating.value = false
             return
         }
 
@@ -476,7 +509,6 @@ class GenerationOrchestrator(
         val assistantMessageId = chatManager.appendTranscriptMessage(TranscriptRole.ASSISTANT, "")
         chatManager.activeAssistantTranscriptId = assistantMessageId
         uiState.streamState.beginGeneration()
-        uiState._isGenerating.value = true
         uiState._runtimeStatus.value = RuntimeStatus.GENERATING
         onStartForeground()
 
@@ -723,9 +755,8 @@ class GenerationOrchestrator(
                         } else {
                             "Generation superseded"
                         }
-                        agentTrace.finalizeOwnedTrace(
+                        agentTrace.finalizeStaleOwnedTrace(
                             chainId = agentChainId,
-                            success = false,
                             abortReason = abortReason,
                         )
                     }
@@ -834,6 +865,7 @@ class GenerationOrchestrator(
         }
 
     private suspend fun startBenchmarkChat(name: String) {
+        onBeforeChatIdentityChange("Benchmark chat changed")
         chatManager.createChatInternal("Benchmark - $name", publishEvent = false)
         runCatching { engine.resetConversation() }
     }

@@ -740,8 +740,8 @@ fun ChatScreen(
                         pendingAgentToolAction?.let { action ->
                             AgentToolConfirmationDialog(
                                 action = action,
-                                onConfirm = { service?.confirmPendingAgentTool() },
-                                onDismiss = { service?.cancelPendingAgentTool() },
+                                onConfirm = { service?.confirmPendingAgentTool(action.id) },
+                                onDismiss = { service?.cancelPendingAgentTool(action.id) },
                             )
                         }
                     }

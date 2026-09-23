@@ -116,6 +116,22 @@ class AgentTraceContinuationTest {
     }
 
     @Test
+    fun continuationPreservationSuppressesStaleFinalizationUntilReleased() = runBlocking {
+        val harness = newActiveTrace()
+        val chainId = harness.trace.beginChain("continuation chain")
+
+        assertTrue(harness.trace.preserveChainForCancellation(chainId))
+        assertFalse(harness.trace.finalizeStaleOwnedTrace(chainId, "stale completion"))
+        assertEquals(chainId, harness.trace.activeChainId)
+
+        assertTrue(harness.trace.releaseChainPreservation(chainId))
+        assertTrue(harness.trace.finalizeStaleOwnedTrace(chainId, "stale completion"))
+        val artifact = withTimeout(2_000) { harness.artifacts.receive() }
+        assertFalse(artifact.getBoolean("success"))
+        assertEquals("stale completion", artifact.getString("abort_reason"))
+    }
+
+    @Test
     fun persistedArtifactIncludesTotalChainTokens() = runBlocking {
         val harness = newActiveTrace()
         val chainId = harness.trace.beginChain("prompt")

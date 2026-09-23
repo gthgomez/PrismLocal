@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-09-23T13:18:15Z",
+  "generatedAt": "2026-09-23T14:02:54Z",
   "git": {
-    "head": "23f44bc74fa9300e17fc64450a43911e061faff7",
+    "head": "f833710ebafbbb82e3c46f41a83213642146838d",
     "branch": "feat/inference-correctness-p0",
     "porcelain": [],
     "submodules": [
@@ -12,10 +12,10 @@
   "llamaCppGitlink": "160000 commit bbeb89d76c41bc250f16e4a6fefcc9b530d6e3f3\tapp/src/main/cpp/third_party/llama.cpp",
   "localPatchSha256": "5697e97d9085bfbb968909c648c3f95596a298d2c02683ee8b0c145da7b4b5af",
   "toolchain": {
-    "java": "java version \"17.0.1\" 2021-10-19 LTS",
-    "cmake": "cmake version 4.0.2",
+    "java": "openjdk version \"17.0.20\" 2026-07-21",
+    "cmake": "cmake version 3.22.1",
     "ninja": null,
-    "gradleWrapper": "https/://services.gradle.org/distributions/gradle-9.4.1-bin.zip"
+    "gradleWrapper": "https\\://services.gradle.org/distributions/gradle-9.4.1-bin.zip"
   },
   "buildInputsSha256": {
     "app/build.gradle.kts": "0c0f39c84bb0315c2e4c955a18069267386dc5e394a77107123ea23ad80b100c",

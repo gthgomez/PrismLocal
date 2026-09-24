@@ -103,6 +103,46 @@ class InferenceLifecycleCoordinatorTest {
     }
 
     @Test(timeout = 2_000)
+    fun nestedTransitionShutdownSuppressesMutationAndReturnsFailedOutcome() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val coordinator = InferenceLifecycleCoordinator(scope)
+        val cleanupStarted = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
+        val mutationCalled = CompletableDeferred<Unit>()
+        val nestedOutcome = CompletableDeferred<ChatTransitionOutcome>()
+
+        val admission = async {
+            coordinator.runGenerationAdmission {
+                coordinator.requestAndAwaitChatTransition(
+                    cleanup = {
+                        cleanupStarted.complete(Unit)
+                        withContext(NonCancellable) {
+                            releaseCleanup.await()
+                        }
+                    },
+                    mutation = {
+                        mutationCalled.complete(Unit)
+                        ChatTransitionOutcome.Applied
+                    },
+                ).also { nestedOutcome.complete(it) }
+            }
+        }
+        withTimeout(500) { cleanupStarted.await() }
+
+        val stopped = withTimeout(500) {
+            coordinator.closeAndJoin(drainTimeoutMs = 50L, cancelTimeoutMs = 100L)
+        }
+        assertFalse(stopped)
+        assertFalse(mutationCalled.isCompleted)
+
+        releaseCleanup.complete(Unit)
+        assertTrue(withTimeout(500) { nestedOutcome.await() } is ChatTransitionOutcome.Failed)
+        assertFalse(mutationCalled.isCompleted)
+        assertTrue(runCatching { admission.await() }.isFailure)
+        scope.cancel()
+    }
+
+    @Test(timeout = 2_000)
     fun closeAndJoinWaitsForQueuedTransitionToDrain() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val coordinator = InferenceLifecycleCoordinator(scope)

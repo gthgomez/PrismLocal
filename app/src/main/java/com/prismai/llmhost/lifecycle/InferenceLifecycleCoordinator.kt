@@ -6,6 +6,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -61,9 +62,13 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
         if (currentCoroutineContext()[LifecycleActorContext]?.coordinator === this) {
             return try {
                 cleanup()
+                currentCoroutineContext().ensureActive()
                 mutation()
             } catch (failure: kotlinx.coroutines.CancellationException) {
-                throw failure
+                if (currentCoroutineContext().isActive) {
+                    throw failure
+                }
+                ChatTransitionOutcome.Failed(TRANSITION_FAILURE_REASON, failure)
             } catch (failure: Throwable) {
                 ChatTransitionOutcome.Failed(TRANSITION_FAILURE_REASON, failure)
             }
@@ -172,6 +177,8 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
                     completion.complete(
                         withContext(LifecycleActorContext(this@InferenceLifecycleCoordinator)) {
                             (command.block as suspend () -> Any?)()
+                        }.also {
+                            currentCoroutineContext().ensureActive()
                         },
                     )
                 } catch (failure: Throwable) {

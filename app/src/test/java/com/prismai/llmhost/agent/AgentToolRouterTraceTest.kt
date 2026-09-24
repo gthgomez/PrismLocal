@@ -575,11 +575,24 @@ class AgentToolRouterTraceTest {
             }
         }
         appendEntered.await()
-        val replacement = async(Dispatchers.Default) { harness.trace.beginChain("new") }
+        val replacementStarted = CompletableDeferred<Thread>()
+        val replacement = async(Dispatchers.Default) {
+            replacementStarted.complete(Thread.currentThread())
+            harness.trace.beginChain("new")
+        }
 
-        delay(50)
-        assertFalse(replacement.isCompleted)
-        releaseAppend.complete(Unit)
+        val replacementThread = replacementStarted.await()
+        try {
+            withTimeout(1_500) {
+                while (!replacement.isCompleted && replacementThread.state != Thread.State.BLOCKED) {
+                    delay(1)
+                }
+                assertTrue(replacementThread.state == Thread.State.BLOCKED)
+                assertFalse(replacement.isCompleted)
+            }
+        } finally {
+            releaseAppend.complete(Unit)
+        }
         assertTrue(append.await())
         assertEquals(2L, replacement.await())
         assertEquals(2L, harness.trace.activeChainId)

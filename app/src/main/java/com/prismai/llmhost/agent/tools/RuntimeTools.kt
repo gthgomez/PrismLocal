@@ -16,7 +16,7 @@ import org.json.JSONObject
 class RuntimeTools(
     private val uiState: ServiceUiState,
     private val deviceProfiler: DeviceProfiler,
-    private val onUpdateSettings: (GenerationSettings) -> Unit,
+    private val onUpdateSettings: suspend (GenerationSettings) -> Unit,
     private val onContinueGeneration: () -> Unit,
     private val onCancelGeneration: () -> Unit,
     private val onCancelImport: () -> Unit,
@@ -30,7 +30,7 @@ class RuntimeTools(
     private val importState: () -> ImportState,
     private val modelDownloadState: () -> ModelDownloadState,
 ) {
-    fun setRuntimeSettings(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+    suspend fun setRuntimeSettings(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Runtime settings change requires confirmation")
         val before = uiState.generationSettings.value.clamped()
         val requested = FormatUtils.proposedRuntimeSettings(call.arguments, before)
@@ -56,7 +56,7 @@ class RuntimeTools(
                 .put("warnings", JSONArray(validation.second)))
     }
 
-    fun restorePreviousRuntimeSettings(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+    suspend fun restorePreviousRuntimeSettings(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Restore requires confirmation")
         val previous = getPreviousSettings()
             ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "No previous runtime settings snapshot is available")

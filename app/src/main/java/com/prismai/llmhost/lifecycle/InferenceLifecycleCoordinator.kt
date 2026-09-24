@@ -28,9 +28,9 @@ sealed interface ChatTransitionOutcome {
 /**
  * Serializes chat transitions and generation admission through one actor queue.
  *
- * A transition's cleanup and mutation run in enqueue order. Generation
- * admission runs only for the admission/start section of a generation; it does
- * not own native generation execution.
+ * Awaited commands remember the caller's Job only until the actor starts the
+ * command. Cancellation before that linearization point removes the command;
+ * cancellation after it cannot interrupt an already-admitted mutation.
  */
 class InferenceLifecycleCoordinator(scope: CoroutineScope) {
     private val commands = Channel<Command>(capacity = Channel.UNLIMITED)
@@ -48,12 +48,19 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
                 }
             }
         }
+        actorJob.invokeOnCompletion { failPendingCommands() }
     }
 
     fun requestChatTransition(
         cleanup: suspend () -> Unit,
         mutation: suspend () -> ChatTransitionOutcome,
-    ): ChatTransitionRequestResult = enqueueTransition(cleanup, mutation).requestResult
+        onOutcome: (ChatTransitionOutcome) -> Unit = {},
+    ): ChatTransitionRequestResult = enqueueTransition(
+        cleanup = cleanup,
+        mutation = mutation,
+        callerJob = null,
+        onOutcome = onOutcome,
+    ).requestResult
 
     suspend fun requestAndAwaitChatTransition(
         cleanup: suspend () -> Unit,
@@ -64,16 +71,19 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
                 cleanup()
                 currentCoroutineContext().ensureActive()
                 mutation()
-            } catch (failure: kotlinx.coroutines.CancellationException) {
-                if (currentCoroutineContext().isActive) {
-                    throw failure
-                }
+            } catch (failure: CancellationException) {
+                if (currentCoroutineContext().isActive) throw failure
                 ChatTransitionOutcome.Failed(TRANSITION_FAILURE_REASON, failure)
             } catch (failure: Throwable) {
                 ChatTransitionOutcome.Failed(TRANSITION_FAILURE_REASON, failure)
             }
         }
-        val submission = enqueueTransition(cleanup, mutation)
+        val submission = enqueueTransition(
+            cleanup = cleanup,
+            mutation = mutation,
+            callerJob = currentCoroutineContext()[Job],
+            onOutcome = {},
+        )
         return when (val requestResult = submission.requestResult) {
             ChatTransitionRequestResult.Queued -> submission.completion!!.await()
             is ChatTransitionRequestResult.Rejected -> ChatTransitionOutcome.Rejected(requestResult.reason)
@@ -81,12 +91,17 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
     }
 
     suspend fun <T> runGenerationAdmission(block: suspend () -> T): T {
+        currentCoroutineContext().ensureActive()
         val completion = CompletableDeferred<T>()
+        val command = Command.GenerationAdmission(
+            block = block,
+            completion = completion,
+            callerJob = currentCoroutineContext()[Job],
+        )
+        bindCaller(command)
         synchronized(stateLock) {
             check(acceptingRequests) { CLOSED_REASON }
-            check(commands.trySend(Command.GenerationAdmission(block, completion)).isSuccess) {
-                CLOSED_REASON
-            }
+            check(commands.trySend(command).isSuccess) { CLOSED_REASON }
         }
         return completion.await()
     }
@@ -140,24 +155,45 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
     private fun enqueueTransition(
         cleanup: suspend () -> Unit,
         mutation: suspend () -> ChatTransitionOutcome,
+        callerJob: Job?,
+        onOutcome: (ChatTransitionOutcome) -> Unit,
     ): TransitionSubmission {
         val completion = CompletableDeferred<ChatTransitionOutcome>()
-        val command = Command.ChatTransition(cleanup, mutation, completion)
+        val command = Command.ChatTransition(cleanup, mutation, completion, callerJob, onOutcome)
+        bindCaller(command)
         return synchronized(stateLock) {
             if (!acceptingRequests) {
+                val outcome = ChatTransitionOutcome.Rejected(CLOSED_REASON)
+                completeTransition(command, outcome)
                 TransitionSubmission(ChatTransitionRequestResult.Rejected(CLOSED_REASON), null)
+            } else if (commands.trySend(command).isSuccess) {
+                TransitionSubmission(ChatTransitionRequestResult.Queued, completion)
             } else {
-                val sent = commands.trySend(command).isSuccess
-                if (sent) {
-                    TransitionSubmission(ChatTransitionRequestResult.Queued, completion)
-                } else {
-                    TransitionSubmission(ChatTransitionRequestResult.Rejected(CLOSED_REASON), null)
-                }
+                val outcome = ChatTransitionOutcome.Rejected(CLOSED_REASON)
+                completeTransition(command, outcome)
+                TransitionSubmission(ChatTransitionRequestResult.Rejected(CLOSED_REASON), null)
+            }
+        }
+    }
+
+    /**
+     * Cancellation is a pre-start skip, not an actor cancellation. The small
+     * command gate makes the start/cancel order explicit and race-free.
+     */
+    private fun bindCaller(command: Command) {
+        val caller = command.callerJob ?: return
+        caller.invokeOnCompletion { cause ->
+            if (command.cancelBeforeStart()) {
+                failCommand(command, cause ?: CancellationException(CALLER_CANCEL_REASON))
             }
         }
     }
 
     private suspend fun execute(command: Command) {
+        if (command.markStartedAndCheckCancellation()) {
+            failCommand(command, CancellationException(CALLER_CANCEL_REASON))
+            return
+        }
         when (command) {
             is Command.ChatTransition -> {
                 val outcome = try {
@@ -167,7 +203,7 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
                 } catch (failure: Throwable) {
                     ChatTransitionOutcome.Failed(TRANSITION_FAILURE_REASON, failure)
                 }
-                command.completion.complete(outcome)
+                completeTransition(command, outcome)
             }
 
             is Command.GenerationAdmission<*> -> {
@@ -188,12 +224,17 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
         }
     }
 
+    private fun completeTransition(command: Command.ChatTransition, outcome: ChatTransitionOutcome) {
+        command.completion.complete(outcome)
+        runCatching { command.onOutcome(outcome) }
+    }
+
     private fun failCommand(command: Command, failure: Throwable) {
         when (command) {
-            is Command.ChatTransition -> {
-                command.completion.complete(ChatTransitionOutcome.Failed(TRANSITION_FAILURE_REASON, failure))
-            }
-
+            is Command.ChatTransition -> completeTransition(
+                command,
+                ChatTransitionOutcome.Failed(TRANSITION_FAILURE_REASON, failure),
+            )
             is Command.GenerationAdmission<*> -> {
                 @Suppress("UNCHECKED_CAST")
                 (command.completion as CompletableDeferred<Any?>).completeExceptionally(failure)
@@ -206,17 +247,36 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
         val completion: CompletableDeferred<ChatTransitionOutcome>?,
     )
 
-    private sealed interface Command {
-        data class ChatTransition(
+    private sealed class Command(val callerJob: Job?) {
+        private val gate = Any()
+        private var started = false
+        private var cancelledBeforeStart = false
+
+        fun markStartedAndCheckCancellation(): Boolean = synchronized(gate) {
+            if (cancelledBeforeStart) return true
+            started = true
+            false
+        }
+
+        fun cancelBeforeStart(): Boolean = synchronized(gate) {
+            if (started) return false
+            cancelledBeforeStart = true
+            true
+        }
+
+        class ChatTransition(
             val cleanup: suspend () -> Unit,
             val mutation: suspend () -> ChatTransitionOutcome,
             val completion: CompletableDeferred<ChatTransitionOutcome>,
-        ) : Command
+            callerJob: Job?,
+            val onOutcome: (ChatTransitionOutcome) -> Unit,
+        ) : Command(callerJob)
 
-        data class GenerationAdmission<T>(
+        class GenerationAdmission<T>(
             val block: suspend () -> T,
             val completion: CompletableDeferred<T>,
-        ) : Command
+            callerJob: Job?,
+        ) : Command(callerJob)
     }
 
     private class LifecycleActorContext(
@@ -228,6 +288,7 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
     private companion object {
         const val CLOSED_REASON = "Inference lifecycle coordinator is closed"
         const val ACTOR_CANCEL_REASON = "Inference lifecycle coordinator drained after timeout"
+        const val CALLER_CANCEL_REASON = "Lifecycle command cancelled before admission"
         const val TRANSITION_FAILURE_REASON = "Chat transition failed"
         const val DEFAULT_DRAIN_TIMEOUT_MS = 1_000L
         const val DEFAULT_CANCEL_TIMEOUT_MS = 1_000L

@@ -6,6 +6,7 @@ import com.prismai.llmhost.GenerationSettings
 import com.prismai.llmhost.TranscriptRole
 import com.prismai.llmhost.service.hasPendingConfirmationWork
 import com.prismai.llmhost.tools.AgentToolCall
+import com.prismai.llmhost.tools.AgentToolRegistry
 import com.prismai.llmhost.tools.AgentToolResult
 import com.prismai.llmhost.ui.ServiceUiState
 import kotlinx.coroutines.CompletableDeferred
@@ -353,6 +354,42 @@ class AgentToolRouterTraceTest {
         assertEquals("old chat", artifact.getString("prompt"))
     }
 
+    @Test(timeout = 2_000)
+    fun appendRechecksSourceChatAfterWaitingForTraceOwnership() = runBlocking {
+        val traceEntered = CompletableDeferred<Unit>()
+        val releaseTrace = CompletableDeferred<Unit>()
+        val firstChatRead = CompletableDeferred<Unit>()
+        val harness = newHarness(onCurrentChatRead = { firstChatRead.complete(Unit) })
+        val chainId = harness.trace.beginChain("old chat")
+
+        val traceHolder = async(Dispatchers.Default) {
+            harness.trace.withCurrentChain(chainId) {
+                traceEntered.complete(Unit)
+                runBlocking { releaseTrace.await() }
+            }
+        }
+        traceEntered.await()
+
+        val append = async(Dispatchers.Default) {
+            harness.router.appendOwnedToolResult(
+                chainId = chainId,
+                sourceChatId = "chat-1",
+                result = AgentToolResult(
+                    call = AgentToolCall("get_model_status"),
+                    success = true,
+                    summary = "stale result",
+                ),
+            )
+        }
+        withTimeout(500) { firstChatRead.await() }
+        harness.switchChat("chat-2")
+        releaseTrace.complete(Unit)
+        traceHolder.await()
+
+        assertFalse(append.await())
+        assertEquals(0, harness.resultAppends.get())
+    }
+
     @Test
     fun confirmedCallbackRacingChatSwitchIsDiscardedAfterChainInvalidation() = runBlocking {
         val gate = CompletableDeferred<Unit>()
@@ -475,6 +512,37 @@ class AgentToolRouterTraceTest {
         assertNull(harness.confirmation.pendingAuthorization)
         assertNull(harness.uiState.pendingAgentToolAction.value)
         assertNotNull(oldAuthorization.token)
+    }
+
+    @Test
+    fun wrongSourceChatDiscardPreservesNewerUiCardAndToken() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("prompt")
+        harness.router.handleToolCall(
+            call = AgentToolCall("switch_model", JSONObject().put("model_id", "model-a")),
+            originalPrompt = "prompt",
+            depth = 0,
+            chainId = chainId,
+        )
+        val oldToken = harness.confirmation.pendingAuthorization!!.token
+        val newChain = harness.trace.beginChain("new prompt")
+        val newer = harness.confirmation.stagePending(
+            call = AgentToolCall("switch_model", JSONObject().put("model_id", "model-b")),
+            originalPrompt = "new prompt",
+            depth = 0,
+            chainId = newChain,
+            sourceChatId = "chat-1",
+        )!!
+        harness.uiState._pendingAgentToolAction.value = harness.confirmation.build(
+            id = newer.token,
+            call = newer.call,
+            definition = AgentToolRegistry.find(newer.call.name)!!,
+        )
+
+        assertFalse(harness.confirmation.discardAuthorizationForChain(newChain, "chat-2"))
+        assertEquals(newer.token, harness.confirmation.pendingAuthorization?.token)
+        assertEquals(newer.token, harness.uiState.pendingAgentToolAction.value?.id)
+        assertTrue(newer.token != oldToken)
     }
 
     @Test
@@ -707,6 +775,7 @@ class AgentToolRouterTraceTest {
         executeTool: suspend (AgentToolCall, Boolean) -> AgentToolResult = { call, _ ->
             AgentToolResult(call = call, success = true, summary = "ok")
         },
+        onCurrentChatRead: () -> Unit = {},
     ): RouterHarness {
         val uiState = ServiceUiState()
         uiState._generationSettings.value = GenerationSettings(maxAgentIterations = 5)
@@ -736,7 +805,7 @@ class AgentToolRouterTraceTest {
             getCachedProfile = { safeProfile() },
             clock = { 0L },
             executeTool = executeTool,
-            onFollowUp = { _, _, _, _ -> followUps.incrementAndGet() },
+            onFollowUp = { _, _, _, _, _ -> followUps.incrementAndGet() },
             onAppendTranscriptMessage = { role: TranscriptRole, text: String ->
                 transcriptIds.incrementAndGet()
                 if (role == TranscriptRole.TOOL && text.contains("status\":\"done\"")) {
@@ -746,7 +815,10 @@ class AgentToolRouterTraceTest {
             },
             onPublishUiEvent = {},
             scope = scope,
-            currentChatId = { currentChatId.get() },
+            currentChatId = {
+                onCurrentChatRead()
+                currentChatId.get()
+            },
         )
         return RouterHarness(
             uiState = uiState,

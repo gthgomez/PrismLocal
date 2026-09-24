@@ -19,6 +19,25 @@ class AgentActivityTrackerTest {
     }
 
     @Test
+    fun everyMethodRejectsZeroAndNegativeIds() {
+        val tracker = AgentActivityTracker()
+        listOf(0L, -1L).forEach { id ->
+            assertFails { tracker.markFollowUp(id) }
+            assertFails { tracker.clearFollowUp(id) }
+            assertFails { tracker.hasFollowUp(id) }
+        }
+    }
+
+    private fun assertFails(block: () -> Unit) {
+        try {
+            block()
+        } catch (_: IllegalArgumentException) {
+            return
+        }
+        throw AssertionError("Expected invalid chain ID")
+    }
+
+    @Test
     fun idempotentMarkAndClearDoNotClobberOtherOwners() {
         val tracker = AgentActivityTracker()
         tracker.markFollowUp(7L)

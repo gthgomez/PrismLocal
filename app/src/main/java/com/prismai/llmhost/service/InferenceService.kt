@@ -411,8 +411,8 @@ class InferenceService : Service() {
             confirmation = agentToolConfirmation,
             getCachedProfile = { deviceProfiler.getCachedProfile() },
             executeTool = { call, confirmed -> executeAgentTool(call, confirmed) },
-            onFollowUp = { prompt, result, depth, chainId ->
-                startAgentFollowUpGeneration(prompt, result, depth, chainId)
+            onFollowUp = { prompt, result, depth, chainId, sourceChatId ->
+                startAgentFollowUpGeneration(prompt, result, depth, chainId, sourceChatId)
             },
             onAppendTranscriptMessage = { role, text -> appendTranscriptMessage(role, text) },
             onPublishUiEvent = { msg -> publishUiEvent(msg) },
@@ -738,7 +738,8 @@ class InferenceService : Service() {
         }
         val transition = claimAgentChatTransition("Chat changed before tool confirmation")
             ?: return ChatTransitionRequestResult.Rejected("Chat transition could not be claimed")
-        return coordinator.requestChatTransition(
+        return requestPublicChatTransition(
+            operation = "create chat",
             cleanup = { cleanupAgentChatTransition(transition) },
             mutation = {
                 if (_isGenerating.value) {
@@ -751,6 +752,30 @@ class InferenceService : Service() {
             },
         )
     }
+
+    private fun requestPublicChatTransition(
+        operation: String,
+        cleanup: suspend () -> Unit,
+        mutation: suspend () -> ChatTransitionOutcome,
+    ): ChatTransitionRequestResult = coordinator.requestChatTransition(
+        cleanup = cleanup,
+        mutation = mutation,
+        onOutcome = { outcome ->
+            when (outcome) {
+                ChatTransitionOutcome.Applied -> Unit
+                is ChatTransitionOutcome.Rejected -> {
+                    val message = "Chat transition $operation rejected: ${outcome.reason}"
+                    Log.w(TAG, message)
+                    publishUiEvent(message)
+                }
+                is ChatTransitionOutcome.Failed -> {
+                    val message = "Chat transition $operation failed: ${outcome.reason}"
+                    Log.w(TAG, message, outcome.cause)
+                    publishUiEvent(message)
+                }
+            }
+        },
+    )
 
     private fun ensureChatForGenerationBlocking() {
         if (_currentChatId.value == null) {
@@ -796,7 +821,8 @@ class InferenceService : Service() {
         }
         val transition = claimAgentChatTransition("Chat changed before tool confirmation")
             ?: return ChatTransitionRequestResult.Rejected("Chat transition could not be claimed")
-        return coordinator.requestChatTransition(
+        return requestPublicChatTransition(
+            operation = "switch chat",
             cleanup = { cleanupAgentChatTransition(transition) },
             mutation = {
                 if (_isGenerating.value) {
@@ -821,7 +847,8 @@ class InferenceService : Service() {
         }
         val transition = claimAgentChatTransition("Chat deleted before tool confirmation")
             ?: return ChatTransitionRequestResult.Rejected("Chat transition could not be claimed")
-        return coordinator.requestChatTransition(
+        return requestPublicChatTransition(
+            operation = "delete chat",
             cleanup = { cleanupAgentChatTransition(transition) },
             mutation = {
                 if (_isGenerating.value) {
@@ -842,7 +869,8 @@ class InferenceService : Service() {
         }
         val transition = claimAgentChatTransition("Transcript cleared before tool confirmation")
             ?: return ChatTransitionRequestResult.Rejected("Chat transition could not be claimed")
-        return coordinator.requestChatTransition(
+        return requestPublicChatTransition(
+            operation = "clear transcript",
             cleanup = { cleanupAgentChatTransition(transition) },
             mutation = {
                 if (_isGenerating.value) {
@@ -1618,17 +1646,33 @@ class InferenceService : Service() {
         toolResult: AgentToolResult,
         depth: Int,
         chainId: Long? = null,
+        sourceChatId: String? = null,
     ) {
         val ownerChainId = chainId ?: agentTrace.activeChainId ?: return
+        val ownerChatId = sourceChatId ?: _currentChatId.value ?: return
         agentActivityTracker.markFollowUp(ownerChainId)
-        serviceScope.launch {
-            try {
+        val followUpJob = serviceScope.launch {
+            coordinator.runGenerationAdmission {
                 operationMutex.withLock {
-                    generationOrchestrator.startFollowUp(originalPrompt, toolResult, depth, ownerChainId)
+                    // This is the admission linearization point. A transition
+                    // that claimed this chain before the command runs has
+                    // already changed the chat and is rejected here; one that
+                    // arrives later observes the follow-up generation state.
+                    if (agentToolRouter.isCurrentOwner(ownerChainId, ownerChatId)) {
+                        generationOrchestrator.startFollowUp(
+                            originalPrompt,
+                            toolResult,
+                            depth,
+                            ownerChainId,
+                        )
+                    }
                 }
-            } finally {
-                agentActivityTracker.clearFollowUp(ownerChainId)
             }
+        }
+        // Do not clear the marker in the launching coroutine: cancellation
+        // after actor admission must not make an admitted follow-up invisible.
+        followUpJob.invokeOnCompletion {
+            agentActivityTracker.clearFollowUp(ownerChainId)
         }
     }
 

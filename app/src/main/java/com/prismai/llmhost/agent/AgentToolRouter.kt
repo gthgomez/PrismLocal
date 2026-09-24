@@ -35,7 +35,7 @@ class AgentToolRouter(
     private val getCachedProfile: () -> DeviceCapabilityProfile,
     private val clock: () -> Long = { SystemClock.elapsedRealtime() },
     private val executeTool: suspend (AgentToolCall, Boolean) -> AgentToolResult,
-    private val onFollowUp: (String, AgentToolResult, Int, Long?) -> Unit,
+    private val onFollowUp: (String, AgentToolResult, Int, Long?, String?) -> Unit,
     private val onAppendTranscriptMessage: (TranscriptRole, String) -> Long,
     private val onPublishUiEvent: (String) -> Unit,
     private val scope: CoroutineScope,
@@ -295,9 +295,17 @@ class AgentToolRouter(
         text: String,
     ): Boolean {
         if (currentChatId() != sourceChatId) return false
-        return agentTrace.withCurrentChain(chainId ?: return false) {
-            onAppendTranscriptMessage(role, text)
+        var appended = false
+        val chainOwned = agentTrace.withCurrentChain(chainId ?: return false) {
+            // The first chat check is only an early rejection. Recheck while
+            // holding the same monitor as beginChain, immediately before the
+            // append, so a transition cannot switch chats in this window.
+            if (currentChatId() == sourceChatId) {
+                onAppendTranscriptMessage(role, text)
+                appended = true
+            }
         }
+        return chainOwned && appended
     }
 
     // ── Main routing entry point ────────────────────────────────────────
@@ -532,7 +540,7 @@ class AgentToolRouter(
                     if (!isCurrentOwner(chainId, sourceChatId)) return@toolJob
                     val maxIter = uiState.generationSettings.value.maxAgentIterations
                     if (depth + 1 < maxIter) {
-                        onFollowUp(originalPrompt, result, depth + 1, chainId)
+                        onFollowUp(originalPrompt, result, depth + 1, chainId, sourceChatId)
                     } else {
                         failTrace(chainId, "Tool loop stopped after $maxIter steps")
                     }

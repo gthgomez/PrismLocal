@@ -2,6 +2,7 @@ package com.prismai.llmhost.lifecycle
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
@@ -214,6 +215,132 @@ class InferenceLifecycleCoordinatorTest {
         assertFalse(mutationCalled.isCompleted)
         assertTrue(withTimeout(500) { transition.await() } is ChatTransitionOutcome.Failed)
         scope.cancel()
+    }
+
+    @Test(timeout = 2_000)
+    fun callerCancellationBeforeActorStartSkipsQueuedAdmission() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val coordinator = InferenceLifecycleCoordinator(scope)
+        val actorBlocked = CompletableDeferred<Unit>()
+        val releaseActor = CompletableDeferred<Unit>()
+        val admitted = AtomicBoolean(false)
+        coordinator.requestChatTransition(
+            cleanup = {
+                actorBlocked.complete(Unit)
+                releaseActor.await()
+            },
+            mutation = { ChatTransitionOutcome.Applied },
+        )
+        actorBlocked.await()
+
+        val caller = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.runGenerationAdmission { admitted.set(true) }
+        }
+        caller.cancel()
+        caller.join()
+        releaseActor.complete(Unit)
+
+        assertTrue(runCatching { caller.await() }.isFailure)
+        assertFalse(admitted.get())
+        coordinator.close()
+        scope.cancel()
+    }
+
+    @Test(timeout = 2_000)
+    fun callerCancellationAfterActorStartCannotInterruptAdmission() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val coordinator = InferenceLifecycleCoordinator(scope)
+        val actorStarted = CompletableDeferred<Unit>()
+        val releaseActor = CompletableDeferred<Unit>()
+        val completed = AtomicBoolean(false)
+        val caller = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.runGenerationAdmission {
+                actorStarted.complete(Unit)
+                releaseActor.await()
+                completed.set(true)
+            }
+        }
+        withTimeout(500) { actorStarted.await() }
+        caller.cancel()
+        releaseActor.complete(Unit)
+
+        assertTrue(runCatching { caller.await() }.isFailure)
+        withTimeout(500) { while (!completed.get()) yield() }
+        assertTrue(completed.get())
+        coordinator.close()
+        scope.cancel()
+    }
+
+    @Test(timeout = 2_000)
+    fun publicTransitionObserverReceivesRejectedOutcomeWithoutChangingRequestResult() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val coordinator = InferenceLifecycleCoordinator(scope)
+        val outcomes = mutableListOf<ChatTransitionOutcome>()
+        val result = coordinator.requestChatTransition(
+            cleanup = {},
+            mutation = { ChatTransitionOutcome.Rejected("busy") },
+            onOutcome = { synchronized(outcomes) { outcomes += it } },
+        )
+        assertEquals(ChatTransitionRequestResult.Queued, result)
+        withTimeout(500) { while (synchronized(outcomes) { outcomes.isEmpty() }) yield() }
+        assertEquals(listOf<ChatTransitionOutcome>(ChatTransitionOutcome.Rejected("busy")), outcomes)
+        coordinator.close()
+        scope.cancel()
+    }
+
+    @Test(timeout = 2_000)
+    fun followUpAdmissionAndLaterTransitionRemainOrdered() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val coordinator = InferenceLifecycleCoordinator(scope)
+        val owner = java.util.concurrent.atomic.AtomicReference("chat-1")
+        val events = mutableListOf<String>()
+        val followUp = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.runGenerationAdmission {
+                events += "follow-up-admission"
+                if (owner.get() == "chat-1") events += "follow-up-start"
+            }
+        }
+        coordinator.requestChatTransition(
+            cleanup = { events += "transition-cleanup" },
+            mutation = {
+                owner.set("chat-2")
+                events += "transition-mutation"
+                ChatTransitionOutcome.Applied
+            },
+        )
+        followUp.await()
+        withTimeout(500) { while (events.size < 3) yield() }
+        assertEquals(
+            listOf("follow-up-admission", "follow-up-start", "transition-cleanup", "transition-mutation"),
+            events,
+        )
+        coordinator.close()
+        scope.cancel()
+    }
+
+    @Test(timeout = 2_000)
+    fun parentActorShutdownCompletesOutstandingCommands() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val coordinator = InferenceLifecycleCoordinator(scope)
+        val firstStarted = CompletableDeferred<Unit>()
+        val first = async {
+            coordinator.requestAndAwaitChatTransition(
+                cleanup = { firstStarted.complete(Unit); delay(Long.MAX_VALUE) },
+                mutation = { ChatTransitionOutcome.Applied },
+            )
+        }
+        withTimeout(500) { firstStarted.await() }
+        val second = async {
+            coordinator.requestAndAwaitChatTransition(
+                cleanup = { error("queued cleanup must be skipped") },
+                mutation = { error("queued mutation must be skipped") },
+            )
+        }
+        yield()
+        scope.cancel()
+
+        assertTrue(withTimeout(500) { first.await() } is ChatTransitionOutcome.Failed)
+        assertTrue(withTimeout(500) { second.await() } is ChatTransitionOutcome.Failed)
     }
 
     @Test(timeout = 2_000)

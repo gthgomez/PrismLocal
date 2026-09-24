@@ -222,6 +222,34 @@ class AgentToolRouterTraceTest {
     }
 
     @Test
+    fun confirmedJobIsRegisteredBeforeRegistrationCallbackRuns() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("confirmed prompt")
+        val startGate = CompletableDeferred<Unit>()
+        var registeredBeforeCallback = false
+
+        val job = harness.router.launchConfirmedToolJob(
+            chainId = chainId,
+            sourceChatId = "chat-1",
+            onRegistered = {
+                registeredBeforeCallback = harness.router.hasActiveToolJobs(chainId)
+            },
+        ) {
+            try {
+                startGate.await()
+            } finally {
+                startGate.complete(Unit)
+            }
+        }
+
+        assertTrue(registeredBeforeCallback)
+        assertTrue(harness.router.hasActiveToolJobs(chainId))
+        startGate.complete(Unit)
+        job.join()
+        assertFalse(harness.router.hasActiveToolJobs(chainId))
+    }
+
+    @Test
     fun boundedCleanupDoesNotWaitForeverForNonCooperativeJob() = runBlocking {
         val release = CompletableDeferred<Unit>()
         val harness = newHarness()

@@ -16,7 +16,7 @@ import org.json.JSONObject
 class RuntimeTools(
     private val uiState: ServiceUiState,
     private val deviceProfiler: DeviceProfiler,
-    private val onUpdateSettings: suspend (GenerationSettings) -> Unit,
+    private val onUpdateSettings: suspend (GenerationSettings) -> Boolean,
     private val onContinueGeneration: () -> Unit,
     private val onCancelGeneration: () -> Unit,
     private val onCancelImport: () -> Unit,
@@ -37,7 +37,9 @@ class RuntimeTools(
         val requested = FormatUtils.proposedRuntimeSettings(call.arguments, before)
         val validation = FormatUtils.validateRuntimeSettingsPayload(requested, getCachedProfile())
         setPreviousSettings(before)
-        onUpdateSettings(requested)
+        if (!onUpdateSettings(requested)) {
+            return toolFailure(call, AgentToolErrorCode.FAILED, "Runtime settings update failed")
+        }
         return toolSuccess(call,
             "Runtime settings updated: tokens ${requested.maxTokens}, threads ${requested.threadCount}, ctx ${requested.contextLength}, batch ${requested.batchSize}",
             JSONObject().put("before", before.toAgentJson()).put("after", requested.toAgentJson())
@@ -62,7 +64,9 @@ class RuntimeTools(
         val previous = getPreviousSettings()
             ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "No previous runtime settings snapshot is available")
         val before = uiState.generationSettings.value.clamped()
-        onUpdateSettings(previous)
+        if (!onUpdateSettings(previous)) {
+            return toolFailure(call, AgentToolErrorCode.FAILED, "Runtime settings restore failed")
+        }
         setPreviousSettings(before)
         return toolSuccess(call, "Restored previous runtime settings",
             JSONObject().put("before", before.toAgentJson()).put("after", previous.toAgentJson())

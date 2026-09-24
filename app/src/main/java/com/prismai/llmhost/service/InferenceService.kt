@@ -30,6 +30,7 @@ import androidx.core.app.NotificationCompat
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -858,21 +859,30 @@ class InferenceService : Service() {
         val reloadModelId: String?,
     )
 
-    private fun applyGenerationSettings(settings: GenerationSettings): AppliedGenerationSettings {
+    private fun applyGenerationSettings(
+        settings: GenerationSettings,
+        finalizeAgentDisable: Boolean = true,
+    ): AppliedGenerationSettings {
         val previous = _generationSettings.value.clamped()
         val next = settings.clamped()
         _generationSettings.value = next
         syncCapabilities(next)
+        if (finalizeAgentDisable) {
+            finalizeDisabledAgent(previous, next)
+        }
+        refreshDeviceAndModelReadiness()
+        persistGenerationSettings(next)
+        val reloadModelId = if (settingsRequireReload(previous, next)) _currentModel.value else null
+        return AppliedGenerationSettings(previous, next, reloadModelId)
+    }
+
+    private fun finalizeDisabledAgent(previous: GenerationSettings, next: GenerationSettings) {
         if (previous.agentEnabled && !next.agentEnabled && ::agentTrace.isInitialized) {
             agentTrace.activeChainId?.let { chainId ->
                 agentTrace.abortTrace(chainId, "Agent mode disabled")
             }
             agentToolConfirmation.clearMemory()
         }
-        refreshDeviceAndModelReadiness()
-        persistGenerationSettings(next)
-        val reloadModelId = if (settingsRequireReload(previous, next)) _currentModel.value else null
-        return AppliedGenerationSettings(previous, next, reloadModelId)
     }
 
     fun updateGenerationSettings(settings: GenerationSettings) {
@@ -887,14 +897,18 @@ class InferenceService : Service() {
         }
     }
 
-    private suspend fun updateGenerationSettingsForConfirmedAgent(settings: GenerationSettings) {
-        val applied = applyGenerationSettings(settings)
-        val modelId = applied.reloadModelId ?: return
-        if (_isGenerating.value) {
-            reloadPending = true
-        } else {
-            switchModel(modelId)
-        }
+    private suspend fun updateGenerationSettingsForConfirmedAgent(settings: GenerationSettings): Boolean {
+        val applied = applyGenerationSettings(settings, finalizeAgentDisable = false)
+        return completeConfirmedSettingsUpdate(
+            reloadModelId = applied.reloadModelId,
+            reload = { modelId -> switchModel(modelId) },
+            onReloadFailed = {
+                applyGenerationSettings(applied.previous, finalizeAgentDisable = false)
+            },
+            finalizeDisabledAgent = {
+                finalizeDisabledAgent(applied.previous, applied.next)
+            },
+        )
     }
 
     private fun resetNativeConversationAsync(reason: String) {
@@ -1177,97 +1191,115 @@ class InferenceService : Service() {
             publishUiEvent("Tool confirmation is no longer active")
             return
         }
-        agentToolConfirmation.clearConsumedAuthorization(authorization)
-        agentToolRouter.launchConfirmedToolJob(
-            chainId = authorization.chainId,
-            sourceChatId = authorization.sourceChatId,
-        ) confirmedJob@{
-            if (!agentToolConfirmation.isAuthorizationCurrent(
-                    authorization = authorization,
-                    activeChainId = agentTrace.activeChainId,
-                    activeChatId = _currentChatId.value,
-                )
-            ) {
-                agentToolRouter.failTrace(authorization.chainId, "Tool confirmation authorization is stale")
-                return@confirmedJob
-            }
-            val stepStart = SystemClock.elapsedRealtime()
-            val result = try {
-                withContext(ConfirmedAgentOperationContext(authorization)) {
-                    executeAgentTool(
-                        call = authorization.call,
-                        confirmed = true,
-                        authorization = authorization,
-                    )
-                }
-            } catch (e: CancellationException) {
-                agentToolRouter.failTrace(authorization.chainId, "Tool confirmation cancelled")
-                throw e
-            } catch (e: Exception) {
-                AgentToolResult(
-                    call = authorization.call,
-                    success = false,
-                    summary = "Tool execution failed with exception: ${e.message ?: "unknown error"}",
-                    errorCode = AgentToolErrorCode.FAILED,
-                )
-            }
-            val transitionApplied = result.details.optBoolean(CHAT_IDENTITY_RESULT_APPLIED, false)
-            result.details.remove(CHAT_IDENTITY_RESULT_APPLIED)
-            if (!transitionApplied && !agentToolConfirmation.isAuthorizationCurrent(
-                    authorization = authorization,
-                    activeChainId = agentTrace.activeChainId,
-                    activeChatId = _currentChatId.value,
-                )
-            ) {
-                agentToolRouter.failTrace(authorization.chainId, "Tool confirmation authorization changed during execution")
-                return@confirmedJob
-            }
-            val latency = SystemClock.elapsedRealtime() - stepStart
-            val sanitizedResult = com.prismai.llmhost.agent.ToolInputSanitizer.sanitizeResult(result)
-            agentTrace.recordStep(authorization.call, sanitizedResult, latency, authorization.chainId)
-            val appended = if (transitionApplied) {
-                agentToolRouter.appendAuthorizedTransitionToolResult(
-                    chainId = authorization.chainId,
-                    result = sanitizedResult,
-                )
-            } else {
-                agentToolRouter.appendOwnedToolResult(
-                    chainId = authorization.chainId,
-                    sourceChatId = authorization.sourceChatId,
-                    result = sanitizedResult,
-                )
-            }
-            if (!appended) {
-                agentToolRouter.failTrace(authorization.chainId, "Tool result arrived after chat transition")
-                return@confirmedJob
-            }
-            CapabilityRegistryHolder.auditLog.record(
-                "CONFIRM_EXECUTED",
-                authorization.call.name,
-                result.summary.take(160),
-            )
-            val shouldContinue = agentToolRouter.completeConfirmedTool(
-                call = authorization.call,
-                result = result,
-                depth = authorization.depth,
-                maxIterations = _generationSettings.value.maxAgentIterations,
+        val startGate = CompletableDeferred<Unit>()
+        try {
+            agentToolRouter.launchConfirmedToolJob(
                 chainId = authorization.chainId,
-            )
-            if (shouldContinue && (
-                    transitionApplied ||
-                        agentToolRouter.isCurrentOwner(
-                            authorization.chainId,
-                            authorization.sourceChatId,
-                        )
-                    )
+                sourceChatId = authorization.sourceChatId,
+                onRegistered = {
+                    agentToolConfirmation.clearConsumedAuthorization(authorization)
+                },
             ) {
-                startAgentFollowUpGeneration(
-                    authorization.originalPrompt,
-                    result,
-                    authorization.depth + 1,
-                    authorization.chainId,
+                try {
+                    startGate.await()
+                    executeConfirmedAgentAuthorization(authorization)
+                } finally {
+                    startGate.complete(Unit)
+                }
+            }
+        } finally {
+            startGate.complete(Unit)
+        }
+    }
+
+    private suspend fun executeConfirmedAgentAuthorization(
+        authorization: AgentToolConfirmation.PendingToolAuthorization,
+    ) {
+        if (!agentToolConfirmation.isAuthorizationCurrent(
+                authorization = authorization,
+                activeChainId = agentTrace.activeChainId,
+                activeChatId = _currentChatId.value,
+            )
+        ) {
+            agentToolRouter.failTrace(authorization.chainId, "Tool confirmation authorization is stale")
+            return
+        }
+        val stepStart = SystemClock.elapsedRealtime()
+        val result = try {
+            withContext(ConfirmedAgentOperationContext(authorization)) {
+                executeAgentTool(
+                    call = authorization.call,
+                    confirmed = true,
+                    authorization = authorization,
                 )
             }
+        } catch (e: CancellationException) {
+            agentToolRouter.failTrace(authorization.chainId, "Tool confirmation cancelled")
+            throw e
+        } catch (e: Exception) {
+            AgentToolResult(
+                call = authorization.call,
+                success = false,
+                summary = "Tool execution failed with exception: ${e.message ?: "unknown error"}",
+                errorCode = AgentToolErrorCode.FAILED,
+            )
+        }
+        val transitionApplied = result.details.optBoolean(CHAT_IDENTITY_RESULT_APPLIED, false)
+        result.details.remove(CHAT_IDENTITY_RESULT_APPLIED)
+        if (!transitionApplied && !agentToolConfirmation.isAuthorizationCurrent(
+                authorization = authorization,
+                activeChainId = agentTrace.activeChainId,
+                activeChatId = _currentChatId.value,
+            )
+        ) {
+            agentToolRouter.failTrace(authorization.chainId, "Tool confirmation authorization changed during execution")
+            return
+        }
+        val latency = SystemClock.elapsedRealtime() - stepStart
+        val sanitizedResult = com.prismai.llmhost.agent.ToolInputSanitizer.sanitizeResult(result)
+        agentTrace.recordStep(authorization.call, sanitizedResult, latency, authorization.chainId)
+        val appended = if (transitionApplied) {
+            agentToolRouter.appendAuthorizedTransitionToolResult(
+                chainId = authorization.chainId,
+                result = sanitizedResult,
+            )
+        } else {
+            agentToolRouter.appendOwnedToolResult(
+                chainId = authorization.chainId,
+                sourceChatId = authorization.sourceChatId,
+                result = sanitizedResult,
+            )
+        }
+        if (!appended) {
+            agentToolRouter.failTrace(authorization.chainId, "Tool result arrived after chat transition")
+            return
+        }
+        CapabilityRegistryHolder.auditLog.record(
+            "CONFIRM_EXECUTED",
+            authorization.call.name,
+            result.summary.take(160),
+        )
+        val shouldContinue = agentToolRouter.completeConfirmedTool(
+            call = authorization.call,
+            result = result,
+            depth = authorization.depth,
+            maxIterations = _generationSettings.value.maxAgentIterations,
+            chainId = authorization.chainId,
+        )
+        if (shouldContinue && (
+                transitionApplied ||
+                    agentToolRouter.isCurrentOwner(
+                        authorization.chainId,
+                        authorization.sourceChatId,
+                    )
+                )
+        ) {
+            startAgentFollowUpGeneration(
+                authorization.originalPrompt,
+                result,
+                authorization.depth + 1,
+                authorization.chainId,
+            )
         }
     }
 
@@ -1316,6 +1348,7 @@ class InferenceService : Service() {
             )
         }
         var appliedResult: AgentToolResult? = null
+        var concreteFailure: AgentToolResult? = null
         var transitionOutcome: ChatTransitionOutcome? = null
         val outcome = coordinator.requestAndAwaitChatTransition(
             cleanup = {},
@@ -1345,7 +1378,8 @@ class InferenceService : Service() {
                             appliedResult = result
                             transitionOutcome = ChatTransitionOutcome.Applied
                         } else {
-                            transitionOutcome = ChatTransitionOutcome.Rejected(result.summary)
+                            concreteFailure = result
+                            transitionOutcome = classifyConfirmedChatIdentityResult(result)
                         }
                     }
                 }
@@ -1354,12 +1388,12 @@ class InferenceService : Service() {
         )
         return when (outcome) {
             ChatTransitionOutcome.Applied -> checkNotNull(appliedResult)
-            is ChatTransitionOutcome.Rejected -> toolFailure(
+            is ChatTransitionOutcome.Rejected -> concreteFailure ?: toolFailure(
                 call,
                 AgentToolErrorCode.BUSY,
                 outcome.reason,
             )
-            is ChatTransitionOutcome.Failed -> toolFailure(
+            is ChatTransitionOutcome.Failed -> concreteFailure ?: toolFailure(
                 call,
                 AgentToolErrorCode.FAILED,
                 outcome.reason,
@@ -1842,7 +1876,6 @@ class InferenceService : Service() {
     fun debugIsGenerationForegroundActive(): Boolean = generationForegroundActive
 
     override fun onDestroy() {
-        coordinator.close()
         saveTranscriptSafely()
         importJob?.cancel()
         importJob = null
@@ -1855,6 +1888,7 @@ class InferenceService : Service() {
         // duplicate call cannot free the native handle twice.
         if (teardownStarted.compareAndSet(false, true)) {
             val teardownJob = teardownScope.launch {
+                coordinator.closeAndJoin()
                 operationMutex.withLock {
                     cancelAndJoinGenerationLocked("service destroy")
                     engine.destroySafely()

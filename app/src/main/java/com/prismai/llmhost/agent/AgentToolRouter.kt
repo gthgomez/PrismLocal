@@ -82,7 +82,7 @@ class AgentToolRouter(
     fun hasActiveToolJobs(chainId: Long?): Boolean {
         if (chainId == null) return false
         synchronized(toolJobsLock) {
-            return toolJobsByChain[chainId]?.any { it.job.isActive } == true
+            return toolJobsByChain[chainId]?.any { !it.job.isCompleted } == true
         }
     }
 
@@ -99,6 +99,7 @@ class AgentToolRouter(
     fun launchOwnedToolJob(
         chainId: Long?,
         sourceChatId: String? = currentChatId(),
+        onRegistered: () -> Unit = {},
         block: suspend CoroutineScope.() -> Unit,
     ): Job {
         val owner = if (chainId != null && !sourceChatId.isNullOrBlank()) {
@@ -127,7 +128,11 @@ class AgentToolRouter(
                 if (jobs.isEmpty()) toolJobsByChain.remove(chainId)
             }
         }
-        job.start()
+        try {
+            onRegistered()
+        } finally {
+            job.start()
+        }
         return job
     }
 
@@ -135,8 +140,9 @@ class AgentToolRouter(
     fun launchConfirmedToolJob(
         chainId: Long,
         sourceChatId: String,
+        onRegistered: () -> Unit = {},
         block: suspend CoroutineScope.() -> Unit,
-    ): Job = launchOwnedToolJob(chainId, sourceChatId, block)
+    ): Job = launchOwnedToolJob(chainId, sourceChatId, onRegistered, block)
 
     data class ChatTransitionClaim(
         val chainIds: List<Long>,

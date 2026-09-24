@@ -3,7 +3,12 @@ package com.prismai.llmhost.lifecycle
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 
 sealed interface ChatTransitionRequestResult {
     data object Queued : ChatTransitionRequestResult
@@ -27,9 +32,10 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
     private val commands = Channel<Command>(capacity = Channel.UNLIMITED)
     private val stateLock = Any()
     private var acceptingRequests = true
+    private lateinit var actorJob: Job
 
     init {
-        scope.launch {
+        actorJob = scope.launch {
             for (command in commands) {
                 try {
                     execute(command)
@@ -49,6 +55,16 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
         cleanup: suspend () -> Unit,
         mutation: suspend () -> ChatTransitionOutcome,
     ): ChatTransitionOutcome {
+        if (currentCoroutineContext()[LifecycleActorContext]?.coordinator === this) {
+            return try {
+                cleanup()
+                mutation()
+            } catch (failure: kotlinx.coroutines.CancellationException) {
+                throw failure
+            } catch (failure: Throwable) {
+                ChatTransitionOutcome.Failed(TRANSITION_FAILURE_REASON, failure)
+            }
+        }
         val submission = enqueueTransition(cleanup, mutation)
         return when (val requestResult = submission.requestResult) {
             ChatTransitionRequestResult.Queued -> submission.completion!!.await()
@@ -74,6 +90,11 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
                 commands.close()
             }
         }
+    }
+
+    suspend fun closeAndJoin() {
+        close()
+        actorJob.join()
     }
 
     private fun enqueueTransition(
@@ -112,7 +133,11 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
                 @Suppress("UNCHECKED_CAST")
                 val completion = command.completion as CompletableDeferred<Any?>
                 try {
-                    completion.complete((command.block as suspend () -> Any?)())
+                    completion.complete(
+                        withContext(LifecycleActorContext(this@InferenceLifecycleCoordinator)) {
+                            (command.block as suspend () -> Any?)()
+                        },
+                    )
                 } catch (failure: Throwable) {
                     completion.completeExceptionally(failure)
                 }
@@ -149,6 +174,12 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
             val block: suspend () -> T,
             val completion: CompletableDeferred<T>,
         ) : Command
+    }
+
+    private class LifecycleActorContext(
+        val coordinator: InferenceLifecycleCoordinator,
+    ) : AbstractCoroutineContextElement(Key) {
+        companion object Key : CoroutineContext.Key<LifecycleActorContext>
     }
 
     private companion object {

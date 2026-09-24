@@ -68,6 +68,74 @@ class InferenceLifecycleCoordinatorTest {
     }
 
     @Test(timeout = 2_000)
+    fun nestedTransitionFromGenerationAdmissionExecutesWithoutSelfAwait() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val coordinator = InferenceLifecycleCoordinator(scope)
+        val events = mutableListOf<String>()
+
+        try {
+            withTimeout(500) {
+                coordinator.runGenerationAdmission {
+                    events += "generation"
+                    val outcome = coordinator.requestAndAwaitChatTransition(
+                        cleanup = { events += "cleanup" },
+                        mutation = {
+                            events += "mutation"
+                            ChatTransitionOutcome.Applied
+                        },
+                    )
+                    events += outcome.toString()
+                }
+            }
+
+            assertEquals(
+                listOf("generation", "cleanup", "mutation", ChatTransitionOutcome.Applied.toString()),
+                events,
+            )
+        } finally {
+            coordinator.close()
+            scope.cancel()
+        }
+    }
+
+    @Test(timeout = 2_000)
+    fun closeAndJoinWaitsForQueuedTransitionToDrain() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val coordinator = InferenceLifecycleCoordinator(scope)
+        val cleanupStarted = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
+        val events = mutableListOf<String>()
+
+        coordinator.requestChatTransition(
+            cleanup = {
+                events += "cleanup"
+                cleanupStarted.complete(Unit)
+                releaseCleanup.await()
+            },
+            mutation = {
+                events += "mutation"
+                ChatTransitionOutcome.Applied
+            },
+        )
+        withTimeout(500) { cleanupStarted.await() }
+
+        val shutdown = async { coordinator.closeAndJoin() }
+        yield()
+        assertTrue(shutdown.isCompleted.not())
+        releaseCleanup.complete(Unit)
+        shutdown.await()
+
+        assertEquals(listOf("cleanup", "mutation"), events)
+        assertTrue(
+            coordinator.requestChatTransition(
+                cleanup = {},
+                mutation = { ChatTransitionOutcome.Applied },
+            ) is ChatTransitionRequestResult.Rejected,
+        )
+        scope.cancel()
+    }
+
+    @Test(timeout = 2_000)
     fun closeRejectsNewRequests() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val coordinator = InferenceLifecycleCoordinator(scope)

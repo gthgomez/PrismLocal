@@ -7,6 +7,7 @@ import com.prismai.llmhost.ImportState
 import com.prismai.llmhost.ModelDownloadState
 import com.prismai.llmhost.model.DeviceProfiler
 import com.prismai.llmhost.tools.AgentToolCall
+import com.prismai.llmhost.tools.AgentToolErrorCode
 import com.prismai.llmhost.ui.ServiceUiState
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CompletableDeferred
@@ -29,6 +30,7 @@ class RuntimeToolsTest {
                 callbackStarted.complete(Unit)
                 releaseApplication.await()
                 applied.complete(it)
+                true
             },
         )
         val before = GenerationSettings()
@@ -56,8 +58,24 @@ class RuntimeToolsTest {
         assertEquals(requested.contextLength, applied.await().contextLength)
     }
 
+    @Test(timeout = 2_000)
+    fun setRuntimeSettingsReportsFailedConfirmedApplication() = runBlocking {
+        val tools = newHarness(onUpdateSettings = { false })
+
+        val result = tools.setRuntimeSettings(
+            AgentToolCall(
+                "set_runtime_settings",
+                arguments = JSONObject().put("context_length", GenerationSettings().contextLength + 512),
+            ),
+            confirmed = true,
+        )
+
+        assertFalse(result.success)
+        assertEquals(AgentToolErrorCode.FAILED, result.errorCode)
+    }
+
     private fun newHarness(
-        onUpdateSettings: suspend (GenerationSettings) -> Unit,
+        onUpdateSettings: suspend (GenerationSettings) -> Boolean,
     ): RuntimeTools = RuntimeTools(
         uiState = ServiceUiState(),
         deviceProfiler = DeviceProfiler(ContextWrapper(null)),

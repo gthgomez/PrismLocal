@@ -1,5 +1,6 @@
 package com.prismai.llmhost.lifecycle
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
@@ -7,6 +8,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 
@@ -92,9 +94,41 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
         }
     }
 
-    suspend fun closeAndJoin() {
+    suspend fun closeAndJoin(
+        drainTimeoutMs: Long = DEFAULT_DRAIN_TIMEOUT_MS,
+        cancelTimeoutMs: Long = DEFAULT_CANCEL_TIMEOUT_MS,
+    ): Boolean {
+        require(drainTimeoutMs >= 0L) { "drainTimeoutMs must be non-negative" }
+        require(cancelTimeoutMs >= 0L) { "cancelTimeoutMs must be non-negative" }
         close()
-        actorJob.join()
+        val drained = try {
+            withTimeoutOrNull(drainTimeoutMs) { actorJob.join() } != null
+        } catch (failure: CancellationException) {
+            actorJob.cancel(CancellationException(ACTOR_CANCEL_REASON))
+            failPendingCommands()
+            throw failure
+        }
+        if (drained) {
+            failPendingCommands()
+            return true
+        }
+
+        actorJob.cancel(CancellationException(ACTOR_CANCEL_REASON))
+        val stopped = try {
+            withTimeoutOrNull(cancelTimeoutMs) { actorJob.join() } != null
+        } catch (failure: CancellationException) {
+            failPendingCommands()
+            throw failure
+        }
+        failPendingCommands()
+        return stopped
+    }
+
+    private fun failPendingCommands() {
+        while (true) {
+            val command = commands.tryReceive().getOrNull() ?: return
+            failCommand(command, CancellationException(ACTOR_CANCEL_REASON))
+        }
     }
 
     private fun enqueueTransition(
@@ -184,6 +218,9 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
 
     private companion object {
         const val CLOSED_REASON = "Inference lifecycle coordinator is closed"
+        const val ACTOR_CANCEL_REASON = "Inference lifecycle coordinator drained after timeout"
         const val TRANSITION_FAILURE_REASON = "Chat transition failed"
+        const val DEFAULT_DRAIN_TIMEOUT_MS = 1_000L
+        const val DEFAULT_CANCEL_TIMEOUT_MS = 1_000L
     }
 }

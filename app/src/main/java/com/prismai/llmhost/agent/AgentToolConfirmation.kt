@@ -75,10 +75,16 @@ class AgentToolConfirmation(
     @Volatile
     private var pending: PendingToolAuthorization? = null
     @Volatile
+    private var _consumedAuthorization: PendingToolAuthorization? = null
+    @Volatile
     private var consumedToken: String? = null
 
     val pendingAuthorization: PendingToolAuthorization?
         get() = pending?.let { immutableCopy(it) }
+
+    /** Immutable consumed work retained until its owned job is registered. */
+    val consumedAuthorization: PendingToolAuthorization?
+        get() = _consumedAuthorization?.let { immutableCopy(it) }
 
     /**
      * Publishes one immutable authorization snapshot. A confirmation without
@@ -91,7 +97,7 @@ class AgentToolConfirmation(
         chainId: Long?,
         sourceChatId: String?,
     ): PendingToolAuthorization? {
-        if (consumedToken != null) return null
+        if (consumedToken != null || _consumedAuthorization != null) return null
         val source = sourceChatId?.takeIf { it.isNotBlank() } ?: return null
         if (chainId == null || currentChatId() != source) return null
         val safeCall = copyCall(call)
@@ -106,7 +112,7 @@ class AgentToolConfirmation(
             callFingerprint = fingerprint(safeCall),
         )
         synchronized(this) {
-            if (consumedToken != null) return null
+            if (consumedToken != null || _consumedAuthorization != null) return null
             pending = authorization
         }
         return immutableCopy(authorization)
@@ -117,6 +123,8 @@ class AgentToolConfirmation(
         synchronized(this) {
             val snapshot = pending ?: return null
             pending = null
+            _consumedAuthorization = immutableCopy(snapshot)
+            consumedToken = snapshot.token
             return immutableCopy(snapshot)
         }
     }
@@ -128,6 +136,7 @@ class AgentToolConfirmation(
             val snapshot = pending ?: return null
             if (snapshot.token != token) return null
             pending = null
+            _consumedAuthorization = immutableCopy(snapshot)
             consumedToken = snapshot.token
             return immutableCopy(snapshot)
         }
@@ -148,11 +157,13 @@ class AgentToolConfirmation(
             if (snapshot.token != token) return null
             if (!isAuthorizationCurrent(snapshot, activeChainId, activeChatId)) {
                 pending = null
+                _consumedAuthorization = null
                 consumedToken = null
                 uiState._pendingAgentToolAction.value = null
                 return null
             }
             pending = null
+            _consumedAuthorization = immutableCopy(snapshot)
             consumedToken = snapshot.token
             return immutableCopy(snapshot)
         }
@@ -177,6 +188,9 @@ class AgentToolConfirmation(
             val current = pending
             if (current != null && current.token != authorization.token) return
             pending = null
+            if (_consumedAuthorization?.token == authorization.token) {
+                _consumedAuthorization = null
+            }
             if (consumedToken == authorization.token) consumedToken = null
             uiState._pendingAgentToolAction.value = null
             removePersisted(authorization.sourceChatId)
@@ -189,6 +203,9 @@ class AgentToolConfirmation(
             val current = pending
             if (current != null && current.token != token) return
             pending = null
+            if (_consumedAuthorization?.token == token) {
+                _consumedAuthorization = null
+            }
             if (consumedToken == token) consumedToken = null
             uiState._pendingAgentToolAction.value = null
             removePersisted(sourceChatId)
@@ -201,9 +218,10 @@ class AgentToolConfirmation(
      */
     fun discardAuthorizationForChain(chainId: Long, sourceChatId: String): Boolean {
         synchronized(this) {
-            val current = pending ?: return false
+            val current = pending ?: _consumedAuthorization ?: return false
             if (current.chainId != chainId || current.sourceChatId != sourceChatId) return false
             pending = null
+            _consumedAuthorization = null
             consumedToken = null
             uiState._pendingAgentToolAction.value = null
             removePersisted(sourceChatId)
@@ -411,6 +429,7 @@ class AgentToolConfirmation(
     fun clearMemory() {
         synchronized(this) {
             pending = null
+            _consumedAuthorization = null
             consumedToken = null
         }
         uiState._pendingAgentToolAction.value = null

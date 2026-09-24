@@ -1,5 +1,8 @@
 package com.prismai.llmhost.service
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -59,6 +62,31 @@ class ConfirmedSettingsUpdatePolicyTest {
         )
 
         assertFalse(success)
+        assertEquals(listOf("reload", "rollback"), events)
+    }
+
+    @Test
+    fun cancelledReloadRollsBackBeforeCancellationPropagates() = runBlocking {
+        val reloadStarted = CompletableDeferred<Unit>()
+        val events = mutableListOf<String>()
+
+        val update = async {
+            completeConfirmedSettingsUpdate(
+                reloadModelId = "model-a",
+                reload = {
+                    events += "reload"
+                    reloadStarted.complete(Unit)
+                    CompletableDeferred<Unit>().await()
+                    true
+                },
+                onReloadFailed = { events += "rollback" },
+                finalizeDisabledAgent = { events += "finalize" },
+            )
+        }
+
+        reloadStarted.await()
+        update.cancelAndJoin()
+
         assertEquals(listOf("reload", "rollback"), events)
     }
 

@@ -3,13 +3,16 @@ package com.prismai.llmhost.lifecycle
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicBoolean
@@ -132,6 +135,33 @@ class InferenceLifecycleCoordinatorTest {
                 mutation = { ChatTransitionOutcome.Applied },
             ) is ChatTransitionRequestResult.Rejected,
         )
+        scope.cancel()
+    }
+
+    @Test(timeout = 2_000)
+    fun closeAndJoinTimesOutAndCancelsNonCooperativeActor() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val coordinator = InferenceLifecycleCoordinator(scope)
+        val cleanupStarted = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
+
+        coordinator.requestChatTransition(
+            cleanup = {
+                cleanupStarted.complete(Unit)
+                withContext(kotlinx.coroutines.NonCancellable) {
+                    releaseCleanup.await()
+                }
+            },
+            mutation = { ChatTransitionOutcome.Applied },
+        )
+        withTimeout(500) { cleanupStarted.await() }
+
+        val completed = withTimeout(500) {
+            coordinator.closeAndJoin(drainTimeoutMs = 50L, cancelTimeoutMs = 100L)
+        }
+
+        assertFalse(completed)
+        releaseCleanup.complete(Unit)
         scope.cancel()
     }
 

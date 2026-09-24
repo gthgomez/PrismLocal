@@ -4,6 +4,7 @@ import android.content.SharedPreferences
 import com.prismai.llmhost.DeviceCapabilityProfile
 import com.prismai.llmhost.GenerationSettings
 import com.prismai.llmhost.TranscriptRole
+import com.prismai.llmhost.service.hasPendingConfirmationWork
 import com.prismai.llmhost.tools.AgentToolCall
 import com.prismai.llmhost.tools.AgentToolResult
 import com.prismai.llmhost.ui.ServiceUiState
@@ -219,6 +220,49 @@ class AgentToolRouterTraceTest {
         gate.complete(Unit)
         job.join()
         assertFalse(harness.router.hasActiveToolJobs(chainId))
+    }
+
+    @Test
+    fun consumedConfirmationRemainsPendingUntilStartedJobCompletes() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("confirmed prompt")
+        val staged = harness.confirmation.stagePending(
+            call = AgentToolCall("restore_previous_runtime_settings"),
+            originalPrompt = "prompt",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )!!
+        val consumed = harness.confirmation.consumePendingAndRevalidate(
+            token = staged.token,
+            activeChainId = chainId,
+            activeChatId = "chat-1",
+        )!!
+        val startGate = CompletableDeferred<Unit>()
+
+        fun idleConfirmationPending(): Boolean = hasPendingConfirmationWork(
+            confirmation = harness.confirmation,
+            activeChainId = chainId,
+            activeChatId = harness.currentChatId(),
+            hasActiveToolJob = harness.router.hasActiveToolJobs(chainId),
+        )
+
+        assertNull(harness.confirmation.pendingAuthorization)
+        assertEquals(consumed.token, harness.confirmation.consumedAuthorization?.token)
+        assertTrue(idleConfirmationPending())
+
+        val job = harness.router.launchConfirmedToolJob(chainId, "chat-1") {
+            startGate.await()
+        }
+        assertTrue(idleConfirmationPending())
+
+        harness.confirmation.clearConsumedAuthorization(consumed)
+        assertNull(harness.confirmation.consumedAuthorization)
+        assertTrue(idleConfirmationPending())
+
+        startGate.complete(Unit)
+        job.join()
+        assertFalse(idleConfirmationPending())
     }
 
     @Test

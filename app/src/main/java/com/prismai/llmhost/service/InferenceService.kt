@@ -124,6 +124,8 @@ class InferenceService : Service() {
         // for the off-main teardown to finish before returning; the teardown
         // job itself keeps running if it overruns (see onDestroy).
         private const val NATIVE_TEARDOWN_WAIT_MS = 2_000L
+        private const val COORDINATOR_DRAIN_WAIT_MS = 500L
+        private const val COORDINATOR_CANCEL_WAIT_MS = 500L
     }
 
     private fun pendingAgentActionKey(chatId: String): String = "$KEY_PENDING_AGENT_ACTION_PREFIX$chatId"
@@ -996,10 +998,12 @@ class InferenceService : Service() {
         val chainId = if (::agentTrace.isInitialized) agentTrace.activeChainId else null
         val toolActive = chainId != null && ::agentToolRouter.isInitialized &&
             agentToolRouter.hasActiveToolJobs(chainId)
-        val pendingAuthorization = agentToolConfirmation.pendingAuthorization
-        val pendingConfirmation = pendingAuthorization?.let {
-            agentToolConfirmation.isAuthorizationCurrent(it, chainId, _currentChatId.value)
-        } == true
+        val pendingConfirmation = hasPendingConfirmationWork(
+            confirmation = agentToolConfirmation,
+            activeChainId = chainId,
+            activeChatId = _currentChatId.value,
+            hasActiveToolJob = toolActive,
+        )
         val followUpPending = chainId != null && agentActivityTracker.hasFollowUp(chainId)
         val continuationAvailable = chainId != null && agentContinuationAvailable(chainId)
         return GenerationIdleInputs(
@@ -1209,6 +1213,7 @@ class InferenceService : Service() {
             }
         } finally {
             startGate.complete(Unit)
+            agentToolConfirmation.clearConsumedAuthorization(authorization)
         }
     }
 
@@ -1888,7 +1893,13 @@ class InferenceService : Service() {
         // duplicate call cannot free the native handle twice.
         if (teardownStarted.compareAndSet(false, true)) {
             val teardownJob = teardownScope.launch {
-                coordinator.closeAndJoin()
+                val coordinatorStopped = coordinator.closeAndJoin(
+                    drainTimeoutMs = COORDINATOR_DRAIN_WAIT_MS,
+                    cancelTimeoutMs = COORDINATOR_CANCEL_WAIT_MS,
+                )
+                if (!coordinatorStopped) {
+                    Log.w(TAG, "Lifecycle coordinator did not stop within shutdown budget")
+                }
                 operationMutex.withLock {
                     cancelAndJoinGenerationLocked("service destroy")
                     engine.destroySafely()

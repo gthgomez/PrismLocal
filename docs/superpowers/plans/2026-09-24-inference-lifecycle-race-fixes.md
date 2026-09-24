@@ -626,7 +626,7 @@ git commit -m "fix(service): unify generation and chat lifecycle admission"
 - Consumes: complete implementation.
 - Produces: verified commits and updated PR #13.
 
-- [ ] **Step 1: Run formatting/whitespace checks**
+- [x] **Step 1: Run formatting/whitespace checks**
 
 ```bash
 git diff --check
@@ -635,7 +635,7 @@ rg -n 'ChatTransitionGate|confirmedChatTransitionChain|confirmedChatTransitionTh
 
 Expected: no whitespace errors and no obsolete lifecycle symbols.
 
-- [ ] **Step 2: Run forced full unit matrix**
+- [x] **Step 2: Run forced full unit matrix**
 
 ```bash
 ANDROID_HOME=/home/linuxuser/android-sdk ./gradlew --no-daemon --rerun-tasks \
@@ -645,7 +645,7 @@ ANDROID_HOME=/home/linuxuser/android-sdk ./gradlew --no-daemon --rerun-tasks \
 
 Expected: `BUILD SUCCESSFUL` with both test tasks executed.
 
-- [ ] **Step 3: Run native host tests**
+- [x] **Step 3: Run native host tests**
 
 Use the repository's current host-test configuration:
 

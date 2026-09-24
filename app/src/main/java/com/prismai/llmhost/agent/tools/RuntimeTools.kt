@@ -29,12 +29,13 @@ class RuntimeTools(
     private val importJobIsActive: () -> Boolean,
     private val importState: () -> ImportState,
     private val modelDownloadState: () -> ModelDownloadState,
+    private val getCachedProfile: () -> DeviceCapabilityProfile = { deviceProfiler.getCachedProfile() },
 ) {
     suspend fun setRuntimeSettings(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Runtime settings change requires confirmation")
         val before = uiState.generationSettings.value.clamped()
         val requested = FormatUtils.proposedRuntimeSettings(call.arguments, before)
-        val validation = FormatUtils.validateRuntimeSettingsPayload(requested, deviceProfiler.getCachedProfile())
+        val validation = FormatUtils.validateRuntimeSettingsPayload(requested, getCachedProfile())
         setPreviousSettings(before)
         onUpdateSettings(requested)
         return toolSuccess(call,
@@ -48,7 +49,7 @@ class RuntimeTools(
         val args = call.arguments.optJSONObject("proposed_settings") ?: call.arguments
         val current = uiState.generationSettings.value.clamped()
         val proposed = FormatUtils.proposedRuntimeSettings(args, current)
-        val validation = FormatUtils.validateRuntimeSettingsPayload(proposed, deviceProfiler.getCachedProfile())
+        val validation = FormatUtils.validateRuntimeSettingsPayload(proposed, getCachedProfile())
         return toolSuccess(call, "Runtime settings validation: ${validation.first} risk",
             JSONObject().put("valid", true).put("estimated_risk", validation.first)
                 .put("current", current.toAgentJson()).put("proposed", proposed.toAgentJson())

@@ -126,6 +126,7 @@ class InferenceService : Service() {
         private const val NATIVE_TEARDOWN_WAIT_MS = 2_000L
         private const val COORDINATOR_DRAIN_WAIT_MS = 500L
         private const val COORDINATOR_CANCEL_WAIT_MS = 500L
+        private const val LIFECYCLE_LOCK_WAIT_MS = 500L
     }
 
     private fun pendingAgentActionKey(chatId: String): String = "$KEY_PENDING_AGENT_ACTION_PREFIX$chatId"
@@ -1900,10 +1901,25 @@ class InferenceService : Service() {
                 if (!coordinatorStopped) {
                     Log.w(TAG, "Lifecycle coordinator did not stop within shutdown budget")
                 }
-                operationMutex.withLock {
-                    cancelAndJoinGenerationLocked("service destroy")
-                    engine.destroySafely()
-                }
+                runBoundedNativeTeardown(
+                    lifecycleLock = operationMutex,
+                    lockTimeoutMs = LIFECYCLE_LOCK_WAIT_MS,
+                    cancelAndJoinGeneration = {
+                        cancelAndJoinGenerationLocked("service destroy")
+                    },
+                    destroyNative = {
+                        // NativeLlmBridge serializes model operations internally;
+                        // destroySafely is the idempotent native safety boundary.
+                        engine.destroySafely()
+                    },
+                    onLockTimeout = { timeoutMs ->
+                        Log.w(
+                            TAG,
+                            "Lifecycle operation mutex not acquired within ${timeoutMs}ms; " +
+                                "skipping generation cancellation and destroying native engine without lifecycle lock",
+                        )
+                    },
+                )
             }
             val finishedInTime = runBlocking {
                 withTimeoutOrNull(NATIVE_TEARDOWN_WAIT_MS) { teardownJob.join() } != null

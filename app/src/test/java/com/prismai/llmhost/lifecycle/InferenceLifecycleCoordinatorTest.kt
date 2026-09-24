@@ -7,6 +7,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -144,16 +145,22 @@ class InferenceLifecycleCoordinatorTest {
         val coordinator = InferenceLifecycleCoordinator(scope)
         val cleanupStarted = CompletableDeferred<Unit>()
         val releaseCleanup = CompletableDeferred<Unit>()
+        val mutationCalled = CompletableDeferred<Unit>()
 
-        coordinator.requestChatTransition(
-            cleanup = {
-                cleanupStarted.complete(Unit)
-                withContext(kotlinx.coroutines.NonCancellable) {
-                    releaseCleanup.await()
-                }
-            },
-            mutation = { ChatTransitionOutcome.Applied },
-        )
+        val transition = async {
+            coordinator.requestAndAwaitChatTransition(
+                cleanup = {
+                    cleanupStarted.complete(Unit)
+                    withContext(NonCancellable) {
+                        releaseCleanup.await()
+                    }
+                },
+                mutation = {
+                    mutationCalled.complete(Unit)
+                    ChatTransitionOutcome.Applied
+                },
+            )
+        }
         withTimeout(500) { cleanupStarted.await() }
 
         val completed = withTimeout(500) {
@@ -161,7 +168,11 @@ class InferenceLifecycleCoordinatorTest {
         }
 
         assertFalse(completed)
+        assertFalse(mutationCalled.isCompleted)
         releaseCleanup.complete(Unit)
+        delay(100)
+        assertFalse(mutationCalled.isCompleted)
+        assertTrue(withTimeout(500) { transition.await() } is ChatTransitionOutcome.Failed)
         scope.cancel()
     }
 

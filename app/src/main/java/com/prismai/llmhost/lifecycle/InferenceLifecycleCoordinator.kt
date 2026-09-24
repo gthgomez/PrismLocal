@@ -5,6 +5,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -156,6 +157,7 @@ class InferenceLifecycleCoordinator(scope: CoroutineScope) {
             is Command.ChatTransition -> {
                 val outcome = try {
                     command.cleanup()
+                    currentCoroutineContext().ensureActive()
                     command.mutation()
                 } catch (failure: Throwable) {
                     ChatTransitionOutcome.Failed(TRANSITION_FAILURE_REASON, failure)

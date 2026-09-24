@@ -6,6 +6,7 @@ import com.prismai.llmhost.storage.*
 import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
+import com.prismai.llmhost.lifecycle.ChatTransitionRequestResult
 
 import android.content.Intent
 import android.net.Uri
@@ -678,11 +679,12 @@ fun ChatScreen(
                                     isGenerating = isGenerating,
                                     hasCurrentTranscript = transcript.isNotEmpty(),
                                     onNewChat = {
-                                        service?.createChat()
-                                        chatsVisible = false
+                                        if (service?.createChat() is ChatTransitionRequestResult.Queued) {
+                                            chatsVisible = false
+                                        }
                                     },
                                     onSwitchChat = { chatId ->
-                                        if (service?.switchChat(chatId) == true) {
+                                        if (service?.switchChat(chatId) is ChatTransitionRequestResult.Queued) {
                                             chatsVisible = false
                                         }
                                     },

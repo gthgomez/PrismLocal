@@ -195,6 +195,22 @@ class AgentToolConfirmation(
         }
     }
 
+    /**
+     * Discards the pending authorization only when both chain and source-chat
+     * ownership match. A superseded call must not clear a newer card.
+     */
+    fun discardAuthorizationForChain(chainId: Long, sourceChatId: String): Boolean {
+        synchronized(this) {
+            val current = pending ?: return false
+            if (current.chainId != chainId || current.sourceChatId != sourceChatId) return false
+            pending = null
+            consumedToken = null
+            uiState._pendingAgentToolAction.value = null
+            removePersisted(sourceChatId)
+            return true
+        }
+    }
+
     // ── Confirmation builder ────────────────────────────────────────────
 
     fun build(

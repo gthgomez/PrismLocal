@@ -376,6 +376,35 @@ class AgentToolRouterTraceTest {
     }
 
     @Test
+    fun supersedingChainDiscardsOnlyMatchingAuthorization() = runBlocking {
+        val harness = newHarness()
+        val oldChain = harness.trace.beginChain("old")
+        harness.router.handleToolCall(
+            call = AgentToolCall("switch_model", JSONObject().put("model_id", "model-a")),
+            originalPrompt = "old",
+            depth = 0,
+            chainId = oldChain,
+        )
+        val oldAuthorization = harness.confirmation.pendingAuthorization!!
+        val newChain = harness.trace.beginChain("new")
+        val newAuthorization = harness.confirmation.stagePending(
+            call = AgentToolCall("switch_model", JSONObject().put("model_id", "model-b")),
+            originalPrompt = "new",
+            depth = 0,
+            chainId = newChain,
+            sourceChatId = "chat-1",
+        )!!
+
+        assertFalse(harness.confirmation.discardAuthorizationForChain(oldChain, "chat-1"))
+        assertEquals(newAuthorization.token, harness.confirmation.pendingAuthorization?.token)
+
+        assertTrue(harness.confirmation.discardAuthorizationForChain(newChain, "chat-1"))
+        assertNull(harness.confirmation.pendingAuthorization)
+        assertNull(harness.uiState.pendingAgentToolAction.value)
+        assertNotNull(oldAuthorization.token)
+    }
+
+    @Test
     fun pendingConfirmationRejectsNullChainOwner() = runBlocking {
         val harness = newHarness()
         val call = AgentToolCall("switch_model", JSONObject().put("model_id", "next-model"))

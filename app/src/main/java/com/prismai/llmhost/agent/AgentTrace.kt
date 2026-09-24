@@ -82,6 +82,14 @@ class AgentTrace(
     fun isCurrentChain(chainId: Long?): Boolean =
         chainId == null || currentChainId == chainId
 
+    /** Runs [block] atomically while [chainId] remains the active chain owner. */
+    @Synchronized
+    fun withCurrentChain(chainId: Long, block: () -> Unit): Boolean {
+        if (chainId <= 0L || currentChainId != chainId) return false
+        block()
+        return true
+    }
+
     /** Holds a chain across an operation that must not turn native cancellation into chain failure. */
     @Synchronized
     fun preserveChainForCancellation(chainId: Long): Boolean {

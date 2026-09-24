@@ -256,18 +256,19 @@ class AgentToolRouter(
     fun appendAuthorizedTransitionToolResult(
         chainId: Long,
         result: AgentToolResult,
-    ): Boolean = synchronized(toolJobsLock) {
-        if (!agentTrace.isCurrentChain(chainId)) return@synchronized false
-        onAppendTranscriptMessage(
-            TranscriptRole.TOOL,
-            AgentToolProtocol.toolEventJson(
-                status = if (result.success) "done" else "failed",
-                toolName = result.call.name,
-                summary = result.summary,
-                details = result.details,
-            ),
-        )
-        true
+    ): Boolean {
+        if (!agentTrace.isCurrentChain(chainId)) return false
+        return agentTrace.withCurrentChain(chainId) {
+            onAppendTranscriptMessage(
+                TranscriptRole.TOOL,
+                AgentToolProtocol.toolEventJson(
+                    status = if (result.success) "done" else "failed",
+                    toolName = result.call.name,
+                    summary = result.summary,
+                    details = result.details,
+                ),
+            )
+        }
     }
 
     fun appendOwnedAssistantMessage(
@@ -287,12 +288,10 @@ class AgentToolRouter(
         role: TranscriptRole,
         text: String,
     ): Boolean {
-        if (!isCurrentOwner(chainId, sourceChatId)) return false
-        synchronized(toolJobsLock) {
-            if (!isCurrentOwner(chainId, sourceChatId)) return false
+        if (currentChatId() != sourceChatId) return false
+        return agentTrace.withCurrentChain(chainId ?: return false) {
             onAppendTranscriptMessage(role, text)
         }
-        return true
     }
 
     // ── Main routing entry point ────────────────────────────────────────

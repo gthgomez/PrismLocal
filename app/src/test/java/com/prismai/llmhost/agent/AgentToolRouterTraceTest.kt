@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -558,6 +559,30 @@ class AgentToolRouterTraceTest {
         confirmation.clearPersistedForChat("chat-1")
 
         assertEquals(0, prefs.commitCount)
+    }
+
+    @Test(timeout = 2_000)
+    fun beginChainCannotReplaceOwnerDuringOwnedAppend() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("old")
+        val appendEntered = CompletableDeferred<Unit>()
+        val releaseAppend = CompletableDeferred<Unit>()
+
+        val append = async(Dispatchers.Default) {
+            harness.trace.withCurrentChain(chainId) {
+                appendEntered.complete(Unit)
+                runBlocking { releaseAppend.await() }
+            }
+        }
+        appendEntered.await()
+        val replacement = async(Dispatchers.Default) { harness.trace.beginChain("new") }
+
+        delay(50)
+        assertFalse(replacement.isCompleted)
+        releaseAppend.complete(Unit)
+        assertTrue(append.await())
+        assertEquals(2L, replacement.await())
+        assertEquals(2L, harness.trace.activeChainId)
     }
 
     @Test

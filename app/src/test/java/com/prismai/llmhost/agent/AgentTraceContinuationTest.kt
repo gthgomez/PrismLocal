@@ -187,14 +187,22 @@ class AgentTraceContinuationTest {
             while (File(dir, "agent_traces").listFiles()?.any { it.extension == "json" } != true) kotlinx.coroutines.delay(2)
         }
 
+        val other = File(dir, "agent_traces/other-chat.json").apply {
+            writeText(JSONObject().put("owner_chat_id", "kept-chat").toString())
+        }
+        val unreadable = File(dir, "agent_traces/broken.json").apply { writeText("{") }
         trace.deleteForChat("deleted-chat")
-        assertTrue(File(dir, "agent_traces").listFiles()?.none { it.extension == "json" } ?: true)
+        assertTrue(other.exists())
+        assertTrue(unreadable.exists())
+        assertTrue(File(dir, "agent_traces").listFiles()?.none { it.name.startsWith("agent_trace_") } ?: true)
         assertNull(ui.lastAgentTracePath.value)
 
         val next = trace.beginChain("stale", ownerChatId = "deleted-chat")
         trace.finalizeOwnedTrace(next, success = true)
         kotlinx.coroutines.delay(30)
-        assertTrue(File(dir, "agent_traces").listFiles()?.none { it.extension == "json" } ?: true)
+        assertTrue(File(dir, "agent_traces").listFiles()?.none { it.name.startsWith("agent_trace_") } ?: true)
+        assertTrue(other.exists())
+        assertTrue(unreadable.exists())
     }
 
     @Test

@@ -29,6 +29,8 @@ class BenchmarkRunner(
     private val store: BenchmarkStore,
     private val orchestrator: GenerationOrchestrator,
     private val scope: CoroutineScope,
+    private val runJoinedGeneration: suspend (String, BenchmarkPreset) -> Unit,
+    private val runExclusive: suspend (suspend () -> Unit) -> Unit,
 ) {
     companion object {
         private const val TAG = "BenchmarkRunner"
@@ -49,7 +51,7 @@ class BenchmarkRunner(
             return
         }
         scope.launch {
-            orchestrator.generate(prompt = preset.prompt, benchmarkPreset = preset)
+            runJoinedGeneration(preset.prompt, preset)
         }
     }
 
@@ -74,6 +76,11 @@ class BenchmarkRunner(
             return
         }
         scope.launch {
+            runExclusive {
+            if (uiState.isGenerating.value) {
+                eventBus.publish("Stop the current generation before running a native benchmark")
+                return@runExclusive
+            }
             uiState._benchmarkStatus.value = BenchmarkStatus(
                 isRunning = true,
                 presetId = "native_pp_tg",
@@ -91,13 +98,14 @@ class BenchmarkRunner(
                 eventBus.publish("Native benchmark failed: ${error.message ?: error::class.java.simpleName}")
             }
             uiState._benchmarkStatus.value = BenchmarkStatus()
+            }
         }
     }
 
     fun runNextQueued() {
         val next = queue.pollFirst() ?: return
         scope.launch {
-            orchestrator.generate(prompt = next.prompt, benchmarkPreset = next)
+            runJoinedGeneration(next.prompt, next)
         }
     }
 

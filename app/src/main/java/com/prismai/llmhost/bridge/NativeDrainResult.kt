@@ -24,8 +24,9 @@ class NativeDrainResult {
     @JvmField val textBuffer: ByteArray = ByteArray(TEXT_CAPACITY)
     @JvmField var textCount: Int = 0
 
-    // Overflow fallback: JNI sets this when text exceeds textBuffer capacity.
-    // Kotlin checks this field; if non-empty, it takes priority over textBuffer.
+    // Overflow fallback. Raw bytes preserve a code point split at the buffer edge.
+    // textOverflow remains for callers that already hold a complete Java string.
+    @JvmField var textOverflowBytes: ByteArray? = null
     @JvmField var textOverflow: String = ""
 
     @JvmField var state: Int = 0

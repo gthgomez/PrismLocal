@@ -294,18 +294,19 @@ class AgentTrace(
     @Synchronized
     fun deleteForChat(chatId: String) {
         deletedChatIds += chatId
+        val lastPath = uiState._lastAgentTracePath.value
+        var removedLast = false
         val dir = File(filesDir, "agent_traces")
-        dir.listFiles()?.filter { it.extension == "json" || it.extension == "tmp" }?.forEach { file ->
+        dir.listFiles()?.filter { it.extension == "json" }?.forEach { file ->
             val owner = runCatching { JSONObject(file.readText()).optString("owner_chat_id") }
                 .getOrNull()
                 ?.takeIf { it.isNotBlank() && it != "null" }
-            if (owner == null || owner == chatId) file.delete()
+            if (owner == chatId) {
+                if (file.absolutePath == lastPath) removedLast = true
+                file.delete()
+            }
         }
-        val lastPath = uiState._lastAgentTracePath.value
-        if (lastPath != null && (!File(lastPath).exists() || runCatching {
-                JSONObject(File(lastPath).readText()).optString("owner_chat_id") == chatId
-            }.getOrDefault(false))
-        ) uiState._lastAgentTracePath.value = null
+        if (removedLast) uiState._lastAgentTracePath.value = null
     }
 
     private fun applyRetentionLocked(dir: File) {

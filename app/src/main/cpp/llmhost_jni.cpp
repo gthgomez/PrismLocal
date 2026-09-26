@@ -48,6 +48,7 @@ jfieldID g_tokens_count_field = nullptr;
 jfieldID g_text_buffer_field = nullptr;
 jfieldID g_text_count_field = nullptr;
 jfieldID g_text_overflow_field = nullptr;
+jfieldID g_text_overflow_bytes_field = nullptr;
 jfieldID g_drain_result_state_field = nullptr;
 jfieldID g_drain_result_prompt_tokens_field = nullptr;
 jfieldID g_drain_result_ttft_ms_field = nullptr;
@@ -68,6 +69,7 @@ bool drainResultFieldsReady() {
         && g_text_buffer_field != nullptr
         && g_text_count_field != nullptr
         && g_text_overflow_field != nullptr
+        && g_text_overflow_bytes_field != nullptr
         && g_drain_result_state_field != nullptr
         && g_drain_result_prompt_tokens_field != nullptr
         && g_drain_result_ttft_ms_field != nullptr
@@ -91,6 +93,7 @@ void ensureDrainResultCache(JNIEnv* env) {
             g_text_buffer_field = env->GetFieldID(g_drain_result_class, "textBuffer", "[B");
             g_text_count_field = env->GetFieldID(g_drain_result_class, "textCount", "I");
             g_text_overflow_field = env->GetFieldID(g_drain_result_class, "textOverflow", "Ljava/lang/String;");
+            g_text_overflow_bytes_field = env->GetFieldID(g_drain_result_class, "textOverflowBytes", "[B");
             g_drain_result_state_field = env->GetFieldID(g_drain_result_class, "state", "I");
             g_drain_result_prompt_tokens_field = env->GetFieldID(g_drain_result_class, "promptTokens", "I");
             g_drain_result_ttft_ms_field = env->GetFieldID(g_drain_result_class, "ttftMs", "J");
@@ -595,42 +598,54 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
             env->SetIntField(result, g_tokens_count_field, 0);
         }
 
-        // --- Text: copy raw UTF-8 bytes into pre-allocated ByteArray ---
-        //     Overflow fallback: if text exceeds buffer, allocate jstring into textOverflow.
+        // Copy raw UTF-8 into the pre-allocated buffer. Overflow keeps those
+        // bytes so a code point split at the edge is not replaced by U+FFFD.
+        auto publish_overflow_bytes = [&](const std::string& text) {
+            env->SetIntField(result, g_text_count_field, 0);
+            env->SetObjectField(result, g_text_overflow_field, nullptr);
+            const jsize text_len = static_cast<jsize>(text.size());
+            jbyteArray raw = env->NewByteArray(text_len);
+            if (raw == nullptr) {
+                return;
+            }
+            env->SetByteArrayRegion(
+                raw,
+                0,
+                text_len,
+                reinterpret_cast<const jbyte*>(text.data()));
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                env->DeleteLocalRef(raw);
+                return;
+            }
+            env->SetObjectField(result, g_text_overflow_bytes_field, raw);
+            env->DeleteLocalRef(raw);
+        };
         if (!drain_result.text.empty()) {
             const jsize text_len = static_cast<jsize>(drain_result.text.size());
             jbyteArray buf = static_cast<jbyteArray>(
                 env->GetObjectField(result, g_text_buffer_field));
             if (buf == nullptr) {
-                env->SetIntField(result, g_text_count_field, 0);
-                jstring overflow = toJavaString(env, drain_result.text);
-                if (overflow != nullptr) {
-                    env->SetObjectField(result, g_text_overflow_field, overflow);
-                    env->DeleteLocalRef(overflow);
-                }
+                publish_overflow_bytes(drain_result.text);
             } else {
                 const jsize buf_len = env->GetArrayLength(buf);
-
                 if (text_len <= buf_len) {
-                    // Fast path: zero-alloc copy into pre-allocated buffer
                     env->SetByteArrayRegion(buf, 0, text_len,
                         reinterpret_cast<const jbyte*>(drain_result.text.data()));
                     env->SetIntField(result, g_text_count_field, text_len);
+                    env->SetObjectField(result, g_text_overflow_bytes_field, nullptr);
+                    env->SetObjectField(result, g_text_overflow_field, nullptr);
                 } else {
-                    // Overflow path: fall back to dynamic jstring allocation
-                    LOGW("drain_text_overflow text_len=%d buf=%d; using jstring fallback",
+                    LOGW("drain_text_overflow text_len=%d buf=%d; keeping raw bytes",
                          static_cast<int>(text_len), static_cast<int>(buf_len));
-                    env->SetIntField(result, g_text_count_field, 0);
-                    jstring overflow = toJavaString(env, drain_result.text);
-                    if (overflow != nullptr) {
-                        env->SetObjectField(result, g_text_overflow_field, overflow);
-                        env->DeleteLocalRef(overflow);
-                    }
+                    publish_overflow_bytes(drain_result.text);
                 }
                 env->DeleteLocalRef(buf);
             }
         } else {
             env->SetIntField(result, g_text_count_field, 0);
+            env->SetObjectField(result, g_text_overflow_bytes_field, nullptr);
+            env->SetObjectField(result, g_text_overflow_field, nullptr);
         }
 
         env->SetIntField(result, g_drain_result_state_field, drain_result.state);

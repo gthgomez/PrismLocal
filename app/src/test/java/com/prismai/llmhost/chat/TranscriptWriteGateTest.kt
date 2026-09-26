@@ -9,6 +9,19 @@ import org.junit.Test
 
 class TranscriptWriteGateTest {
     @Test
+    fun newerSnapshotRejectsAnOlderPublish() {
+        val gate = TranscriptWriteGate()
+        val first = gate.snapshotRevision("chat-a")
+        val second = gate.snapshotRevision("chat-a")
+        var published = false
+
+        assertFalse(gate.publish("chat-a", first) { published = true })
+        assertFalse(published)
+        assertTrue(gate.publish("chat-a", second) { published = true })
+        assertTrue(published)
+    }
+
+    @Test
     fun queuedSnapshotCannotPublishAfterClearInvalidatesItsRevision() {
         val gate = TranscriptWriteGate()
         val revision = gate.snapshotRevision("chat-a")

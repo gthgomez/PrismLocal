@@ -314,6 +314,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 if (isDestroyed) {
                     reusableResult.tokensCount = 0
                     reusableResult.textCount = 0
+                    reusableResult.textOverflowBytes = null
                     reusableResult.textOverflow = ""
                     reusableResult.produced = 0L
                     reusableResult.drained = 0L
@@ -324,6 +325,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 } else {
                     reusableResult.tokensCount = 0
                     reusableResult.textCount = 0
+                    reusableResult.textOverflowBytes = null
                     reusableResult.textOverflow = ""
                     reusableResult.produced = 0L
                     reusableResult.drained = 0L
@@ -341,21 +343,22 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 val state = reusableResult.state
                 val promptTokens = reusableResult.promptTokens
 
+                val holdAckForTerminal = acknowledgeOnlyAfterTerminal(state, reusableResult.errorCode)
                 if (tokenCount > 0) {
-                    pollDelay = 2L // reset backoff on active token receipt
+                    pollDelay = 2L
 
-                    // Decode text incrementally: prefer buffer bytes, fall back
-                    // to the already-decoded overflow string. Multi-byte code
-                    // points split across drains are carried until complete.
-                    val decodedText = if (reusableResult.textOverflow.isNotEmpty()) {
-                        utf8.append(reusableResult.textOverflow.toByteArray(Charsets.UTF_8))
-                    } else if (reusableResult.textCount > 0) {
-                        utf8.append(reusableResult.textBuffer, reusableResult.textCount)
-                    } else {
-                        ""
+                    val overflowBytes = reusableResult.textOverflowBytes
+                    val decodedText = when {
+                        overflowBytes != null && overflowBytes.isNotEmpty() ->
+                            utf8.append(overflowBytes)
+                        reusableResult.textOverflow.isNotEmpty() ->
+                            utf8.append(reusableResult.textOverflow.toByteArray(Charsets.UTF_8))
+                        reusableResult.textCount > 0 ->
+                            utf8.append(reusableResult.textBuffer, reusableResult.textCount)
+                        else -> ""
                     }
 
-                    if (decodedText.isNotEmpty() || tokenCount > 0) {
+                    if (!holdAckForTerminal && (decodedText.isNotEmpty() || tokenCount > 0)) {
                         val dataSent = sendChunk(
                             GenerationChunk(
                                 text = decodedText,
@@ -380,7 +383,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 if (decision.action == DrainStateAction.STOP) break
                 if (
                     decision.action == DrainStateAction.TERMINAL &&
-                    (!reusableResult.pending || !decision.waitForPending)
+                    (holdAckForTerminal || !reusableResult.pending || !decision.waitForPending)
                 ) {
                     // Finalize the decoder. Any buffered trailing bytes (e.g. a
                     // truncated final multi-byte sequence) are delivered *inside*
@@ -403,6 +406,11 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             errorCode = reusableResult.errorCode,
                         )
                     ) == StreamSendResult.SENT
+                    if (holdAckForTerminal && observedTerminal && tokenCount > 0 &&
+                        !nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)
+                    ) {
+                        throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
+                    }
                     break
                 }
 

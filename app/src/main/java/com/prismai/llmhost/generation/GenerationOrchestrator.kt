@@ -138,6 +138,9 @@ class GenerationOrchestrator(
     fun outputForGeneration(sessionId: Long, agentChainId: Long? = null): String? =
         generationResults.outputFor(sessionId, agentChainId)
 
+    fun terminalReasonForGeneration(sessionId: Long, agentChainId: Long? = null): String? =
+        generationResults.terminalReasonFor(sessionId, agentChainId)
+
     fun retainGenerationOutput(sessionId: Long?, agentChainId: Long?) =
         generationResults.retain(sessionId, agentChainId)
 
@@ -229,6 +232,25 @@ class GenerationOrchestrator(
         }
 
         val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
+        if (benchmarkPreset == null && !GenerationBudget.userTurnFits(
+                contextLength = settings.contextLength,
+                maxTokens = settings.maxTokens,
+                userPrompt = prompt,
+                memoryContext = memoryContext,
+                instructionText = if (agentEnabled) AgentToolProtocol.instructionBlock() else "",
+                reservedTokens = if (agentEnabled) {
+                    GenerationBudget.DEFAULT_AGENT_PAD_TOKENS
+                } else {
+                    GenerationBudget.DEFAULT_NON_AGENT_RESERVED_TOKENS
+                },
+            )
+        ) {
+            if (agentChainId != null) {
+                agentTrace.abortTrace(agentChainId, "Prompt exceeds context window")
+            }
+            eventBus.publish("This message is too long for the context window")
+            return
+        }
         // Structured, role-preserving messages for normal chat. The legacy string
         // path stays for agent turns and benchmark presets, which build their own
         // protocol prompts and must keep byte-identical behavior.
@@ -251,9 +273,10 @@ class GenerationOrchestrator(
                 val maxHistoryChars = GenerationBudget.calculateAgentHistoryCharBudget(
                     contextLength = settings.contextLength,
                     maxTokens = settings.maxTokens,
-                    userPromptChars = prompt.length,
+                    userPromptChars = GenerationBudget.estimateTokens(prompt) * GenerationBudget.CHARS_PER_TOKEN,
                     instructionBlockChars = AgentToolProtocol.instructionBlock().length,
-                    extraContextChars = memoryContext.length,
+                    extraContextChars = GenerationBudget.estimateTokens(memoryContext) *
+                        GenerationBudget.CHARS_PER_TOKEN,
                 )
                 val history = getFormattedHistoryForAgent(emptySet(), maxHistoryChars = maxHistoryChars)
                 val historyWithMemory = buildString {
@@ -759,7 +782,15 @@ class GenerationOrchestrator(
             }
             .onCompletion { cause ->
                 val ownedOutput = sessionOutput.snapshot()
-                generationResults.record(session, agentChainId, ownedOutput)
+                val resolved = GenerationTerminalReducer.resolveFinal(
+                    current = terminalState,
+                    causeIsCancellation = cause is CancellationException,
+                    checkEmptyStart = config.checkEmptyStart,
+                    generatedTokens = generatedTokens,
+                    userStopLikely = uiState.runtimeStatus.value == RuntimeStatus.CANCELLING,
+                )
+                val finalReason = resolved.reason ?: "EOF"
+                generationResults.record(session, agentChainId, ownedOutput, finalReason)
                 val ownsAgentChain = agentChainId == null || agentTrace.isCurrentChain(agentChainId)
                 if (session != getActiveSession() || !ownsAgentChain) {
                     if (agentChainId != null && agentTrace.isCurrentChain(agentChainId)) {
@@ -780,15 +811,7 @@ class GenerationOrchestrator(
                 if (cause is CancellationException) {
                     Log.d(TAG, "${config.errorLabel} cancelled session=$session")
                 }
-                val resolved = GenerationTerminalReducer.resolveFinal(
-                    current = terminalState,
-                    causeIsCancellation = cause is CancellationException,
-                    checkEmptyStart = config.checkEmptyStart,
-                    generatedTokens = generatedTokens,
-                    userStopLikely = uiState.runtimeStatus.value == RuntimeStatus.CANCELLING,
-                )
                 terminalState = resolved
-                val finalReason = resolved.reason ?: "EOF"
                 val terminalDetail = resolved.detail
                 if (finalReason == "ERROR" && terminalDetail == "generation_did_not_start") {
                     uiState._runtimeStatus.value = RuntimeStatus.ERROR

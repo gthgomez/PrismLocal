@@ -107,6 +107,14 @@ class NativeBridgeBackpressureTest {
     }
 
     @Test
+    fun failedDecodeIsNotAcknowledgedBeforeItsTerminal() {
+        assertTrue(acknowledgeOnlyAfterTerminal(NATIVE_STATE_ERROR, errorCode = 0))
+        assertTrue(acknowledgeOnlyAfterTerminal(NATIVE_STATE_EOF, errorCode = 7))
+        assertFalse(acknowledgeOnlyAfterTerminal(NATIVE_STATE_GENERATING, errorCode = 0))
+        assertFalse(acknowledgeOnlyAfterTerminal(NATIVE_STATE_EOF, errorCode = 0))
+    }
+
+    @Test
     fun deliveredTrueTerminalsDoNotRequestSyntheticCancellation() {
         val trueTerminalStates = listOf(
             NATIVE_STATE_EOF,

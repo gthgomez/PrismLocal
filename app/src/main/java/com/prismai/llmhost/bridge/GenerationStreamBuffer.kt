@@ -75,6 +75,13 @@ internal fun shouldCancelNative(
     decision: DrainStateDecision?,
 ): Boolean = !observedTerminal || decision?.requiresNativeCancellation == true
 
+/** A failed decode stays on the ring until its error terminal is accepted. */
+internal fun acknowledgeOnlyAfterTerminal(state: Int, errorCode: Int): Boolean {
+    val decision = decideDrainState(state, errorCode)
+    return decision.action == DrainStateAction.TERMINAL &&
+        (state == NATIVE_STATE_ERROR || errorCode != 0)
+}
+
 /** Bounds the stream by the native token limit while reserving terminal headroom. */
 internal fun generationStreamBufferCapacity(maxTokens: Int): Int =
     maxTokens.coerceIn(GenerationSettings.MIN_MAX_TOKENS, GenerationSettings.MAX_MAX_TOKENS) +

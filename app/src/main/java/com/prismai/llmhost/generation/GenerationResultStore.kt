@@ -17,8 +17,13 @@ class GenerationResultStore(
     private val maxSessionResults: Int = 64,
     private val maxChainResults: Int = 32,
 ) {
-    private val sessionOutputs = LinkedHashMap<Long, String>()
-    private val chainOutputs = LinkedHashMap<Long, Pair<Long, String>>()
+    private data class StoredGeneration(
+        val output: String,
+        val terminalReason: String,
+    )
+
+    private val sessionOutputs = LinkedHashMap<Long, StoredGeneration>()
+    private val chainOutputs = LinkedHashMap<Long, Pair<Long, StoredGeneration>>()
     private val retainedSessions = mutableMapOf<Long, Int>()
     private val retainedChains = mutableMapOf<Long, Int>()
 
@@ -37,14 +42,20 @@ class GenerationResultStore(
     }
 
     @Synchronized
-    fun record(sessionId: Long, agentChainId: Long?, output: String) {
-        sessionOutputs[sessionId] = output
+    fun record(
+        sessionId: Long,
+        agentChainId: Long?,
+        output: String,
+        terminalReason: String = "EOF",
+    ) {
+        val stored = StoredGeneration(output, terminalReason)
+        sessionOutputs[sessionId] = stored
         trimToLimit(sessionOutputs, maxSessionResults, retainedSessions.keys)
         if (agentChainId != null) {
             val previous = chainOutputs[agentChainId]
             if (previous == null || sessionId >= previous.first) {
                 chainOutputs.remove(agentChainId)
-                chainOutputs[agentChainId] = sessionId to output
+                chainOutputs[agentChainId] = sessionId to stored
             }
             trimToLimit(chainOutputs, maxChainResults, retainedChains.keys)
         }
@@ -52,6 +63,13 @@ class GenerationResultStore(
 
     @Synchronized
     fun outputFor(sessionId: Long, agentChainId: Long? = null): String? =
+        storedFor(sessionId, agentChainId)?.output
+
+    @Synchronized
+    fun terminalReasonFor(sessionId: Long, agentChainId: Long? = null): String? =
+        storedFor(sessionId, agentChainId)?.terminalReason
+
+    private fun storedFor(sessionId: Long, agentChainId: Long?): StoredGeneration? =
         if (agentChainId != null) chainOutputs[agentChainId]?.second else sessionOutputs[sessionId]
 
     private fun <K, V> trimToLimit(

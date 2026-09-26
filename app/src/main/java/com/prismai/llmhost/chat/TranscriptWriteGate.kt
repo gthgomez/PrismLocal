@@ -7,7 +7,10 @@ class TranscriptWriteGate {
     private val retiredOwners = mutableSetOf<String>()
 
     fun snapshotRevision(chatId: String): Long = synchronized(lock) {
-        revisions[chatId] ?: 0L
+        if (chatId in retiredOwners) return@synchronized -1L
+        val next = (revisions[chatId] ?: 0L) + 1L
+        revisions[chatId] = next
+        next
     }
 
     fun publish(chatId: String, expectedRevision: Long, write: () -> Unit): Boolean =

@@ -601,6 +601,14 @@ class InferenceService : Service() {
             store = benchmarkStore,
             orchestrator = generationOrchestrator,
             scope = serviceScope,
+            runJoinedGeneration = { prompt, preset ->
+                generateSafelyAndAwait(
+                    prompt = prompt,
+                    benchmarkPreset = preset,
+                    preserveBenchmarkQueue = true,
+                )
+            },
+            runExclusive = { block -> operationMutex.withLock { block() } },
         )
 
         benchmarkStore.load()
@@ -770,8 +778,13 @@ class InferenceService : Service() {
     fun cancelGeneration() {
         benchmarkRunner.cancelGeneration()
         serviceScope.launch {
-            operationMutex.withLock {
-                cancelAndJoinGenerationLocked("user cancel")
+            val backgroundTaskId = backgroundGenerationOwnership.ownerId()
+            if (backgroundTaskId != null) {
+                backgroundAgentManager.cancelTask(backgroundTaskId)
+            } else {
+                operationMutex.withLock {
+                    cancelAndJoinGenerationLocked("user cancel")
+                }
             }
         }
     }
@@ -1098,7 +1111,21 @@ class InferenceService : Service() {
                 sessionId = resultSessionId ?: -1L,
                 agentChainId = resultAgentChainId,
             )
-            return ownedOutput?.takeIf { it.isNotBlank() } ?: "Background task completed"
+            val terminalReason = generationOrchestrator.terminalReasonForGeneration(
+                sessionId = resultSessionId ?: -1L,
+                agentChainId = resultAgentChainId,
+            )
+            if (terminalReason == null ||
+                terminalReason == "ERROR" ||
+                terminalReason == "CANCELLED" ||
+                terminalReason == "QUALITY_ABORT" ||
+                ownedOutput.isNullOrBlank()
+            ) {
+                throw IllegalStateException(
+                    "Generation ended without a successful response: ${terminalReason ?: "no result"}",
+                )
+            }
+            return ownedOutput
         } catch (cancelled: CancellationException) {
             withContext(NonCancellable) {
                 cancelGenerationAndJoin("generation owner cancelled")
@@ -1988,6 +2015,7 @@ class InferenceService : Service() {
             )
             chatManager.activeAssistantTranscriptId = null
         }
+        persistTranscriptNow()
         if (_runtimeStatus.value == RuntimeStatus.GENERATING || _runtimeStatus.value == RuntimeStatus.CANCELLING) {
             _runtimeStatus.value = RuntimeStatus.IDLE
         }

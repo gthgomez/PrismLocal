@@ -188,11 +188,34 @@ class AgentTraceContinuationTest {
 
         trace.deleteForChat("deleted-chat")
         assertTrue(File(dir, "agent_traces").listFiles()?.none { it.extension == "json" } ?: true)
+        assertNull(ui.lastAgentTracePath.value)
 
         val next = trace.beginChain("stale", ownerChatId = "deleted-chat")
         trace.finalizeOwnedTrace(next, success = true)
         kotlinx.coroutines.delay(30)
         assertTrue(File(dir, "agent_traces").listFiles()?.none { it.extension == "json" } ?: true)
+    }
+
+    @Test
+    fun traceRetentionRemovesExpiredArtifacts() = runBlocking {
+        val dir = tempFolder.newFolder()
+        val tracesDir = File(dir, "agent_traces").apply { mkdirs() }
+        val expired = File(tracesDir, "expired.json").apply {
+            writeText(JSONObject().put("owner_chat_id", "chat-old").toString())
+            setLastModified(System.currentTimeMillis() - 31L * 24 * 60 * 60 * 1000)
+        }
+        val trace = AgentTrace(
+            uiState = ServiceUiState().also { it._currentChatId.value = "chat-new" },
+            filesDir = dir,
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+        )
+        val chain = trace.beginChain("retention fixture")
+        trace.finalizeOwnedTrace(chain, success = true)
+        withTimeout(2_000) {
+            while (tracesDir.listFiles()?.any { it.name.startsWith("agent_trace_") } != true) kotlinx.coroutines.delay(2)
+        }
+
+        assertFalse(expired.exists())
     }
 
     @Test

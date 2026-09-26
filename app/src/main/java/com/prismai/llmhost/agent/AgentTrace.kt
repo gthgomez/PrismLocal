@@ -215,7 +215,8 @@ class AgentTrace(
             .put("total_tokens", totalTokens)
             .put("owner_chat_id", ownerChatId)
         if (rawContentOptIn) json.put("prompt", trace.prompt)
-        if (trace.abortReason != null) {
+        json.put("has_abort_reason", trace.abortReason != null)
+        if (rawContentOptIn && trace.abortReason != null) {
             json.put("abort_reason", trace.abortReason)
         }
 
@@ -235,6 +236,7 @@ class AgentTrace(
 
         val tracesDir = File(filesDir, "agent_traces")
         val file = File(tracesDir, "agent_trace_${trace.timestamp}_${java.util.UUID.randomUUID()}.json")
+        val temp = File(tracesDir, ".${file.name}.tmp")
         val persist = {
             runCatching {
                 if (!tracesDir.exists()) {
@@ -243,7 +245,6 @@ class AgentTrace(
                 synchronized(this) {
                     if (ownerChatId != null && ownerChatId in deletedChatIds) return@synchronized
                     if (!tracesDir.exists()) tracesDir.mkdirs()
-                    val temp = File(tracesDir, ".${file.name}.tmp")
                     writeArtifact(temp, json)
                     if (ownerChatId != null && ownerChatId in deletedChatIds) {
                         temp.delete()
@@ -258,6 +259,7 @@ class AgentTrace(
                 }
                 logDebug("Agent trace saved: ${file.absolutePath}")
             }.onFailure { error ->
+                temp.delete()
                 logError("Failed to serialize/save agent trace", error)
             }
         }
@@ -278,22 +280,28 @@ class AgentTrace(
     fun deleteForChat(chatId: String) {
         deletedChatIds += chatId
         val dir = File(filesDir, "agent_traces")
-        dir.listFiles()?.filter { it.extension == "json" }?.forEach { file ->
-            val owner = runCatching { JSONObject(file.readText()).optString("owner_chat_id") }.getOrNull()
-            if (owner == chatId) file.delete()
+        dir.listFiles()?.filter { it.extension == "json" || it.extension == "tmp" }?.forEach { file ->
+            val owner = runCatching { JSONObject(file.readText()).optString("owner_chat_id") }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() && it != "null" }
+            if (owner == null || owner == chatId) file.delete()
         }
         val lastPath = uiState._lastAgentTracePath.value
-        if (lastPath != null && runCatching {
+        if (lastPath != null && (!File(lastPath).exists() || runCatching {
                 JSONObject(File(lastPath).readText()).optString("owner_chat_id") == chatId
-            }.getOrDefault(false)
+            }.getOrDefault(false))
         ) uiState._lastAgentTracePath.value = null
     }
 
     private fun applyRetentionLocked(dir: File) {
         val now = System.currentTimeMillis()
-        dir.listFiles()?.filter { it.extension == "json" }
-            ?.sortedByDescending { it.lastModified() }
-            ?.forEachIndexed { index, file ->
+        val artifacts = dir.listFiles()?.filter { it.extension == "json" } ?: emptyList()
+        dir.listFiles()?.filter { it.extension == "tmp" }?.forEach { temp ->
+            if (now - temp.lastModified() > 30L * 24 * 60 * 60 * 1000) temp.delete()
+        }
+        artifacts
+            .sortedByDescending { it.lastModified() }
+            .forEachIndexed { index, file ->
                 if (index >= 20 || now - file.lastModified() > 30L * 24 * 60 * 60 * 1000) file.delete()
             }
     }

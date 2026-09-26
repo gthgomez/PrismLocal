@@ -50,9 +50,12 @@ class PromptBuilder(
                 message.text.isNotBlank() && message.id != activeAssistantTranscriptId
             }
             val selected = ArrayDeque<TranscriptMessage>()
-            var estimatedTokens = (newPrompt.length + memoryContext.length) / 4
+            var estimatedTokens = GenerationBudget.estimateTokens(newPrompt) +
+                GenerationBudget.estimateTokens(memoryContext) +
+                GenerationBudget.MESSAGE_TEMPLATE_TOKENS
             for (message in history.asReversed()) {
-                val tokens = message.toChatMessage().content.length / 4
+                val tokens = GenerationBudget.estimateTokens(message.toChatMessage().content) +
+                    GenerationBudget.MESSAGE_TEMPLATE_TOKENS
                 if (estimatedTokens + tokens <= tokenBudget) {
                     selected.addFirst(message)
                     estimatedTokens += tokens

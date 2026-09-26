@@ -95,7 +95,7 @@ internal fun ControlPlaneSheet(
     isGenerating: Boolean,
     serviceAvailable: Boolean,
     onSwitchModel: (String) -> Unit,
-    onDeleteModel: ((String) -> Unit)? = null,
+    onDeleteModel: ((ModelIdentity) -> Unit)? = null,
     onImportModel: () -> Unit,
     onLinkModel: (() -> Unit)? = null,
     onCancelImport: () -> Unit,
@@ -490,17 +490,25 @@ internal fun ControlPlaneSheet(
 
     modelToDelete?.let { targetId ->
         val targetReadiness = modelReadiness.firstOrNull { it.info.id == targetId }
+        val identity = targetReadiness?.info?.let(ModelIdentity::from)
         val sizeLabel = targetReadiness?.let { formatBytes(it.info.bytes) } ?: "model"
         AlertDialog(
             onDismissRequest = { modelToDelete = null },
             title = { Text("Delete Model?") },
             text = {
-                Text("Are you sure you want to delete ${compactModelName(targetId)} ($sizeLabel) from device storage? This cannot be undone.")
+                Text(
+                    if (identity == null) {
+                        "This model has no confirmed version, hash, and path, so it cannot be deleted."
+                    } else {
+                        "Delete ${compactModelName(targetId)} ($sizeLabel) only if it is still version ${identity.versionId}, SHA-256 ${identity.sha256}, at ${identity.path}. This cannot be undone."
+                    },
+                )
             },
             confirmButton = {
                 TextButton(
+                    enabled = identity != null,
                     onClick = {
-                        val toDelete = targetId
+                        val toDelete = identity ?: return@TextButton
                         modelToDelete = null
                         onDeleteModel?.invoke(toDelete)
                     },

@@ -3,9 +3,12 @@ package com.prismai.llmhost
 import android.content.Context
 import android.content.ContextWrapper
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -16,6 +19,53 @@ class FakeTestContext : ContextWrapper(null) {
 }
 
 class BackgroundAgentManagerTest {
+
+    @Test
+    fun deletingSourceChatDiscardsOnlyItsQueuedTasks() = runBlocking {
+        val manager = BackgroundAgentManager(
+            context = FakeTestContext(),
+            isDeviceBusyWithUserGeneration = { true },
+        )
+        val owned = manager.enqueue("owned prompt", sourceChatId = "chat-a")!!
+        val other = manager.enqueue("other prompt", sourceChatId = "chat-b")!!
+
+        var deleted = false
+        val removed = manager.deleteChatAndInvalidateTasks("chat-a") {
+            deleted = true
+            true
+        }
+
+        assertTrue(deleted)
+        assertTrue(removed)
+        assertEquals(listOf(other.id), manager.state.value.queuedTasks.map { it.id })
+    }
+
+    @Test
+    fun sourceChatDeletionIsRejectedWhileItsTaskIsActive() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        val holdTask = CompletableDeferred<String>()
+        val manager = BackgroundAgentManager(
+            context = FakeTestContext(),
+            executeTask = {
+                started.complete(Unit)
+                holdTask.await()
+            },
+        )
+        val task = manager.enqueue("active prompt", sourceChatId = "chat-a")!!
+        started.await()
+        var deleted = false
+
+        val deletedAndInvalidated = manager.deleteChatAndInvalidateTasks("chat-a") {
+            deleted = true
+            true
+        }
+
+        assertFalse(deletedAndInvalidated)
+        assertFalse(deleted)
+        assertEquals(task.id, manager.state.value.activeTask?.id)
+        manager.cancelTask(task.id)
+        delay(50)
+    }
 
     @Test
     fun enqueuedTaskExecutesViaRunner() = runBlocking {
@@ -312,5 +362,70 @@ class BackgroundAgentManagerTest {
         assertEquals(BackgroundTaskStatus.COMPLETED, manager.state.value.completedTasks.first().status)
         assertEquals(0, manager.state.value.queuedTasks.size)
         assertNull(manager.state.value.activeTask)
+    }
+
+    @Test
+    fun taskDeferredAfterPromotionReturnsToQueueInsteadOfCompleting() = runBlocking {
+        val testContext = FakeTestContext()
+        val attempts = AtomicInteger()
+        val deviceBusy = AtomicBoolean(false)
+        val firstDeferred = CompletableDeferred<Unit>()
+        val manager = BackgroundAgentManager(
+            context = testContext,
+            executeTask = {
+                if (attempts.incrementAndGet() == 1) {
+                    deviceBusy.set(true)
+                    firstDeferred.complete(Unit)
+                    throw BackgroundTaskDeferredException()
+                }
+                "completed after retry"
+            },
+            isDeviceBusyWithUserGeneration = { deviceBusy.get() },
+        )
+
+        val task = manager.enqueue("retry after admission race", sourceChatId = "chat-a")!!
+        firstDeferred.await()
+        var attemptsToRequeue = 0
+        while (manager.state.value.activeTask != null && attemptsToRequeue < 40) {
+            delay(25)
+            attemptsToRequeue++
+        }
+        assertNull(manager.state.value.activeTask)
+        assertEquals(task.id, manager.state.value.queuedTasks.firstOrNull()?.id)
+        assertTrue(manager.state.value.completedTasks.none { it.id == task.id })
+
+        deviceBusy.set(false)
+        var attemptsToComplete = 0
+        while (manager.state.value.completedTasks.none { it.id == task.id } && attemptsToComplete < 100) {
+            delay(50)
+            attemptsToComplete++
+        }
+        assertEquals(2, attempts.get())
+        assertEquals(
+            BackgroundTaskStatus.COMPLETED,
+            manager.state.value.completedTasks.first { it.id == task.id }.status,
+        )
+    }
+
+    @Test
+    fun deferredTaskDoesNotRetryInATightLoop() = runBlocking {
+        val attempts = AtomicInteger()
+        val manager = BackgroundAgentManager(
+            context = FakeTestContext(),
+            executeTask = {
+                attempts.incrementAndGet()
+                throw BackgroundTaskDeferredException()
+            },
+            isDeviceBusyWithUserGeneration = { false },
+        )
+
+        manager.enqueue("stay queued", sourceChatId = "chat-a")
+        delay(400)
+
+        assertEquals(1, attempts.get())
+        assertEquals(1, manager.state.value.queuedTasks.size)
+        assertNull(manager.state.value.activeTask)
+        manager.cancelTask(manager.state.value.queuedTasks.first().id)
+        Unit
     }
 }

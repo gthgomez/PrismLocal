@@ -9,6 +9,8 @@
 #include "runtime/ConversationState.hpp" // PIR-05
 #include "runtime/StreamProtocol.hpp" // PIR-02
 #include "runtime/NativeErrorCode.hpp"
+#include "runtime/GenerationLifecycleGate.hpp"
+#include "runtime/GenerationDrainAck.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -66,7 +68,7 @@ struct ControlBlock {
     std::atomic<uint32_t> tail{0};
     std::atomic<uint32_t> capacity{kTokenCapacity};
     std::atomic<uint32_t> overflow{0};
-    std::atomic<uint32_t> error_code{0};
+    std::atomic<uint32_t> error_code{static_cast<uint32_t>(NativeErrorCode::OK)};
     // PIR-02: monotonic per-session token accounting. `produced_tokens` is
     // incremented after a successful ring write, `drained_tokens` after the
     // consumer advances the tail. A terminal state with produced > drained has
@@ -114,7 +116,7 @@ void clearRing(ControlBlock* ctrl) {
     ctrl->head.store(0, std::memory_order_release);
     ctrl->tail.store(0, std::memory_order_release);
     ctrl->overflow.store(0, std::memory_order_release);
-    ctrl->error_code.store(0, std::memory_order_release);
+    ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::OK), std::memory_order_release);
     // PIR-02: a cleared ring has no produced/drained backlog. Reset the
     // accounting so a subsequent terminal cannot inherit stale pending output.
     ctrl->produced_tokens.store(0, std::memory_order_release);
@@ -1013,10 +1015,19 @@ struct Engine::Impl {
     }
 
     void finishSession(const std::shared_ptr<GenerationSession>& session, StreamState final_state) {
-        buffers.control->state.store(static_cast<uint32_t>(final_state), std::memory_order_release);
+        auto* ctrl = buffers.control;
+        if (ctrl->generation_id.load(std::memory_order_acquire) != session->generation_id) return;
+        uint32_t observed_state = ctrl->state.load(std::memory_order_acquire);
+        while (observed_state != static_cast<uint32_t>(StreamState::Error) &&
+               !ctrl->state.compare_exchange_weak(
+                   observed_state,
+                   static_cast<uint32_t>(final_state),
+                   std::memory_order_acq_rel,
+                   std::memory_order_acquire)) {}
         // PIR-02: derive the terminal reason from the frozen StreamState via the
         // portable protocol mapping (values are unchanged) for the log line.
-        const StreamTerminal terminal = toStreamTerminal(final_state);
+        const StreamTerminal terminal = toStreamTerminal(static_cast<StreamState>(
+            ctrl->state.load(std::memory_order_acquire)));
         LOGI("terminal=%s terminal_code=%u generation_id=%u",
              streamTerminalName(terminal),
              static_cast<unsigned>(terminal),
@@ -1029,11 +1040,13 @@ struct Engine::Impl {
         int32_t* token_buffer = buffers.tokens;
         if (prompt == "DEBUG_SIMULATE_RING") {
             if (!debugHooksAllowed()) {
-                ctrl->error_code.store(403, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::DEBUG_HOOKS_REJECTED), std::memory_order_release);
                 finishSession(session, StreamState::Error);
                 return;
             }
-            for (int i = 0; i < 1000; i++) {
+            // More than kTokenCapacity proves that the consumer acknowledgement
+            // path applies backpressure instead of overwriting uncommitted data.
+            for (int i = 0; i < static_cast<int>(kTokenCapacity) + 1024; i++) {
                 if (memory_pressure_level.load(std::memory_order_acquire) >= 3) {
                     session->cancel_requested.store(true, std::memory_order_release);
                 }
@@ -1051,7 +1064,7 @@ struct Engine::Impl {
         (void) session;
         (void) prompt;
 #endif
-        buffers.control->error_code.store(501, std::memory_order_release);
+        buffers.control->error_code.store(static_cast<uint32_t>(NativeErrorCode::DEBUG_GENERATION_REJECTED), std::memory_order_release);
         LOGW("debug_generation_rejected prompt=%s", prompt.c_str());
         finishSession(session, StreamState::Error);
     }
@@ -1061,7 +1074,7 @@ struct Engine::Impl {
         auto* ctrl = buffers.control;
 
         if (!runtime || runtime->model == nullptr || runtime->ctx == nullptr || runtime->vocab == nullptr) {
-            ctrl->error_code.store(404, std::memory_order_release);
+            ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::HANDLE_INVALID_OR_CLOSED), std::memory_order_release);
             finishSession(session, StreamState::Error);
             return;
         }
@@ -1130,7 +1143,7 @@ struct Engine::Impl {
             }
             if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens + kContextHeadroom, false,
                                              cache_identity)) {
-                ctrl->error_code.store(426, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::CONTEXT_SHIFT_FAILED), std::memory_order_release);
                 LOGE("continue_context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
                      static_cast<int>(runtime->current_position),
@@ -1261,7 +1274,7 @@ struct Engine::Impl {
 
             if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens + kContextHeadroom, true,
                                              cache_identity)) {
-                ctrl->error_code.store(426, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::CONTEXT_SHIFT_FAILED), std::memory_order_release);
                 LOGE("context_shift_failed n_ctx=%d current_position=%d required=%d",
                      runtime->context_length,
                      static_cast<int>(runtime->current_position),
@@ -1402,7 +1415,7 @@ struct Engine::Impl {
         }
         llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
         if (sampler == nullptr) {
-            ctrl->error_code.store(424, std::memory_order_release);
+            ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::SAMPLER_INIT_FAILED), std::memory_order_release);
             finishSession(session, StreamState::Error);
             return;
         }
@@ -1467,7 +1480,7 @@ struct Engine::Impl {
                 // No unconstrained fallback: when a required grammar rejects every
                 // candidate, fail with a typed error instead of emitting output that
                 // violates the requested structure.
-                ctrl->error_code.store(425, std::memory_order_release);
+                ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::NULL_TOKEN_PRODUCED), std::memory_order_release);
                 LOGE("sample_failed token=null grammar=%d generation_id=%u",
                      session->config.grammar.empty() ? 0 : 1,
                      session->generation_id);
@@ -1569,6 +1582,10 @@ struct Engine::Impl {
     }
 
     int startSessionInternal(std::string prompt, std::vector<ChatMessage> messages, int generation_id, GenerationConfig config) {
+        // One transition boundary serializes stream ownership changes against
+        // drain/decode/ack. recursive_mutex is required because the combined
+        // drain API composes the primitive public operations below.
+        auto lifecycle_lock = lifecycle_gate.enter();
         std::shared_ptr<GenerationSession> old_session;
         std::shared_ptr<ModelRuntime> runtime;
         {
@@ -1609,6 +1626,7 @@ struct Engine::Impl {
     }
 
     std::mutex mu;
+    GenerationLifecycleGate lifecycle_gate;
     StaticBuffers buffers;
     std::shared_ptr<ModelRuntime> active_runtime;
     std::shared_ptr<GenerationSession> active_session;
@@ -1629,6 +1647,7 @@ bool Engine::loadModel(const std::string& path, GenerationConfig config) {
     if (!impl_) {
         return false;
     }
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
     impl_->cancelAndJoinActiveSession();
     const GenerationConfig safe_config = sanitizeGenerationConfig(config, kDefaultThreadCount);
 
@@ -1674,6 +1693,7 @@ void Engine::resetConversation() {
     if (!impl_) {
         return;
     }
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
     impl_->cancelAndJoinActiveSession();
     std::shared_ptr<ModelRuntime> runtime;
     {
@@ -1694,6 +1714,7 @@ void Engine::unloadModel() {
     if (!impl_) {
         return;
     }
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
     impl_->cancelAndJoinActiveSession();
     std::string previous_path;
     std::lock_guard<std::mutex> lock(impl_->mu);
@@ -1830,6 +1851,7 @@ void Engine::cancelGeneration(int generation_id) {
     if (!impl_) {
         return;
     }
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
     std::shared_ptr<GenerationSession> session_to_join;
     {
         std::lock_guard<std::mutex> lock(impl_->mu);
@@ -1843,13 +1865,16 @@ void Engine::cancelGeneration(int generation_id) {
     if (session_to_join && session_to_join->worker.joinable()) {
         session_to_join->worker.join();
     }
-    // PIR-02: deliberately do NOT clearRing here. The cancelled session is already
-    // detached above and any leftover ring tokens are discarded by the next
-    // startSessionInternal(), which calls clearRing at the session boundary.
-    // Clearing after releasing `mu` to join would race a newer generation that
-    // started in that window (wiping its ring/counters) and could race a
-    // concurrent drainTokens. An empty ring is treated as no-pending by
-    // ackEof/drainDecodeAndState, so no ack can get stuck either way.
+    // The lifecycle gate stays held through the join, so no replacement session
+    // or drain can observe this cancelled generation's unacknowledged batch.
+    // Explicit cancellation discards that batch only after its producer stops.
+    if (session_to_join) {
+        auto* ctrl = impl_->buffers.control;
+        if (ctrl->generation_id.load(std::memory_order_acquire) == static_cast<uint32_t>(generation_id)) {
+            clearRing(ctrl);
+            ctrl->state.store(static_cast<uint32_t>(StreamState::Cancelled), std::memory_order_release);
+        }
+    }
 }
 
 std::vector<int32_t> Engine::drainTokens(int generation_id, int max_tokens) {
@@ -1857,6 +1882,7 @@ std::vector<int32_t> Engine::drainTokens(int generation_id, int max_tokens) {
     if (!impl_ || max_tokens <= 0) {
         return result;
     }
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
 
     auto* ctrl = impl_->buffers.control;
     if (ctrl->generation_id.load(std::memory_order_acquire) != static_cast<uint32_t>(generation_id)) {
@@ -1879,10 +1905,28 @@ std::vector<int32_t> Engine::drainTokens(int generation_id, int max_tokens) {
     return result;
 }
 
+bool Engine::acknowledgeDrainedTokens(int generation_id, int expected_tail, int token_count) {
+    if (!impl_ || token_count <= 0) return false;
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
+    auto* ctrl = impl_->buffers.control;
+    if (ctrl->generation_id.load(std::memory_order_acquire) != static_cast<uint32_t>(generation_id)) {
+        return false;
+    }
+    const uint32_t tail = ctrl->tail.load(std::memory_order_acquire);
+    const uint32_t head = ctrl->head.load(std::memory_order_acquire);
+    const uint32_t capacity = ctrl->capacity.load(std::memory_order_acquire);
+    const uint32_t available = head >= tail ? head - tail : capacity - tail + head;
+    if (!validDrainAcknowledgement(expected_tail, tail, token_count, available)) return false;
+    ctrl->tail.store((tail + static_cast<uint32_t>(token_count)) % capacity, std::memory_order_release);
+    ctrl->drained_tokens.fetch_add(static_cast<uint32_t>(token_count), std::memory_order_acq_rel);
+    return true;
+}
+
 void Engine::ackEof(int generation_id) {
     if (!impl_) {
         return;
     }
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
     std::shared_ptr<GenerationSession> session_to_join;
     {
         std::lock_guard<std::mutex> lock(impl_->mu);
@@ -1918,12 +1962,18 @@ void Engine::ackEof(int generation_id) {
 }
 
 std::string Engine::decodeTokens(int generation_id, const std::vector<int32_t>& tokens) {
-    if (!impl_ || tokens.empty()) {
-        return "";
-    }
+    std::string output;
+    decodeTokensChecked(generation_id, tokens, output);
+    return output;
+}
+
+bool Engine::decodeTokensChecked(int generation_id, const std::vector<int32_t>& tokens, std::string& output) {
+    output.clear();
+    if (!impl_ || tokens.empty()) return false;
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
     auto* ctrl = impl_->buffers.control;
     if (ctrl->generation_id.load(std::memory_order_acquire) != static_cast<uint32_t>(generation_id)) {
-        return "";
+        return false;
     }
 
     std::shared_ptr<ModelRuntime> runtime;
@@ -1932,21 +1982,18 @@ std::string Engine::decodeTokens(int generation_id, const std::vector<int32_t>& 
         runtime = impl_->active_runtime;
     }
     if (!runtime) {
-        return "";
+        return false;
     }
     if (runtime->mock_model) {
-        std::string text;
         for (size_t i = 0; i < tokens.size(); i++) {
-            text += "T";
-            text += std::to_string(tokens[i]);
-            if (i + 1 < tokens.size()) {
-                text += " ";
-            }
+            output += "T";
+            output += std::to_string(tokens[i]);
+            if (i + 1 < tokens.size()) output += " ";
         }
-        return text;
+        return true;
     }
     if (runtime->vocab == nullptr) {
-        return "";
+        return false;
     }
 
     std::vector<llama_token> llama_tokens;
@@ -1967,22 +2014,23 @@ std::string Engine::decodeTokens(int generation_id, const std::vector<int32_t>& 
         needed = -needed;
     }
     if (needed <= 0) {
-        return "";
+        return true;
     }
-    std::string text(static_cast<size_t>(needed), '\0');
+    output.resize(static_cast<size_t>(needed));
     const int32_t actual = llama_detokenize(
         runtime->vocab,
         llama_tokens.data(),
         static_cast<int32_t>(llama_tokens.size()),
-        text.data(),
+        output.data(),
         needed,
         false,
         false);
     if (actual <= 0) {
-        return "";
+        output.clear();
+        return false;
     }
-    text.resize(static_cast<size_t>(actual));
-    return text;
+    output.resize(static_cast<size_t>(actual));
+    return true;
 }
 
 std::vector<float> Engine::encode(const std::string& text) {
@@ -2074,9 +2122,39 @@ Engine::DrainResult Engine::drainDecodeAndState(int generation_id, int max_token
     if (!impl_) {
         return result;
     }
-    result.tokens = drainTokens(generation_id, max_tokens);
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
+    auto* control = impl_->buffers.control;
+    if (control->generation_id.load(std::memory_order_acquire) != static_cast<uint32_t>(generation_id)) {
+        result.state = static_cast<int>(StreamState::Tombstoned);
+        result.error_code = static_cast<int>(NativeErrorCode::HANDLE_INVALID_OR_CLOSED);
+        return result;
+    }
+    if (max_tokens > 0 && impl_->buffers.control->generation_id.load(std::memory_order_acquire) ==
+            static_cast<uint32_t>(generation_id)) {
+        auto* ctrl = impl_->buffers.control;
+        const uint32_t tail = ctrl->tail.load(std::memory_order_acquire);
+        const uint32_t head = ctrl->head.load(std::memory_order_acquire);
+        const uint32_t capacity = ctrl->capacity.load(std::memory_order_acquire);
+        uint32_t count = head >= tail ? head - tail : capacity - tail + head;
+        count = std::min<uint32_t>(count, static_cast<uint32_t>(max_tokens));
+        result.drain_tail = static_cast<int>(tail);
+        result.tokens.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            result.tokens.push_back(impl_->buffers.tokens[(tail + i) % capacity]);
+        }
+    }
     if (!result.tokens.empty()) {
-        result.text = decodeTokens(generation_id, result.tokens);
+        if (!decodeTokensChecked(generation_id, result.tokens, result.text)) {
+            auto* ctrl = impl_->buffers.control;
+            ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::NATIVE_EXCEPTION), std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(impl_->mu);
+                if (impl_->active_session && impl_->active_session->generation_id == static_cast<uint32_t>(generation_id)) {
+                    impl_->active_session->cancel_requested.store(true, std::memory_order_release);
+                }
+            }
+            ctrl->state.store(static_cast<uint32_t>(StreamState::Error), std::memory_order_release);
+        }
     }
     result.state = getState(generation_id);
 
@@ -2119,6 +2197,7 @@ int Engine::getState(int generation_id) const {
     if (!impl_) {
         return static_cast<int>(StreamState::Tombstoned);
     }
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
     auto* ctrl = impl_->buffers.control;
     if (ctrl->generation_id.load(std::memory_order_acquire) != static_cast<uint32_t>(generation_id)) {
         return static_cast<int>(StreamState::Tombstoned);
@@ -2185,6 +2264,7 @@ bool Engine::applyLoraAdapters(const std::vector<LoraAdapterSpec>& adapters) {
     if (!impl_) {
         return false;
     }
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
     impl_->cancelAndJoinActiveSession();
     std::lock_guard<std::mutex> lock(impl_->mu);
     if (!impl_->active_runtime) {
@@ -2198,6 +2278,7 @@ void Engine::clearLoraAdapters() {
     if (!impl_) {
         return;
     }
+    auto lifecycle_lock = impl_->lifecycle_gate.enter();
     impl_->cancelAndJoinActiveSession();
     std::lock_guard<std::mutex> lock(impl_->mu);
     if (impl_->active_runtime) {

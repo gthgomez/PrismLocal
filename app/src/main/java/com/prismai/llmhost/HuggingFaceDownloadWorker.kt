@@ -50,15 +50,20 @@ object HuggingFaceDownloadWork {
     const val KEY_MODEL_ID = "model_id"
     const val KEY_MODEL_BYTES = "model_bytes"
     const val KEY_MODEL_SHA256 = "model_sha256"
+    const val MODEL_OWNER_TAG_PREFIX = "model_storage_owner:"
 
     /** Download integrity outcome: [INTEGRITY_VERIFIED] or [INTEGRITY_UNVERIFIED]. */
     const val KEY_INTEGRITY = "integrity"
     const val INTEGRITY_VERIFIED = "verified"
     const val INTEGRITY_UNVERIFIED = "unverified"
 
-    fun request(entryId: String): OneTimeWorkRequest =
-        OneTimeWorkRequestBuilder<HuggingFaceDownloadWorker>()
+    fun request(entryId: String): OneTimeWorkRequest {
+        val ownerTag = HuggingFaceModelCatalog.find(entryId)?.let { entry ->
+            MODEL_OWNER_TAG_PREFIX + ModelStorageManager.modelIdFromDisplayName(entry.fileName)
+        }
+        return OneTimeWorkRequestBuilder<HuggingFaceDownloadWorker>()
             .setInputData(workDataOf(KEY_ENTRY_ID to entryId))
+            .apply { ownerTag?.let { tag -> addTag(tag) } }
             .setConstraints(
                 Constraints.Builder()
                     .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -66,6 +71,7 @@ object HuggingFaceDownloadWork {
             )
             .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
             .build()
+    }
 }
 
 class HuggingFaceDownloadWorker(
@@ -82,6 +88,8 @@ class HuggingFaceDownloadWorker(
             ?: return Result.failure(workDataOf(HuggingFaceDownloadWork.KEY_MESSAGE to "Missing catalog entry id"))
         val entry = HuggingFaceModelCatalog.find(entryId)
             ?: return Result.failure(workDataOf(HuggingFaceDownloadWork.KEY_MESSAGE to "Model catalog entry not found"))
+        val storage = ModelStorageManager(appContext)
+        val storageRevision = storage.captureLifecycleRevisionForDisplayName(entry.fileName)
 
         setForeground(downloadForegroundInfo(entry, "Queued"))
         setDownloadProgress(entry, ModelDownloadState.Running.Stage.QUEUED, 0L, entry.expectedBytes, "Waiting for network")
@@ -120,22 +128,27 @@ class HuggingFaceDownloadWorker(
                 totalBytes = partialFile.length(),
                 message = if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) "Installing verified GGUF" else "Installing GGUF (unverified)",
             )
-            val storage = ModelStorageManager(appContext)
             val importResult = partialFile.inputStream().use { input ->
-                storage.importModelFromStream(entry.fileName, partialFile.length(), input) { progress ->
-                    // importModelFromStream is synchronous, so the suspend progress call is
-                    // wrapped here. copyStream throttles emissions to ~500 ms (plus one final
-                    // 100% emission), keeping these runBlocking commits rare.
-                    runBlocking {
-                        setDownloadProgress(
-                            entry = entry,
-                            stage = ModelDownloadState.Running.Stage.IMPORTING,
-                            bytesDone = progress.bytesCopied,
-                            totalBytes = progress.totalBytes,
-                            message = if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) "Installing verified GGUF" else "Installing GGUF (unverified)",
-                        )
-                    }
-                }
+                storage.importModelFromStream(
+                    displayName = entry.fileName,
+                    reportedSize = partialFile.length(),
+                    input = input,
+                    onProgress = { progress ->
+                        // importModelFromStream is synchronous, so the suspend progress call is
+                        // wrapped here. copyStream throttles emissions to ~500 ms (plus one final
+                        // 100% emission), keeping these runBlocking commits rare.
+                        runBlocking {
+                            setDownloadProgress(
+                                entry = entry,
+                                stage = ModelDownloadState.Running.Stage.IMPORTING,
+                                bytesDone = progress.bytesCopied,
+                                totalBytes = progress.totalBytes,
+                                message = if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) "Installing verified GGUF" else "Installing GGUF (unverified)",
+                            )
+                        }
+                    },
+                    expectedLifecycleRevision = storageRevision,
+                )
             }
             when (importResult) {
                 is ModelStorageManager.ImportResult.Failure -> {

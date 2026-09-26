@@ -30,6 +30,8 @@ import androidx.core.app.NotificationCompat
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -54,8 +56,13 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import org.json.JSONObject
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.ui.UiEventBus
@@ -70,12 +77,19 @@ import com.prismai.llmhost.model.ModelDownloadManager
 import com.prismai.llmhost.model.ModelImportManager
 import com.prismai.llmhost.model.ModelManager
 import com.prismai.llmhost.model.ModelReadinessAssessor
+import com.prismai.llmhost.generation.GenerationIdleInputs
+import com.prismai.llmhost.generation.GenerationIdlePolicy
+import com.prismai.llmhost.generation.GenerationStartGate
+import com.prismai.llmhost.generation.BackgroundGenerationOwnership
+import com.prismai.llmhost.generation.ServiceGenerationOwnership
 import com.prismai.llmhost.generation.GenerationMetrics
 import com.prismai.llmhost.generation.GenerationOrchestrator
 import com.prismai.llmhost.generation.PromptBuilder
 import com.prismai.llmhost.agent.AgentTrace
 import com.prismai.llmhost.agent.AgentToolConfirmation
 import com.prismai.llmhost.agent.AgentToolRouter
+import com.prismai.llmhost.agent.ChatTransitionGate
+import com.prismai.llmhost.agent.tools.toolFailure
 import com.prismai.llmhost.util.FormatUtils
 
 class InferenceService : Service() {
@@ -101,8 +115,11 @@ class InferenceService : Service() {
         private const val CHAT_DIR_NAME = "chats"
         private const val TRANSCRIPT_PERSIST_THROTTLE_MS = 1000L
         private const val MAX_BENCHMARK_RUNS = 250
+        private val CHAT_IDENTITY_TOOLS = setOf("clear_chat", "delete_chat", "delete_or_clear_chat")
         private const val KEY_AGENT_ENABLED = "agent_enabled"
         private const val KEY_PENDING_AGENT_ACTION_PREFIX = "pending_agent_action_"
+        private const val AGENT_CHAT_CLEANUP_TIMEOUT_MS = 1_000L
+        private const val CHAT_IDENTITY_RESULT_APPLIED = "agent_chat_identity_applied"
         // onDestroy() is a main-thread callback. Native teardown (freeing the
         // loaded ggml/llama model, context and compute buffers) can block for
         // seconds, which would trip an ANR. We therefore only wait this long
@@ -125,6 +142,7 @@ class InferenceService : Service() {
     // waits a bounded budget on the main thread; if that budget expires the
     // job continues to completion off-main.
     private val teardownScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val chatTransitionGate = ChatTransitionGate(teardownScope)
     // Guards onDestroy() against a duplicate teardown launch (reentrancy /
     // defensive double-destroy). destroySafely() is itself idempotent, but this
     // avoids enqueuing redundant cancellation work.
@@ -140,10 +158,24 @@ class InferenceService : Service() {
     @Volatile
     private var generationForegroundActive = false
     private val operationMutex = Mutex()
+    private val generationStartGate = GenerationStartGate()
+    private val serviceGenerationOwnership = ServiceGenerationOwnership()
+    private val backgroundGenerationOwnership = serviceGenerationOwnership.engine
     @Volatile
     private var activeGenerationSource: String = "user"
+    @Volatile
+    private var agentFollowUpScheduled = false
+    private val confirmedChatTransitionChain = AtomicReference<Long?>(null)
+    private val confirmedChatTransitionThread = ThreadLocal.withInitial { false }
     private val transcriptLock = Any()
     private var generationSession = 0L
+
+    private data class ConfirmedAgentOperationContext(
+        val authorization: AgentToolConfirmation.PendingToolAuthorization,
+    ) : AbstractCoroutineContextElement(Key) {
+        companion object Key : CoroutineContext.Key<ConfirmedAgentOperationContext>
+    }
+
     @Volatile
     private var previousRuntimeSettings: GenerationSettings? = null
     // nextTranscriptId / activeAssistantTranscriptId / lastTranscriptPersistAt
@@ -348,11 +380,36 @@ class InferenceService : Service() {
         backgroundAgentManager = BackgroundAgentManager(
             context = this,
             executeTask = { bgTask ->
-                generateSafelyAndAwait(
-                    prompt = bgTask.prompt,
-                    preserveBenchmarkQueue = true,
-                    initiatedByBackground = true,
-                )
+                check(backgroundGenerationOwnership.begin(bgTask.id)) {
+                    "Another background task already owns the generation engine"
+                }
+                try {
+                    generateSafelyAndAwait(
+                        prompt = bgTask.prompt,
+                        preserveBenchmarkQueue = true,
+                        initiatedByBackground = true,
+                        sourceChatId = bgTask.sourceChatId,
+                        backgroundTaskId = bgTask.id,
+                    )
+                } finally {
+                    withContext(NonCancellable) {
+                        operationMutex.withLock {
+                            val createChat = backgroundGenerationOwnership.takeDeferredChatCreation(bgTask.id)
+                            val deferredChatId = backgroundGenerationOwnership.finish(bgTask.id)
+                            val applied = applyPendingBackgroundChatSwitchLocked(
+                                bgTask.sourceChatId,
+                                deferredChatId,
+                                createChat,
+                            )
+                            if (!applied) {
+                                if (deferredChatId != null) {
+                                    backgroundGenerationOwnership.parkDeferredChatSwitch(deferredChatId)
+                                }
+                                if (createChat) backgroundGenerationOwnership.parkDeferredChatCreation()
+                            }
+                        }
+                    }
+                }
             },
             cancelNativeGeneration = {
                 val sourceIsBackground = operationMutex.withLock { activeGenerationSource == "background" }
@@ -361,33 +418,46 @@ class InferenceService : Service() {
                 }
             },
             isDeviceBusyWithUserGeneration = {
-                _isGenerating.value || _pendingAgentToolAction.value != null
+                confirmedChatTransitionChain.get() != null ||
+                    generationStartGate.isStartInProgress() ||
+                    serviceGenerationOwnership.mustDeferBackgroundTask(
+                        generationRunning = _isGenerating.value,
+                        confirmationPending = _pendingAgentToolAction.value != null,
+                        followUpScheduled = agentFollowUpScheduled,
+                        agentToolJobActive = hasActiveAgentToolJobs(),
+                    )
             },
         )
 
         // ── Phase C: generation & agent core ────────────────────────────
         generationMetrics = GenerationMetrics(uiState)
         promptBuilder = PromptBuilder(memoryStore, ragManager)
-        agentTrace = AgentTrace(uiState, filesDir, serviceScope)
+        // Trace writes use the non-cancelled teardown scope so shutdown/cancellation
+        // cannot discard the final ownership artifact.
+        agentTrace = AgentTrace(uiState, filesDir, teardownScope)
         agentToolConfirmation = AgentToolConfirmation(
             uiState = uiState,
             prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE),
             currentChatId = { _currentChatId.value },
             pendingActionKey = { chatId -> pendingAgentActionKey(chatId) },
             getDeviceProfile = { getDeviceCapabilityProfileCached() },
+            resolveModelIdentity = { modelId ->
+                modelStorageManager.activeModelInfo(modelId)?.let(ModelIdentity::from)
+            },
         )
         agentToolRouter = AgentToolRouter(
             uiState = uiState,
             agentTrace = agentTrace,
             confirmation = agentToolConfirmation,
-            deviceProfiler = deviceProfiler,
+            getCachedProfile = { deviceProfiler.getCachedProfile() },
             executeTool = { call, confirmed -> executeAgentTool(call, confirmed) },
-            onFollowUp = { prompt, result, depth ->
-                startAgentFollowUpGeneration(prompt, result, depth)
+            onFollowUp = { prompt, result, depth, chainId ->
+                startAgentFollowUpGeneration(prompt, result, depth, chainId)
             },
             onAppendTranscriptMessage = { role, text -> appendTranscriptMessage(role, text) },
             onPublishUiEvent = { msg -> publishUiEvent(msg) },
             scope = serviceScope,
+            currentChatId = { _currentChatId.value },
         )
         generationOrchestrator = GenerationOrchestrator(
             engine = engine,
@@ -412,6 +482,9 @@ class InferenceService : Service() {
             },
             // Runner is constructed after the orchestrator; guard the lazy reference.
             onBenchmarkComplete = { if (::benchmarkRunner.isInitialized) benchmarkRunner.runNextQueued() },
+            onBeforeChatIdentityChange = { reason, mutation ->
+                prepareAgentChatTransition(reason, afterCleanup = mutation)
+            },
             onDeferredReload = { modelId -> switchModel(modelId) },
             getReloadPending = { reloadPending },
             setReloadPending = { v -> reloadPending = v },
@@ -435,8 +508,8 @@ class InferenceService : Service() {
             onResetNativeConversation = { reason -> resetNativeConversationAsync(reason) },
         )
         modelTools = com.prismai.llmhost.agent.tools.ModelTools(
-            modelManager = modelManager,
-            modelStorageManager = modelStorageManager,
+            listInstalledModelInfos = modelStorageManager::listInstalledModelInfos,
+            deleteModelDirectly = modelManager::deleteModel,
             modelReadinessAssessor = modelReadinessAssessor,
             modelImportManager = modelImportManager,
             modelDownloadManager = modelDownloadManager,
@@ -446,7 +519,7 @@ class InferenceService : Service() {
             chatDirectory = { chatDirectory() },
             benchmarkFileSize = { benchmarkRunsFile().sizeRecursive() },
             chatIndexFile = { chatIndexFile() },
-            deleteModelSafely = { modelId -> deleteModel(modelId) },
+            deleteModelSafely = { modelId, identity -> deleteModel(modelId, identity) },
         )
         runtimeTools = com.prismai.llmhost.agent.tools.RuntimeTools(
             uiState = uiState,
@@ -528,6 +601,14 @@ class InferenceService : Service() {
             store = benchmarkStore,
             orchestrator = generationOrchestrator,
             scope = serviceScope,
+            runJoinedGeneration = { prompt, preset ->
+                generateSafelyAndAwait(
+                    prompt = prompt,
+                    benchmarkPreset = preset,
+                    preserveBenchmarkQueue = true,
+                )
+            },
+            runExclusive = { block -> operationMutex.withLock { block() } },
         )
 
         benchmarkStore.load()
@@ -628,18 +709,63 @@ class InferenceService : Service() {
     }
 
     suspend fun switchModel(modelId: String): Boolean {
+        val confirmedAuthorization = currentCoroutineContext()[ConfirmedAgentOperationContext]?.authorization
         return operationMutex.withLock {
-            Log.d(TAG, "switchModel requested modelId=$modelId")
-            cancelAndJoinGenerationLocked("model switch")
-            modelManager.switchModel(modelId)
+            if (confirmedAuthorization != null &&
+                !agentTrace.isCurrentChain(confirmedAuthorization.chainId)
+            ) {
+                return@withLock false
+            }
+            val preserveConfirmedChain = confirmedAuthorization != null
+            try {
+                Log.d(TAG, "switchModel requested modelId=$modelId")
+                cancelAndJoinGenerationLocked(
+                    reason = "model switch",
+                    finalizeActiveTrace = !preserveConfirmedChain,
+                    preserveActiveTrace = preserveConfirmedChain,
+                )
+                modelManager.switchModel(modelId)
+            } finally {
+                if (preserveConfirmedChain) {
+                    agentTrace.releaseChainPreservation(confirmedAuthorization.chainId)
+                }
+            }
         }
     }
 
-    suspend fun deleteModel(modelId: String): Boolean {
+    suspend fun deleteModel(modelId: String, confirmedIdentity: ModelIdentity? = null): Boolean {
+        val confirmedAuthorization = currentCoroutineContext()[ConfirmedAgentOperationContext]?.authorization
+        val identity = when {
+            confirmedAuthorization?.call?.name == "delete_model" -> {
+                val confirmed = confirmedAuthorization.confirmedModelIdentity
+                if (confirmed == null || confirmed.modelId != modelId) return false
+                if (confirmedIdentity != null && confirmedIdentity != confirmed) return false
+                confirmed
+            }
+            confirmedIdentity != null -> confirmedIdentity
+            else -> return false
+        }
         return operationMutex.withLock {
-            Log.d(TAG, "deleteModel requested modelId=$modelId")
-            cancelAndJoinGenerationLocked("model delete")
-            modelManager.deleteModel(modelId)
+            if (confirmedAuthorization != null &&
+                !agentTrace.isCurrentChain(confirmedAuthorization.chainId)
+            ) {
+                return@withLock false
+            }
+            val preserveConfirmedChain = confirmedAuthorization != null
+            try {
+                Log.d(TAG, "deleteModel requested modelId=$modelId")
+                modelDownloadManager.cancelDownloadForModel(modelId)
+                cancelAndJoinGenerationLocked(
+                    reason = "model delete",
+                    finalizeActiveTrace = !preserveConfirmedChain,
+                    preserveActiveTrace = preserveConfirmedChain,
+                )
+                modelManager.deleteModel(modelId, identity)
+            } finally {
+                if (preserveConfirmedChain) {
+                    agentTrace.releaseChainPreservation(confirmedAuthorization.chainId)
+                }
+            }
         }
     }
 
@@ -652,8 +778,13 @@ class InferenceService : Service() {
     fun cancelGeneration() {
         benchmarkRunner.cancelGeneration()
         serviceScope.launch {
-            operationMutex.withLock {
-                cancelAndJoinGenerationLocked("user cancel")
+            val backgroundTaskId = backgroundGenerationOwnership.ownerId()
+            if (backgroundTaskId != null) {
+                backgroundAgentManager.cancelTask(backgroundTaskId)
+            } else {
+                operationMutex.withLock {
+                    cancelAndJoinGenerationLocked("user cancel")
+                }
             }
         }
     }
@@ -665,28 +796,99 @@ class InferenceService : Service() {
     }
 
     fun createChat(): String {
-        if (_isGenerating.value) {
+        if (backgroundGenerationOwnership.hasOwner()) {
+            backgroundGenerationOwnership.deferChatCreation()
+            publishUiEvent("Chat creation queued until the background task finishes")
+            return _currentChatId.value.orEmpty()
+        }
+        if (_isGenerating.value || generationStartGate.isStartInProgress()) {
             publishUiEvent("Cancel generation before creating a new chat")
             return _currentChatId.value.orEmpty()
         }
-        agentToolConfirmation.clearMemory()
-        val id = chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
-        resetNativeConversationAsync("new chat")
-        return id
+        abandonPendingAgentTool(
+            reason = "Chat changed before tool confirmation",
+            afterCleanup = {
+                generationStartGate.runChatTransition {
+                    if (_isGenerating.value || backgroundGenerationOwnership.hasOwner()) return@runChatTransition
+                    chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+                    resetNativeConversationAsync("new chat")
+                }
+            },
+        )
+        // The UI does not use this value; identity mutation is intentionally
+        // completed by the transition worker after cleanup.
+        return _currentChatId.value.orEmpty()
     }
 
-    private fun createChatInternal(
-        title: String,
-        publishEvent: Boolean = false,
-    ): String {
-        agentToolConfirmation.clearMemory()
-        val id = chatManager.createChatInternal(title, publishEvent)
-        resetNativeConversationAsync("new chat")
-        return id
+    private suspend fun ensureChatForGeneration() {
+        if (_currentChatId.value != null) return
+        val prepared = prepareAgentChatTransition(
+            reason = "Preparing generation chat",
+            afterCleanup = {
+                if (_currentChatId.value == null) {
+                    chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+                    resetNativeConversationAsync("new chat")
+                }
+            },
+        )
+        if (!prepared && _currentChatId.value == null) {
+            chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+            resetNativeConversationAsync("new chat")
+        }
+    }
+
+    private fun ensureChatForGenerationBlocking() {
+        if (_currentChatId.value == null) {
+            chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+            resetNativeConversationAsync("new chat")
+        }
+    }
+
+    private fun performSwitchChat(chatId: String): Boolean {
+        return generationStartGate.runChatTransition {
+            if (_isGenerating.value || backgroundGenerationOwnership.hasOwner()) return@runChatTransition false
+            if (_chatSessions.value.none { it.id == chatId }) return@runChatTransition false
+            val switched = chatManager.switchChat(chatId)
+            if (switched) {
+                agentToolConfirmation.restore()
+                resetNativeConversationAsync("chat switch")
+            }
+            switched
+        } ?: false
+    }
+
+    private fun performClearTranscript(): Boolean {
+        return generationStartGate.runChatTransition {
+            if (_isGenerating.value || backgroundGenerationOwnership.hasOwner()) return@runChatTransition false
+            chatManager.clearTranscript()
+            resetNativeConversationAsync("clear transcript")
+            true
+        } ?: false
+    }
+
+    private fun performDeleteChat(chatId: String): Boolean {
+        return generationStartGate.runChatTransition {
+            if (_isGenerating.value) return@runChatTransition false
+            val deleted = backgroundAgentManager.deleteChatAndInvalidateTasks(chatId) {
+                chatManager.deleteChat(chatId)
+            }
+            if (deleted) agentTrace.deleteForChat(chatId)
+            deleted
+        } ?: false
     }
 
     fun switchChat(chatId: String): Boolean {
-        if (_isGenerating.value) {
+        if (_chatSessions.value.none { it.id == chatId }) {
+            publishUiEvent("Chat no longer exists")
+            return false
+        }
+        val backgroundSwitchQueued = backgroundGenerationOwnership.deferChatSwitch(chatId)
+        if (backgroundSwitchQueued) {
+            publishUiEvent("Chat switch queued until the background task finishes")
+            return true
+        }
+        if (confirmedChatTransitionThread.get() == true) return performSwitchChat(chatId)
+        if (_isGenerating.value || generationStartGate.isStartInProgress()) {
             publishUiEvent("Cancel generation before switching chats")
             return false
         }
@@ -694,41 +896,61 @@ class InferenceService : Service() {
             publishUiEvent("Chat no longer exists")
             return false
         }
-        agentToolConfirmation.clearMemory()
-        if (!chatManager.switchChat(chatId)) return false
-        agentToolConfirmation.restore()
-        resetNativeConversationAsync("chat switch")
-        return true
+        return abandonPendingAgentTool(
+            reason = "Chat changed before tool confirmation",
+            afterCleanup = {
+                performSwitchChat(chatId)
+                Unit
+            },
+        )
     }
 
     fun renameChat(chatId: String, title: String) {
         chatManager.renameChat(chatId, title)
     }
 
-    fun deleteChat(chatId: String) {
-        if (_isGenerating.value) {
+    fun deleteChat(chatId: String): Boolean {
+        if (confirmedChatTransitionThread.get() == true) return performDeleteChat(chatId)
+        if (_isGenerating.value || generationStartGate.isStartInProgress()) {
             publishUiEvent("Cancel generation before deleting a chat")
-            return
+            return false
         }
-        agentToolConfirmation.clearPrefs(chatId)
-        chatManager.deleteChat(chatId)
+        return abandonPendingAgentTool(
+            reason = "Chat deleted before tool confirmation",
+            afterCleanup = {
+                performDeleteChat(chatId)
+                Unit
+            },
+        )
     }
 
-    fun clearTranscript() {
+    fun clearTranscript(): Boolean {
+        if (confirmedChatTransitionThread.get() == true) return performClearTranscript()
         if (_isGenerating.value) {
             publishUiEvent("Cancel generation before clearing chat")
-            return
+            return false
         }
-        chatManager.clearTranscript()
-        agentToolConfirmation.clearPrefs()
-        resetNativeConversationAsync("clear transcript")
+        return abandonPendingAgentTool(
+            reason = "Transcript cleared before tool confirmation",
+            afterCleanup = {
+                performClearTranscript()
+                Unit
+            },
+        )
     }
 
     fun updateGenerationSettings(settings: GenerationSettings) {
         val previous = _generationSettings.value.clamped()
         val safeSettings = settings.clamped()
-        _generationSettings.value = safeSettings
+        // Close authorization admission before publishing agent mode as disabled.
         syncCapabilities(safeSettings)
+        _generationSettings.value = safeSettings
+        if (previous.agentEnabled && !safeSettings.agentEnabled && ::agentTrace.isInitialized) {
+            agentTrace.activeChainId?.let { chainId ->
+                agentTrace.abortTrace(chainId, "Agent mode disabled")
+            }
+            agentToolConfirmation.clearMemory()
+        }
         refreshDeviceAndModelReadiness()
         persistGenerationSettings(safeSettings)
         if (settingsRequireReload(previous, safeSettings)) {
@@ -745,12 +967,22 @@ class InferenceService : Service() {
     }
 
     private fun resetNativeConversationAsync(reason: String) {
+        val scheduledSession = generationSession
         serviceScope.launch {
-            runCatching {
-                engine.resetConversation()
-                Log.d(TAG, "native conversation reset reason=$reason")
-            }.onFailure { error ->
-                Log.w(TAG, "native conversation reset failed reason=$reason", error)
+            operationMutex.withLock {
+                if (generationSession != scheduledSession ||
+                    _isGenerating.value ||
+                    backgroundGenerationOwnership.hasOwner() ||
+                    generationStartGate.isStartInProgress()
+                ) {
+                    return@withLock
+                }
+                runCatching {
+                    engine.resetConversation()
+                    Log.d(TAG, "native conversation reset reason=$reason")
+                }.onFailure { error ->
+                    Log.w(TAG, "native conversation reset failed reason=$reason", error)
+                }
             }
         }
     }
@@ -788,37 +1020,232 @@ class InferenceService : Service() {
         benchmarkPreset: BenchmarkPreset? = null,
         preserveBenchmarkQueue: Boolean = false,
         initiatedByBackground: Boolean = false,
+        sourceChatId: String? = null,
+        backgroundTaskId: String? = null,
     ): String {
-        var activeJob: Job? = null
-        operationMutex.withLock {
-            if (initiatedByBackground &&
-                (_isGenerating.value || _pendingAgentToolAction.value != null)
-            ) {
-                return "Background task deferred: device busy"
-            }
-            activeGenerationSource = if (initiatedByBackground) "background" else "user"
-            cancelAndJoinGenerationLocked(
-                reason = "new generation",
-                clearQueuedBenchmarks = !preserveBenchmarkQueue,
-            )
-            generationOrchestrator.generate(prompt, benchmarkPreset)
-            activeJob = generationJob
+        if (confirmedChatTransitionChain.get() != null) {
+            if (initiatedByBackground) throw BackgroundTaskDeferredException()
+            return "Chat transition in progress"
         }
-        activeJob?.join()
-        awaitGenerationSessionIdle()
-        return streamState.snapshotText().takeIf { it.isNotBlank() } ?: "Background task completed"
+        var restoreChatId: String? = null
+        var resultSessionId: Long? = null
+        var resultAgentChainId: Long? = null
+        var resultRetained = false
+        var launchResult = GenerationOrchestrator.GenerationLaunch.REFUSED
+        operationMutex.withLock {
+            if (!initiatedByBackground && backgroundGenerationOwnership.hasOwner()) {
+                publishUiEvent("A background task currently owns the generation engine")
+                return "Background task owns the engine"
+            }
+            if (initiatedByBackground &&
+                serviceGenerationOwnership.mustDeferBackgroundTask(
+                    generationRunning = _isGenerating.value,
+                    confirmationPending = _pendingAgentToolAction.value != null ||
+                        confirmedChatTransitionChain.get() != null,
+                    followUpScheduled = agentFollowUpScheduled,
+                    agentToolJobActive = hasActiveAgentToolJobs(),
+                )
+            ) {
+                throw BackgroundTaskDeferredException()
+            }
+            if (!generationStartGate.beginStart()) {
+                if (initiatedByBackground) throw BackgroundTaskDeferredException()
+                return "Generation deferred while a chat transition completes"
+            }
+            val startGateReserved = true
+            try {
+                if (initiatedByBackground) {
+                    val prepared = serviceGenerationOwnership.prepareBackgroundChat(
+                        taskId = backgroundTaskId,
+                        sourceChatId = sourceChatId,
+                        selectedChatId = _currentChatId.value,
+                        chatExists = { id -> _chatSessions.value.any { it.id == id } },
+                        switchToSource = { id -> chatManager.switchChat(id) },
+                    )
+                    if (prepared.switchedToSource) engine.resetConversation()
+                    restoreChatId = prepared.restoreChatId
+                }
+                activeGenerationSource = if (initiatedByBackground) "background" else "user"
+                cancelAndJoinGenerationLocked(
+                    reason = "new generation",
+                    clearQueuedBenchmarks = !preserveBenchmarkQueue,
+                )
+                if (benchmarkPreset == null && _currentChatId.value == null) {
+                    ensureChatForGeneration()
+                }
+                val previousSessionId = generationSession
+                val previousAgentChainId = agentTrace.activeChainId
+                generationOrchestrator.generate(prompt, benchmarkPreset)
+                launchResult = generationOrchestrator.takeLaunchResult()
+                if (generationSession != previousSessionId) resultSessionId = generationSession
+                val startedAgentChainId = agentTrace.activeChainId
+                if (startedAgentChainId != previousAgentChainId) {
+                    resultAgentChainId = startedAgentChainId
+                }
+                if (resultSessionId != null || resultAgentChainId != null) {
+                    generationOrchestrator.retainGenerationOutput(resultSessionId, resultAgentChainId)
+                    resultRetained = true
+                }
+                if (initiatedByBackground) {
+                    backgroundGenerationOwnership.bindAgentChain(
+                        backgroundTaskId.orEmpty(),
+                        agentTrace.activeChainId,
+                    )
+                }
+            } finally {
+                if (startGateReserved) generationStartGate.finishStart()
+            }
+        }
+        try {
+            if (!awaitGenerationSessionIdle()) {
+                if (initiatedByBackground) {
+                    withContext(NonCancellable) {
+                        cancelGenerationAndJoin("background generation wait timed out")
+                    }
+                    throw IllegalStateException("Generation session exceeded its bounded wait")
+                }
+                return "Generation session wait timed out"
+            }
+            if (initiatedByBackground && !backgroundGenerationOwnership.isOwner(backgroundTaskId)) {
+                throw IllegalStateException("Background task generation ownership changed")
+            }
+            val ownedOutput = generationOrchestrator.outputForGeneration(
+                sessionId = resultSessionId ?: -1L,
+                agentChainId = resultAgentChainId,
+            )
+            val terminalReason = generationOrchestrator.terminalReasonForGeneration(
+                sessionId = resultSessionId ?: -1L,
+                agentChainId = resultAgentChainId,
+            )
+            if (initiatedByBackground) {
+                when (launchResult) {
+                    GenerationOrchestrator.GenerationLaunch.REFUSED ->
+                        throw IllegalStateException("Generation did not start")
+                    GenerationOrchestrator.GenerationLaunch.HANDLED ->
+                        return ownedOutput?.takeIf { it.isNotBlank() } ?: "Tool action completed"
+                    GenerationOrchestrator.GenerationLaunch.STARTED -> {
+                        val failed = terminalReason == "ERROR" ||
+                            terminalReason == "CANCELLED" ||
+                            terminalReason == "QUALITY_ABORT" ||
+                            ownedOutput.isNullOrBlank()
+                        if (failed) {
+                            throw IllegalStateException(
+                                "Generation ended without a successful response: ${terminalReason ?: "no result"}",
+                            )
+                        }
+                    }
+                }
+            }
+            return ownedOutput.orEmpty()
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) {
+                cancelGenerationAndJoin("generation owner cancelled")
+            }
+            throw cancelled
+        } finally {
+            if (resultRetained) {
+                generationOrchestrator.releaseGenerationOutput(resultSessionId, resultAgentChainId)
+            }
+            if (restoreChatId != null || backgroundTaskId != null) {
+                withContext(NonCancellable) {
+                    operationMutex.withLock {
+                        val requestedChatId = serviceGenerationOwnership.chatToRestore(
+                            taskId = backgroundTaskId,
+                            restoreChatId = restoreChatId,
+                            generating = _isGenerating.value,
+                            sessionStillWaiting = shouldWaitForGenerationSession(),
+                            currentChatId = _currentChatId.value,
+                            sourceChatId = sourceChatId,
+                            chatExists = { id -> _chatSessions.value.any { it.id == id } },
+                        )
+                        if (requestedChatId != null && chatManager.switchChat(requestedChatId)) {
+                            agentToolConfirmation.restore()
+                            engine.resetConversation()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun agentContinuationAvailable(chainId: Long): Boolean {
+        if (chainId <= 0L || !_generationSettings.value.agentEnabled || _currentModel.value == null) return false
+        if (_generationPerformance.value?.terminalReason != "MAX_TOKENS") return false
+        return _transcript.value.any { message ->
+            message.role == TranscriptRole.ASSISTANT && message.text.isNotBlank()
+        }
+    }
+
+    private suspend fun applyPendingBackgroundChatSwitchLocked(
+        sourceChatId: String?,
+        targetChatId: String?,
+        createChat: Boolean,
+    ): Boolean {
+        if (!createChat && targetChatId == null) return true
+        if (_isGenerating.value || shouldWaitForGenerationSession() ||
+            (sourceChatId != null && _currentChatId.value != sourceChatId)
+        ) {
+            return false
+        }
+        if (createChat) {
+            chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+            resetNativeConversationAsync("new chat")
+            return true
+        }
+        if (targetChatId == null || _chatSessions.value.none { it.id == targetChatId }) return true
+        if (!chatManager.switchChat(targetChatId)) return false
+        agentToolConfirmation.restore()
+        engine.resetConversation()
+        return true
+    }
+
+    private fun generationIdleInputs(): GenerationIdleInputs {
+        val chainId = if (::agentTrace.isInitialized) agentTrace.activeChainId else null
+        val toolActive = chainId != null && ::agentToolRouter.isInitialized &&
+            agentToolRouter.hasActiveToolJobs(chainId)
+        val pendingConfirmation = _pendingAgentToolAction.value != null || agentFollowUpScheduled
+        val continuationAvailable = chainId != null && agentContinuationAvailable(chainId)
+        return GenerationIdleInputs(
+            generationRunning = _isGenerating.value,
+            generationJobActive = generationJob?.isActive == true,
+            agentToolActive = toolActive,
+            confirmationPending = pendingConfirmation,
+            agentChainActive = chainId != null,
+            continuationAvailable = continuationAvailable,
+        )
+    }
+
+    private fun hasActiveAgentToolJobs(): Boolean {
+        if (!::agentTrace.isInitialized || !::agentToolRouter.isInitialized) return false
+        val chainId = agentTrace.activeChainId ?: return false
+        return agentToolRouter.hasActiveToolJobs(chainId)
+    }
+
+    private fun shouldWaitForGenerationSession(): Boolean {
+        val inputs = generationIdleInputs()
+        if (GenerationIdlePolicy.shouldAbortUnresumableChain(inputs)) {
+            val chainId = if (::agentTrace.isInitialized) agentTrace.activeChainId else null
+            val aborted = chainId != null && agentTrace.abortTrace(
+                chainId,
+                "Continuation unavailable: agent mode or response cannot continue",
+            )
+            return if (aborted) {
+                GenerationIdlePolicy.shouldWait(
+                    inputs.copy(agentChainActive = false, continuationAvailable = false),
+                )
+            } else {
+                GenerationIdlePolicy.shouldWait(inputs)
+            }
+        }
+        return GenerationIdlePolicy.shouldWait(inputs)
     }
 
     private suspend fun awaitGenerationSessionIdle(
         pollMs: Long = 20L,
         maxWaitMs: Long = 30 * 60 * 1000L,
-    ) {
-        com.prismai.llmhost.generation.GenerationSessionWait.awaitSessionIdle(
-            isGenerating = {
-                _isGenerating.value ||
-                (::agentTrace.isInitialized && agentTrace.activeAgentChainStartTime != 0L) ||
-                _pendingAgentToolAction.value != null
-            },
+    ): Boolean {
+        return com.prismai.llmhost.generation.GenerationSessionWait.awaitSessionIdle(
+            isGenerating = { shouldWaitForGenerationSession() },
             getJob = { generationJob },
             pollMs = pollMs,
             maxWaitMs = maxWaitMs,
@@ -835,63 +1262,265 @@ class InferenceService : Service() {
 
     fun cancelGenerationSafely() {
         serviceScope.launch {
-            cancelGenerationAndJoin("user cancellation")
+            val backgroundTaskId = backgroundGenerationOwnership.ownerId()
+            if (backgroundTaskId != null) {
+                backgroundAgentManager.cancelTask(backgroundTaskId)
+            } else {
+                cancelGenerationAndJoin("user cancellation")
+            }
         }
     }
 
     fun continueGenerationSafely() {
         serviceScope.launch {
             operationMutex.withLock {
-                cancelAndJoinGenerationLocked("continue generation")
-                generationOrchestrator.continueGeneration()
+                if (backgroundGenerationOwnership.hasOwner()) {
+                    publishUiEvent("A background task currently owns the generation engine")
+                    return@withLock
+                }
+                if (!generationStartGate.beginStart()) return@withLock
+                try {
+                    cancelAndJoinGenerationLocked(
+                        reason = "continue generation",
+                        finalizeActiveTrace = false,
+                        preserveActiveTrace = true,
+                    )
+                    generationOrchestrator.continueGeneration()
+                } finally {
+                    generationStartGate.finishStart()
+                }
             }
         }
     }
 
-    fun cancelPendingAgentTool() {
-        val action = _pendingAgentToolAction.value ?: return
-        val capturedCall = agentToolConfirmation.pendingCall
-        if (capturedCall != null) {
-            agentToolRouter.removeFromHistory(capturedCall)
+    private data class AgentChatTransition(
+        val claim: AgentToolRouter.ChatTransitionClaim,
+        val sourceChatId: String?,
+        val currentChatId: String?,
+    )
+
+    private fun claimAgentChatTransition(
+        reason: String,
+        expectedToken: String? = null,
+    ): AgentChatTransition? {
+        if (confirmedChatTransitionChain.get() != null) return null
+        val claim = agentToolRouter.claimChatTransition(
+            expectedToken = expectedToken,
+            abortReason = reason,
+        ) ?: return null
+        claim.pending?.let { pending ->
+            agentToolRouter.removeFromHistory(pending.call)
         }
-        CapabilityRegistryHolder.auditLog.record("CONFIRM_CANCELLED", action.name, "")
-        agentToolConfirmation.clearMemory()
-        agentToolConfirmation.clearPrefs()
-        appendTranscriptMessage(
-            TranscriptRole.TOOL,
-            AgentToolProtocol.toolEventJson(
-                status = "cancelled",
-                toolName = action.name,
-                summary = "Tool cancelled",
-            ),
+        val transition = AgentChatTransition(
+            claim = claim,
+            sourceChatId = claim.pending?.sourceChatId ?: _currentChatId.value,
+            currentChatId = _currentChatId.value,
         )
-        publishUiEvent("Tool cancelled: ${action.name}")
+        // Remove the in-memory card immediately; persistence cleanup is
+        // deferred to the lifecycle transition worker.
+        agentToolConfirmation.clearMemory()
+        return transition
     }
 
-    fun confirmPendingAgentTool() {
-        val call = agentToolConfirmation.pendingCall ?: return
-        val originalPrompt = agentToolConfirmation.pendingOriginalPrompt.orEmpty()
-        val depth = agentToolConfirmation.pendingDepth
-        agentToolConfirmation.clearMemory()
-        agentToolConfirmation.clearPrefs()
-        serviceScope.launch {
+    private suspend fun cleanupAgentChatTransition(transition: AgentChatTransition) {
+        transition.claim.chainIds.forEach { chainId ->
+            val joined = agentToolRouter.joinInvalidatedChainBounded(
+                chainId = chainId,
+                timeoutMs = AGENT_CHAT_CLEANUP_TIMEOUT_MS,
+            )
+            if (!joined) {
+                Log.w(TAG, "Timed out joining invalidated agent chain $chainId")
+            }
+        }
+        // Do not touch SharedPreferences when there was no authorization to
+        // remove. For a real pending card, apply() schedules disk cleanup.
+        if (transition.claim.pending != null) {
+            agentToolConfirmation.clearPersistedForChat(transition.sourceChatId)
+            if (transition.currentChatId != null && transition.currentChatId != transition.sourceChatId) {
+                agentToolConfirmation.clearPersistedForChat(transition.currentChatId)
+            }
+        }
+    }
+
+    /** Claims synchronously, then performs bounded cleanup and mutation off-main. */
+    private fun abandonPendingAgentTool(
+        reason: String,
+        expectedToken: String? = null,
+        afterCleanup: (suspend () -> Unit)? = null,
+    ): Boolean {
+        val transition = claimAgentChatTransition(reason, expectedToken) ?: return false
+        chatTransitionGate.enqueue(
+            cleanup = { cleanupAgentChatTransition(transition) },
+            mutation = { afterCleanup?.invoke() },
+        )
+        return true
+    }
+
+    /** Suspending variant for lifecycle paths that must await cleanup. */
+    private suspend fun prepareAgentChatTransition(
+        reason: String,
+        expectedToken: String? = null,
+        afterCleanup: (suspend () -> Unit)? = null,
+    ): Boolean {
+        val transition = claimAgentChatTransition(reason, expectedToken) ?: return false
+        chatTransitionGate.enqueueAndAwait(
+            cleanup = { cleanupAgentChatTransition(transition) },
+            mutation = { afterCleanup?.invoke() },
+        )
+        return true
+    }
+
+    fun cancelPendingAgentTool(actionToken: String) {
+        val action = _pendingAgentToolAction.value ?: return
+        if (actionToken != action.id) return
+        abandonPendingAgentTool(
+            reason = "Tool confirmation cancelled",
+            expectedToken = actionToken,
+            afterCleanup = {
+                CapabilityRegistryHolder.auditLog.record("CONFIRM_CANCELLED", action.name, "")
+                appendTranscriptMessage(
+                    TranscriptRole.TOOL,
+                    AgentToolProtocol.toolEventJson(
+                        status = "cancelled",
+                        toolName = action.name,
+                        summary = "Tool cancelled",
+                    ),
+                )
+                publishUiEvent("Tool cancelled: ${action.name}")
+            },
+        )
+    }
+
+    fun confirmPendingAgentTool(actionToken: String) {
+        val staged = agentToolConfirmation.pendingAuthorization?.takeIf { it.token == actionToken } ?: return
+        val authorization = agentToolConfirmation.consumePendingAndRevalidate(
+            token = staged.token,
+            activeChainId = agentTrace.activeChainId,
+            activeChatId = _currentChatId.value,
+        )
+        if (authorization == null) {
+            agentToolConfirmation.discardStaleAuthorization(
+                token = staged.token,
+                sourceChatId = staged.sourceChatId,
+            )
+            publishUiEvent("Tool confirmation is no longer active")
+            return
+        }
+        val confirmedJob = agentToolRouter.launchConfirmedToolJob(
+            chainId = authorization.chainId,
+            sourceChatId = authorization.sourceChatId,
+        ) confirmedJob@{
+            if (!agentToolConfirmation.isAuthorizationCurrent(
+                    authorization = authorization,
+                    activeChainId = agentTrace.activeChainId,
+                    activeChatId = _currentChatId.value,
+                )
+            ) {
+                agentToolConfirmation.clearConsumedAuthorization(authorization)
+                agentToolRouter.failTrace(authorization.chainId, "Tool confirmation authorization is stale")
+                return@confirmedJob
+            }
+            val chatIdentityOperation = authorization.call.name in setOf(
+                "clear_chat", "delete_chat", "delete_or_clear_chat",
+            )
+            if (!chatIdentityOperation && !agentToolConfirmation.tryBeginDispatch(authorization)) {
+                agentToolConfirmation.clearConsumedAuthorization(authorization)
+                agentToolRouter.failTrace(
+                    authorization.chainId,
+                    "Tool confirmation was revoked before dispatch",
+                )
+                return@confirmedJob
+            }
             val stepStart = SystemClock.elapsedRealtime()
-            val result = executeAgentTool(call, confirmed = true)
+            val result = try {
+                withContext(ConfirmedAgentOperationContext(authorization)) {
+                    executeAgentTool(
+                        call = authorization.call,
+                        confirmed = true,
+                        authorization = authorization,
+                    )
+                }
+            } catch (e: CancellationException) {
+                agentToolRouter.failTrace(authorization.chainId, "Tool confirmation cancelled")
+                throw e
+            } catch (e: Exception) {
+                AgentToolResult(
+                    call = authorization.call,
+                    success = false,
+                    summary = "Tool execution failed with exception: ${e.message ?: "unknown error"}",
+                    errorCode = AgentToolErrorCode.FAILED,
+                )
+            }
+            val transitionApplied = result.details.optBoolean(CHAT_IDENTITY_RESULT_APPLIED, false)
+            result.details.remove(CHAT_IDENTITY_RESULT_APPLIED)
+            if (!transitionApplied && !agentToolConfirmation.isOperationOwnerCurrent(
+                    authorization = authorization,
+                    activeChainId = agentTrace.activeChainId,
+                    activeChatId = _currentChatId.value,
+                )
+            ) {
+                agentToolRouter.failTrace(authorization.chainId, "Tool confirmation authorization changed during execution")
+                return@confirmedJob
+            }
             val latency = SystemClock.elapsedRealtime() - stepStart
             val sanitizedResult = com.prismai.llmhost.agent.ToolInputSanitizer.sanitizeResult(result)
-            agentTrace.recordStep(call, sanitizedResult, latency)
-            appendToolResult(sanitizedResult)
-            CapabilityRegistryHolder.auditLog.record("CONFIRM_EXECUTED", call.name, result.summary.take(160))
-            val maxIterations = _generationSettings.value.maxAgentIterations
-            if (result.success && agentToolRouter.shouldContinueAfterTool(call) && depth + 1 < maxIterations) {
-                startAgentFollowUpGeneration(originalPrompt, result, depth + 1)
+            agentTrace.recordStep(authorization.call, sanitizedResult, latency, authorization.chainId)
+            val appended = if (transitionApplied) {
+                agentToolRouter.appendAuthorizedTransitionToolResult(
+                    chainId = authorization.chainId,
+                    result = sanitizedResult,
+                )
+            } else {
+                agentToolRouter.appendOwnedToolResult(
+                    chainId = authorization.chainId,
+                    sourceChatId = authorization.sourceChatId,
+                    result = sanitizedResult,
+                )
+            }
+            if (!appended) {
+                agentToolRouter.failTrace(authorization.chainId, "Tool result arrived after chat transition")
+                return@confirmedJob
+            }
+            CapabilityRegistryHolder.auditLog.record(
+                "CONFIRM_EXECUTED",
+                authorization.call.name,
+                result.summary.take(160),
+            )
+            val shouldContinue = agentToolRouter.completeConfirmedTool(
+                call = authorization.call,
+                result = result,
+                depth = authorization.depth,
+                maxIterations = _generationSettings.value.maxAgentIterations,
+                chainId = authorization.chainId,
+            )
+            if (shouldContinue && (
+                    transitionApplied ||
+                        agentToolRouter.isCurrentOwner(
+                            authorization.chainId,
+                            authorization.sourceChatId,
+                        )
+                    )
+            ) {
+                startAgentFollowUpGeneration(
+                    authorization.originalPrompt,
+                    result,
+                    authorization.depth + 1,
+                    authorization.chainId,
+                )
             }
         }
+        if (authorization.call.name in CHAT_IDENTITY_TOOLS) {
+            confirmedJob.invokeOnCompletion {
+                confirmedChatTransitionChain.compareAndSet(authorization.chainId, null)
+                confirmedChatTransitionThread.remove()
+            }
+        }
+        agentToolConfirmation.clearConsumedAuthorization(authorization)
     }
 
     private fun appendTranscriptMessage(role: TranscriptRole, text: String): Long {
         if (_currentChatId.value == null) {
-            createChat()
+            ensureChatForGenerationBlocking()
         }
         val id = synchronized(transcriptLock) {
             val id = nextTranscriptId++
@@ -922,8 +1551,110 @@ class InferenceService : Service() {
         )
     }
 
-    private suspend fun executeAgentTool(call: AgentToolCall, confirmed: Boolean): AgentToolResult =
-        when (call.name) {
+    private suspend fun executeConfirmedChatIdentityTool(
+        call: AgentToolCall,
+        authorization: AgentToolConfirmation.PendingToolAuthorization,
+    ): AgentToolResult {
+        if (!_generationSettings.value.agentEnabled) {
+            return toolFailure(
+                call,
+                AgentToolErrorCode.CONFIRMATION_REQUIRED,
+                "Agent mode is disabled",
+            )
+        }
+        if (!confirmedChatTransitionChain.compareAndSet(null, authorization.chainId)) {
+            return toolFailure(
+                call,
+                AgentToolErrorCode.BUSY,
+                "Another confirmed chat transition is already running",
+            )
+        }
+        val outcome = CompletableDeferred<AgentToolResult>()
+        try {
+            chatTransitionGate.enqueueAndAwait(
+                cleanup = {},
+                mutation = {
+                    if (!agentToolConfirmation.isOperationOwnerCurrent(
+                            authorization = authorization,
+                            activeChainId = agentTrace.activeChainId,
+                            activeChatId = _currentChatId.value,
+                        ) || !agentToolConfirmation.tryBeginDispatch(authorization)
+                    ) {
+                        outcome.complete(
+                            toolFailure(
+                                call,
+                                AgentToolErrorCode.CONFIRMATION_REQUIRED,
+                                "Chat transition authorization is stale",
+                            ),
+                        )
+                    } else {
+                        confirmedChatTransitionThread.set(true)
+                        try {
+                            val result = when (call.name) {
+                                "clear_chat" -> chatTools.clearChat(call, confirmed = true)
+                                "delete_chat" -> chatTools.deleteChat(call, confirmed = true)
+                                "delete_or_clear_chat" -> chatTools.deleteOrClearChat(call, confirmed = true)
+                                else -> toolFailure(call, AgentToolErrorCode.FAILED, "Unsupported chat transition")
+                            }
+                            result.details.put(
+                                CHAT_IDENTITY_RESULT_APPLIED,
+                                _currentChatId.value != authorization.sourceChatId,
+                            )
+                            outcome.complete(result)
+                        } catch (error: Exception) {
+                            outcome.complete(
+                                toolFailure(
+                                    call,
+                                    AgentToolErrorCode.FAILED,
+                                    "Chat transition failed: ${error.message ?: "unknown error"}",
+                                ),
+                            )
+                        } finally {
+                            confirmedChatTransitionThread.remove()
+                        }
+                    }
+                },
+            )
+        } catch (error: CancellationException) {
+            if (!outcome.isCompleted) {
+                outcome.complete(
+                    toolFailure(call, AgentToolErrorCode.FAILED, "Chat transition cancelled"),
+                )
+            }
+            throw error
+        } catch (error: Exception) {
+            if (!outcome.isCompleted) {
+                outcome.complete(
+                    toolFailure(call, AgentToolErrorCode.FAILED, "Chat transition failed"),
+                )
+            }
+        }
+        return outcome.await()
+    }
+
+    private suspend fun executeAgentTool(
+        call: AgentToolCall,
+        confirmed: Boolean,
+        authorization: AgentToolConfirmation.PendingToolAuthorization? = null,
+    ): AgentToolResult {
+        if (confirmed && authorization != null &&
+            !agentToolConfirmation.isOperationOwnerCurrent(
+                authorization = authorization,
+                activeChainId = agentTrace.activeChainId,
+                activeChatId = _currentChatId.value,
+            )
+        ) {
+            return AgentToolResult(
+                call = call,
+                success = false,
+                summary = "Tool confirmation authorization is no longer valid",
+                errorCode = AgentToolErrorCode.CONFIRMATION_REQUIRED,
+            )
+        }
+        if (confirmed && authorization != null && call.name in CHAT_IDENTITY_TOOLS) {
+            return executeConfirmedChatIdentityTool(call, authorization)
+        }
+        return when (call.name) {
             // ── System tools ────────────────────────────────────────────────
             "get_model_status" -> systemHandlerTools.modelStatus(call)
             "get_tool_capabilities" -> systemHandlerTools.getToolCapabilities(call)
@@ -942,7 +1673,11 @@ class InferenceService : Service() {
             "list_curated_downloadable_models" -> modelTools.listCuratedDownloadableModels(call)
             "get_download_status" -> modelTools.getDownloadStatus(call)
             "download_model" -> modelTools.downloadModel(call, confirmed)
-            "delete_model" -> modelTools.deleteModel(call, confirmed)
+            "delete_model" -> modelTools.deleteModel(
+                call,
+                confirmed,
+                confirmedIdentity = authorization?.confirmedModelIdentity,
+            )
             "recommend_runtime_settings" -> modelTools.recommendRuntimeSettings(call)
             "explain_runtime_settings" -> modelTools.explainRuntimeSettings(call)
             // ── Runtime tools ────────────────────────────────────────────────
@@ -993,13 +1728,18 @@ class InferenceService : Service() {
             "read_workspace_file" -> workspaceTools.readWorkspaceFile(call)
             "search_workspace_files" -> workspaceTools.searchWorkspaceFiles(call)
             // ── Background agent tools ───────────────────────────────────────
-            "run_in_background" -> backgroundAgentHandlerTools.runInBackground(call, confirmed)
+            "run_in_background" -> backgroundAgentHandlerTools.runInBackground(
+                call,
+                confirmed,
+                sourceChatId = authorization?.sourceChatId,
+            )
             "check_background_tasks" -> backgroundAgentHandlerTools.checkBackgroundTasks(call)
             "cancel_background_task" -> backgroundAgentHandlerTools.cancelBackgroundTask(call, confirmed)
             // ── Web search ───────────────────────────────────────────────────
             "web_search" -> webSearchTools.webSearch(call)
             else -> AgentToolResult(call, success = false, summary = "Unknown tool: ${call.name}")
         }
+    }
 
     private fun File.sizeRecursive(): Long {
         if (!exists()) return 0L
@@ -1110,10 +1850,25 @@ class InferenceService : Service() {
         originalPrompt: String,
         toolResult: AgentToolResult,
         depth: Int,
+        chainId: Long? = null,
     ) {
+        agentFollowUpScheduled = true
         serviceScope.launch {
-            operationMutex.withLock {
-                generationOrchestrator.startFollowUp(originalPrompt, toolResult, depth)
+            try {
+                operationMutex.withLock {
+                    if (!backgroundGenerationOwnership.allowsAgentFollowUp(chainId)) {
+                        publishUiEvent("Background task owns the generation engine")
+                        return@withLock
+                    }
+                    if (!generationStartGate.beginStart()) return@withLock
+                    try {
+                        generationOrchestrator.startFollowUp(originalPrompt, toolResult, depth, chainId)
+                    } finally {
+                        generationStartGate.finishStart()
+                    }
+                }
+            } finally {
+                agentFollowUpScheduled = false
             }
         }
     }
@@ -1137,16 +1892,10 @@ class InferenceService : Service() {
     private fun syncCapabilities(settings: GenerationSettings) {
         val registry = CapabilityRegistryHolder.registry
         if (settings.agentEnabled) {
-            registry.grant(Capability.MODEL_IMPORT)
-            registry.grant(Capability.MODEL_DOWNLOAD)
-            registry.grant(Capability.FILE_READ)
-            registry.grant(Capability.FILE_WRITE)
+            registry.setAgentModeEnabled(true)
             Log.d(TAG, "Restricted capabilities granted (Agent mode enabled)")
         } else {
-            registry.revoke(Capability.MODEL_IMPORT)
-            registry.revoke(Capability.MODEL_DOWNLOAD)
-            registry.revoke(Capability.FILE_READ)
-            registry.revoke(Capability.FILE_WRITE)
+            registry.setAgentModeEnabled(false)
             Log.d(TAG, "Restricted capabilities revoked (Agent mode disabled)")
         }
     }
@@ -1216,12 +1965,13 @@ class InferenceService : Service() {
 
     private fun persistTranscriptNow() {
         val chatId = _currentChatId.value ?: return
+        val revision = chatManager.transcriptWriteRevision(chatId)
         val messages = synchronized(transcriptLock) {
             _transcript.value
         }
         serviceScope.launch(Dispatchers.IO) {
             runCatching {
-                chatManager.persistTranscript(chatId, messages)
+                chatManager.persistTranscript(chatId, messages, revision)
             }.onFailure { error ->
                 Log.w(TAG, "failed to persist transcript", error)
             }
@@ -1235,14 +1985,32 @@ class InferenceService : Service() {
     private suspend fun cancelAndJoinGenerationLocked(
         reason: String,
         clearQueuedBenchmarks: Boolean = true,
+        finalizeActiveTrace: Boolean = true,
+        preserveActiveTrace: Boolean = false,
     ) {
         val job = generationJob
+        val shouldPreserveTrace = !finalizeActiveTrace || preserveActiveTrace
+        val traceOwner = if (::agentTrace.isInitialized) {
+            agentTrace.activeChainId
+        } else {
+            null
+        }
+        if (shouldPreserveTrace && traceOwner != null) {
+            agentTrace.preserveChainForCancellation(traceOwner)
+        }
         generationSession++
         generationJob = null
         if (job != null) {
             Log.d(TAG, "cancelAndJoinGeneration reason=$reason")
             job.cancelAndJoin()
             benchmarkStore.recordInterrupted(reason, streamState.snapshotText())
+        }
+        if (finalizeActiveTrace && traceOwner != null && agentTrace.isCurrentChain(traceOwner)) {
+            agentTrace.finalizeOwnedTrace(
+                chainId = traceOwner,
+                success = false,
+                abortReason = "Generation cancelled: $reason",
+            )
         }
         stopGenerationForeground()
         _isGenerating.value = false
@@ -1258,6 +2026,7 @@ class InferenceService : Service() {
             )
             chatManager.activeAssistantTranscriptId = null
         }
+        persistTranscriptNow()
         if (_runtimeStatus.value == RuntimeStatus.GENERATING || _runtimeStatus.value == RuntimeStatus.CANCELLING) {
             _runtimeStatus.value = RuntimeStatus.IDLE
         }

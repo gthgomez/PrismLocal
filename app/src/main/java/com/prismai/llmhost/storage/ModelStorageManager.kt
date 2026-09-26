@@ -29,9 +29,29 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
-class ModelStorageManager(private val context: Context) {
+internal object ModelStorageLifecycleGate {
+    private val lock = Any()
+    private val revisions = mutableMapOf<String, Long>()
+
+    fun <T> withLock(action: () -> T): T = synchronized(lock, action)
+
+    fun revision(modelId: String): Long = synchronized(lock) { revisions[modelId] ?: 0L }
+
+    fun advanceRevision(modelId: String): Long = synchronized(lock) {
+        val next = (revisions[modelId] ?: 0L) + 1L
+        revisions[modelId] = next
+        next
+    }
+}
+
+class ModelStorageManager(
+    private val context: Context,
+    private val modelsDirectoryOverride: File? = null,
+) {
     private val modelsDir: File
-        get() = context.getExternalFilesDir("models") ?: File(context.filesDir, "models")
+        get() = modelsDirectoryOverride
+            ?: context.getExternalFilesDir("models")
+            ?: File(context.filesDir, "models")
 
     data class ActiveModelInfo(
         val id: String,
@@ -134,6 +154,7 @@ class ModelStorageManager(private val context: Context) {
         onProgress: (ImportProgress) -> Unit = {},
     ): ImportResult {
         val displayName = displayNameFor(uri)
+        val expectedRevision = ModelStorageLifecycleGate.revision(modelIdFromDisplayName(displayName))
         val reportedSize = sizeFor(uri)
         val input = try {
             context.contentResolver.openInputStream(uri)
@@ -148,16 +169,47 @@ class ModelStorageManager(private val context: Context) {
         )
 
         input.use {
-            return importModelFromStream(displayName, reportedSize, it, onProgress)
+            return importModelFromStream(
+                displayName = displayName,
+                reportedSize = reportedSize,
+                input = it,
+                expectedLifecycleRevision = expectedRevision,
+                onProgress = onProgress,
+            )
         }
     }
+
+    internal fun captureLifecycleRevisionForDisplayName(displayName: String): Long =
+        ModelStorageLifecycleGate.revision(modelIdFromDisplayName(displayName))
 
     @VisibleForTesting
     fun importModelFromStream(
         displayName: String,
         reportedSize: Long,
         input: InputStream,
+        expectedLifecycleRevision: Long? = null,
         onProgress: (ImportProgress) -> Unit = {},
+    ): ImportResult = ModelStorageLifecycleGate.withLock {
+        val modelId = modelIdFromDisplayName(displayName)
+        val expected = expectedLifecycleRevision ?: ModelStorageLifecycleGate.revision(modelId)
+        if (ModelStorageLifecycleGate.revision(modelId) != expected) {
+            ImportResult.Failure(
+                ModelStorageError(
+                    ModelStorageError.Code.PROMOTION_FAILED,
+                    "Model installation was cancelled because its storage owner changed",
+                    "stale lifecycle revision for modelId=$modelId",
+                ),
+            )
+        } else {
+            importModelFromStreamLocked(displayName, reportedSize, input, onProgress)
+        }
+    }
+
+    private fun importModelFromStreamLocked(
+        displayName: String,
+        reportedSize: Long,
+        input: InputStream,
+        onProgress: (ImportProgress) -> Unit,
     ): ImportResult {
         val modelId = modelIdFrom(displayName)
         val versionId = newVersionId()
@@ -256,19 +308,35 @@ class ModelStorageManager(private val context: Context) {
         }
     }
 
-    fun deleteModel(modelId: String): Boolean {
-        val modelRoot = File(modelsDir, modelId)
-        val isSafeModelDir = runCatching {
-            modelRoot.canonicalFile != modelsDir.canonicalFile && isInside(modelsDir, modelRoot)
-        }.getOrDefault(false)
-        if (!isSafeModelDir) {
-            Log.w(TAG, "Refusing to delete model outside models dir modelId=$modelId")
-            return false
+    fun deleteModel(modelId: String, confirmedIdentity: ModelIdentity? = null): Boolean =
+        ModelStorageLifecycleGate.withLock {
+            val modelRoot = File(modelsDir, modelId)
+            val isSafeModelDir = runCatching {
+                modelRoot.canonicalFile != modelsDir.canonicalFile && isInside(modelsDir, modelRoot)
+            }.getOrDefault(false)
+            if (!isSafeModelDir) {
+                runCatching { Log.w(TAG, "Refusing to delete model outside models dir modelId=$modelId") }
+                return@withLock false
+            }
+            if (confirmedIdentity != null && !confirmedIdentityStillInstalled(modelId, modelRoot, confirmedIdentity)) {
+                return@withLock false
+            }
+            ModelStorageLifecycleGate.advanceRevision(modelId)
+            if (!modelRoot.exists()) return@withLock false
+            val deleted = runCatching { modelRoot.deleteRecursively() }.getOrDefault(false)
+            runCatching { Log.d(TAG, "deleteModel modelId=$modelId deleted=$deleted") }
+            deleted
         }
-        if (!modelRoot.exists()) return false
-        val deleted = runCatching { modelRoot.deleteRecursively() }.getOrDefault(false)
-        Log.d(TAG, "deleteModel modelId=$modelId deleted=$deleted")
-        return deleted
+
+    private fun confirmedIdentityStillInstalled(
+        modelId: String,
+        modelRoot: File,
+        confirmedIdentity: ModelIdentity,
+    ): Boolean {
+        if (confirmedIdentity.modelId != modelId || !modelRoot.exists()) return false
+        val resolved = parseManifest(modelRoot, verifyHash = false)
+        val installed = (resolved as? ModelResolveResult.Success)?.model ?: return false
+        return confirmedIdentity.matches(installed)
     }
 
     private fun pruneInactiveVersions(modelRoot: File, activeVersionId: String) {
@@ -290,7 +358,11 @@ class ModelStorageManager(private val context: Context) {
     fun activeModelInfo(modelId: String): ActiveModelInfo? =
         (resolveActiveModel(modelId, verifyHash = false) as? ModelResolveResult.Success)?.model
 
-    fun linkExternalModelUri(uri: Uri): ImportResult {
+    fun linkExternalModelUri(uri: Uri): ImportResult = ModelStorageLifecycleGate.withLock {
+        linkExternalModelUriLocked(uri)
+    }
+
+    private fun linkExternalModelUriLocked(uri: Uri): ImportResult {
         val displayName = displayNameFor(uri)
         val modelId = modelIdFrom(displayName)
         val versionId = newVersionId()
@@ -842,9 +914,7 @@ class ModelStorageManager(private val context: Context) {
     }
 
     private fun modelIdFrom(displayName: String): String {
-        val withoutExtension = displayName.removeSuffix(".gguf")
-        val cleaned = withoutExtension.replace(Regex("[^A-Za-z0-9._-]+"), "-").trim('-', '.', '_')
-        return cleaned.ifBlank { "imported-model" }
+        return modelIdFromDisplayName(displayName)
     }
 
     private fun newVersionId(): String = "v${System.currentTimeMillis()}"
@@ -890,7 +960,13 @@ class ModelStorageManager(private val context: Context) {
         }
     }
 
-    private companion object {
+    companion object {
+        internal fun modelIdFromDisplayName(displayName: String): String {
+            val withoutExtension = displayName.removeSuffix(".gguf")
+            val cleaned = withoutExtension.replace(Regex("[^A-Za-z0-9._-]+"), "-").trim('-', '.', '_')
+            return cleaned.ifBlank { "imported-model" }
+        }
+
         const val TAG = "ModelStorageManager"
         const val MANIFEST_FILE = "manifest.json"
         const val MODEL_FILE = "model.gguf"

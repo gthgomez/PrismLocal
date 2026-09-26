@@ -28,8 +28,68 @@ object GenerationBudget {
      */
     const val AGENT_FOLLOW_UP_PREAMBLE_CHARS = 512
 
+    const val CONTEXT_HEADROOM_TOKENS = 8
+    const val MESSAGE_TEMPLATE_TOKENS = 8
+
     fun estimateTokensFromChars(chars: Int): Int =
         (chars.coerceAtLeast(0) / CHARS_PER_TOKEN)
+
+    /** ASCII stays near chars/4. Non-ASCII counts as at least one token per character. */
+    fun estimateTokens(text: String): Int {
+        var tokens = 0
+        var ascii = 0
+        for (ch in text) {
+            if (ch.code <= 0x7F) {
+                ascii++
+            } else {
+                tokens += (ascii + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
+                ascii = 0
+                tokens += 1
+            }
+        }
+        tokens += (ascii + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
+        return tokens
+    }
+
+    /**
+     * True when the new user turn, memory, and instruction text fit with no history.
+     * History can be dropped; this turn cannot.
+     */
+    fun userTurnFits(
+        contextLength: Int,
+        maxTokens: Int,
+        userPrompt: String,
+        memoryContext: String = "",
+        instructionText: String = "",
+    ): Boolean {
+        val needed = estimateTokens(userPrompt) +
+            estimateTokens(memoryContext) +
+            estimateTokens(instructionText) +
+            MESSAGE_TEMPLATE_TOKENS * 2 +
+            CONTEXT_HEADROOM_TOKENS +
+            maxTokens.coerceAtLeast(0)
+        return needed <= contextLength
+    }
+
+    /** Room left for agent transcript history after the text that cannot be dropped. */
+    fun historyTokenBudget(
+        contextLength: Int,
+        maxTokens: Int,
+        userPrompt: String,
+        instructionText: String,
+        memoryContext: String = "",
+        toolResult: String = "",
+        reservedPadTokens: Int = DEFAULT_AGENT_PAD_TOKENS,
+    ): Int {
+        val used = estimateTokens(userPrompt) +
+            estimateTokens(instructionText) +
+            estimateTokens(memoryContext) +
+            estimateTokens(toolResult) +
+            reservedPadTokens.coerceAtLeast(0) +
+            CONTEXT_HEADROOM_TOKENS +
+            maxTokens.coerceAtLeast(0)
+        return (contextLength - used).coerceAtLeast(0)
+    }
 
     /**
      * Token budget for non-agent packing in [PromptBuilder].

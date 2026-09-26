@@ -4,6 +4,7 @@ import com.prismai.llmhost.generation.GenerationBudget
 import com.prismai.llmhost.generation.PromptBuilder
 import com.prismai.llmhost.tools.AgentToolProtocol
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -127,6 +128,45 @@ class GenerationBudgetTest {
         )
         assertTrue(small > large)
         assertEquals(largePayload - smallPayload, small - large)
+    }
+
+    @Test
+    fun nonAsciiTextCountsAtLeastOneTokenPerCharacter() {
+        assertEquals(40, GenerationBudget.estimateTokens("字".repeat(40)))
+        assertTrue(
+            GenerationBudget.userTurnFits(
+                contextLength = 2048,
+                maxTokens = 128,
+                userPrompt = "hello",
+            ),
+        )
+        assertFalse(
+            GenerationBudget.userTurnFits(
+                contextLength = 2048,
+                maxTokens = 128,
+                userPrompt = "字".repeat(3000),
+            ),
+        )
+        assertTrue(
+            GenerationBudget.userTurnFits(
+                contextLength = 512,
+                maxTokens = 256,
+                userPrompt = "hello",
+            ),
+        )
+        val cjkHistory = GenerationBudget.historyTokenBudget(
+            contextLength = 4096,
+            maxTokens = 256,
+            userPrompt = "字".repeat(40),
+            instructionText = "instructions",
+        )
+        val asciiHistory = GenerationBudget.historyTokenBudget(
+            contextLength = 4096,
+            maxTokens = 256,
+            userPrompt = "x".repeat(40),
+            instructionText = "instructions",
+        )
+        assertTrue(cjkHistory < asciiHistory)
     }
 
     @Test

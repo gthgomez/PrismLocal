@@ -50,29 +50,30 @@ class ModelManager(
 
     fun listModels(): List<String> = modelStorageManager.listInstalledModels()
 
-    suspend fun deleteModel(modelId: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-        Log.d(TAG, "deleteModel requested modelId=$modelId")
-        if (uiState._currentModel.value == modelId) {
-            engine.unloadModel()
-            lastLoadedPlanKey = null
-            uiState.streamState.clear()
-            uiState._currentModel.value = null
-            uiState._activeModelInfo.value = null
-            uiState._runtimeStatus.value = RuntimeStatus.IDLE
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .remove(KEY_ACTIVE_MODEL)
-                .apply()
-        }
-        val deleted = modelStorageManager.deleteModel(modelId)
-        if (deleted) {
+    suspend fun deleteModel(modelId: String, confirmedIdentity: ModelIdentity): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            Log.d(TAG, "deleteModel requested modelId=$modelId")
+            val deleted = modelStorageManager.deleteModel(modelId, confirmedIdentity)
+            if (!deleted) {
+                eventBus.publish("Failed to delete model $modelId")
+                return@withContext false
+            }
+            if (uiState._currentModel.value == modelId) {
+                engine.unloadModel()
+                lastLoadedPlanKey = null
+                uiState.streamState.clear()
+                uiState._currentModel.value = null
+                uiState._activeModelInfo.value = null
+                uiState._runtimeStatus.value = RuntimeStatus.IDLE
+                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .remove(KEY_ACTIVE_MODEL)
+                    .apply()
+            }
             eventBus.publish("Deleted model $modelId")
             onRefreshReadiness()
-        } else {
-            eventBus.publish("Failed to delete model $modelId")
+            true
         }
-        deleted
-    }
 
     suspend fun switchModel(modelId: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         Log.d(TAG, "switchModel requested modelId=$modelId")

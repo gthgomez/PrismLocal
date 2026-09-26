@@ -63,6 +63,9 @@ jobs:
       - name: Accept SDK licenses (auto-installs NDK 28.2 / cmake 3.22.1 pinned by AGP)
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
+      - name: Compile DevDebug Android instrumentation tests
+        run: ./gradlew :app:assembleDevDebugAndroidTest --no-daemon --stacktrace
+
       - name: Assemble DevBenchmark & PlayRelease (unsigned)
         env:
           LLMHOST_SUPABASE_ANON_KEY: "ci-public-build-placeholder"
@@ -90,6 +93,5 @@ jobs:
 
       - name: Run CTest
         run: ctest --test-dir build/prism-native-tests --output-on-failure
-
 
 

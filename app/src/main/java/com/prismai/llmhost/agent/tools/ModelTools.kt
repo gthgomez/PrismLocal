@@ -9,7 +9,6 @@ import com.prismai.llmhost.model.*
 import com.prismai.llmhost.*
 import com.prismai.llmhost.model.ModelDownloadManager
 import com.prismai.llmhost.model.ModelImportManager
-import com.prismai.llmhost.model.ModelManager
 import com.prismai.llmhost.model.ModelReadinessAssessor
 import com.prismai.llmhost.util.FormatUtils
 import kotlinx.coroutines.Dispatchers
@@ -19,8 +18,8 @@ import org.json.JSONObject
 import java.util.Locale
 
 class ModelTools(
-    private val modelManager: ModelManager,
-    private val modelStorageManager: ModelStorageManager,
+    private val listInstalledModelInfos: () -> List<ModelStorageManager.ActiveModelInfo>,
+    private val deleteModelDirectly: suspend (String, ModelIdentity) -> Boolean,
     private val modelReadinessAssessor: ModelReadinessAssessor,
     private val modelImportManager: ModelImportManager,
     private val modelDownloadManager: ModelDownloadManager,
@@ -30,7 +29,7 @@ class ModelTools(
     private val chatDirectory: () -> java.io.File,
     private val benchmarkFileSize: () -> Long,
     private val chatIndexFile: () -> java.io.File,
-    private val deleteModelSafely: (suspend (String) -> Boolean)? = null,
+    private val deleteModelSafely: (suspend (String, ModelIdentity) -> Boolean)? = null,
 ) {
     fun listInstalledModels(call: AgentToolCall): AgentToolResult {
         onRefreshReadiness()
@@ -198,24 +197,51 @@ class ModelTools(
             details = JSONObject().put("settings", settings.toAgentJson()).put("explanations", explanations))
     }
 
-    suspend fun deleteModel(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+    suspend fun deleteModel(
+        call: AgentToolCall,
+        confirmed: Boolean,
+        confirmedIdentity: ModelIdentity? = null,
+    ): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Model delete requires confirmation")
+        val identity = confirmedIdentity
+            ?: return toolFailure(
+                call,
+                AgentToolErrorCode.CONFIRMATION_REQUIRED,
+                "Model delete requires the confirmed version, hash, and path",
+            )
         val modelId = call.arguments.optString("model_id").trim()
-        if (modelId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Missing model_id parameter")
-        val installedModel = withContext(Dispatchers.IO) {
-            modelStorageManager.listInstalledModelInfos().firstOrNull { it.id == modelId }
-        } ?: return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Unknown installed model_id: $modelId")
-        val deleted = if (deleteModelSafely != null) {
-            deleteModelSafely.invoke(modelId)
-        } else {
-            modelManager.deleteModel(modelId)
+        if (modelId.isBlank() || modelId != identity.modelId) {
+            return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Confirmed model identity does not match model_id")
         }
+        val installedModel = withContext(Dispatchers.IO) {
+            listInstalledModelInfos().firstOrNull { it.id == modelId }
+        } ?: return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Unknown installed model_id: $modelId")
+        if (ModelIdentity.from(installedModel) != identity) {
+            return toolFailure(
+                call,
+                AgentToolErrorCode.FAILED,
+                "Installed model no longer matches the confirmed version, hash, and path",
+            )
+        }
+        val deleted = if (deleteModelSafely != null) {
+            deleteModelSafely.invoke(modelId, identity)
+        } else {
+            deleteModelDirectly(modelId, identity)
+        }
+        val identityDetails = JSONObject()
+            .put("model_id", identity.modelId)
+            .put("version_id", identity.versionId)
+            .put("sha256", identity.sha256)
+            .put("path", identity.path)
         return if (deleted) {
             onRefreshReadiness()
-            toolSuccess(call, "Deleted model $modelId",
-                JSONObject().put("model_id", modelId).put("bytes_freed", installedModel.bytes))
+            toolSuccess(
+                call,
+                "Deleted model $modelId",
+                identityDetails.put("bytes_freed", installedModel.bytes),
+            )
         } else {
-            toolFailure(call, AgentToolErrorCode.FAILED, "Failed to delete model $modelId")
+            toolFailure(call, AgentToolErrorCode.FAILED, "Failed to delete model $modelId", identityDetails)
         }
     }
 }

@@ -12,6 +12,7 @@ enum class NativeErrorCode : uint32_t {
     OK = 0,
     DEBUG_HOOKS_REJECTED = 403,
     HANDLE_INVALID_OR_CLOSED = 404,
+    DEBUG_GENERATION_REJECTED = 405,
     PROMPT_DOES_NOT_FIT = 420,
     TOKENIZE_SIZE_FAILED = 421,
     CONTEXT_WINDOW_TOO_SMALL = 422,
@@ -21,6 +22,8 @@ enum class NativeErrorCode : uint32_t {
     CONTEXT_SHIFT_FAILED = 426,
     GRAMMAR_COMPILE_FAILED = 427,
     NO_CONTINUATION_CONTEXT = 428,
+    // Generic JNI/native exception; kept typed so it cannot drift from Kotlin.
+    NATIVE_EXCEPTION = 500,
     MODEL_LOAD_FAILED = 501,
 };
 

@@ -39,10 +39,14 @@ import kotlinx.coroutines.launch
 data class BackgroundTask(
     val id: String,
     val prompt: String,
+    val sourceChatId: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val status: BackgroundTaskStatus = BackgroundTaskStatus.QUEUED,
     val resultSummary: String? = null,
 )
+
+/** A temporary scheduling conflict; the task must remain queued for retry. */
+class BackgroundTaskDeferredException : Exception("Background task deferred until the device is idle")
 
 enum class BackgroundTaskStatus { QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED }
 
@@ -84,6 +88,7 @@ class BackgroundAgentManager(
         private const val NOTIFICATION_ID_BASE = 3000
         private const val MAX_QUEUED_TASKS = 5
         private const val MAX_COMPLETED_TASKS_SAVED = 20
+        private const val MAX_PERSISTED_RESULT_SUMMARY_CHARS = 120
         private const val LOW_BATTERY_THRESHOLD = 15
         private const val DEVICE_BUSY_RETRY_INTERVAL_MS = 2_000L
         const val TASKS_FILE_NAME = "background_tasks.json"
@@ -131,19 +136,22 @@ class BackgroundAgentManager(
         }
     }
 
-    private fun taskToJson(task: BackgroundTask): JSONObject = JSONObject().apply {
+    private fun taskToJson(task: BackgroundTask, includePrompt: Boolean): JSONObject = JSONObject().apply {
         put("id", task.id)
-        put("prompt", task.prompt)
+        if (includePrompt) put("prompt", task.prompt)
         put("createdAt", task.createdAt)
+        if (!task.sourceChatId.isNullOrBlank()) put("sourceChatId", task.sourceChatId)
         put("status", task.status.name)
         if (task.resultSummary != null) {
-            put("resultSummary", task.resultSummary)
+            put("resultSummary", task.resultSummary.take(MAX_PERSISTED_RESULT_SUMMARY_CHARS))
         }
     }
 
-    private fun parseTask(json: JSONObject): BackgroundTask? {
+    private fun parseTask(json: JSONObject, includePrompt: Boolean = true): BackgroundTask? {
         val id = json.optString("id").takeIf { it.isNotBlank() } ?: return null
-        val prompt = json.optString("prompt").takeIf { it.isNotBlank() } ?: return null
+        val prompt = if (includePrompt) {
+            json.optString("prompt").takeIf { it.isNotBlank() } ?: return null
+        } else ""
         val createdAt = json.optLong("createdAt", System.currentTimeMillis())
         val statusStr = json.optString("status", BackgroundTaskStatus.QUEUED.name)
         val status = runCatching { BackgroundTaskStatus.valueOf(statusStr) }.getOrDefault(BackgroundTaskStatus.QUEUED)
@@ -151,6 +159,7 @@ class BackgroundAgentManager(
         return BackgroundTask(
             id = id,
             prompt = prompt,
+            sourceChatId = json.optString("sourceChatId").takeIf { it.isNotBlank() && it != "null" },
             createdAt = createdAt,
             status = status,
             resultSummary = resultSummary,
@@ -200,7 +209,7 @@ class BackgroundAgentManager(
             if (completedArray != null) {
                 for (i in 0 until completedArray.length()) {
                     val obj = completedArray.optJSONObject(i) ?: continue
-                    val task = parseTask(obj) ?: continue
+                    val task = parseTask(obj, includePrompt = false) ?: continue
                     trackId(task.id)
                     completed.add(task)
                 }
@@ -211,6 +220,8 @@ class BackgroundAgentManager(
                 queuedTasks = queued.take(MAX_QUEUED_TASKS),
                 completedTasks = completed.takeLast(MAX_COMPLETED_TASKS_SAVED),
             )
+            // Rewrite legacy completed records without their formerly persisted prompts.
+            persistTasksLocked()
             logD(TAG, "Restored ${queued.size} queued tasks, ${completed.size} completed tasks from disk")
         }.onFailure { e ->
             logW(TAG, "Failed to load persisted background tasks: ${e.message}")
@@ -224,17 +235,18 @@ class BackgroundAgentManager(
             val root = JSONObject().apply {
                 put("version", 1)
                 val queuedArr = JSONArray()
-                current.queuedTasks.forEach { queuedArr.put(taskToJson(it)) }
+                current.queuedTasks.forEach { queuedArr.put(taskToJson(it, includePrompt = true)) }
                 put("queuedTasks", queuedArr)
 
                 if (current.activeTask != null) {
-                    put("activeTask", taskToJson(current.activeTask))
+                    put("activeTask", taskToJson(current.activeTask, includePrompt = true))
                 } else {
                     put("activeTask", JSONObject.NULL)
                 }
 
                 val completedArr = JSONArray()
-                current.completedTasks.takeLast(MAX_COMPLETED_TASKS_SAVED).forEach { completedArr.put(taskToJson(it)) }
+                current.completedTasks.takeLast(MAX_COMPLETED_TASKS_SAVED)
+                    .forEach { completedArr.put(taskToJson(it, includePrompt = false)) }
                 put("completedTasks", completedArr)
             }
 
@@ -253,7 +265,7 @@ class BackgroundAgentManager(
      * Queue a task for background execution. Returns task ID.
      * Rejects if the queue is full (max [MAX_QUEUED_TASKS]).
      */
-    fun enqueue(prompt: String): BackgroundTask? {
+    fun enqueue(prompt: String, sourceChatId: String? = null): BackgroundTask? {
         val queued: BackgroundTask = synchronized(stateLock) {
             val current = _state.value
             if (current.queuedTasks.size >= MAX_QUEUED_TASKS) {
@@ -261,16 +273,34 @@ class BackgroundAgentManager(
                 return null
             }
             val id = "bg_task_${taskIdCounter.incrementAndGet()}"
-            val task = BackgroundTask(id = id, prompt = prompt)
+            val task = BackgroundTask(id = id, prompt = prompt, sourceChatId = sourceChatId)
             _state.value = current.copy(queuedTasks = current.queuedTasks + task)
             persistTasksLocked()
             task
         }
 
-        if (BuildConfig.DEBUG) logD(TAG, "Enqueued task ${queued.id}: ${prompt.take(80)}")
+        if (BuildConfig.DEBUG) logD(TAG, "Enqueued task ${queued.id}")
         processNextTask()
         return queued
     }
+
+    /**
+     * Atomically delete a chat and invalidate its queued/completed background
+     * records. An active task blocks deletion until it is explicitly cancelled,
+     * so an in-flight generation cannot publish back into a deleted chat.
+     */
+    fun deleteChatAndInvalidateTasks(chatId: String, deleteChat: () -> Boolean): Boolean =
+        synchronized(stateLock) {
+            val current = _state.value
+            if (current.activeTask?.sourceChatId == chatId) return@synchronized false
+            if (!deleteChat()) return@synchronized false
+            _state.value = current.copy(
+                queuedTasks = current.queuedTasks.filterNot { it.sourceChatId == chatId },
+                completedTasks = current.completedTasks.filterNot { it.sourceChatId == chatId },
+            )
+            persistTasksLocked()
+            true
+        }
 
     /** Start processing the queue. Acquires wake lock. */
     fun startBackgroundMode() {
@@ -351,6 +381,7 @@ class BackgroundAgentManager(
 
         val task = promoted ?: return
         activeTaskJob = bgScope.launch {
+            var deferred = false
             try {
                 wakeLock?.acquire(300_000L) // 5-minute wake lock per background task
                 val summary = executeTask?.invoke(task) ?: "Background task executed"
@@ -358,6 +389,20 @@ class BackgroundAgentManager(
             } catch (c: kotlinx.coroutines.CancellationException) {
                 logD(TAG, "Background task ${task.id} cancelled")
                 throw c
+            } catch (_: BackgroundTaskDeferredException) {
+                deferred = true
+                synchronized(stateLock) {
+                    val current = _state.value
+                    if (current.activeTask?.id == task.id) {
+                        _state.value = current.copy(
+                            activeTask = null,
+                            queuedTasks = listOf(
+                                task.copy(status = BackgroundTaskStatus.QUEUED),
+                            ) + current.queuedTasks,
+                        )
+                        persistTasksLocked()
+                    }
+                }
             } catch (e: Exception) {
                 logE(TAG, "Background task ${task.id} failed", e)
                 failCurrentTask(e.message ?: "Task execution error")
@@ -369,7 +414,7 @@ class BackgroundAgentManager(
                     }
                 }
                 if (!cancelInFlight) {
-                    processNextTask()
+                    if (deferred) scheduleDeviceBusyRetry(initialDelay = true) else processNextTask()
                 }
             }
         }
@@ -380,7 +425,7 @@ class BackgroundAgentManager(
      * retrying [processNextTask] via a cooperative poll. Only one retry poll
      * runs at a time and it never blocks a thread while waiting.
      */
-    private fun scheduleDeviceBusyRetry() {
+    private fun scheduleDeviceBusyRetry(initialDelay: Boolean = false) {
         synchronized(stateLock) {
             if (deviceBusyRetryJob?.isActive == true || cancelInFlight ||
                 _state.value.activeTask != null || _state.value.queuedTasks.isEmpty()
@@ -391,6 +436,7 @@ class BackgroundAgentManager(
                 val selfJob = coroutineContext[Job]
                 var cancelled = false
                 try {
+                    if (initialDelay) delay(DEVICE_BUSY_RETRY_INTERVAL_MS)
                     while (isDeviceBusyWithUserGeneration()) {
                         delay(DEVICE_BUSY_RETRY_INTERVAL_MS)
                     }

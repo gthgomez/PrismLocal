@@ -13,6 +13,51 @@ import org.junit.Test
 
 class AgentToolsTest {
     @Test
+    fun capabilityRevocationInvalidatesPendingDispatchButDoesNotUndoAdmittedWork() {
+        val registry = CapabilityRegistry().apply { grant(Capability.MODEL_DOWNLOAD) }
+        val pending = registry.snapshot(setOf(Capability.MODEL_DOWNLOAD))
+
+        assertTrue(registry.tryBeginDispatch(pending))
+
+        registry.revoke(Capability.MODEL_DOWNLOAD)
+
+        assertFalse(registry.tryBeginDispatch(pending))
+        assertFalse(registry.isCurrent(pending))
+    }
+
+    @Test
+    fun agentDisablementRevokesEveryAgentOnlyCapabilityAsOnePolicyChange() {
+        val registry = CapabilityRegistry()
+        registry.setAgentModeEnabled(true)
+        val pending = registry.snapshot(
+            setOf(Capability.MODEL_DOWNLOAD, Capability.FILE_READ, Capability.CHAT_MANAGE),
+            requireAgentMode = true,
+        )
+
+        registry.setAgentModeEnabled(false)
+
+        assertFalse(registry.isCurrent(pending))
+        assertFalse(registry.tryBeginDispatch(pending))
+        assertFalse(registry.check(setOf(Capability.MODEL_DOWNLOAD)).granted)
+        assertFalse(registry.check(setOf(Capability.FILE_READ)).granted)
+    }
+
+    @Test
+    fun disablingAgentModeRejectsConfirmedCapabilitiesThatRemainGranted() {
+        val registry = CapabilityRegistry().apply { setAgentModeEnabled(true) }
+        val pending = registry.snapshot(
+            setOf(Capability.CHAT_MANAGE),
+            requireAgentMode = true,
+        )
+
+        assertTrue(registry.tryBeginDispatch(pending))
+        registry.setAgentModeEnabled(false)
+
+        assertFalse(registry.tryBeginDispatch(pending))
+        assertTrue(registry.check(setOf(Capability.CHAT_MANAGE)).granted)
+    }
+
+    @Test
     fun unknownToolIsRejectedWithUnknownCode() {
         val result = AgentToolRegistry.validate(AgentToolCall("invented_tool"))
 

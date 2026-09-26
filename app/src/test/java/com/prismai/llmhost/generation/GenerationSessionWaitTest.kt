@@ -4,7 +4,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicBoolean
@@ -14,13 +16,34 @@ class GenerationSessionWaitTest {
 
     @Test
     fun returnsImmediatelyWhenIdle() = runBlocking {
-        GenerationSessionWait.awaitSessionIdle(
+        val completed = GenerationSessionWait.awaitSessionIdle(
             isGenerating = { false },
             getJob = { null },
             pollMs = 10L,
             maxWaitMs = 1000L,
         )
-        assertTrue(true)
+        assertTrue(completed)
+    }
+
+    @Test
+    fun timesOutWhenOwnedJobDoesNotFinishBeforeDeadline() = runBlocking {
+        val neverCompletes = Job()
+        var timedOut = false
+
+        val completed = withTimeoutOrNull(250L) {
+            GenerationSessionWait.awaitSessionIdle(
+                isGenerating = { true },
+                getJob = { neverCompletes },
+                pollMs = 5L,
+                maxWaitMs = 30L,
+                onTimeout = { timedOut = true },
+            )
+        } ?: false
+
+        assertFalse("stuck job should produce a bounded timeout", completed)
+        assertTrue(timedOut)
+        assertTrue(neverCompletes.isActive)
+        neverCompletes.cancel()
     }
 
     @Test
@@ -59,6 +82,36 @@ class GenerationSessionWaitTest {
 
         assertTrue("Follow up generation turn should have completed before await finished", followUpRan.get())
         assertEquals(false, isGenerating.get())
+    }
+
+    @Test
+    fun resumableMaxTokensTraceIsIdleWhileRemainingAvailableForUserContinuation() {
+        val inputs = GenerationIdleInputs(
+            generationRunning = false,
+            generationJobActive = false,
+            agentToolActive = false,
+            confirmationPending = false,
+            agentChainActive = true,
+            continuationAvailable = true,
+        )
+
+        assertFalse(GenerationIdlePolicy.shouldWait(inputs))
+        assertFalse(GenerationIdlePolicy.shouldAbortUnresumableChain(inputs))
+    }
+
+    @Test
+    fun agentDisabledTraceRequestsAbortInsteadOfWaitingForContinuation() {
+        val inputs = GenerationIdleInputs(
+            generationRunning = false,
+            generationJobActive = false,
+            agentToolActive = false,
+            confirmationPending = false,
+            agentChainActive = true,
+            continuationAvailable = false,
+        )
+
+        assertTrue(GenerationIdlePolicy.shouldAbortUnresumableChain(inputs))
+        assertTrue(GenerationIdlePolicy.shouldWait(inputs))
     }
 
     @Test

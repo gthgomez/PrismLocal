@@ -8,22 +8,23 @@ import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
 import android.content.SharedPreferences
-import android.os.SystemClock
 import android.util.Log
 import com.prismai.llmhost.ChatSession
 import com.prismai.llmhost.DeviceCapabilityProfile
-import com.prismai.llmhost.GenerationSettings
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.util.FormatUtils
 import org.json.JSONObject
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.Locale
+import java.util.UUID
 
 /**
  * Builds UI-facing tool-confirmation cards and manages the persistence
  * lifecycle of pending agent tool calls (save / restore / clear).
  *
- * Owns the in-memory pending state that was previously top-level vars in
- * [InferenceService]: [pendingCall], [pendingOriginalPrompt], [pendingDepth].
+ * Owns the immutable in-memory confirmation authorization snapshot and the
+ * safe persistence lifecycle for pending tool cards.
  */
 class AgentToolConfirmation(
     private val uiState: ServiceUiState,
@@ -31,19 +32,204 @@ class AgentToolConfirmation(
     private val currentChatId: () -> String?,
     private val pendingActionKey: (String) -> String,
     private val getDeviceProfile: () -> DeviceCapabilityProfile?,
+    private val capabilityRegistry: CapabilityRegistry = CapabilityRegistryHolder.registry,
+    private val resolveModelIdentity: (String) -> ModelIdentity? = { null },
 ) {
     companion object {
         private const val TAG = "AgentToolConfirm"
+
+        fun fingerprint(call: AgentToolCall): String {
+            val payload = buildString {
+                append(call.name)
+                append('\u0000')
+                append(call.arguments.toString())
+                append('\u0000')
+                append(call.reason.orEmpty())
+            }
+            return MessageDigest.getInstance("SHA-256")
+                .digest(payload.toByteArray(StandardCharsets.UTF_8))
+                .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        }
+
+        fun resolveTarget(call: AgentToolCall, sourceChatId: String): String = when (call.name) {
+            "switch_model", "delete_model" -> call.arguments.optString("model_id").trim()
+            "clear_chat", "delete_chat", "delete_or_clear_chat" ->
+                call.arguments.optString("chat_id", "current").let { requested ->
+                    if (requested.isBlank() || requested == "current") sourceChatId else requested
+                }
+            else -> sourceChatId
+        }.ifBlank { sourceChatId }
     }
+
+    data class PendingToolAuthorization(
+        val token: String,
+        val call: AgentToolCall,
+        val originalPrompt: String,
+        val depth: Int,
+        val chainId: Long,
+        val sourceChatId: String,
+        val resolvedTarget: String,
+        val callFingerprint: String,
+        val capabilityAuthorization: CapabilityAuthorizationSnapshot,
+        val confirmedModelIdentity: ModelIdentity? = null,
+    )
 
     // ── In-memory pending state ─────────────────────────────────────────
 
     @Volatile
-    var pendingCall: AgentToolCall? = null
+    private var pending: PendingToolAuthorization? = null
     @Volatile
-    var pendingOriginalPrompt: String? = null
-    @Volatile
-    var pendingDepth: Int = 0
+    private var consumedToken: String? = null
+
+    val pendingAuthorization: PendingToolAuthorization?
+        get() = pending?.let { immutableCopy(it) }
+
+    /**
+     * Publishes one immutable authorization snapshot. A confirmation without
+     * both a chain owner and source chat is never made actionable.
+     */
+    fun stagePending(
+        call: AgentToolCall,
+        originalPrompt: String,
+        depth: Int,
+        chainId: Long?,
+        sourceChatId: String?,
+    ): PendingToolAuthorization? {
+        if (consumedToken != null) return null
+        val source = sourceChatId?.takeIf { it.isNotBlank() } ?: return null
+        if (chainId == null || currentChatId() != source) return null
+        val safeCall = copyCall(call)
+        if (!ToolCapabilityMapping.isMapped(safeCall.name)) return null
+        val modelIdentity = if (safeCall.name == "delete_model") {
+            confirmedDeleteIdentity(safeCall) ?: return null
+        } else {
+            null
+        }
+        val capabilityAuthorization = capabilityRegistry.snapshot(
+            ToolCapabilityMapping.capabilitiesFor(safeCall.name),
+            requireAgentMode = true,
+        )
+        if (!capabilityAuthorization.grantedAtSnapshot) return null
+        val authorization = PendingToolAuthorization(
+            token = UUID.randomUUID().toString(),
+            call = safeCall,
+            originalPrompt = originalPrompt,
+            depth = depth.coerceIn(0, (uiState.generationSettings.value.maxAgentIterations - 1).coerceAtLeast(0)),
+            chainId = chainId,
+            sourceChatId = source,
+            resolvedTarget = resolveTarget(safeCall, source),
+            callFingerprint = fingerprint(safeCall),
+            capabilityAuthorization = capabilityAuthorization,
+            confirmedModelIdentity = modelIdentity,
+        )
+        synchronized(this) {
+            if (consumedToken != null) return null
+            pending = authorization
+        }
+        return immutableCopy(authorization)
+    }
+
+    /** Atomically consumes the currently staged authorization, if any. */
+    fun consumePending(): PendingToolAuthorization? {
+        synchronized(this) {
+            val snapshot = pending ?: return null
+            pending = null
+            return immutableCopy(snapshot)
+        }
+    }
+
+    /** Atomically consumes only the exact opaque token that was staged. */
+    fun consumePending(token: String): PendingToolAuthorization? {
+        if (token.isBlank()) return null
+        synchronized(this) {
+            val snapshot = pending ?: return null
+            if (snapshot.token != token) return null
+            pending = null
+            consumedToken = snapshot.token
+            return immutableCopy(snapshot)
+        }
+    }
+
+    /**
+     * Atomically consumes and rechecks chain/chat ownership. Stale cards are
+     * removed rather than left actionable.
+     */
+    fun consumePendingAndRevalidate(
+        token: String,
+        activeChainId: Long?,
+        activeChatId: String?,
+    ): PendingToolAuthorization? {
+        if (token.isBlank()) return null
+        synchronized(this) {
+            val snapshot = pending ?: return null
+            if (snapshot.token != token) return null
+            if (!isAuthorizationCurrent(snapshot, activeChainId, activeChatId)) {
+                pending = null
+                consumedToken = null
+                uiState._pendingAgentToolAction.value = null
+                return null
+            }
+            pending = null
+            consumedToken = snapshot.token
+            return immutableCopy(snapshot)
+        }
+    }
+
+    fun isAuthorizationCurrent(
+        authorization: PendingToolAuthorization,
+        activeChainId: Long?,
+        activeChatId: String?,
+    ): Boolean =
+        authorization.token.isNotBlank() &&
+            authorization.chainId > 0L &&
+            activeChainId == authorization.chainId &&
+            activeChatId == authorization.sourceChatId &&
+            authorization.resolvedTarget.isNotBlank() &&
+            authorization.resolvedTarget == resolveTarget(authorization.call, authorization.sourceChatId) &&
+            authorization.callFingerprint == fingerprint(authorization.call) &&
+            capabilityRegistry.isCurrent(authorization.capabilityAuthorization)
+
+    /** The owner stays valid for reporting work admitted before a later revocation. */
+    fun isOperationOwnerCurrent(
+        authorization: PendingToolAuthorization,
+        activeChainId: Long?,
+        activeChatId: String?,
+    ): Boolean =
+        authorization.token.isNotBlank() &&
+            authorization.chainId > 0L &&
+            activeChainId == authorization.chainId &&
+            activeChatId == authorization.sourceChatId &&
+            authorization.resolvedTarget.isNotBlank() &&
+            authorization.resolvedTarget == resolveTarget(authorization.call, authorization.sourceChatId) &&
+            authorization.callFingerprint == fingerprint(authorization.call)
+
+    /** Linearize admission of this operation against concurrent policy changes. */
+    fun tryBeginDispatch(authorization: PendingToolAuthorization): Boolean =
+        capabilityRegistry.tryBeginDispatch(authorization.capabilityAuthorization)
+
+    /** Clears the consumed card without clobbering a newer staged token. */
+    fun clearConsumedAuthorization(authorization: PendingToolAuthorization) {
+        synchronized(this) {
+            val current = pending
+            if (current != null && current.token != authorization.token) return
+            pending = null
+            if (consumedToken == authorization.token) consumedToken = null
+            uiState._pendingAgentToolAction.value = null
+            removePersisted(authorization.sourceChatId)
+        }
+    }
+
+    /** Discards a stale token only if no newer authorization has replaced it. */
+    fun discardStaleAuthorization(token: String, sourceChatId: String) {
+        synchronized(this) {
+            val current = pending
+            if (current != null && current.token != token) return
+            pending = null
+            if (consumedToken == token) consumedToken = null
+            uiState._pendingAgentToolAction.value = null
+            removePersisted(sourceChatId)
+        }
+    }
 
     // ── Confirmation builder ────────────────────────────────────────────
 
@@ -51,6 +237,7 @@ class AgentToolConfirmation(
         id: String,
         call: AgentToolCall,
         definition: AgentToolDefinition,
+        modelIdentity: ModelIdentity? = null,
     ): PendingAgentToolAction {
         val sanitizedName = com.prismai.llmhost.util.SanitizerUtils.stripControlCharacters(call.name)
         val sanitizedDescription = com.prismai.llmhost.util.SanitizerUtils.stripControlCharacters(definition.description)
@@ -144,16 +331,32 @@ class AgentToolConfirmation(
             }
             "delete_model" -> {
                 val modelId = call.arguments.optString("model_id")
-                base.copy(
-                    title = "Delete installed model?",
-                    summary = "Delete GGUF model $modelId from app storage.",
-                    changes = listOf(
-                        "Model: $modelId",
-                    ),
-                    riskNotes = listOf("Permanently removes the GGUF model binary from device storage."),
-                    confirmLabel = "Delete Model",
-                    destructive = true,
-                )
+                if (modelIdentity == null || modelIdentity.modelId != modelId.trim()) {
+                    base.copy(
+                        title = "Delete installed model?",
+                        summary = "Delete was not bound to a version, hash, and path.",
+                        changes = listOf("Model: $modelId"),
+                        riskNotes = listOf("This confirmation cannot delete a model."),
+                        confirmLabel = "Delete Model",
+                        destructive = true,
+                    )
+                } else {
+                    base.copy(
+                        title = "Delete installed model?",
+                        summary = "Delete only this GGUF file. A newer version of $modelId will not be deleted.",
+                        changes = listOf(
+                            "Model: ${modelIdentity.modelId}",
+                            "Version: ${modelIdentity.versionId}",
+                            "SHA-256: ${modelIdentity.sha256}",
+                            "Path: ${modelIdentity.path}",
+                        ),
+                        riskNotes = listOf(
+                            "Permanently removes this version only. The delete is refused if the installed version, hash, or path changes.",
+                        ),
+                        confirmLabel = "Delete Model",
+                        destructive = true,
+                    )
+                }
             }
             "switch_model" -> {
                 val target = call.arguments.optString("model_id")
@@ -201,28 +404,26 @@ class AgentToolConfirmation(
 
     // ── Persistence ─────────────────────────────────────────────────────
 
-    fun persist(call: AgentToolCall, originalPrompt: String, depth: Int) {
-        val chatId = currentChatId() ?: return
+    fun persist(authorization: PendingToolAuthorization) {
+        val chatId = authorization.sourceChatId
         try {
+            // Chain ownership and the opaque token are intentionally not
+            // persisted: a restored card cannot be safely authorized.
             val json = JSONObject()
                 .put("chatId", chatId)
-                .put("toolName", call.name)
-                .put("arguments", call.arguments.toString())
-                .put("reason", call.reason ?: "")
-                .put("originalPrompt", originalPrompt)
-                .put("depth", depth)
+                .put("toolName", authorization.call.name)
+                .put("arguments", authorization.call.arguments.toString())
+                .put("reason", authorization.call.reason ?: "")
+                .put("originalPrompt", authorization.originalPrompt)
+                .put("depth", authorization.depth)
 
             val key = pendingActionKey(chatId)
-            val success = prefs.edit()
+            prefs.edit()
                 .putString(key, json.toString())
-                .commit()
-            if (success) {
-                Log.d(TAG, "Persisted pending agent tool call: ${call.name} for chat $chatId")
-            } else {
-                Log.w(TAG, "Failed to commit pending agent tool call: ${call.name} for chat $chatId")
-            }
+                .apply()
+            logDebug("Scheduled pending agent tool persistence: ${authorization.call.name} for chat $chatId")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to persist pending agent tool call", e)
+            logError("Failed to persist pending agent tool call", e)
         }
     }
 
@@ -233,72 +434,34 @@ class AgentToolConfirmation(
             return false
         }
         val key = pendingActionKey(chatId)
-        val rawJson = prefs.getString(key, null)
-        if (rawJson == null) {
+        if (prefs.getString(key, null) == null) {
             clearMemory()
             return false
         }
-        return try {
-            val json = JSONObject(rawJson)
-            val storedChatId = json.optString("chatId")
-            if (storedChatId == chatId) {
-                val toolName = json.optString("toolName")
-                val argumentsStr = json.optString("arguments")
-                val reason = json.optString("reason").takeIf { it.isNotBlank() }
-                val originalPrompt = json.optString("originalPrompt")
-                val depth = json.optInt("depth", 0)
-
-                val arguments = if (argumentsStr.isNotBlank()) JSONObject(argumentsStr) else JSONObject()
-                val call = AgentToolCall(toolName, arguments, reason)
-
-                val validation = AgentToolRegistry.validate(call)
-                val definition = validation.definition
-                if (!validation.valid || definition == null) {
-                    Log.w(TAG, "Restored pending agent tool call failed validation: ${validation.message}")
-                    clearPrefs(chatId)
-                    return false
-                }
-
-                pendingCall = call
-                pendingOriginalPrompt = originalPrompt
-                pendingDepth = depth.coerceIn(0, uiState.generationSettings.value.maxAgentIterations - 1)
-                val actionId = "agent_tool_${SystemClock.uptimeMillis()}"
-                uiState._pendingAgentToolAction.value = build(actionId, call, definition)
-                Log.d(TAG, "Restored pending agent tool call: $toolName for chat $chatId")
-                true
-            } else {
-                Log.d(TAG, "Discarded stale pending agent tool call for chat $storedChatId (current: $chatId)")
-                clearPrefs(chatId)
-                false
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to restore pending agent tool call", e)
-            clearPrefs(chatId)
-            false
-        }
+        // Persisted confirmations intentionally contain no chain owner or
+        // opaque token. Treat every restored card as dead instead of creating
+        // a confirmation that can execute against a newer chat/chain.
+        clearPrefs(chatId)
+        return false
     }
 
     fun clearMemory() {
-        pendingCall = null
-        pendingOriginalPrompt = null
-        pendingDepth = 0
+        synchronized(this) {
+            pending = null
+            consumedToken = null
+        }
         uiState._pendingAgentToolAction.value = null
     }
 
     fun clearPrefs(chatId: String? = null) {
         val targetChatId = chatId ?: currentChatId()
         clearMemory()
-        if (!targetChatId.isNullOrBlank()) {
-            val key = pendingActionKey(targetChatId)
-            val success = prefs.edit()
-                .remove(key)
-                .commit()
-            if (success) {
-                Log.d(TAG, "Cleared pending agent tool SharedPreferences for chat $targetChatId")
-            } else {
-                Log.w(TAG, "Failed to commit clearing pending agent tool SharedPreferences for chat $targetChatId")
-            }
-        }
+        removePersisted(targetChatId)
+    }
+
+    /** Removes only a source-chat preference; it cannot clobber a newer in-memory card. */
+    fun clearPersistedForChat(chatId: String?) {
+        removePersisted(chatId)
     }
 
     fun cleanupStale(validChatIds: Set<String>) {
@@ -310,7 +473,7 @@ class AgentToolConfirmation(
                     val chatId = JSONObject(rawJson).optString("chatId")
                     if (chatId !in validChatIds) {
                         prefs.edit().remove(key).apply()
-                        Log.d(TAG, "Cleaned up stale pending agent tool pref for chat $chatId")
+                        logDebug("Cleaned up stale pending agent tool pref for chat $chatId")
                     }
                 } catch (_: Exception) {
                     prefs.edit().remove(key).apply()
@@ -320,9 +483,47 @@ class AgentToolConfirmation(
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
+    private fun removePersisted(chatId: String?) {
+        if (chatId.isNullOrBlank()) return
+        val key = pendingActionKey(chatId)
+        prefs.edit()
+            .remove(key)
+            .apply()
+        logDebug("Scheduled pending agent tool preference cleanup for chat $chatId")
+    }
+
     private fun resolveToolChatSession(chatIdArg: String): ChatSession? {
         val chatId = if (chatIdArg == "current" || chatIdArg.isBlank()) currentChatId() else chatIdArg
         return uiState.chatSessions.value.firstOrNull { it.id == chatId }
+    }
+
+    private fun confirmedDeleteIdentity(call: AgentToolCall): ModelIdentity? {
+        val modelId = call.arguments.optString("model_id").trim()
+        if (modelId.isBlank()) return null
+        return resolveModelIdentity(modelId)?.takeIf { it.modelId == modelId }
+    }
+
+    private fun copyCall(call: AgentToolCall): AgentToolCall =
+        AgentToolCall(
+            name = call.name,
+            arguments = JSONObject(call.arguments.toString()),
+            reason = call.reason,
+        )
+
+    private fun immutableCopy(authorization: PendingToolAuthorization): PendingToolAuthorization =
+        authorization.copy(
+            call = copyCall(authorization.call),
+            capabilityAuthorization = authorization.capabilityAuthorization.copy(
+                required = authorization.capabilityAuthorization.required.toSet(),
+            ),
+        )
+
+    private fun logDebug(message: String) {
+        runCatching { Log.d(TAG, message) }
+    }
+
+    private fun logError(message: String, error: Throwable) {
+        runCatching { Log.e(TAG, message, error) }
     }
 
 }

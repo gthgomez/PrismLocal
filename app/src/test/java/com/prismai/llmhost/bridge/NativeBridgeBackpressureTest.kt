@@ -1,116 +1,266 @@
 package com.prismai.llmhost.bridge
 
 import com.prismai.llmhost.GenerationChunk
+import com.prismai.llmhost.GenerationSettings
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.channels.ProducerScope
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * JVM unit tests verifying the lossless flow buffering invariant for [NativeLlmBridge].
- *
- * Ensures that with a bounded channel capacity >= maxTokens + headroom, rapid non-blocking
- * emissions via trySend() never drop chunks under backpressure from a slow consumer.
+ * JVM coverage for the bridge's production stream-buffer seam. The native
+ * engine is intentionally not mocked: the channel, producer, and slow consumer
+ * are real coroutine components, while only the JNI boundary is omitted.
  */
 class NativeBridgeBackpressureTest {
 
-    private fun ProducerScope<GenerationChunk>.emitChunk(chunk: GenerationChunk): Boolean {
-        val result = trySend(chunk)
-        return result.isSuccess
+    private fun chunk(index: Int, terminal: Boolean = false): GenerationChunk =
+        GenerationChunk(
+            text = if (terminal) "terminal" else "t$index",
+            tokenCount = if (terminal) 0 else 1,
+            generationId = 42,
+            isTerminal = terminal,
+            terminalReason = if (terminal) "EOF" else "NONE",
+        )
+
+    @Test
+    fun productionCapacityIsClampedAndLeavesTerminalHeadroom() {
+        assertEquals(65, generationStreamBufferCapacity(0))
+        assertEquals(65, generationStreamBufferCapacity(1))
+        assertEquals(1088, generationStreamBufferCapacity(1024))
+        assertEquals(1088, generationStreamBufferCapacity(2048))
     }
 
     @Test
-    fun testLosslessBufferingUnderSlowConsumer() = runBlocking(Dispatchers.Default) {
-        val totalTokens = 1024
-        val headroom = 64
-        val capacity = totalTokens + headroom
+    fun tombstonedWithErrorRequestsImmediateErrorTerminal() {
+        val decision = decideDrainState(NATIVE_STATE_TOMBSTONED, errorCode = 404)
 
+        assertEquals(DrainStateAction.TERMINAL, decision.action)
+        assertEquals("ERROR", decision.terminalReason)
+        assertFalse(decision.waitForPending)
+    }
+
+    @Test
+    fun tombstonedWithoutErrorStopsForCleanup() {
+        val decision = decideDrainState(NATIVE_STATE_TOMBSTONED, errorCode = 0)
+
+        assertEquals(DrainStateAction.STOP, decision.action)
+        assertEquals(null, decision.terminalReason)
+    }
+
+    @Test
+    fun partialStreamIdleEmitsCancellationTerminal() = runBlocking {
+        val decision = decideDrainState(NATIVE_STATE_IDLE, errorCode = 0)
         val flow = callbackFlow {
-            // Rapidly emit 1,024 non-terminal chunks + 1 terminal chunk
-            for (i in 1..totalTokens) {
-                val ok = emitChunk(
+            sendChunk(chunk(1))
+            if (decision.action == DrainStateAction.TERMINAL) {
+                sendChunk(
                     GenerationChunk(
-                        text = "t$i ",
-                        tokenCount = 1,
-                        generationId = 1,
-                        isTerminal = false,
-                    )
+                        text = "",
+                        tokenCount = 0,
+                        generationId = 42,
+                        isTerminal = true,
+                        terminalReason = decision.terminalReason.orEmpty(),
+                    ),
                 )
-                assertTrue("Emission $i failed unexpectedly on buffered channel", ok)
             }
-            val termOk = emitChunk(
-                GenerationChunk(
-                    text = "",
-                    tokenCount = 0,
-                    generationId = 1,
-                    isTerminal = true,
-                    terminalReason = "EOF",
-                )
-            )
-            assertTrue("Terminal emission failed unexpectedly", termOk)
             close()
-        }.buffer(capacity)
+        }.buffer(generationStreamBufferCapacity(1))
+
+        val received = withTimeout(5_000) { flow.toList() }
+
+        assertEquals(2, received.size)
+        assertEquals("t1", received.first().text)
+        assertTrue(received.last().isTerminal)
+        assertEquals("CANCELLED", received.last().terminalReason)
+    }
+
+    @Test
+    fun staleIdleWithErrorRequestsErrorTerminal() {
+        val decision = decideDrainState(NATIVE_STATE_IDLE, errorCode = 404)
+
+        assertEquals(DrainStateAction.TERMINAL, decision.action)
+        assertEquals("ERROR", decision.terminalReason)
+        assertFalse(decision.waitForPending)
+    }
+
+    @Test
+    fun syntheticIdleTerminalRequiresExplicitNativeCancellation() {
+        val decision = decideDrainState(NATIVE_STATE_IDLE, errorCode = 0)
+
+        assertTrue(decision.requiresNativeCancellation)
+        assertTrue(shouldCancelNative(observedTerminal = true, decision = decision))
+    }
+
+    @Test
+    fun failedDecodeIsNotAcknowledgedBeforeItsTerminal() {
+        assertTrue(acknowledgeOnlyAfterTerminal(NATIVE_STATE_ERROR, errorCode = 0))
+        assertTrue(acknowledgeOnlyAfterTerminal(NATIVE_STATE_EOF, errorCode = 7))
+        assertFalse(acknowledgeOnlyAfterTerminal(NATIVE_STATE_GENERATING, errorCode = 0))
+        assertFalse(acknowledgeOnlyAfterTerminal(NATIVE_STATE_EOF, errorCode = 0))
+        assertTrue(heldBatchCoversRing(produced = 50, drained = 0, tokenCount = 50))
+        assertFalse(heldBacklogRemains(produced = 50, drained = 0, tokenCount = 50))
+        assertFalse(heldBatchCoversRing(produced = 200, drained = 0, tokenCount = 128))
+        assertTrue(heldBacklogRemains(produced = 200, drained = 0, tokenCount = 128))
+        assertFalse(heldBatchCoversRing(produced = 200, drained = 0, tokenCount = 0))
+    }
+
+    @Test
+    fun deliveredTrueTerminalsDoNotRequestSyntheticCancellation() {
+        val trueTerminalStates = listOf(
+            NATIVE_STATE_EOF,
+            NATIVE_STATE_CANCELLED,
+            NATIVE_STATE_ERROR,
+            NATIVE_STATE_MAX_TOKENS,
+        )
+
+        for (state in trueTerminalStates) {
+            val decision = decideDrainState(state, errorCode = 0)
+            assertFalse(shouldCancelNative(observedTerminal = true, decision = decision))
+        }
+    }
+
+    @Test
+    fun losslessDeliveryAndTerminalWithSlowConsumer() = runBlocking {
+        val maxTokens = GenerationSettings.MAX_MAX_TOKENS
+        val flow = callbackFlow {
+            for (index in 1..maxTokens) {
+                sendChunk(chunk(index))
+            }
+            sendChunk(chunk(0, terminal = true))
+            close()
+        }.buffer(generationStreamBufferCapacity(maxTokens))
 
         val received = mutableListOf<GenerationChunk>()
-        flow.collect { chunk ->
-            received.add(chunk)
-            // Simulate slow consumer (e.g. UI rendering or transcript formatting delay)
-            if (received.size % 100 == 0) {
-                delay(2)
-            }
+        withTimeout(10_000) {
+            flow.collect { received += it; delay(1) }
         }
 
-        assertEquals("All chunks must be delivered without loss", totalTokens + 1, received.size)
-        for (i in 1..totalTokens) {
-            assertEquals("Chunk $i text mismatch", "t$i ", received[i - 1].text)
-            assertEquals("Chunk $i token count mismatch", 1, received[i - 1].tokenCount)
-            assertFalse("Chunk $i should not be terminal", received[i - 1].isTerminal)
-        }
+        assertEquals(maxTokens + 1, received.size)
+        assertEquals(
+            (1..maxTokens).map { "t$it" },
+            received.take(maxTokens).map { it.text },
+        )
+        assertEquals(1, received.count { it.isTerminal })
         val terminal = received.last()
-        assertTrue("Last chunk must be terminal", terminal.isTerminal)
-        assertEquals("Terminal reason must be EOF", "EOF", terminal.terminalReason)
+        assertTrue(terminal.isTerminal)
+        assertEquals("EOF", terminal.terminalReason)
+        assertEquals("terminal", terminal.text)
     }
 
     @Test
-    fun testCancellationHandlesTrySendGracefully() = runBlocking(Dispatchers.Default) {
-        val capacity = 16
+    fun fullBufferAppliesBackpressureWithoutDroppingChunks() = runBlocking {
+        val totalDataChunks = 32
         val flow = callbackFlow {
-            val ok1 = emitChunk(
-                GenerationChunk(
-                    text = "start",
-                    tokenCount = 1,
-                    generationId = 1,
-                    isTerminal = false,
-                )
-            )
-            assertTrue("Initial emission should succeed", ok1)
+            for (index in 1..totalDataChunks) {
+                sendChunk(chunk(index))
+            }
+            sendChunk(chunk(0, terminal = true))
             close()
-            // After close(), trySend must return failure (isSuccess == false) without throwing
-            val ok2 = emitChunk(
-                GenerationChunk(
-                    text = "after_close",
-                    tokenCount = 1,
-                    generationId = 1,
-                    isTerminal = false,
-                )
-            )
-            assertFalse("trySend must report failure on closed channel", ok2)
-        }.buffer(capacity)
+        }.buffer(1)
 
-        val list = flow.toList()
-        assertEquals(1, list.size)
-        assertEquals("start", list[0].text)
+        val received = withTimeout(5_000) {
+            flow.toList()
+        }
+
+        assertEquals(totalDataChunks + 1, received.size)
+        assertEquals(
+            (1..totalDataChunks).map { "t$it" },
+            received.take(totalDataChunks).map { it.text },
+        )
+        assertTrue(received.last().isTerminal)
+        assertEquals("EOF", received.last().terminalReason)
+    }
+
+    @Test
+    fun closedTerminalSendIsExplicitAndStopsProducer() = runBlocking {
+        val producerFinished = CompletableDeferred<Unit>()
+        val terminalResult = CompletableDeferred<StreamSendResult>()
+        val continuedAfterClose = CompletableDeferred<Unit>()
+        val flow = callbackFlow {
+            assertEquals(StreamSendResult.SENT, sendChunk(chunk(1)))
+            close()
+            val result = sendChunk(chunk(0, terminal = true))
+            terminalResult.complete(result)
+            if (result == StreamSendResult.SENT) {
+                continuedAfterClose.complete(Unit)
+            }
+            producerFinished.complete(Unit)
+        }.buffer(generationStreamBufferCapacity(1))
+
+        val received = withTimeout(5_000) { flow.toList() }
+        assertEquals(listOf("t1"), received.map { it.text })
+        assertEquals(
+            StreamSendResult.CLOSED,
+            withTimeout(5_000) { terminalResult.await() },
+        )
+        assertFalse(continuedAfterClose.isCompleted)
+        withTimeout(5_000) { producerFinished.await() }
+    }
+
+    @Test
+    fun unexpectedCloseCauseIsNotSwallowed() = runBlocking {
+        val expected = IllegalStateException("downstream failure")
+        val producerFailure = CompletableDeferred<Throwable>()
+        val flow = callbackFlow {
+            close(expected)
+            try {
+                sendChunk(chunk(1))
+            } catch (failure: Throwable) {
+                producerFailure.complete(failure)
+                throw failure
+            }
+        }
+
+        withTimeout(5_000) { runCatching { flow.toList() } }
+        assertSame(expected, withTimeout(5_000) { producerFailure.await() })
+    }
+
+    @Test
+    fun cancellationDuringBackpressureCompletesProducerAndCleanup() = runBlocking {
+        val firstReceived = CompletableDeferred<Unit>()
+        val cleanupFinished = CompletableDeferred<Unit>()
+        val producerFinished = CompletableDeferred<Unit>()
+        val flow = callbackFlow {
+            try {
+                sendChunk(chunk(1))
+                sendChunk(chunk(2))
+            } finally {
+                withStreamCleanup {
+                    delay(10)
+                    cleanupFinished.complete(Unit)
+                }
+                producerFinished.complete(Unit)
+            }
+        }.buffer(Channel.RENDEZVOUS)
+
+        val collector = launch(Dispatchers.Default) {
+            runCatching {
+                flow.collect {
+                    firstReceived.complete(Unit)
+                    awaitCancellation()
+                }
+            }
+        }
+
+        withTimeout(5_000) { firstReceived.await() }
+        withTimeout(5_000) { collector.cancelAndJoin() }
+        withTimeout(5_000) { cleanupFinished.await() }
+        withTimeout(5_000) { producerFinished.await() }
+        assertTrue("collector should finish after cancellation", collector.isCompleted)
     }
 }

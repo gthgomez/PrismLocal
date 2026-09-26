@@ -150,4 +150,15 @@ class PromptBuilderMessagesTest {
         assertEquals(ChatMessage.ROLE_USER, result.last().role)
         assertEquals("q", result.last().content)
     }
+
+    @Test
+    fun denseHistoryIsDroppedWhenCharEstimateWouldKeepIt() {
+        val dense = "字".repeat(40)
+        val transcript = listOf(message(1, TranscriptRole.USER, dense))
+
+        val result = PromptBuilder.assembleChatMessages("q", transcript, null, "", 30)
+
+        assertEquals(2, result.size)
+        assertEquals("q", result.last().content)
+    }
 }

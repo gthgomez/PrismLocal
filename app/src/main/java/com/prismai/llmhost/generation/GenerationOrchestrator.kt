@@ -30,6 +30,24 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
+ * Cancels the exact native generation that produced the active chunk. A retry
+ * repeats the same ID; cancelling generation 0 would leave the active session
+ * running.
+ */
+internal suspend fun cancelActiveGeneration(
+    generationId: Int,
+    cancel: suspend (Int) -> Unit,
+    onRetry: (Throwable) -> Unit = {},
+    onFailure: (Throwable) -> Unit = {},
+): Boolean = runCatching { cancel(generationId) }
+    .recoverCatching { error ->
+        onRetry(error)
+        cancel(generationId)
+    }
+    .onFailure(onFailure)
+    .isSuccess
+
+/**
  * Orchestrates the prompt → token-stream generation lifecycle for chat,
  * continuation, and agent follow-up paths.
  *
@@ -63,7 +81,10 @@ class GenerationOrchestrator(
     private val setReloadPending: (Boolean) -> Unit,
     /** Fired exactly once after a benchmark-preset generation fully completes/cleans up. */
     private val onBenchmarkComplete: () -> Unit = {},
+    private val onBeforeChatIdentityChange: suspend (String, suspend () -> Unit) -> Unit = { _, mutation -> mutation() },
 ) {
+    private val generationResults = GenerationResultStore()
+
     companion object {
         private const val TAG = "GenOrchestrator"
         /** Soft warning threshold only — does not hard-block generation (B4). */
@@ -71,7 +92,60 @@ class GenerationOrchestrator(
         private const val TRUNCATION_MAX_DEPTH = 4
         private const val TRUNCATED_STRING_LIMIT = 150
         private const val TRUNCATED_ARRAY_LIMIT = 5
+
+        internal fun mapErrorCodeToUserMessage(errorCode: Int, detail: String?): String {
+            return when (NativeErrorCode.fromValue(errorCode)) {
+                NativeErrorCode.OK -> detail ?: "native runtime error"
+                NativeErrorCode.DEBUG_HOOKS_REJECTED -> "Debug hooks rejected operation"
+                NativeErrorCode.HANDLE_INVALID_OR_CLOSED -> "Model is not loaded"
+                NativeErrorCode.DEBUG_GENERATION_REJECTED -> "Debug generation rejected"
+                NativeErrorCode.PROMPT_DOES_NOT_FIT -> "Prompt exceeds context window limit"
+                NativeErrorCode.TOKENIZE_SIZE_FAILED -> "Prompt token count estimation failed"
+                NativeErrorCode.CONTEXT_WINDOW_TOO_SMALL -> "Context window too small for prompt"
+                NativeErrorCode.TOKENIZE_FAILED -> "Tokenization failed"
+                NativeErrorCode.SAMPLER_INIT_FAILED -> "Sampler initialization failed"
+                NativeErrorCode.NULL_TOKEN_PRODUCED -> "Null token produced"
+                NativeErrorCode.CONTEXT_SHIFT_FAILED -> "Context shift operation failed"
+                NativeErrorCode.GRAMMAR_COMPILE_FAILED -> "Grammar compilation failed"
+                NativeErrorCode.NO_CONTINUATION_CONTEXT -> "Cannot continue without prior context"
+                NativeErrorCode.NATIVE_EXCEPTION -> "Native exception"
+                NativeErrorCode.MODEL_LOAD_FAILED -> "Failed to load model"
+                null -> when {
+                    errorCode in 5000..5999 -> "Native decode error (code $errorCode)"
+                    else -> if (errorCode > 0) {
+                        "Error code $errorCode ($detail)"
+                    } else {
+                        detail ?: "native runtime error"
+                    }
+                }
+            }
+        }
+
+        internal fun resolveFollowUpChainOrAbort(
+            agentTrace: AgentTrace,
+            suppliedChainId: Long?,
+            modelAvailable: Boolean,
+        ): Long? {
+            val resolved = suppliedChainId ?: agentTrace.activeChainId
+            if (!modelAvailable) {
+                agentTrace.abortTrace(resolved, "Follow-up aborted: no model selected")
+                return null
+            }
+            return resolved
+        }
     }
+
+    fun outputForGeneration(sessionId: Long, agentChainId: Long? = null): String? =
+        generationResults.outputFor(sessionId, agentChainId)
+
+    fun terminalReasonForGeneration(sessionId: Long, agentChainId: Long? = null): String? =
+        generationResults.terminalReasonFor(sessionId, agentChainId)
+
+    fun retainGenerationOutput(sessionId: Long?, agentChainId: Long?) =
+        generationResults.retain(sessionId, agentChainId)
+
+    fun releaseGenerationOutput(sessionId: Long?, agentChainId: Long?) =
+        generationResults.release(sessionId, agentChainId)
 
     // ── Flow deduplication types ─────────────────────────────────────────
 
@@ -98,10 +172,21 @@ class GenerationOrchestrator(
     // ── Public API ──────────────────────────────────────────────────────
 
     /** Main entry point for chat generation. Acquires [InferenceService]'s operation mutex itself. */
+    enum class GenerationLaunch {
+        REFUSED,
+        HANDLED,
+        STARTED,
+    }
+
+    private val launchResult = java.util.concurrent.atomic.AtomicReference(GenerationLaunch.REFUSED)
+
+    fun takeLaunchResult(): GenerationLaunch = launchResult.getAndSet(GenerationLaunch.REFUSED)
+
     suspend fun generate(
         prompt: String,
         benchmarkPreset: BenchmarkPreset? = null,
     ) {
+        launchResult.set(GenerationLaunch.REFUSED)
         val baseSettings = uiState.generationSettings.value.clamped()
 
         // ── Direct NL → agent tool call path ────────────────────────────
@@ -109,11 +194,12 @@ class GenerationOrchestrator(
             val directToolCall = agentToolRouter.directToolCall(prompt)
             if (directToolCall != null) {
                 chatManager.appendTranscriptMessage(TranscriptRole.USER, prompt)
-                agentTrace.reset()
-                agentTrace.activeAgentChainPrompt = prompt
-                agentTrace.activeAgentChainStartTime = System.currentTimeMillis()
+                val chainId = agentTrace.beginChain(prompt)
                 agentToolRouter.activeAgentToolHistory.clear()
-                agentToolRouter.handleToolCall(directToolCall, prompt, depth = 0)
+                agentToolRouter.handleToolCall(directToolCall, prompt, depth = 0, chainId = chainId)
+                if (agentTrace.isCurrentChain(chainId)) {
+                    launchResult.set(GenerationLaunch.HANDLED)
+                }
                 return
             }
         }
@@ -150,14 +236,30 @@ class GenerationOrchestrator(
         }
 
         val agentEnabled = settings.agentEnabled
+        val agentChainId = if (agentEnabled) {
+            agentTrace.beginChain(prompt)
+        } else {
+            null
+        }
         if (agentEnabled) {
-            agentTrace.reset()
-            agentTrace.activeAgentChainPrompt = prompt
-            agentTrace.activeAgentChainStartTime = System.currentTimeMillis()
             agentToolRouter.activeAgentToolHistory.clear()
         }
 
         val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
+        if (benchmarkPreset == null && !GenerationBudget.userTurnFits(
+                contextLength = settings.contextLength,
+                maxTokens = settings.maxTokens,
+                userPrompt = prompt,
+                memoryContext = memoryContext,
+                instructionText = if (agentEnabled) AgentToolProtocol.instructionBlock() else "",
+            )
+        ) {
+            if (agentChainId != null) {
+                agentTrace.abortTrace(agentChainId, "Prompt exceeds context window")
+            }
+            eventBus.publish("This message is too long for the context window")
+            return
+        }
         // Structured, role-preserving messages for normal chat. The legacy string
         // path stays for agent turns and benchmark presets, which build their own
         // protocol prompts and must keep byte-identical behavior.
@@ -177,14 +279,14 @@ class GenerationOrchestrator(
         }
         val enginePrompt = if (benchmarkPreset == null) {
             if (agentEnabled) {
-                val maxHistoryChars = GenerationBudget.calculateAgentHistoryCharBudget(
+                val maxHistoryTokens = GenerationBudget.historyTokenBudget(
                     contextLength = settings.contextLength,
                     maxTokens = settings.maxTokens,
-                    userPromptChars = prompt.length,
-                    instructionBlockChars = AgentToolProtocol.instructionBlock().length,
-                    extraContextChars = memoryContext.length,
+                    userPrompt = prompt,
+                    instructionText = AgentToolProtocol.instructionBlock(),
+                    memoryContext = memoryContext,
                 )
-                val history = getFormattedHistoryForAgent(emptySet(), maxHistoryChars = maxHistoryChars)
+                val history = getFormattedHistoryForAgent(emptySet(), maxHistoryTokens = maxHistoryTokens)
                 val historyWithMemory = buildString {
                     append(history)
                     if (memoryContext.isNotEmpty()) {
@@ -211,6 +313,7 @@ class GenerationOrchestrator(
             )
         } ?: BenchmarkStatus()
 
+        launchResult.set(GenerationLaunch.STARTED)
         val session = incrementSession()
 
         uiState._generationPerformance.value = null
@@ -242,6 +345,7 @@ class GenerationOrchestrator(
             grammar = if (agentEnabled) AgentToolProtocol.toolGrammar else null,
             startedAt = startedAt,
             messages = chatMessages,
+            agentChainId = agentChainId,
             config = GenerationFlowConfig(
                 errorLabel = "generation",
                 checkReload = true,
@@ -264,13 +368,14 @@ class GenerationOrchestrator(
                     result.finalReason,
                     result.terminalDetail,
                 )
-                if (agentEnabled) {
-                    agentTrace.addChainTokens(result.generatedTokens)
-                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
-                }
-            } else if (result.finalReason == "ERROR" && agentEnabled) {
-                agentTrace.addChainTokens(result.generatedTokens)
-                agentTrace.finalizeTrace(success = false)
+            }
+            if (agentEnabled) {
+                agentTrace.recordGenerationTurn(
+                    terminalReason = result.finalReason,
+                    generatedTokens = result.generatedTokens,
+                    hasToolCall = agentToolCall != null,
+                    chainId = agentChainId,
+                )
             }
 
             val completedPreset = metrics.activeBenchmarkPreset
@@ -285,7 +390,12 @@ class GenerationOrchestrator(
             // Benchmark queue drain handled by InferenceService
 
             if (agentToolCall != null) {
-                agentToolRouter.handleToolCall(agentToolCall, prompt, depth = 0)
+                agentToolRouter.handleToolCall(
+                    agentToolCall,
+                    prompt,
+                    depth = 0,
+                    chainId = agentChainId,
+                )
             }
         }
 
@@ -294,6 +404,8 @@ class GenerationOrchestrator(
 
     /** Continuation generation. Acquires [InferenceService]'s operation mutex via [com.prismai.llmhost.InferenceService.continueGenerationSafely]. */
     fun continueGeneration() {
+        val agentChainId = agentTrace.activeChainId
+        agentChainId?.let { agentTrace.releaseChainPreservation(it) }
         if (uiState.currentModel.value == null) {
             eventBus.publish("Select a model before continuing")
             return
@@ -339,6 +451,7 @@ class GenerationOrchestrator(
             assistantMessageId = assistantMessage.id,
             continueFromContext = true,
             grammar = if (agentEnabled) AgentToolProtocol.toolGrammar else null,
+            agentChainId = agentChainId,
             startedAt = startedAt,
             config = GenerationFlowConfig(errorLabel = "continuation"),
         ) { result ->
@@ -354,13 +467,14 @@ class GenerationOrchestrator(
                     result.finalReason,
                     result.terminalDetail,
                 )
-                if (agentEnabled) {
-                    agentTrace.addChainTokens(result.generatedTokens)
-                    agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
-                }
-            } else if (result.finalReason == "ERROR" && agentEnabled) {
-                agentTrace.addChainTokens(result.generatedTokens)
-                agentTrace.finalizeTrace(success = false)
+            }
+            if (agentEnabled) {
+                agentTrace.recordGenerationTurn(
+                    terminalReason = result.finalReason,
+                    generatedTokens = result.generatedTokens,
+                    hasToolCall = agentToolCall != null,
+                    chainId = agentChainId,
+                )
             }
             val reasoningPrefix = if (agentToolCall != null) {
                 AgentToolProtocol.extractReasoningPrefix(result.finalOutput)
@@ -370,7 +484,12 @@ class GenerationOrchestrator(
             chatManager.updateTranscriptMessage(assistantMessage.id, if (agentToolCall == null) result.finalOutput else reasoningPrefix)
 
             if (agentToolCall != null) {
-                agentToolRouter.handleToolCall(agentToolCall, "[continue]", depth = 0)
+                agentToolRouter.handleToolCall(
+                    agentToolCall,
+                    "[continue]",
+                    depth = 0,
+                    chainId = agentChainId,
+                )
             }
         }
 
@@ -382,8 +501,27 @@ class GenerationOrchestrator(
         originalPrompt: String,
         toolResult: AgentToolResult,
         depth: Int,
+        chainId: Long? = null,
     ) {
-        if (uiState.currentModel.value == null) return
+        val modelAvailable = uiState.currentModel.value != null
+        if (!modelAvailable) {
+            resolveFollowUpChainOrAbort(
+                agentTrace = agentTrace,
+                suppliedChainId = chainId,
+                modelAvailable = false,
+            )
+            return
+        }
+        val agentChainId = chainId ?: agentTrace.activeChainId
+        if (agentChainId != null && !agentTrace.isCurrentChain(agentChainId)) return
+        // Reserve the chat identity before any follow-up setup or transcript
+        // append. Chat transitions must either see this reservation or make
+        // the chain owner check fail before the append below.
+        uiState._isGenerating.value = true
+        if (agentChainId != null && !agentTrace.isCurrentChain(agentChainId)) {
+            uiState._isGenerating.value = false
+            return
+        }
         val session = incrementSession()
         val settings = uiState.generationSettings.value.clamped()
 
@@ -400,11 +538,12 @@ class GenerationOrchestrator(
                 isHot -> "Device is too hot (thermal state: $thermalStatus)"
                 else -> "Battery level is low (${profile.batteryPercent}%)"
             }
-            agentTrace.finalizeTrace(success = false, abortReason = "Follow-up aborted: $reason")
+            agentTrace.abortTrace(agentChainId, "Follow-up aborted: $reason")
             chatManager.appendTranscriptMessage(
                 TranscriptRole.ASSISTANT,
                 "⚠️ Agent follow-up aborted: $reason. Stopping execution to protect device resources.",
             )
+            uiState._isGenerating.value = false
             return
         }
 
@@ -412,7 +551,6 @@ class GenerationOrchestrator(
         val assistantMessageId = chatManager.appendTranscriptMessage(TranscriptRole.ASSISTANT, "")
         chatManager.activeAssistantTranscriptId = assistantMessageId
         uiState.streamState.beginGeneration()
-        uiState._isGenerating.value = true
         uiState._runtimeStatus.value = RuntimeStatus.GENERATING
         onStartForeground()
 
@@ -425,18 +563,20 @@ class GenerationOrchestrator(
         metrics.activeSettings = settings
         val truncatedRaw = truncateToolResultForBudget(toolResult, originalPrompt, settings)      // truncate RAW first
         val sanitized = ToolInputSanitizer.sanitizeResult(truncatedRaw) // sanitize ONCE
-        val toolPayloadChars = with(AgentToolProtocol) { sanitized.toJson().toString().length }   // measure SANITIZED payload
-        val maxHistoryChars = GenerationBudget.calculateAgentHistoryCharBudget(
+        val toolPayload = with(AgentToolProtocol) { sanitized.toJson().toString() }
+        val maxHistoryTokens = GenerationBudget.historyTokenBudget(
             contextLength = settings.contextLength,
             maxTokens = settings.maxTokens,
-            userPromptChars = originalPrompt.length,
-            toolResultChars = toolPayloadChars,
-            instructionBlockChars = GenerationBudget.AGENT_FOLLOW_UP_PREAMBLE_CHARS,
+            userPrompt = originalPrompt,
+            instructionText = "",
+            toolResult = toolPayload,
+            reservedPadTokens = GenerationBudget.DEFAULT_AGENT_PAD_TOKENS +
+                GenerationBudget.estimateTokensFromChars(GenerationBudget.AGENT_FOLLOW_UP_PREAMBLE_CHARS),
         )
         val enginePrompt = AgentToolProtocol.buildToolResultPrompt(
             originalPrompt,
             sanitized,
-            getFormattedHistoryForAgent(setOf(assistantMessageId), maxHistoryChars = maxHistoryChars),
+            getFormattedHistoryForAgent(setOf(assistantMessageId), maxHistoryTokens = maxHistoryTokens),
         )
 
         val job = runGenerationFlow(
@@ -446,6 +586,7 @@ class GenerationOrchestrator(
             assistantMessageId = assistantMessageId,
             grammar = if (settings.agentEnabled) AgentToolProtocol.toolGrammar else null,
             startedAt = startedAt,
+            agentChainId = agentChainId,
             config = GenerationFlowConfig(
                 errorLabel = "agent follow-up",
                 hasTerminalErrorEvent = false,
@@ -454,12 +595,12 @@ class GenerationOrchestrator(
             ),
         ) { result ->
             val nextToolCall = if (result.finalReason == "EOF") AgentToolProtocol.parseToolCall(result.finalOutput) else null
-            agentTrace.addChainTokens(result.generatedTokens)
-            if (nextToolCall == null) {
-                agentTrace.finalizeTrace(success = (result.finalReason == "EOF"))
-            } else if (result.finalReason == "ERROR") {
-                agentTrace.finalizeTrace(success = false)
-            }
+            agentTrace.recordGenerationTurn(
+                terminalReason = result.finalReason,
+                generatedTokens = result.generatedTokens,
+                hasToolCall = nextToolCall != null,
+                chainId = agentChainId,
+            )
             metrics.clear()
             val reasoningPrefix = if (nextToolCall != null) {
                 AgentToolProtocol.extractReasoningPrefix(result.finalOutput)
@@ -468,7 +609,12 @@ class GenerationOrchestrator(
             chatManager.updateTranscriptMessage(assistantMessageId, if (nextToolCall == null) result.finalOutput else reasoningPrefix)
 
             if (nextToolCall != null) {
-                agentToolRouter.handleToolCall(nextToolCall, originalPrompt, depth)
+                agentToolRouter.handleToolCall(
+                    nextToolCall,
+                    originalPrompt,
+                    depth,
+                    chainId = agentChainId,
+                )
             }
         }
 
@@ -496,8 +642,10 @@ class GenerationOrchestrator(
         config: GenerationFlowConfig,
         messages: List<ChatMessage>? = null,
         continueFromContext: Boolean = false,
+        agentChainId: Long? = null,
         onComplete: (GenerationFlowResult) -> Unit,
     ): Job {
+        val sessionOutput = GenerationOutputAccumulator(uiState.streamState.snapshotText())
         var firstTokenAt: Long? = null
         var generatedTokens = 0
         var promptTokens = 0
@@ -520,6 +668,7 @@ class GenerationOrchestrator(
                     return@onEach
                 }
                 val uiChunk = Utf8TextPipeline.normalizeChunk(chunk)
+                if (uiChunk.text.isNotEmpty()) sessionOutput.append(uiChunk.text)
                 val now = SystemClock.elapsedRealtime()
                 if (promptTokens == 0 && chunk.promptTokens > 0) {
                     promptTokens = chunk.promptTokens
@@ -588,13 +737,12 @@ class GenerationOrchestrator(
                         )
                         Log.w(TAG, "quality_abort session=$session detail=$baseDetail")
                         eventBus.publish("Benchmark stopped: quality abort (${verdict.reasonCode})")
-                        val cancelOk = runCatching { engine.cancelGeneration() }
-                            .recoverCatching { first ->
-                                Log.w(TAG, "quality abort cancel retry", first)
-                                engine.cancelGeneration()
-                            }
-                            .onFailure { error -> Log.w(TAG, "quality abort cancel failed", error) }
-                            .isSuccess
+                        val cancelOk = cancelActiveGeneration(
+                            generationId = uiChunk.generationId,
+                            cancel = { generationId -> engine.cancelGeneration(generationId) },
+                            onRetry = { error -> Log.w(TAG, "quality abort cancel retry", error) },
+                            onFailure = { error -> Log.w(TAG, "quality abort cancel failed", error) },
+                        )
                         if (!cancelOk) {
                             // Keep QUALITY_ABORT; annotate that native cancel failed.
                             terminalState = terminalState.copy(
@@ -644,13 +792,7 @@ class GenerationOrchestrator(
                 }
             }
             .onCompletion { cause ->
-                if (session != getActiveSession()) {
-                    Log.d(TAG, "ignored stale ${config.errorLabel} completion session=$session active=${getActiveSession()}")
-                    return@onCompletion
-                }
-                if (cause is CancellationException) {
-                    Log.d(TAG, "${config.errorLabel} cancelled session=$session")
-                }
+                val ownedOutput = sessionOutput.snapshot()
                 val resolved = GenerationTerminalReducer.resolveFinal(
                     current = terminalState,
                     causeIsCancellation = cause is CancellationException,
@@ -658,8 +800,29 @@ class GenerationOrchestrator(
                     generatedTokens = generatedTokens,
                     userStopLikely = uiState.runtimeStatus.value == RuntimeStatus.CANCELLING,
                 )
-                terminalState = resolved
                 val finalReason = resolved.reason ?: "EOF"
+                generationResults.record(session, agentChainId, ownedOutput, finalReason)
+                val ownsAgentChain = agentChainId == null || agentTrace.isCurrentChain(agentChainId)
+                if (session != getActiveSession() || !ownsAgentChain) {
+                    if (agentChainId != null && agentTrace.isCurrentChain(agentChainId)) {
+                        agentTrace.addChainTokens(generatedTokens)
+                        val abortReason = if (cause is CancellationException) {
+                            "Generation cancelled"
+                        } else {
+                            "Generation superseded"
+                        }
+                        agentTrace.finalizeStaleOwnedTrace(
+                            chainId = agentChainId,
+                            abortReason = abortReason,
+                        )
+                    }
+                    Log.d(TAG, "ignored stale ${config.errorLabel} completion session=$session active=${getActiveSession()}")
+                    return@onCompletion
+                }
+                if (cause is CancellationException) {
+                    Log.d(TAG, "${config.errorLabel} cancelled session=$session")
+                }
+                terminalState = resolved
                 val terminalDetail = resolved.detail
                 if (finalReason == "ERROR" && terminalDetail == "generation_did_not_start") {
                     uiState._runtimeStatus.value = RuntimeStatus.ERROR
@@ -676,7 +839,7 @@ class GenerationOrchestrator(
                     terminalReason = finalReason,
                     promptTokens = promptTokens,
                 )
-                val finalOutput = uiState.streamState.snapshotText()
+                val finalOutput = ownedOutput
 
                 onComplete(
                     GenerationFlowResult(
@@ -722,20 +885,20 @@ class GenerationOrchestrator(
             .launchIn(scope)
     }
 
-    private fun getFormattedHistoryForAgent(excludeIds: Set<Long>, maxHistoryChars: Int): String {
-        if (maxHistoryChars <= 0) return ""
+    private fun getFormattedHistoryForAgent(excludeIds: Set<Long>, maxHistoryTokens: Int): String {
+        if (maxHistoryTokens <= 0) return ""
         val history = uiState.transcript.value.filter { message ->
             message.text.isNotBlank() && message.id !in excludeIds
         }
         if (history.isEmpty()) return ""
         val selected = ArrayDeque<TranscriptMessage>()
-        var chars = 0
-        val safeCharCap = maxHistoryChars
+        var tokens = 0
         for (message in history.asReversed()) {
             val formatted = message.asPromptLine()
-            if (chars + formatted.length > safeCharCap) break
+            val cost = GenerationBudget.estimateTokens(formatted)
+            if (tokens + cost > maxHistoryTokens) break
             selected.addFirst(message)
-            chars += formatted.length
+            tokens += cost
         }
         return buildString {
             selected.forEach { message -> appendLine(message.asPromptLine()) }
@@ -750,8 +913,10 @@ class GenerationOrchestrator(
         }
 
     private suspend fun startBenchmarkChat(name: String) {
-        chatManager.createChatInternal("Benchmark - $name", publishEvent = false)
-        runCatching { engine.resetConversation() }
+        onBeforeChatIdentityChange("Benchmark chat changed") {
+            chatManager.createChatInternal("Benchmark - $name", publishEvent = false)
+            runCatching { engine.resetConversation() }
+        }
     }
 
     // ── Tool result truncation ──────────────────────────────────────────
@@ -889,22 +1054,4 @@ class GenerationOrchestrator(
         else -> value
     }
 
-    private fun mapErrorCodeToUserMessage(errorCode: Int, detail: String?): String {
-        return when (errorCode) {
-            403 -> "Debug hooks rejected operation"
-            404 -> "Model is not loaded"
-            420 -> "Prompt exceeds context window limit"
-            421 -> "Prompt token count estimation failed"
-            422 -> "Context window too small for prompt"
-            423 -> "Tokenization failed"
-            424 -> "Sampler initialization failed"
-            425 -> "Null token produced"
-            426 -> "Context shift operation failed"
-            427 -> "Grammar compilation failed"
-            428 -> "Cannot continue without prior context"
-            501 -> "Failed to load model"
-            in 5000..5999 -> "Native decode error (code $errorCode)"
-            else -> if (errorCode > 0) "Error code $errorCode ($detail)" else detail ?: "native runtime error"
-        }
-    }
 }

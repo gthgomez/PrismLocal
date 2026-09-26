@@ -12,7 +12,6 @@ import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
@@ -27,12 +26,6 @@ import java.util.concurrent.atomic.AtomicInteger
 class NativeLlmBridge private constructor(handle: Long, private val instanceId: Int) {
     companion object {
         private const val TAG = "NativeLlmBridge"
-        private const val STREAM_BUFFER_HEADROOM = 64
-        private const val STATE_EOF = 3
-        private const val STATE_CANCELLED = 4
-        private const val STATE_ERROR = 5
-        private const val STATE_TOMBSTONED = 6
-        private const val STATE_MAX_TOKENS = 7
         private val bridgeInstanceCounter = AtomicInteger(0)
 
         init {
@@ -52,12 +45,11 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     }
 
     // modelMutex serializes model lifecycle: load, unload, reset, destroy.
-    // The drain/decode path does NOT acquire this lock — C++ handles its own
-    // thread safety via atomics and internal mutexes.
+    // Native's lifecycle gate linearizes these operations against combined
+    // drain/decode/state snapshots.
     private val modelMutex = Mutex()
-    // genMutex serializes generation start/cancel/ack to prevent concurrent
-    // generations from racing on session state. The hot drain loop is NOT
-    // serialized — it reads atomics lock-free.
+    // genMutex serializes generation start/cancel/terminal ack. Native also
+    // validates each drain acknowledgement against its generation and tail.
     private val genMutex = Mutex()
     private val sessionCounter = AtomicInteger(1)
 
@@ -136,6 +128,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     private external fun nativeCancelGeneration(handle: Long, genId: Int)
     private external fun nativeDrainTokens(handle: Long, genId: Int, maxTokens: Int): IntArray
     private external fun nativeAckEof(handle: Long, genId: Int)
+    private external fun nativeAckDrainedTokens(handle: Long, genId: Int, expectedTail: Int, tokenCount: Int): Boolean
     private external fun nativeDecodeTokens(handle: Long, genId: Int, tokens: IntArray): String
     private external fun nativeGetState(handle: Long, genId: Int): Int
     private external fun nativeDrainDecodeAndState(handle: Long, genId: Int, maxTokens: Int, outResult: NativeDrainResult)
@@ -278,20 +271,6 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     }
 
     /**
-     * Non-blocking chunk emission into the bounded-but-sufficiently-buffered channel.
-     * With channel capacity >= maxTokens + headroom, trySend() cannot fail due to
-     * buffer exhaustion during active generation. Failure indicates flow closure
-     * or cancellation by the consumer.
-     */
-    private fun ProducerScope<GenerationChunk>.emitChunk(chunk: GenerationChunk) {
-        val result = trySend(chunk)
-        if (!result.isSuccess) {
-            if (!isActive) return
-            Log.e(TAG, "chunk_send_failed genId=${chunk.generationId} terminal=${chunk.isTerminal}")
-        }
-    }
-
-    /**
      * Shared drain/emit/finally body for the string path ([generate]) and the
      * structured chat path ([generateChat]). [start] performs the native start
      * call under [genMutex] and reports whether the generation was accepted.
@@ -315,6 +294,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         }
 
         var observedTerminal = false
+        var terminalDecision: DrainStateDecision? = null
         // Pre-sized primitive array avoids Long boxing and list growth.
         // Max drains ≈ max_tokens (1024) + overhead polls.
         val jniTimingsUs = LongArray(2048)
@@ -327,27 +307,31 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         var pollDelay = 2L
         try {
             while (isActive && !isDestroyed) {
-                // Lock-free drain: C++ handles thread safety via atomics on the
-                // ControlBlock and internal decode_mu. Skipping the Kotlin mutex here
-                // eliminates contention with setMemoryPressure and model operations.
+                // The native Engine linearizes this combined drain/decode/state
+                // snapshot against reset, unload, cancellation, and generation
+                // replacement. The Kotlin mutex remains unnecessary here.
                 val jniStart = SystemClock.elapsedRealtimeNanos()
                 if (isDestroyed) {
                     reusableResult.tokensCount = 0
                     reusableResult.textCount = 0
+                    reusableResult.textOverflowBytes = null
                     reusableResult.textOverflow = ""
                     reusableResult.produced = 0L
                     reusableResult.drained = 0L
                     reusableResult.pending = false
-                    reusableResult.state = STATE_TOMBSTONED
+                    reusableResult.drainTail = 0
+                    reusableResult.state = NATIVE_STATE_TOMBSTONED
                     reusableResult.errorCode = 0
                 } else {
                     reusableResult.tokensCount = 0
                     reusableResult.textCount = 0
+                    reusableResult.textOverflowBytes = null
                     reusableResult.textOverflow = ""
                     reusableResult.produced = 0L
                     reusableResult.drained = 0L
                     reusableResult.pending = false
-                    reusableResult.state = 0
+                    reusableResult.drainTail = 0
+                    reusableResult.state = NATIVE_STATE_IDLE
                     reusableResult.errorCode = 0
                     nativeDrainDecodeAndState(nativeHandle, genId, 128, reusableResult)
                 }
@@ -359,22 +343,25 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 val state = reusableResult.state
                 val promptTokens = reusableResult.promptTokens
 
+                val holdAckForTerminal = acknowledgeOnlyAfterTerminal(state, reusableResult.errorCode)
+                var decodedText = ""
                 if (tokenCount > 0) {
-                    pollDelay = 2L // reset backoff on active token receipt
+                    pollDelay = 2L
 
-                    // Decode text incrementally: prefer buffer bytes, fall back
-                    // to the already-decoded overflow string. Multi-byte code
-                    // points split across drains are carried until complete.
-                    val decodedText = if (reusableResult.textOverflow.isNotEmpty()) {
-                        utf8.append(reusableResult.textOverflow.toByteArray(Charsets.UTF_8))
-                    } else if (reusableResult.textCount > 0) {
-                        utf8.append(reusableResult.textBuffer, reusableResult.textCount)
-                    } else {
-                        ""
+                    val overflowBytes = reusableResult.textOverflowBytes
+                    val overflowText = reusableResult.textOverflow.orEmpty()
+                    decodedText = when {
+                        overflowBytes != null && overflowBytes.isNotEmpty() ->
+                            utf8.append(overflowBytes)
+                        overflowText.isNotEmpty() ->
+                            utf8.append(overflowText.toByteArray(Charsets.UTF_8))
+                        reusableResult.textCount > 0 ->
+                            utf8.append(reusableResult.textBuffer, reusableResult.textCount)
+                        else -> ""
                     }
 
-                    if (decodedText.isNotEmpty() || tokenCount > 0) {
-                        emitChunk(
+                    if (!holdAckForTerminal && (decodedText.isNotEmpty() || tokenCount > 0)) {
+                        val dataSent = sendChunk(
                             GenerationChunk(
                                 text = decodedText,
                                 tokenCount = tokenCount,
@@ -387,33 +374,65 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                                 errorCode = reusableResult.errorCode,
                             )
                         )
+                        if (dataSent == StreamSendResult.CLOSED) break
+                        if (!nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)) {
+                            throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
+                        }
                     }
                 }
 
-                val terminal = state == STATE_EOF || state == STATE_CANCELLED ||
-                    state == STATE_ERROR || state == STATE_MAX_TOKENS
-                if (terminal && !reusableResult.pending) {
-                    val reason = when (state) {
-                        STATE_EOF -> "EOF"
-                        STATE_CANCELLED -> "CANCELLED"
-                        STATE_ERROR -> "ERROR"
-                        STATE_MAX_TOKENS -> "MAX_TOKENS"
-                        else -> "UNKNOWN"
+                val decision = decideDrainState(state, reusableResult.errorCode)
+                if (decision.action == DrainStateAction.STOP) break
+                val finalHeldBatch = holdAckForTerminal && heldBatchCoversRing(
+                    reusableResult.produced,
+                    reusableResult.drained,
+                    tokenCount,
+                )
+                val heldBacklog = holdAckForTerminal && heldBacklogRemains(
+                    reusableResult.produced,
+                    reusableResult.drained,
+                    tokenCount,
+                )
+                val unreadPending = holdAckForTerminal && tokenCount == 0 && reusableResult.pending
+                val terminalNow = decision.action == DrainStateAction.TERMINAL &&
+                    !heldBacklog &&
+                    !unreadPending &&
+                    (!reusableResult.pending || !decision.waitForPending || finalHeldBatch)
+                if (terminalNow) {
+                    val trailingText = if (holdAckForTerminal) {
+                        decodedText + utf8.flush()
+                    } else {
+                        utf8.flush()
                     }
-                    observedTerminal = true
-                    // Finalize the decoder. Any buffered trailing bytes (e.g. a
-                    // truncated final multi-byte sequence) are delivered *inside*
-                    // the terminal chunk: terminal chunks are retried until sent
-                    // (see emitChunk), so the remainder cannot be dropped under
-                    // backpressure the way a separate non-terminal chunk could.
-                    val trailingText = utf8.flush()
-                    emitChunk(
+                    terminalDecision = decision
+                    observedTerminal = sendChunk(
                         GenerationChunk(
                             text = trailingText,
                             tokenCount = 0,
                             generationId = genId,
                             isTerminal = true,
-                            terminalReason = reason,
+                            terminalReason = decision.terminalReason ?: "ERROR",
+                            promptTokens = promptTokens,
+                            ttftMs = reusableResult.ttftMs,
+                            tokensPerSec = reusableResult.tokensPerSec,
+                            activeThreads = reusableResult.activeThreads,
+                            errorCode = reusableResult.errorCode,
+                        )
+                    ) == StreamSendResult.SENT
+                    if (holdAckForTerminal && observedTerminal && tokenCount > 0 &&
+                        !nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)
+                    ) {
+                        throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
+                    }
+                    break
+                }
+                if (heldBacklog) {
+                    val dataSent = sendChunk(
+                        GenerationChunk(
+                            text = decodedText,
+                            tokenCount = tokenCount,
+                            generationId = genId,
+                            isTerminal = false,
                             promptTokens = promptTokens,
                             ttftMs = reusableResult.ttftMs,
                             tokensPerSec = reusableResult.tokensPerSec,
@@ -421,26 +440,27 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             errorCode = reusableResult.errorCode,
                         )
                     )
-                    break
+                    if (dataSent != StreamSendResult.SENT) break
+                    if (!nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)) {
+                        throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
+                    }
                 }
 
-                // PIR-02: a terminal with `pending == true` means the native ring
-                // still holds produced-but-undrained tokens. Do NOT emit the
-                // terminal yet — loop to drain further 128-token batches until
-                // pending clears, then the terminal is emitted above and the
-                // `finally` ackEof tombstones the session.
+                // Pending terminal output stays on the ring until this loop drains it.
                 if (tokenCount == 0) {
                     delay(pollDelay)
                     pollDelay = (pollDelay * 2).coerceAtMost(64L) // backoff up to 64ms
                 }
             }
         } finally {
-            genMutex.withLock {
-                if (!isDestroyed) {
-                    if (!observedTerminal) {
-                        nativeCancelGeneration(nativeHandle, genId)
+            withStreamCleanup {
+                genMutex.withLock {
+                    if (!isDestroyed) {
+                        if (shouldCancelNative(observedTerminal, terminalDecision)) {
+                            nativeCancelGeneration(nativeHandle, genId)
+                        }
+                        nativeAckEof(nativeHandle, genId)
                     }
-                    nativeAckEof(nativeHandle, genId)
                 }
             }
             if (jniTimingsCount > 0) {
@@ -453,7 +473,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
             }
         }
         close()
-    }.buffer(maxTokens.coerceIn(GenerationSettings.MIN_MAX_TOKENS, GenerationSettings.MAX_MAX_TOKENS) + STREAM_BUFFER_HEADROOM)
+    }.buffer(generationStreamBufferCapacity(maxTokens))
 
     fun generate(
         prompt: String,
@@ -520,6 +540,20 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         }
 
     @VisibleForTesting
+    suspend fun debugDrainResultForTesting(generationId: Int, maxTokens: Int): NativeDrainResult =
+        modelMutex.withLock {
+            val result = NativeDrainResult()
+            if (!isDestroyed) nativeDrainDecodeAndState(nativeHandle, generationId, maxTokens, result)
+            result
+        }
+
+    @VisibleForTesting
+    suspend fun debugAcknowledgeDrainedForTesting(generationId: Int, expectedTail: Int, tokenCount: Int): Boolean =
+        modelMutex.withLock {
+            !isDestroyed && nativeAckDrainedTokens(nativeHandle, generationId, expectedTail, tokenCount)
+        }
+
+    @VisibleForTesting
     suspend fun debugDecodeTokensForTesting(generationId: Int, tokens: IntArray): String =
         modelMutex.withLock {
             if (isDestroyed) "" else nativeDecodeTokens(nativeHandle, generationId, tokens)
@@ -563,7 +597,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     @VisibleForTesting
     suspend fun debugStateForTesting(generationId: Int): Int =
         modelMutex.withLock {
-            if (isDestroyed) STATE_TOMBSTONED else nativeGetState(nativeHandle, generationId)
+            if (isDestroyed) NATIVE_STATE_TOMBSTONED else nativeGetState(nativeHandle, generationId)
         }
 
     private fun nativeLoadModelWithSettings(handle: Long, path: String, settings: GenerationSettings): Boolean =

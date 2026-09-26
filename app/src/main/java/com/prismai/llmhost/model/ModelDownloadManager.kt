@@ -19,6 +19,8 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Manages HuggingFace model downloads via WorkManager.
@@ -86,6 +88,15 @@ class ModelDownloadManager(
     fun cancelObserver() {
         downloadObserverJob?.cancel()
         downloadObserverJob = null
+    }
+
+    suspend fun cancelDownloadForModel(modelId: String) {
+        withContext(Dispatchers.IO) {
+            WorkManager.getInstance(context)
+                .cancelAllWorkByTag(HuggingFaceDownloadWork.MODEL_OWNER_TAG_PREFIX + modelId)
+                .result
+                .get()
+        }
     }
 
     private fun applyDownloadWorkInfo(info: WorkInfo) {

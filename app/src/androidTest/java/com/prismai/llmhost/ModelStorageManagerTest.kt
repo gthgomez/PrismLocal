@@ -19,6 +19,10 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 @RunWith(AndroidJUnit4::class)
 class ModelStorageManagerTest {
@@ -173,6 +177,83 @@ class ModelStorageManagerTest {
         assertEquals(2, manifest.getJSONObject("versions").length())
     }
 
+    @Test
+    fun deletionWaitsForImportPromotionThenLeavesModelAbsent() {
+        val manager = ModelStorageManager(context)
+        val modelId = "import-delete-race"
+        cleanup(modelId)
+        val readEntered = CountDownLatch(1)
+        val continueRead = CountDownLatch(1)
+        val deleteStarted = CountDownLatch(1)
+        val deleteFinished = CountDownLatch(1)
+        val importResult = AtomicReference<ModelStorageManager.ImportResult?>()
+        val deleteResult = AtomicBoolean(false)
+        val importer = Thread {
+            importResult.set(
+                manager.importModelFromStream(
+                    displayName = "$modelId.gguf",
+                    reportedSize = validGgufBytes().size.toLong(),
+                    input = FirstReadBarrierInputStream(validGgufBytes(), readEntered, continueRead),
+                ),
+            )
+        }
+        val deleter = Thread {
+            deleteStarted.countDown()
+            deleteResult.set(manager.deleteModel(modelId))
+            deleteFinished.countDown()
+        }
+
+        try {
+            importer.start()
+            assertTrue(readEntered.await(2, TimeUnit.SECONDS))
+            deleter.start()
+            assertTrue(deleteStarted.await(2, TimeUnit.SECONDS))
+            assertFalse("delete must wait while import owns the storage lifecycle", deleteFinished.await(50, TimeUnit.MILLISECONDS))
+            continueRead.countDown()
+            importer.join(2_000)
+            deleter.join(2_000)
+
+            assertFalse(importer.isAlive)
+            assertFalse(deleter.isAlive)
+            assertTrue(importResult.get() is ModelStorageManager.ImportResult.Success)
+            assertTrue(deleteResult.get())
+            assertFalse(File(modelsDir(), modelId).exists())
+        } finally {
+            continueRead.countDown()
+            importer.join(2_000)
+            if (deleter.isAlive) deleter.join(2_000)
+            cleanup(modelId)
+        }
+    }
+
+    @Test
+    fun deletionRevisionRejectsDownloadPromotionThatStartedEarlier() {
+        val manager = ModelStorageManager(context)
+        val modelId = "download-delete-race"
+        cleanup(modelId)
+        val revision = manager.captureLifecycleRevisionForDisplayName("$modelId.gguf")
+
+        assertFalse(manager.deleteModel(modelId))
+        val result = manager.importModelFromStream(
+            displayName = "$modelId.gguf",
+            reportedSize = validGgufBytes().size.toLong(),
+            input = ByteArrayInputStream(validGgufBytes()),
+            expectedLifecycleRevision = revision,
+        )
+
+        assertTrue(result is ModelStorageManager.ImportResult.Failure)
+        assertFalse(File(modelsDir(), modelId).exists())
+    }
+
+    @Test
+    fun downloadRequestCarriesItsModelStorageOwnerTag() {
+        val entry = HuggingFaceModelCatalog.entries.first()
+        val ownerTag = HuggingFaceDownloadWork.MODEL_OWNER_TAG_PREFIX +
+            ModelStorageManager.modelIdFromDisplayName(entry.fileName)
+
+        assertTrue(HuggingFaceDownloadWork.request(entry.id).tags.contains(ownerTag))
+    }
+
     private fun validGgufBytes(seed: Int = 1): ByteArray {
         val bytes = ByteArray(64) { index -> (seed + index).toByte() }
         bytes[0] = 'G'.code.toByte()
@@ -222,6 +303,31 @@ class ModelStorageManagerTest {
             System.arraycopy(bytes, index, buffer, offset, count)
             index += count
             return count
+        }
+    }
+
+    private class FirstReadBarrierInputStream(
+        bytes: ByteArray,
+        private val entered: CountDownLatch,
+        private val release: CountDownLatch,
+    ) : ByteArrayInputStream(bytes) {
+        private val blocked = AtomicBoolean(false)
+
+        private fun waitAtBarrier() {
+            if (blocked.compareAndSet(false, true)) {
+                entered.countDown()
+                check(release.await(2, TimeUnit.SECONDS)) { "test did not release the import stream" }
+            }
+        }
+
+        override fun read(): Int {
+            waitAtBarrier()
+            return super.read()
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            waitAtBarrier()
+            return super.read(buffer, offset, length)
         }
     }
 }

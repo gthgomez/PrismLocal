@@ -694,6 +694,7 @@ class InferenceService : Service() {
             val preserveConfirmedChain = confirmedAuthorization != null
             try {
                 Log.d(TAG, "deleteModel requested modelId=$modelId")
+                modelDownloadManager.cancelDownloadForModel(modelId)
                 cancelAndJoinGenerationLocked(
                     reason = "model delete",
                     finalizeActiveTrace = !preserveConfirmedChain,

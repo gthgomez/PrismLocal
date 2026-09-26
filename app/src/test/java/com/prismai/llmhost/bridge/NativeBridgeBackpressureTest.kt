@@ -112,6 +112,11 @@ class NativeBridgeBackpressureTest {
         assertTrue(acknowledgeOnlyAfterTerminal(NATIVE_STATE_EOF, errorCode = 7))
         assertFalse(acknowledgeOnlyAfterTerminal(NATIVE_STATE_GENERATING, errorCode = 0))
         assertFalse(acknowledgeOnlyAfterTerminal(NATIVE_STATE_EOF, errorCode = 0))
+        assertTrue(heldBatchCoversRing(produced = 50, drained = 0, tokenCount = 50))
+        assertFalse(heldBacklogRemains(produced = 50, drained = 0, tokenCount = 50))
+        assertFalse(heldBatchCoversRing(produced = 200, drained = 0, tokenCount = 128))
+        assertTrue(heldBacklogRemains(produced = 200, drained = 0, tokenCount = 128))
+        assertFalse(heldBatchCoversRing(produced = 200, drained = 0, tokenCount = 0))
     }
 
     @Test

@@ -82,6 +82,17 @@ internal fun acknowledgeOnlyAfterTerminal(state: Int, errorCode: Int): Boolean {
         (state == NATIVE_STATE_ERROR || errorCode != 0)
 }
 
+/** Pending includes this unacknowledged copy, so a full copy is the final batch. */
+internal fun heldBatchCoversRing(produced: Long, drained: Long, tokenCount: Int): Boolean {
+    if (tokenCount <= 0) return false
+    return produced - drained <= tokenCount.toLong()
+}
+
+internal fun heldBacklogRemains(produced: Long, drained: Long, tokenCount: Int): Boolean {
+    if (tokenCount <= 0) return false
+    return produced - drained > tokenCount.toLong()
+}
+
 /** Bounds the stream by the native token limit while reserving terminal headroom. */
 internal fun generationStreamBufferCapacity(maxTokens: Int): Int =
     maxTokens.coerceIn(GenerationSettings.MIN_MAX_TOKENS, GenerationSettings.MAX_MAX_TOKENS) +

@@ -383,8 +383,21 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
                 val decision = decideDrainState(state, reusableResult.errorCode)
                 if (decision.action == DrainStateAction.STOP) break
+                val finalHeldBatch = holdAckForTerminal && heldBatchCoversRing(
+                    reusableResult.produced,
+                    reusableResult.drained,
+                    tokenCount,
+                )
+                val heldBacklog = holdAckForTerminal && heldBacklogRemains(
+                    reusableResult.produced,
+                    reusableResult.drained,
+                    tokenCount,
+                )
+                val unreadPending = holdAckForTerminal && tokenCount == 0 && reusableResult.pending
                 val terminalNow = decision.action == DrainStateAction.TERMINAL &&
-                    (!reusableResult.pending || !decision.waitForPending)
+                    !heldBacklog &&
+                    !unreadPending &&
+                    (!reusableResult.pending || !decision.waitForPending || finalHeldBatch)
                 if (terminalNow) {
                     val trailingText = if (holdAckForTerminal) {
                         decodedText + utf8.flush()
@@ -413,7 +426,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     }
                     break
                 }
-                if (holdAckForTerminal && tokenCount > 0) {
+                if (heldBacklog) {
                     val dataSent = sendChunk(
                         GenerationChunk(
                             text = decodedText,
@@ -427,7 +440,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             errorCode = reusableResult.errorCode,
                         )
                     )
-                    if (dataSent == StreamSendResult.CLOSED) break
+                    if (dataSent != StreamSendResult.SENT) break
                     if (!nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)) {
                         throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
                     }

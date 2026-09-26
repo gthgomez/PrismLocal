@@ -19,9 +19,13 @@
   retarget it; explicit cancellation or source-chat deletion does. The service
   holds an engine ownership lease for the task, binds generation to its source
   chat, defers UI chat switches until release, and prevents user generation
-  from replacing its output. Deletion of an active source chat is rejected;
-  queued tasks from a deleted chat are invalidated. This service orchestration
-  still needs exact-candidate integration review and regression coverage.
+  from replacing its output. Pending user agent tools/follow-ups keep background
+  queue admission closed; while a background task owns the engine, only its
+  recorded agent chain can start a follow-up. Deletion of an active source chat
+  is rejected; queued tasks from a deleted chat are invalidated. Legacy queued
+  records without an owner fail closed rather than adopting the selected chat.
+  This service orchestration still needs exact-candidate review and integration
+  coverage.
 - **Authorization revision** is a capability-policy revision captured with a
   confirmation. Revocation advances the revision. A confirmation must match the
   current revision and capabilities when consumed and when admitted for

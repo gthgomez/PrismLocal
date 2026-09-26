@@ -34,4 +34,44 @@ class BackgroundGenerationOwnershipTest {
         assertNull(ownership.ownerId())
         assertFalse(ownership.deferChatSwitch("chat-c"))
     }
+
+    @Test
+    fun backgroundTaskWaitsForScheduledFollowUpAndActiveAgentTool() {
+        assertTrue(
+            BackgroundGenerationOwnership.shouldDeferBackgroundTask(
+                generationRunning = false,
+                confirmationPending = false,
+                followUpScheduled = true,
+                agentToolJobActive = false,
+            ),
+        )
+        assertTrue(
+            BackgroundGenerationOwnership.shouldDeferBackgroundTask(
+                generationRunning = false,
+                confirmationPending = false,
+                followUpScheduled = false,
+                agentToolJobActive = true,
+            ),
+        )
+        assertFalse(
+            BackgroundGenerationOwnership.shouldDeferBackgroundTask(
+                generationRunning = false,
+                confirmationPending = false,
+                followUpScheduled = false,
+                agentToolJobActive = false,
+            ),
+        )
+    }
+
+    @Test
+    fun onlyOwningBackgroundAgentChainMayStartFollowUp() {
+        val ownership = BackgroundGenerationOwnership()
+        assertTrue(ownership.allowsAgentFollowUp(chainId = 4L))
+        assertTrue(ownership.begin("task-a"))
+
+        ownership.bindAgentChain("task-a", chainId = 8L)
+        assertTrue(ownership.allowsAgentFollowUp(chainId = 8L))
+        assertFalse(ownership.allowsAgentFollowUp(chainId = 4L))
+        assertFalse(ownership.allowsAgentFollowUp(chainId = null))
+    }
 }

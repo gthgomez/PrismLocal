@@ -405,7 +405,12 @@ class InferenceService : Service() {
                 }
             },
             isDeviceBusyWithUserGeneration = {
-                _isGenerating.value || _pendingAgentToolAction.value != null
+                BackgroundGenerationOwnership.shouldDeferBackgroundTask(
+                    generationRunning = _isGenerating.value,
+                    confirmationPending = _pendingAgentToolAction.value != null,
+                    followUpScheduled = agentFollowUpScheduled,
+                    agentToolJobActive = hasActiveAgentToolJobs(),
+                )
             },
         )
 
@@ -1009,6 +1014,12 @@ class InferenceService : Service() {
                     ensureChatForGeneration()
                 }
                 generationOrchestrator.generate(prompt, benchmarkPreset)
+                if (initiatedByBackground) {
+                    backgroundGenerationOwnership.bindAgentChain(
+                        backgroundTaskId.orEmpty(),
+                        agentTrace.activeChainId,
+                    )
+                }
             } finally {
                 if (startGateReserved) generationStartGate.finishStart()
             }
@@ -1091,6 +1102,12 @@ class InferenceService : Service() {
             agentChainActive = chainId != null,
             continuationAvailable = continuationAvailable,
         )
+    }
+
+    private fun hasActiveAgentToolJobs(): Boolean {
+        if (!::agentTrace.isInitialized || !::agentToolRouter.isInitialized) return false
+        val chainId = agentTrace.activeChainId ?: return false
+        return agentToolRouter.hasActiveToolJobs(chainId)
     }
 
     private fun shouldWaitForGenerationSession(): Boolean {
@@ -1724,6 +1741,10 @@ class InferenceService : Service() {
         serviceScope.launch {
             try {
                 operationMutex.withLock {
+                    if (!backgroundGenerationOwnership.allowsAgentFollowUp(chainId)) {
+                        publishUiEvent("Background task owns the generation engine")
+                        return@withLock
+                    }
                     if (!generationStartGate.beginStart()) return@withLock
                     try {
                         generationOrchestrator.startFollowUp(originalPrompt, toolResult, depth, chainId)

@@ -27,7 +27,7 @@ class NativeDrainResult {
     // Overflow fallback. Raw bytes preserve a code point split at the buffer edge.
     // textOverflow remains for callers that already hold a complete Java string.
     @JvmField var textOverflowBytes: ByteArray? = null
-    @JvmField var textOverflow: String = ""
+    @JvmField var textOverflow: String? = ""
 
     @JvmField var state: Int = 0
     @JvmField var promptTokens: Int = 0

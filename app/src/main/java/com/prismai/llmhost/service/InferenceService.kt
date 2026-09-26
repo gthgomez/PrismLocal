@@ -1031,6 +1031,7 @@ class InferenceService : Service() {
         var resultSessionId: Long? = null
         var resultAgentChainId: Long? = null
         var resultRetained = false
+        var launchResult = GenerationOrchestrator.GenerationLaunch.REFUSED
         operationMutex.withLock {
             if (!initiatedByBackground && backgroundGenerationOwnership.hasOwner()) {
                 publishUiEvent("A background task currently owns the generation engine")
@@ -1075,6 +1076,7 @@ class InferenceService : Service() {
                 val previousSessionId = generationSession
                 val previousAgentChainId = agentTrace.activeChainId
                 generationOrchestrator.generate(prompt, benchmarkPreset)
+                launchResult = generationOrchestrator.takeLaunchResult()
                 if (generationSession != previousSessionId) resultSessionId = generationSession
                 val startedAgentChainId = agentTrace.activeChainId
                 if (startedAgentChainId != previousAgentChainId) {
@@ -1115,15 +1117,24 @@ class InferenceService : Service() {
                 sessionId = resultSessionId ?: -1L,
                 agentChainId = resultAgentChainId,
             )
-            val failed = terminalReason == null ||
-                terminalReason == "ERROR" ||
-                terminalReason == "CANCELLED" ||
-                terminalReason == "QUALITY_ABORT" ||
-                ownedOutput.isNullOrBlank()
-            if (initiatedByBackground && failed) {
-                throw IllegalStateException(
-                    "Generation ended without a successful response: ${terminalReason ?: "no result"}",
-                )
+            if (initiatedByBackground) {
+                when (launchResult) {
+                    GenerationOrchestrator.GenerationLaunch.REFUSED ->
+                        throw IllegalStateException("Generation did not start")
+                    GenerationOrchestrator.GenerationLaunch.HANDLED ->
+                        return ownedOutput?.takeIf { it.isNotBlank() } ?: "Tool action completed"
+                    GenerationOrchestrator.GenerationLaunch.STARTED -> {
+                        val failed = terminalReason == "ERROR" ||
+                            terminalReason == "CANCELLED" ||
+                            terminalReason == "QUALITY_ABORT" ||
+                            ownedOutput.isNullOrBlank()
+                        if (failed) {
+                            throw IllegalStateException(
+                                "Generation ended without a successful response: ${terminalReason ?: "no result"}",
+                            )
+                        }
+                    }
+                }
             }
             return ownedOutput.orEmpty()
         } catch (cancelled: CancellationException) {

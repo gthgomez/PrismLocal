@@ -172,10 +172,21 @@ class GenerationOrchestrator(
     // ── Public API ──────────────────────────────────────────────────────
 
     /** Main entry point for chat generation. Acquires [InferenceService]'s operation mutex itself. */
+    enum class GenerationLaunch {
+        REFUSED,
+        HANDLED,
+        STARTED,
+    }
+
+    private val launchResult = java.util.concurrent.atomic.AtomicReference(GenerationLaunch.REFUSED)
+
+    fun takeLaunchResult(): GenerationLaunch = launchResult.getAndSet(GenerationLaunch.REFUSED)
+
     suspend fun generate(
         prompt: String,
         benchmarkPreset: BenchmarkPreset? = null,
     ) {
+        launchResult.set(GenerationLaunch.REFUSED)
         val baseSettings = uiState.generationSettings.value.clamped()
 
         // ── Direct NL → agent tool call path ────────────────────────────
@@ -186,6 +197,9 @@ class GenerationOrchestrator(
                 val chainId = agentTrace.beginChain(prompt)
                 agentToolRouter.activeAgentToolHistory.clear()
                 agentToolRouter.handleToolCall(directToolCall, prompt, depth = 0, chainId = chainId)
+                if (agentTrace.isCurrentChain(chainId)) {
+                    launchResult.set(GenerationLaunch.HANDLED)
+                }
                 return
             }
         }
@@ -238,11 +252,6 @@ class GenerationOrchestrator(
                 userPrompt = prompt,
                 memoryContext = memoryContext,
                 instructionText = if (agentEnabled) AgentToolProtocol.instructionBlock() else "",
-                reservedTokens = if (agentEnabled) {
-                    GenerationBudget.DEFAULT_AGENT_PAD_TOKENS
-                } else {
-                    GenerationBudget.DEFAULT_NON_AGENT_RESERVED_TOKENS
-                },
             )
         ) {
             if (agentChainId != null) {
@@ -270,15 +279,14 @@ class GenerationOrchestrator(
         }
         val enginePrompt = if (benchmarkPreset == null) {
             if (agentEnabled) {
-                val maxHistoryChars = GenerationBudget.calculateAgentHistoryCharBudget(
+                val maxHistoryTokens = GenerationBudget.historyTokenBudget(
                     contextLength = settings.contextLength,
                     maxTokens = settings.maxTokens,
-                    userPromptChars = GenerationBudget.estimateTokens(prompt) * GenerationBudget.CHARS_PER_TOKEN,
-                    instructionBlockChars = AgentToolProtocol.instructionBlock().length,
-                    extraContextChars = GenerationBudget.estimateTokens(memoryContext) *
-                        GenerationBudget.CHARS_PER_TOKEN,
+                    userPrompt = prompt,
+                    instructionText = AgentToolProtocol.instructionBlock(),
+                    memoryContext = memoryContext,
                 )
-                val history = getFormattedHistoryForAgent(emptySet(), maxHistoryChars = maxHistoryChars)
+                val history = getFormattedHistoryForAgent(emptySet(), maxHistoryTokens = maxHistoryTokens)
                 val historyWithMemory = buildString {
                     append(history)
                     if (memoryContext.isNotEmpty()) {
@@ -305,6 +313,7 @@ class GenerationOrchestrator(
             )
         } ?: BenchmarkStatus()
 
+        launchResult.set(GenerationLaunch.STARTED)
         val session = incrementSession()
 
         uiState._generationPerformance.value = null
@@ -554,18 +563,20 @@ class GenerationOrchestrator(
         metrics.activeSettings = settings
         val truncatedRaw = truncateToolResultForBudget(toolResult, originalPrompt, settings)      // truncate RAW first
         val sanitized = ToolInputSanitizer.sanitizeResult(truncatedRaw) // sanitize ONCE
-        val toolPayloadChars = with(AgentToolProtocol) { sanitized.toJson().toString().length }   // measure SANITIZED payload
-        val maxHistoryChars = GenerationBudget.calculateAgentHistoryCharBudget(
+        val toolPayload = with(AgentToolProtocol) { sanitized.toJson().toString() }
+        val maxHistoryTokens = GenerationBudget.historyTokenBudget(
             contextLength = settings.contextLength,
             maxTokens = settings.maxTokens,
-            userPromptChars = originalPrompt.length,
-            toolResultChars = toolPayloadChars,
-            instructionBlockChars = GenerationBudget.AGENT_FOLLOW_UP_PREAMBLE_CHARS,
+            userPrompt = originalPrompt,
+            instructionText = "",
+            toolResult = toolPayload,
+            reservedPadTokens = GenerationBudget.DEFAULT_AGENT_PAD_TOKENS +
+                GenerationBudget.estimateTokensFromChars(GenerationBudget.AGENT_FOLLOW_UP_PREAMBLE_CHARS),
         )
         val enginePrompt = AgentToolProtocol.buildToolResultPrompt(
             originalPrompt,
             sanitized,
-            getFormattedHistoryForAgent(setOf(assistantMessageId), maxHistoryChars = maxHistoryChars),
+            getFormattedHistoryForAgent(setOf(assistantMessageId), maxHistoryTokens = maxHistoryTokens),
         )
 
         val job = runGenerationFlow(
@@ -874,20 +885,20 @@ class GenerationOrchestrator(
             .launchIn(scope)
     }
 
-    private fun getFormattedHistoryForAgent(excludeIds: Set<Long>, maxHistoryChars: Int): String {
-        if (maxHistoryChars <= 0) return ""
+    private fun getFormattedHistoryForAgent(excludeIds: Set<Long>, maxHistoryTokens: Int): String {
+        if (maxHistoryTokens <= 0) return ""
         val history = uiState.transcript.value.filter { message ->
             message.text.isNotBlank() && message.id !in excludeIds
         }
         if (history.isEmpty()) return ""
         val selected = ArrayDeque<TranscriptMessage>()
-        var chars = 0
-        val safeCharCap = maxHistoryChars
+        var tokens = 0
         for (message in history.asReversed()) {
             val formatted = message.asPromptLine()
-            if (chars + formatted.length > safeCharCap) break
+            val cost = GenerationBudget.estimateTokens(formatted)
+            if (tokens + cost > maxHistoryTokens) break
             selected.addFirst(message)
-            chars += formatted.length
+            tokens += cost
         }
         return buildString {
             selected.forEach { message -> appendLine(message.asPromptLine()) }

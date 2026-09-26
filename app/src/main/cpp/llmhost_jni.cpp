@@ -600,12 +600,26 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
 
         // Copy raw UTF-8 into the pre-allocated buffer. Overflow keeps those
         // bytes so a code point split at the edge is not replaced by U+FFFD.
+        auto clear_overflow_string = [&]() {
+            jstring empty = env->NewStringUTF("");
+            if (empty == nullptr) {
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                return;
+            }
+            env->SetObjectField(result, g_text_overflow_field, empty);
+            env->DeleteLocalRef(empty);
+        };
         auto publish_overflow_bytes = [&](const std::string& text) {
             env->SetIntField(result, g_text_count_field, 0);
-            env->SetObjectField(result, g_text_overflow_field, nullptr);
+            clear_overflow_string();
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                return;
+            }
             const jsize text_len = static_cast<jsize>(text.size());
             jbyteArray raw = env->NewByteArray(text_len);
             if (raw == nullptr) {
+                if (env->ExceptionCheck()) env->ExceptionClear();
                 return;
             }
             env->SetByteArrayRegion(
@@ -634,7 +648,7 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
                         reinterpret_cast<const jbyte*>(drain_result.text.data()));
                     env->SetIntField(result, g_text_count_field, text_len);
                     env->SetObjectField(result, g_text_overflow_bytes_field, nullptr);
-                    env->SetObjectField(result, g_text_overflow_field, nullptr);
+                    clear_overflow_string();
                 } else {
                     LOGW("drain_text_overflow text_len=%d buf=%d; keeping raw bytes",
                          static_cast<int>(text_len), static_cast<int>(buf_len));
@@ -645,7 +659,7 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
         } else {
             env->SetIntField(result, g_text_count_field, 0);
             env->SetObjectField(result, g_text_overflow_bytes_field, nullptr);
-            env->SetObjectField(result, g_text_overflow_field, nullptr);
+            clear_overflow_string();
         }
 
         env->SetIntField(result, g_drain_result_state_field, drain_result.state);

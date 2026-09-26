@@ -344,15 +344,17 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                 val promptTokens = reusableResult.promptTokens
 
                 val holdAckForTerminal = acknowledgeOnlyAfterTerminal(state, reusableResult.errorCode)
+                var decodedText = ""
                 if (tokenCount > 0) {
                     pollDelay = 2L
 
                     val overflowBytes = reusableResult.textOverflowBytes
-                    val decodedText = when {
+                    val overflowText = reusableResult.textOverflow.orEmpty()
+                    decodedText = when {
                         overflowBytes != null && overflowBytes.isNotEmpty() ->
                             utf8.append(overflowBytes)
-                        reusableResult.textOverflow.isNotEmpty() ->
-                            utf8.append(reusableResult.textOverflow.toByteArray(Charsets.UTF_8))
+                        overflowText.isNotEmpty() ->
+                            utf8.append(overflowText.toByteArray(Charsets.UTF_8))
                         reusableResult.textCount > 0 ->
                             utf8.append(reusableResult.textBuffer, reusableResult.textCount)
                         else -> ""
@@ -381,16 +383,14 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
                 val decision = decideDrainState(state, reusableResult.errorCode)
                 if (decision.action == DrainStateAction.STOP) break
-                if (
-                    decision.action == DrainStateAction.TERMINAL &&
-                    (holdAckForTerminal || !reusableResult.pending || !decision.waitForPending)
-                ) {
-                    // Finalize the decoder. Any buffered trailing bytes (e.g. a
-                    // truncated final multi-byte sequence) are delivered *inside*
-                    // the terminal chunk. The production sender applies
-                    // backpressure, so the remainder cannot be dropped while a
-                    // slow consumer drains the stream.
-                    val trailingText = utf8.flush()
+                val terminalNow = decision.action == DrainStateAction.TERMINAL &&
+                    (!reusableResult.pending || !decision.waitForPending)
+                if (terminalNow) {
+                    val trailingText = if (holdAckForTerminal) {
+                        decodedText + utf8.flush()
+                    } else {
+                        utf8.flush()
+                    }
                     terminalDecision = decision
                     observedTerminal = sendChunk(
                         GenerationChunk(
@@ -413,12 +413,27 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     }
                     break
                 }
+                if (holdAckForTerminal && tokenCount > 0) {
+                    val dataSent = sendChunk(
+                        GenerationChunk(
+                            text = decodedText,
+                            tokenCount = tokenCount,
+                            generationId = genId,
+                            isTerminal = false,
+                            promptTokens = promptTokens,
+                            ttftMs = reusableResult.ttftMs,
+                            tokensPerSec = reusableResult.tokensPerSec,
+                            activeThreads = reusableResult.activeThreads,
+                            errorCode = reusableResult.errorCode,
+                        )
+                    )
+                    if (dataSent == StreamSendResult.CLOSED) break
+                    if (!nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)) {
+                        throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
+                    }
+                }
 
-                // PIR-02: a terminal with `pending == true` means the native ring
-                // still holds produced-but-undrained tokens. Do NOT emit the
-                // terminal yet — loop to drain further 128-token batches until
-                // pending clears, then the terminal is emitted above and the
-                // `finally` ackEof tombstones the session.
+                // Pending terminal output stays on the ring until this loop drains it.
                 if (tokenCount == 0) {
                     delay(pollDelay)
                     pollDelay = (pollDelay * 2).coerceAtMost(64L) // backoff up to 64ms

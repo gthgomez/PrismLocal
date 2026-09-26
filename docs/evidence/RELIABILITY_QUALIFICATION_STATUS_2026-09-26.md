@@ -97,8 +97,8 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
   generation. A failed native decode could be acknowledged before its error
   terminal was delivered. Chat-trace deletion also removes unowned or
   unreadable artifacts. The first three ownership defects are addressed in the
-  follow-up on this branch. The native decode acknowledgement bug and the
-  trace-deletion suggestion remain open. This review does not approve the
+  follow-up on this branch. Later commits on this branch deliver held decode text before acknowledging
+  it, and delete a chat trace only when its owner matches. This review does not approve the
   candidate. No GitHub review was posted, because the follow-up changes the
   lines those findings cite.
 - **DOCUMENTED — earlier emulator work:**

@@ -61,16 +61,34 @@ object GenerationBudget {
         userPrompt: String,
         memoryContext: String = "",
         instructionText: String = "",
-        reservedTokens: Int = 0,
     ): Boolean {
         val needed = estimateTokens(userPrompt) +
             estimateTokens(memoryContext) +
             estimateTokens(instructionText) +
             MESSAGE_TEMPLATE_TOKENS * 2 +
             CONTEXT_HEADROOM_TOKENS +
-            reservedTokens.coerceAtLeast(0) +
             maxTokens.coerceAtLeast(0)
         return needed <= contextLength
+    }
+
+    /** Room left for agent transcript history after the text that cannot be dropped. */
+    fun historyTokenBudget(
+        contextLength: Int,
+        maxTokens: Int,
+        userPrompt: String,
+        instructionText: String,
+        memoryContext: String = "",
+        toolResult: String = "",
+        reservedPadTokens: Int = DEFAULT_AGENT_PAD_TOKENS,
+    ): Int {
+        val used = estimateTokens(userPrompt) +
+            estimateTokens(instructionText) +
+            estimateTokens(memoryContext) +
+            estimateTokens(toolResult) +
+            reservedPadTokens.coerceAtLeast(0) +
+            CONTEXT_HEADROOM_TOKENS +
+            maxTokens.coerceAtLeast(0)
+        return (contextLength - used).coerceAtLeast(0)
     }
 
     /**

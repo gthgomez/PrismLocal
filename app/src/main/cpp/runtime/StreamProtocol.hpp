@@ -39,7 +39,7 @@
 namespace llmhost {
 
 // Bump when the meaning or layout of the protocol fields changes.
-constexpr int kStreamProtocolVersion = 1;
+constexpr int kStreamProtocolVersion = 2;
 
 // Why a generation ended. `None` means "not terminal yet".
 enum class StreamTerminal : uint8_t {

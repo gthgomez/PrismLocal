@@ -15,6 +15,7 @@ import com.prismai.llmhost.model.*
  * without NewIntArray / NewStringUTF on the fast path.
  */
 class NativeDrainResult {
+    @JvmField var schemaVersion: Int = SCHEMA_VERSION
     // Pre-allocated buffers sized to ring buffer capacity and worst-case UTF-8 expansion.
     // JNI writes directly into these via SetIntArrayRegion / SetByteArrayRegion.
     @JvmField val tokensBuffer: IntArray = IntArray(TOKENS_CAPACITY)
@@ -36,14 +37,19 @@ class NativeDrainResult {
     @JvmField var errorCode: Int = 0
 
     // PIR-02: stream terminal/drain accounting. `produced` is the number of
-    // tokens written into the native ring; `drained` is the number read back.
+    // tokens written into the native ring; `drained` advances only after the
+    // Kotlin bounded stream accepts the copied batch.
     // `pending` is true while a terminal state has been reached but produced
     // output has not been fully drained — the terminal must be deferred.
     @JvmField var produced: Long = 0L
     @JvmField var drained: Long = 0L
     @JvmField var pending: Boolean = false
+    // Tail observed when the unconsumed batch was copied. It prevents a stale
+    // acknowledgement from consuming a different batch from the same ring.
+    @JvmField var drainTail: Int = 0
 
     companion object {
+        const val SCHEMA_VERSION = 2
         // Matches kTokenCapacity (2048) in Engine.cpp.
         // Drain call passes maxTokens=128, but this buffer must accommodate
         // any future increase without silent truncation.

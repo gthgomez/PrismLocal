@@ -57,6 +57,8 @@ jfieldID g_drain_result_error_code_field = nullptr;
 jfieldID g_drain_result_produced_field = nullptr;
 jfieldID g_drain_result_drained_field = nullptr;
 jfieldID g_drain_result_pending_field = nullptr;
+jfieldID g_drain_result_tail_field = nullptr;
+jfieldID g_drain_result_schema_version_field = nullptr;
 std::once_flag g_drain_result_cache_flag;
 
 bool drainResultFieldsReady() {
@@ -74,7 +76,9 @@ bool drainResultFieldsReady() {
         && g_drain_result_error_code_field != nullptr
         && g_drain_result_produced_field != nullptr
         && g_drain_result_drained_field != nullptr
-        && g_drain_result_pending_field != nullptr;
+        && g_drain_result_pending_field != nullptr
+        && g_drain_result_tail_field != nullptr
+        && g_drain_result_schema_version_field != nullptr;
 }
 
 void ensureDrainResultCache(JNIEnv* env) {
@@ -96,6 +100,8 @@ void ensureDrainResultCache(JNIEnv* env) {
             g_drain_result_produced_field = env->GetFieldID(g_drain_result_class, "produced", "J");
             g_drain_result_drained_field = env->GetFieldID(g_drain_result_class, "drained", "J");
             g_drain_result_pending_field = env->GetFieldID(g_drain_result_class, "pending", "Z");
+            g_drain_result_tail_field = env->GetFieldID(g_drain_result_class, "drainTail", "I");
+            g_drain_result_schema_version_field = env->GetFieldID(g_drain_result_class, "schemaVersion", "I");
             env->DeleteLocalRef(local_class);
             if (!drainResultFieldsReady()) {
                 LOGE("ensureDrainResultCache: incomplete field IDs (Kotlin/native layout mismatch)");
@@ -470,6 +476,14 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeAckEof(JNIEnv*, jobject, j
     lease->ackEof(gen_id);
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeAckDrainedTokens(
+        JNIEnv*, jobject, jlong handle, jint gen_id, jint expected_tail, jint token_count) {
+    auto lease = NativeHandleRegistry::instance().acquire(handle);
+    return lease && lease->acknowledgeDrainedTokens(gen_id, expected_tail, token_count)
+        ? JNI_TRUE : JNI_FALSE;
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDecodeTokens(JNIEnv* env, jobject, jlong handle, jint gen_id, jintArray tokens) {
     auto lease = NativeHandleRegistry::instance().acquire(handle);
@@ -620,6 +634,7 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
         }
 
         env->SetIntField(result, g_drain_result_state_field, drain_result.state);
+        env->SetIntField(result, g_drain_result_schema_version_field, drain_result.schema_version);
         env->SetIntField(result, g_drain_result_prompt_tokens_field, drain_result.prompt_tokens);
         env->SetLongField(result, g_drain_result_ttft_ms_field, static_cast<jlong>(drain_result.ttft_ms));
         env->SetFloatField(result, g_drain_result_tokens_per_sec_field, static_cast<jfloat>(drain_result.tokens_per_sec));
@@ -630,6 +645,7 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDrainDecodeAndState(JNIEnv
         env->SetLongField(result, g_drain_result_produced_field, static_cast<jlong>(drain_result.produced));
         env->SetLongField(result, g_drain_result_drained_field, static_cast<jlong>(drain_result.drained));
         env->SetBooleanField(result, g_drain_result_pending_field, drain_result.pending ? JNI_TRUE : JNI_FALSE);
+        env->SetIntField(result, g_drain_result_tail_field, static_cast<jint>(drain_result.drain_tail));
     } catch (const std::exception&) {
         env->SetIntField(result, g_drain_result_state_field, static_cast<jint>(llmhost::StreamState::Error));
         env->SetIntField(

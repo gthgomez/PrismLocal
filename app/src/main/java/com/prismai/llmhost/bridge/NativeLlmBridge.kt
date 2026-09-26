@@ -45,12 +45,11 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     }
 
     // modelMutex serializes model lifecycle: load, unload, reset, destroy.
-    // The drain/decode path does NOT acquire this lock — C++ handles its own
-    // thread safety via atomics and internal mutexes.
+    // Native's lifecycle gate linearizes these operations against combined
+    // drain/decode/state snapshots.
     private val modelMutex = Mutex()
-    // genMutex serializes generation start/cancel/ack to prevent concurrent
-    // generations from racing on session state. The hot drain loop is NOT
-    // serialized — it reads atomics lock-free.
+    // genMutex serializes generation start/cancel/terminal ack. Native also
+    // validates each drain acknowledgement against its generation and tail.
     private val genMutex = Mutex()
     private val sessionCounter = AtomicInteger(1)
 
@@ -129,6 +128,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     private external fun nativeCancelGeneration(handle: Long, genId: Int)
     private external fun nativeDrainTokens(handle: Long, genId: Int, maxTokens: Int): IntArray
     private external fun nativeAckEof(handle: Long, genId: Int)
+    private external fun nativeAckDrainedTokens(handle: Long, genId: Int, expectedTail: Int, tokenCount: Int): Boolean
     private external fun nativeDecodeTokens(handle: Long, genId: Int, tokens: IntArray): String
     private external fun nativeGetState(handle: Long, genId: Int): Int
     private external fun nativeDrainDecodeAndState(handle: Long, genId: Int, maxTokens: Int, outResult: NativeDrainResult)
@@ -307,9 +307,9 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         var pollDelay = 2L
         try {
             while (isActive && !isDestroyed) {
-                // Lock-free drain: C++ handles thread safety via atomics on the
-                // ControlBlock and internal decode_mu. Skipping the Kotlin mutex here
-                // eliminates contention with setMemoryPressure and model operations.
+                // The native Engine linearizes this combined drain/decode/state
+                // snapshot against reset, unload, cancellation, and generation
+                // replacement. The Kotlin mutex remains unnecessary here.
                 val jniStart = SystemClock.elapsedRealtimeNanos()
                 if (isDestroyed) {
                     reusableResult.tokensCount = 0
@@ -318,6 +318,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     reusableResult.produced = 0L
                     reusableResult.drained = 0L
                     reusableResult.pending = false
+                    reusableResult.drainTail = 0
                     reusableResult.state = NATIVE_STATE_TOMBSTONED
                     reusableResult.errorCode = 0
                 } else {
@@ -327,6 +328,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                     reusableResult.produced = 0L
                     reusableResult.drained = 0L
                     reusableResult.pending = false
+                    reusableResult.drainTail = 0
                     reusableResult.state = NATIVE_STATE_IDLE
                     reusableResult.errorCode = 0
                     nativeDrainDecodeAndState(nativeHandle, genId, 128, reusableResult)
@@ -368,6 +370,9 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             )
                         )
                         if (dataSent == StreamSendResult.CLOSED) break
+                        if (!nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)) {
+                            throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
+                        }
                     }
                 }
 
@@ -496,6 +501,20 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     suspend fun debugDrainTokensForTesting(generationId: Int, maxTokens: Int): IntArray =
         modelMutex.withLock {
             if (isDestroyed) IntArray(0) else nativeDrainTokens(nativeHandle, generationId, maxTokens)
+        }
+
+    @VisibleForTesting
+    suspend fun debugDrainResultForTesting(generationId: Int, maxTokens: Int): NativeDrainResult =
+        modelMutex.withLock {
+            val result = NativeDrainResult()
+            if (!isDestroyed) nativeDrainDecodeAndState(nativeHandle, generationId, maxTokens, result)
+            result
+        }
+
+    @VisibleForTesting
+    suspend fun debugAcknowledgeDrainedForTesting(generationId: Int, expectedTail: Int, tokenCount: Int): Boolean =
+        modelMutex.withLock {
+            !isDestroyed && nativeAckDrainedTokens(nativeHandle, generationId, expectedTail, tokenCount)
         }
 
     @VisibleForTesting

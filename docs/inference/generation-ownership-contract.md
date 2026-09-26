@@ -7,7 +7,9 @@
   it does not retarget work already owned by another chat.
 - **Generation identity** is the monotonically allocated generation ID carried
   through Kotlin, JNI, and native code. A generation owns its token stream,
-  terminal result, cancellation, acknowledgement, and cleanup.
+  terminal result, cancellation, acknowledgement, and cleanup. Native currently
+  reuses one bounded ring; a lifecycle gate serializes generation publication,
+  reset/unload/cancel, and the combined drain/decode/state snapshot around it.
 - **Native/model lifetime** is the loaded model runtime shared by generations
   serialized by the service. A generation keeps the runtime alive until its
   worker has stopped; unload/reset cannot replace a generation's stream state.
@@ -46,11 +48,17 @@ they are not aliases for one global epoch.
 
 1. Native drain/decode/ack and terminal cleanup operate only on the requested
    generation's stream. A lifecycle transition cannot occur between ownership
-   validation and its protected operation.
+   validation and the protected combined operation. The native implementation
+   uses a shared ring behind a recursive lifecycle gate rather than allocating
+   a separate ring per generation; only one generation is active at a time.
 2. Output removal is transactional: ring positions advance only after the
-   consumer has accepted the corresponding payload. Decode/delivery failure
-   retains the output for retry or terminalizes that same generation with an
-   explicit error; it is never silently attributed to another generation.
+   Kotlin bounded stream has accepted the corresponding payload. A batch
+   acknowledgement must match both its generation ID and observed ring tail.
+   Decode failure cancels and terminalizes that generation with an explicit
+   native error while preserving the batch until the error payload is accepted.
+   If the downstream collector closes, native cancellation leaves the batch
+   unacknowledged and discards it only after the cancelled producer joins under
+   the lifecycle gate; it is never delivered as another generation's data.
 3. A waiter observes only its captured generation/task result and uses a
    bounded deadline that includes joins.
 4. Queued work keeps its source chat and never resolves transcript or result

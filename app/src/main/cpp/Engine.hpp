@@ -66,6 +66,7 @@ public:
     std::string runBenchmark(GenerationConfig config, int prompt_tokens, int generation_tokens, int repetitions);
     void cancelGeneration(int generation_id);
     std::vector<int32_t> drainTokens(int generation_id, int max_tokens);
+    bool acknowledgeDrainedTokens(int generation_id, int expected_tail, int token_count);
     void ackEof(int generation_id);
     std::string decodeTokens(int generation_id, const std::vector<int32_t>& tokens);
     int getState(int generation_id) const;
@@ -83,9 +84,10 @@ public:
         // PIR-02: stream terminal/drain accounting. `produced` counts tokens
         // written into the ring; `drained` counts tokens handed to the consumer.
         // While `produced > drained` a terminal state must not be acknowledged.
-        int schema_version = 1;
+        int schema_version = 2;
         int64_t produced = 0;
         int64_t drained = 0;
+        int drain_tail = 0;
         bool pending = false;
     };
     DrainResult drainDecodeAndState(int generation_id, int max_tokens);
@@ -104,6 +106,7 @@ public:
     void clearLoraAdapters();
 
 private:
+    bool decodeTokensChecked(int generation_id, const std::vector<int32_t>& tokens, std::string& output);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

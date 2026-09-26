@@ -4,6 +4,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -15,13 +16,34 @@ class GenerationSessionWaitTest {
 
     @Test
     fun returnsImmediatelyWhenIdle() = runBlocking {
-        GenerationSessionWait.awaitSessionIdle(
+        val completed = GenerationSessionWait.awaitSessionIdle(
             isGenerating = { false },
             getJob = { null },
             pollMs = 10L,
             maxWaitMs = 1000L,
         )
-        assertTrue(true)
+        assertTrue(completed)
+    }
+
+    @Test
+    fun timesOutWhenOwnedJobDoesNotFinishBeforeDeadline() = runBlocking {
+        val neverCompletes = Job()
+        var timedOut = false
+
+        val completed = withTimeoutOrNull(250L) {
+            GenerationSessionWait.awaitSessionIdle(
+                isGenerating = { true },
+                getJob = { neverCompletes },
+                pollMs = 5L,
+                maxWaitMs = 30L,
+                onTimeout = { timedOut = true },
+            )
+        } ?: false
+
+        assertFalse("stuck job should produce a bounded timeout", completed)
+        assertTrue(timedOut)
+        assertTrue(neverCompletes.isActive)
+        neverCompletes.cancel()
     }
 
     @Test

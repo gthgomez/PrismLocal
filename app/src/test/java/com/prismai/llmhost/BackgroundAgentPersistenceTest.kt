@@ -30,8 +30,8 @@ class BackgroundAgentPersistenceTest {
             isDeviceBusyWithUserGeneration = { true },
         )
 
-        val task1 = manager1.enqueue("Research quantum gravity")
-        val task2 = manager1.enqueue("Draft executive summary")
+        val task1 = manager1.enqueue("Research quantum gravity", sourceChatId = "chat-a")
+        val task2 = manager1.enqueue("Draft executive summary", sourceChatId = "chat-b")
         assertNotNull(task1)
         assertNotNull(task2)
         assertEquals(2, manager1.state.value.queuedTasks.size)
@@ -52,17 +52,19 @@ class BackgroundAgentPersistenceTest {
         assertEquals(2, restoredState.queuedTasks.size)
         assertEquals(task1?.id, restoredState.queuedTasks[0].id)
         assertEquals("Research quantum gravity", restoredState.queuedTasks[0].prompt)
+        assertEquals("chat-a", restoredState.queuedTasks[0].sourceChatId)
         assertEquals(task2?.id, restoredState.queuedTasks[1].id)
         assertEquals("Draft executive summary", restoredState.queuedTasks[1].prompt)
 
         // Enqueueing in manager2 should produce a monotonically higher ID without collision
-        val task3 = manager2.enqueue("Third task")
+        val task3 = manager2.enqueue("Third task", sourceChatId = "chat-c")
         assertNotNull(task3)
         assertEquals(3, manager2.state.value.queuedTasks.size)
         assertEquals(task1?.id, manager2.state.value.queuedTasks[0].id)
         assertEquals(task2?.id, manager2.state.value.queuedTasks[1].id)
         assertEquals(task3?.id, manager2.state.value.queuedTasks[2].id)
         assertTrue(task3!!.id != task1?.id && task3.id != task2?.id)
+        assertEquals("chat-c", manager2.state.value.queuedTasks[2].sourceChatId)
     }
 
     @Test

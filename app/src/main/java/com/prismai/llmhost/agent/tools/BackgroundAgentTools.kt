@@ -14,11 +14,18 @@ import org.json.JSONObject
 class BackgroundAgentTools(
     private val backgroundAgentManager: BackgroundAgentManager,
 ) {
-    suspend fun runInBackground(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+    suspend fun runInBackground(
+        call: AgentToolCall,
+        confirmed: Boolean,
+        sourceChatId: String?,
+    ): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Background task requires confirmation")
+        if (sourceChatId.isNullOrBlank()) {
+            return toolFailure(call, AgentToolErrorCode.FAILED, "Cannot queue a background task without its source chat")
+        }
         val prompt = call.arguments.optString("prompt").trim()
         if (prompt.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Prompt is required")
-        val task = backgroundAgentManager.enqueue(prompt)
+        val task = backgroundAgentManager.enqueue(prompt, sourceChatId)
             ?: return toolFailure(call, AgentToolErrorCode.BUSY, "Background task queue is full (max 5)")
         backgroundAgentManager.startBackgroundMode()
         return toolSuccess(call, "Queued background task ${task.id}: ${prompt.take(80)}",

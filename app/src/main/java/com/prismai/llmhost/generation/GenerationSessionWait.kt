@@ -2,6 +2,7 @@ package com.prismai.llmhost.generation
 
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 
 data class GenerationIdleInputs(
     val generationRunning: Boolean,
@@ -45,28 +46,36 @@ object GenerationSessionWait {
         maxWaitMs: Long = 30 * 60 * 1000L,
         elapsedTimeMs: () -> Long = { System.currentTimeMillis() },
         onTimeout: () -> Unit = {},
-    ) {
-        val deadline = elapsedTimeMs() + maxWaitMs
-        while (elapsedTimeMs() < deadline) {
-            val job = getJob()
-            if (job != null) {
-                job.join()
-                // If job completed but getter still returns the same completed job,
-                // yield briefly to allow completion handlers to clear job / update state.
-                if (!job.isActive && getJob() === job) {
-                    delay(pollMs)
+    ): Boolean {
+        val completed = withTimeoutOrNull(maxWaitMs.coerceAtLeast(0L)) {
+            val deadline = elapsedTimeMs() + maxWaitMs
+            while (elapsedTimeMs() < deadline) {
+                val job = getJob()
+                if (job != null) {
+                    // join is cancellable, so the same deadline bounds a stuck
+                    // generation job instead of only bounding the polling loop.
+                    job.join()
+                    // If job completed but getter still returns the same completed job,
+                    // yield briefly to allow completion handlers to clear job / update state.
+                    if (!job.isActive && getJob() === job) {
+                        delay(pollMs)
+                    }
+                    continue
                 }
-                continue
-            }
-            if (!isGenerating()) {
-                // Brief settle window: follow-up may flip isGenerating true
-                // on another dispatcher right after job clear.
+                if (!isGenerating()) {
+                    // Brief settle window: follow-up may flip isGenerating true
+                    // on another dispatcher right after job clear.
+                    delay(pollMs)
+                    if (getJob() == null && !isGenerating()) return@withTimeoutOrNull true
+                    continue
+                }
                 delay(pollMs)
-                if (getJob() == null && !isGenerating()) return
-                continue
             }
-            delay(pollMs)
+            false
+        } ?: false
+        if (!completed) {
+            onTimeout()
         }
-        onTimeout()
+        return completed
     }
 }

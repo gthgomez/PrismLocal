@@ -3,6 +3,7 @@ package com.prismai.llmhost
 import android.content.Context
 import android.content.ContextWrapper
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -16,6 +17,53 @@ class FakeTestContext : ContextWrapper(null) {
 }
 
 class BackgroundAgentManagerTest {
+
+    @Test
+    fun deletingSourceChatDiscardsOnlyItsQueuedTasks() = runBlocking {
+        val manager = BackgroundAgentManager(
+            context = FakeTestContext(),
+            isDeviceBusyWithUserGeneration = { true },
+        )
+        val owned = manager.enqueue("owned prompt", sourceChatId = "chat-a")!!
+        val other = manager.enqueue("other prompt", sourceChatId = "chat-b")!!
+
+        var deleted = false
+        val removed = manager.deleteChatAndInvalidateTasks("chat-a") {
+            deleted = true
+            true
+        }
+
+        assertTrue(deleted)
+        assertTrue(removed)
+        assertEquals(listOf(other.id), manager.state.value.queuedTasks.map { it.id })
+    }
+
+    @Test
+    fun sourceChatDeletionIsRejectedWhileItsTaskIsActive() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        val holdTask = CompletableDeferred<String>()
+        val manager = BackgroundAgentManager(
+            context = FakeTestContext(),
+            executeTask = {
+                started.complete(Unit)
+                holdTask.await()
+            },
+        )
+        val task = manager.enqueue("active prompt", sourceChatId = "chat-a")!!
+        started.await()
+        var deleted = false
+
+        val deletedAndInvalidated = manager.deleteChatAndInvalidateTasks("chat-a") {
+            deleted = true
+            true
+        }
+
+        assertFalse(deletedAndInvalidated)
+        assertFalse(deleted)
+        assertEquals(task.id, manager.state.value.activeTask?.id)
+        manager.cancelTask(task.id)
+        delay(50)
+    }
 
     @Test
     fun enqueuedTaskExecutesViaRunner() = runBlocking {

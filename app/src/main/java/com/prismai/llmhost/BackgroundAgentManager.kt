@@ -39,6 +39,7 @@ import kotlinx.coroutines.launch
 data class BackgroundTask(
     val id: String,
     val prompt: String,
+    val sourceChatId: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val status: BackgroundTaskStatus = BackgroundTaskStatus.QUEUED,
     val resultSummary: String? = null,
@@ -136,6 +137,7 @@ class BackgroundAgentManager(
         put("id", task.id)
         if (includePrompt) put("prompt", task.prompt)
         put("createdAt", task.createdAt)
+        if (!task.sourceChatId.isNullOrBlank()) put("sourceChatId", task.sourceChatId)
         put("status", task.status.name)
         if (task.resultSummary != null) {
             put("resultSummary", task.resultSummary.take(MAX_PERSISTED_RESULT_SUMMARY_CHARS))
@@ -154,6 +156,7 @@ class BackgroundAgentManager(
         return BackgroundTask(
             id = id,
             prompt = prompt,
+            sourceChatId = json.optString("sourceChatId").takeIf { it.isNotBlank() && it != "null" },
             createdAt = createdAt,
             status = status,
             resultSummary = resultSummary,
@@ -259,7 +262,7 @@ class BackgroundAgentManager(
      * Queue a task for background execution. Returns task ID.
      * Rejects if the queue is full (max [MAX_QUEUED_TASKS]).
      */
-    fun enqueue(prompt: String): BackgroundTask? {
+    fun enqueue(prompt: String, sourceChatId: String? = null): BackgroundTask? {
         val queued: BackgroundTask = synchronized(stateLock) {
             val current = _state.value
             if (current.queuedTasks.size >= MAX_QUEUED_TASKS) {
@@ -267,7 +270,7 @@ class BackgroundAgentManager(
                 return null
             }
             val id = "bg_task_${taskIdCounter.incrementAndGet()}"
-            val task = BackgroundTask(id = id, prompt = prompt)
+            val task = BackgroundTask(id = id, prompt = prompt, sourceChatId = sourceChatId)
             _state.value = current.copy(queuedTasks = current.queuedTasks + task)
             persistTasksLocked()
             task
@@ -277,6 +280,24 @@ class BackgroundAgentManager(
         processNextTask()
         return queued
     }
+
+    /**
+     * Atomically delete a chat and invalidate its queued/completed background
+     * records. An active task blocks deletion until it is explicitly cancelled,
+     * so an in-flight generation cannot publish back into a deleted chat.
+     */
+    fun deleteChatAndInvalidateTasks(chatId: String, deleteChat: () -> Boolean): Boolean =
+        synchronized(stateLock) {
+            val current = _state.value
+            if (current.activeTask?.sourceChatId == chatId) return@synchronized false
+            if (!deleteChat()) return@synchronized false
+            _state.value = current.copy(
+                queuedTasks = current.queuedTasks.filterNot { it.sourceChatId == chatId },
+                completedTasks = current.completedTasks.filterNot { it.sourceChatId == chatId },
+            )
+            persistTasksLocked()
+            true
+        }
 
     /** Start processing the queue. Acquires wake lock. */
     fun startBackgroundMode() {

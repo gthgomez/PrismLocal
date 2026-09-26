@@ -633,6 +633,7 @@ class AgentToolRouterTraceTest {
             uiState = uiState,
             filesDir = tempFolder.newFolder(),
             scope = scope,
+            rawContentOptIn = true,
             writeArtifact = { _, json -> artifacts.trySend(json) },
         )
         val confirmation = AgentToolConfirmation(

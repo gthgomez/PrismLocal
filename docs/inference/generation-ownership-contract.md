@@ -24,6 +24,24 @@
 These identities are related by explicit ownership fields and lifecycle rules;
 they are not aliases for one global epoch.
 
+## Trace privacy policy
+
+- Persisted traces contain ownership, tool names, success/terminal metadata,
+  token count, and timings by default. Prompts, tool arguments, and result text
+  are omitted. Raw content is included only when a caller explicitly opts in;
+  production construction currently uses the metadata-only default.
+- Each trace records its source chat ID. Chat deletion removes that chat's
+  published traces and tombstones it against already queued trace writes.
+- Trace names include a random identifier and are published by same-directory
+  atomic rename. Retention is capped at 20 artifacts and 30 days, enforced on
+  publication. Teardown persistence uses the service-owned teardown scope and
+  follows the same publication and deletion checks.
+- Trace files remain in app-private storage and are not encrypted by this
+  change. The current threat model is protection against accidental exposure
+  through diagnostics/exports; minimization, ownership, retention, and deletion
+  are the controls. Device compromise or access by the app's own privileged
+  process is not addressed by file encryption.
+
 ## Required invariants
 
 1. Native drain/decode/ack and terminal cleanup operate only on the requested

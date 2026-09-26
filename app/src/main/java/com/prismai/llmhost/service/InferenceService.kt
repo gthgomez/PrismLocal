@@ -790,7 +790,9 @@ class InferenceService : Service() {
 
     private fun performDeleteChat(chatId: String): Boolean {
         if (_isGenerating.value) return false
-        return chatManager.deleteChat(chatId)
+        val deleted = chatManager.deleteChat(chatId)
+        if (deleted) agentTrace.deleteForChat(chatId)
+        return deleted
     }
 
     fun switchChat(chatId: String): Boolean {
@@ -1152,7 +1154,10 @@ class InferenceService : Service() {
                 agentToolRouter.failTrace(authorization.chainId, "Tool confirmation authorization is stale")
                 return@confirmedJob
             }
-            if (!agentToolConfirmation.tryBeginDispatch(authorization)) {
+            val chatIdentityOperation = authorization.call.name in setOf(
+                "clear_chat", "delete_chat", "delete_or_clear_chat",
+            )
+            if (!chatIdentityOperation && !agentToolConfirmation.tryBeginDispatch(authorization)) {
                 agentToolConfirmation.clearConsumedAuthorization(authorization)
                 agentToolRouter.failTrace(
                     authorization.chainId,
@@ -1303,11 +1308,11 @@ class InferenceService : Service() {
             chatTransitionGate.enqueueAndAwait(
                 cleanup = {},
                 mutation = {
-                    if (!agentToolConfirmation.isAuthorizationCurrent(
+                    if (!agentToolConfirmation.isOperationOwnerCurrent(
                             authorization = authorization,
                             activeChainId = agentTrace.activeChainId,
                             activeChatId = _currentChatId.value,
-                        )
+                        ) || !agentToolConfirmation.tryBeginDispatch(authorization)
                     ) {
                         outcome.complete(
                             toolFailure(

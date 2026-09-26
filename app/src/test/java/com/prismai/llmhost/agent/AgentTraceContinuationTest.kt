@@ -17,6 +17,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import java.io.File
+import com.prismai.llmhost.tools.AgentToolCall
+import com.prismai.llmhost.tools.AgentToolResult
 
 class AgentTraceContinuationTest {
 
@@ -145,6 +148,54 @@ class AgentTraceContinuationTest {
     }
 
     @Test
+    fun defaultTracePersistsMetadataWithoutRawPromptArgumentsOrResult() = runBlocking {
+        val ui = ServiceUiState().also { it._currentChatId.value = "owner-chat" }
+        val artifacts = Channel<JSONObject>(Channel.UNLIMITED)
+        val trace = AgentTrace(
+            uiState = ui,
+            filesDir = tempFolder.newFolder(),
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            writeArtifact = { _, json -> artifacts.trySend(json) },
+        )
+        val chain = trace.beginChain("private prompt")
+        trace.recordStep(
+            AgentToolCall("tool", org.json.JSONObject().put("secret", "private argument")),
+            AgentToolResult(AgentToolCall("tool"), true, "private result"),
+            4L,
+            chain,
+        )
+        trace.finalizeOwnedTrace(chain, success = true)
+
+        val artifact = withTimeout(2_000) { artifacts.receive() }
+        assertEquals("metadata_only", artifact.getString("content_mode"))
+        assertEquals("owner-chat", artifact.getString("owner_chat_id"))
+        assertFalse(artifact.has("prompt"))
+        val step = artifact.getJSONArray("steps").getJSONObject(0)
+        assertFalse(step.has("arguments"))
+        assertFalse(step.has("resultSummary"))
+    }
+
+    @Test
+    fun deletingChatRemovesItsPublishedTraceAndBlocksQueuedPublication() = runBlocking {
+        val dir = tempFolder.newFolder()
+        val ui = ServiceUiState().also { it._currentChatId.value = "deleted-chat" }
+        val trace = AgentTrace(ui, dir, CoroutineScope(SupervisorJob() + Dispatchers.Unconfined))
+        val chain = trace.beginChain("private prompt")
+        trace.finalizeOwnedTrace(chain, success = true)
+        withTimeout(2_000) {
+            while (File(dir, "agent_traces").listFiles()?.any { it.extension == "json" } != true) kotlinx.coroutines.delay(2)
+        }
+
+        trace.deleteForChat("deleted-chat")
+        assertTrue(File(dir, "agent_traces").listFiles()?.none { it.extension == "json" } ?: true)
+
+        val next = trace.beginChain("stale", ownerChatId = "deleted-chat")
+        trace.finalizeOwnedTrace(next, success = true)
+        kotlinx.coroutines.delay(30)
+        assertTrue(File(dir, "agent_traces").listFiles()?.none { it.extension == "json" } ?: true)
+    }
+
+    @Test
     fun canceledPersistenceScopeStillWritesArtifact() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         scopes += scope
@@ -154,6 +205,7 @@ class AgentTraceContinuationTest {
             uiState = ServiceUiState(),
             filesDir = tempFolder.newFolder(),
             scope = scope,
+            rawContentOptIn = true,
             writeArtifact = { _, json -> artifacts.trySend(json) },
         )
         val chainId = trace.beginChain("cancelled chain")
@@ -173,6 +225,7 @@ class AgentTraceContinuationTest {
             uiState = uiState,
             filesDir = tempFolder.newFolder(),
             scope = scope,
+            rawContentOptIn = true,
             writeArtifact = { _, json -> artifacts.trySend(json) },
         )
         return TraceHarness(trace, uiState, artifacts)

@@ -5,6 +5,7 @@ import com.prismai.llmhost.model.DeviceProfiler
 import com.prismai.llmhost.model.ModelDownloadManager
 import com.prismai.llmhost.model.ModelImportManager
 import com.prismai.llmhost.model.ModelReadinessAssessor
+import com.prismai.llmhost.storage.ModelIdentity
 import com.prismai.llmhost.storage.ModelStorageManager
 import com.prismai.llmhost.tools.AgentToolCall
 import com.prismai.llmhost.tools.AgentToolErrorCode
@@ -32,19 +33,19 @@ class ModelToolsDeletionTest {
         val callbackModelIds = mutableListOf<String>()
         var directDeletionCalls = 0
         var refreshCalls = 0
-        val tools = newModelTools(
-            directDelete = {
+        val harness = newModelTools(
+            directDelete = { _, _ ->
                 directDeletionCalls += 1
                 false
             },
-            serializedDelete = { modelId ->
+            serializedDelete = { modelId, _ ->
                 callbackModelIds += modelId
                 true
             },
             onRefreshReadiness = { refreshCalls += 1 },
         )
 
-        val result = tools.deleteModel(deleteCall(), confirmed = true)
+        val result = harness.tools.deleteModel(deleteCall(), confirmed = true, confirmedIdentity = harness.identity)
 
         assertTrue(result.success)
         assertEquals(AgentToolErrorCode.OK, result.errorCode)
@@ -59,19 +60,19 @@ class ModelToolsDeletionTest {
         val callbackModelIds = mutableListOf<String>()
         var directDeletionCalls = 0
         var refreshCalls = 0
-        val tools = newModelTools(
-            directDelete = {
+        val harness = newModelTools(
+            directDelete = { _, _ ->
                 directDeletionCalls += 1
                 true
             },
-            serializedDelete = { modelId ->
+            serializedDelete = { modelId, _ ->
                 callbackModelIds += modelId
                 false
             },
             onRefreshReadiness = { refreshCalls += 1 },
         )
 
-        val result = tools.deleteModel(deleteCall(), confirmed = true)
+        val result = harness.tools.deleteModel(deleteCall(), confirmed = true, confirmedIdentity = harness.identity)
 
         assertFalse(result.success)
         assertEquals(AgentToolErrorCode.FAILED, result.errorCode)
@@ -84,8 +85,8 @@ class ModelToolsDeletionTest {
     fun nullSerializedCallbackUsesDirectDeletionAndRefreshesAfterSuccess() = runBlocking {
         val directModelIds = mutableListOf<String>()
         var refreshCalls = 0
-        val tools = newModelTools(
-            directDelete = { modelId ->
+        val harness = newModelTools(
+            directDelete = { modelId, _ ->
                 directModelIds += modelId
                 true
             },
@@ -93,7 +94,7 @@ class ModelToolsDeletionTest {
             onRefreshReadiness = { refreshCalls += 1 },
         )
 
-        val result = tools.deleteModel(deleteCall(), confirmed = true)
+        val result = harness.tools.deleteModel(deleteCall(), confirmed = true, confirmedIdentity = harness.identity)
 
         assertTrue(result.success)
         assertEquals(AgentToolErrorCode.OK, result.errorCode)
@@ -106,8 +107,8 @@ class ModelToolsDeletionTest {
     fun nullSerializedCallbackUsesDirectDeletionAndDoesNotRefreshAfterFailure() = runBlocking {
         val directModelIds = mutableListOf<String>()
         var refreshCalls = 0
-        val tools = newModelTools(
-            directDelete = { modelId ->
+        val harness = newModelTools(
+            directDelete = { modelId, _ ->
                 directModelIds += modelId
                 false
             },
@@ -115,7 +116,7 @@ class ModelToolsDeletionTest {
             onRefreshReadiness = { refreshCalls += 1 },
         )
 
-        val result = tools.deleteModel(deleteCall(), confirmed = true)
+        val result = harness.tools.deleteModel(deleteCall(), confirmed = true, confirmedIdentity = harness.identity)
 
         assertFalse(result.success)
         assertEquals(AgentToolErrorCode.FAILED, result.errorCode)
@@ -127,18 +128,18 @@ class ModelToolsDeletionTest {
     fun rejectedConfirmationDoesNotInvokeEitherDeletionRoute() = runBlocking {
         var directDeletionCalls = 0
         var serializedDeletionCalls = 0
-        val tools = newModelTools(
-            directDelete = {
+        val harness = newModelTools(
+            directDelete = { _, _ ->
                 directDeletionCalls += 1
                 true
             },
-            serializedDelete = {
+            serializedDelete = { _, _ ->
                 serializedDeletionCalls += 1
                 true
             },
         )
 
-        val result = tools.deleteModel(deleteCall(), confirmed = false)
+        val result = harness.tools.deleteModel(deleteCall(), confirmed = false)
 
         assertFalse(result.success)
         assertEquals(AgentToolErrorCode.CONFIRMATION_REQUIRED, result.errorCode)
@@ -146,11 +147,61 @@ class ModelToolsDeletionTest {
         assertEquals(0, serializedDeletionCalls)
     }
 
+    @Test
+    fun confirmedDeletionWithoutIdentityDoesNotDelete() = runBlocking {
+        var deletionCalls = 0
+        val harness = newModelTools(
+            directDelete = { _, _ ->
+                deletionCalls += 1
+                true
+            },
+            serializedDelete = { _, _ ->
+                deletionCalls += 1
+                true
+            },
+        )
+
+        val result = harness.tools.deleteModel(deleteCall(), confirmed = true)
+
+        assertFalse(result.success)
+        assertEquals(AgentToolErrorCode.CONFIRMATION_REQUIRED, result.errorCode)
+        assertEquals(0, deletionCalls)
+    }
+
+    @Test
+    fun changedHashDoesNotDelete() = runBlocking {
+        var deletionCalls = 0
+        val harness = newModelTools(
+            directDelete = { _, _ ->
+                deletionCalls += 1
+                true
+            },
+            serializedDelete = { _, _ ->
+                deletionCalls += 1
+                true
+            },
+        )
+
+        val result = harness.tools.deleteModel(
+            deleteCall(),
+            confirmed = true,
+            confirmedIdentity = harness.identity.copy(sha256 = "f".repeat(64)),
+        )
+
+        assertFalse(result.success)
+        assertEquals(0, deletionCalls)
+    }
+
+    private data class DeletionHarness(
+        val tools: ModelTools,
+        val identity: ModelIdentity,
+    )
+
     private fun newModelTools(
-        directDelete: suspend (String) -> Boolean,
-        serializedDelete: (suspend (String) -> Boolean)?,
+        directDelete: suspend (String, ModelIdentity) -> Boolean,
+        serializedDelete: (suspend (String, ModelIdentity) -> Boolean)?,
         onRefreshReadiness: () -> Unit = {},
-    ): ModelTools {
+    ): DeletionHarness {
         val filesDir = tempFolder.newFolder()
         val context = ContextWrapper(null)
         val uiState = ServiceUiState()
@@ -172,7 +223,9 @@ class ModelToolsDeletionTest {
                 validatedAt = "2026-09-23T00:00:00Z",
             ),
         )
-        return ModelTools(
+        val identity = checkNotNull(ModelIdentity.from(installedModel))
+        return DeletionHarness(
+            tools = ModelTools(
             listInstalledModelInfos = { listOf(installedModel) },
             deleteModelDirectly = directDelete,
             modelReadinessAssessor = ModelReadinessAssessor(
@@ -201,6 +254,8 @@ class ModelToolsDeletionTest {
             benchmarkFileSize = { 0L },
             chatIndexFile = { filesDir },
             deleteModelSafely = serializedDelete,
+        ),
+            identity = identity,
         )
     }
 

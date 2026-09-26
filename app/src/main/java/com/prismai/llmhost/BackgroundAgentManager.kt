@@ -381,6 +381,7 @@ class BackgroundAgentManager(
 
         val task = promoted ?: return
         activeTaskJob = bgScope.launch {
+            var deferred = false
             try {
                 wakeLock?.acquire(300_000L) // 5-minute wake lock per background task
                 val summary = executeTask?.invoke(task) ?: "Background task executed"
@@ -389,6 +390,7 @@ class BackgroundAgentManager(
                 logD(TAG, "Background task ${task.id} cancelled")
                 throw c
             } catch (_: BackgroundTaskDeferredException) {
+                deferred = true
                 synchronized(stateLock) {
                     val current = _state.value
                     if (current.activeTask?.id == task.id) {
@@ -412,7 +414,7 @@ class BackgroundAgentManager(
                     }
                 }
                 if (!cancelInFlight) {
-                    processNextTask()
+                    if (deferred) scheduleDeviceBusyRetry(initialDelay = true) else processNextTask()
                 }
             }
         }
@@ -423,7 +425,7 @@ class BackgroundAgentManager(
      * retrying [processNextTask] via a cooperative poll. Only one retry poll
      * runs at a time and it never blocks a thread while waiting.
      */
-    private fun scheduleDeviceBusyRetry() {
+    private fun scheduleDeviceBusyRetry(initialDelay: Boolean = false) {
         synchronized(stateLock) {
             if (deviceBusyRetryJob?.isActive == true || cancelInFlight ||
                 _state.value.activeTask != null || _state.value.queuedTasks.isEmpty()
@@ -434,6 +436,7 @@ class BackgroundAgentManager(
                 val selfJob = coroutineContext[Job]
                 var cancelled = false
                 try {
+                    if (initialDelay) delay(DEVICE_BUSY_RETRY_INTERVAL_MS)
                     while (isDeviceBusyWithUserGeneration()) {
                         delay(DEVICE_BUSY_RETRY_INTERVAL_MS)
                     }

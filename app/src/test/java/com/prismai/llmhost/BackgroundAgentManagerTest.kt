@@ -406,4 +406,26 @@ class BackgroundAgentManagerTest {
             manager.state.value.completedTasks.first { it.id == task.id }.status,
         )
     }
+
+    @Test
+    fun deferredTaskDoesNotRetryInATightLoop() = runBlocking {
+        val attempts = AtomicInteger()
+        val manager = BackgroundAgentManager(
+            context = FakeTestContext(),
+            executeTask = {
+                attempts.incrementAndGet()
+                throw BackgroundTaskDeferredException()
+            },
+            isDeviceBusyWithUserGeneration = { false },
+        )
+
+        manager.enqueue("stay queued", sourceChatId = "chat-a")
+        delay(400)
+
+        assertEquals(1, attempts.get())
+        assertEquals(1, manager.state.value.queuedTasks.size)
+        assertNull(manager.state.value.activeTask)
+        manager.cancelTask(manager.state.value.queuedTasks.first().id)
+        Unit
+    }
 }

@@ -64,6 +64,22 @@ class BackgroundGenerationOwnershipTest {
     }
 
     @Test
+    fun queuedChatCreationAndUnappliedSwitchSurviveTheNextBegin() {
+        val ownership = BackgroundGenerationOwnership()
+        assertTrue(ownership.begin("task-a"))
+        assertTrue(ownership.deferChatCreation())
+        assertTrue(ownership.deferChatSwitch("chat-c"))
+        assertTrue(ownership.takeDeferredChatCreation("task-a"))
+        val deferredChatId = ownership.finish("task-a")
+        ownership.parkDeferredChatSwitch(checkNotNull(deferredChatId))
+        ownership.parkDeferredChatCreation()
+
+        assertTrue(ownership.begin("task-a"))
+        assertTrue(ownership.takeDeferredChatCreation("task-a"))
+        assertEquals("chat-c", ownership.takeDeferredChatSwitch("task-a"))
+    }
+
+    @Test
     fun onlyOwningBackgroundAgentChainMayStartFollowUp() {
         val ownership = BackgroundGenerationOwnership()
         assertTrue(ownership.allowsAgentFollowUp(chainId = 4L))

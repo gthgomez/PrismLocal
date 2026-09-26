@@ -44,9 +44,14 @@ internal object ModelStorageLifecycleGate {
     }
 }
 
-class ModelStorageManager(private val context: Context) {
+class ModelStorageManager(
+    private val context: Context,
+    private val modelsDirectoryOverride: File? = null,
+) {
     private val modelsDir: File
-        get() = context.getExternalFilesDir("models") ?: File(context.filesDir, "models")
+        get() = modelsDirectoryOverride
+            ?: context.getExternalFilesDir("models")
+            ?: File(context.filesDir, "models")
 
     data class ActiveModelInfo(
         val id: String,
@@ -303,20 +308,35 @@ class ModelStorageManager(private val context: Context) {
         }
     }
 
-    fun deleteModel(modelId: String): Boolean = ModelStorageLifecycleGate.withLock {
-        val modelRoot = File(modelsDir, modelId)
-        val isSafeModelDir = runCatching {
-            modelRoot.canonicalFile != modelsDir.canonicalFile && isInside(modelsDir, modelRoot)
-        }.getOrDefault(false)
-        if (!isSafeModelDir) {
-            Log.w(TAG, "Refusing to delete model outside models dir modelId=$modelId")
-            return@withLock false
+    fun deleteModel(modelId: String, confirmedIdentity: ModelIdentity? = null): Boolean =
+        ModelStorageLifecycleGate.withLock {
+            val modelRoot = File(modelsDir, modelId)
+            val isSafeModelDir = runCatching {
+                modelRoot.canonicalFile != modelsDir.canonicalFile && isInside(modelsDir, modelRoot)
+            }.getOrDefault(false)
+            if (!isSafeModelDir) {
+                runCatching { Log.w(TAG, "Refusing to delete model outside models dir modelId=$modelId") }
+                return@withLock false
+            }
+            if (confirmedIdentity != null && !confirmedIdentityStillInstalled(modelId, modelRoot, confirmedIdentity)) {
+                return@withLock false
+            }
+            ModelStorageLifecycleGate.advanceRevision(modelId)
+            if (!modelRoot.exists()) return@withLock false
+            val deleted = runCatching { modelRoot.deleteRecursively() }.getOrDefault(false)
+            runCatching { Log.d(TAG, "deleteModel modelId=$modelId deleted=$deleted") }
+            deleted
         }
-        ModelStorageLifecycleGate.advanceRevision(modelId)
-        if (!modelRoot.exists()) return@withLock false
-        val deleted = runCatching { modelRoot.deleteRecursively() }.getOrDefault(false)
-        Log.d(TAG, "deleteModel modelId=$modelId deleted=$deleted")
-        deleted
+
+    private fun confirmedIdentityStillInstalled(
+        modelId: String,
+        modelRoot: File,
+        confirmedIdentity: ModelIdentity,
+    ): Boolean {
+        if (confirmedIdentity.modelId != modelId || !modelRoot.exists()) return false
+        val resolved = parseManifest(modelRoot, verifyHash = false)
+        val installed = (resolved as? ModelResolveResult.Success)?.model ?: return false
+        return confirmedIdentity.matches(installed)
     }
 
     private fun pruneInactiveVersions(modelRoot: File, activeVersionId: String) {

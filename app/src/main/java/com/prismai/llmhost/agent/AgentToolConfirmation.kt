@@ -33,6 +33,7 @@ class AgentToolConfirmation(
     private val pendingActionKey: (String) -> String,
     private val getDeviceProfile: () -> DeviceCapabilityProfile?,
     private val capabilityRegistry: CapabilityRegistry = CapabilityRegistryHolder.registry,
+    private val resolveModelIdentity: (String) -> ModelIdentity? = { null },
 ) {
     companion object {
         private const val TAG = "AgentToolConfirm"
@@ -70,6 +71,7 @@ class AgentToolConfirmation(
         val resolvedTarget: String,
         val callFingerprint: String,
         val capabilityAuthorization: CapabilityAuthorizationSnapshot,
+        val confirmedModelIdentity: ModelIdentity? = null,
     )
 
     // ── In-memory pending state ─────────────────────────────────────────
@@ -98,6 +100,11 @@ class AgentToolConfirmation(
         if (chainId == null || currentChatId() != source) return null
         val safeCall = copyCall(call)
         if (!ToolCapabilityMapping.isMapped(safeCall.name)) return null
+        val modelIdentity = if (safeCall.name == "delete_model") {
+            confirmedDeleteIdentity(safeCall) ?: return null
+        } else {
+            null
+        }
         val capabilityAuthorization = capabilityRegistry.snapshot(
             ToolCapabilityMapping.capabilitiesFor(safeCall.name),
             requireAgentMode = true,
@@ -113,6 +120,7 @@ class AgentToolConfirmation(
             resolvedTarget = resolveTarget(safeCall, source),
             callFingerprint = fingerprint(safeCall),
             capabilityAuthorization = capabilityAuthorization,
+            confirmedModelIdentity = modelIdentity,
         )
         synchronized(this) {
             if (consumedToken != null) return null
@@ -229,6 +237,7 @@ class AgentToolConfirmation(
         id: String,
         call: AgentToolCall,
         definition: AgentToolDefinition,
+        modelIdentity: ModelIdentity? = null,
     ): PendingAgentToolAction {
         val sanitizedName = com.prismai.llmhost.util.SanitizerUtils.stripControlCharacters(call.name)
         val sanitizedDescription = com.prismai.llmhost.util.SanitizerUtils.stripControlCharacters(definition.description)
@@ -322,16 +331,32 @@ class AgentToolConfirmation(
             }
             "delete_model" -> {
                 val modelId = call.arguments.optString("model_id")
-                base.copy(
-                    title = "Delete installed model?",
-                    summary = "Delete GGUF model $modelId from app storage.",
-                    changes = listOf(
-                        "Model: $modelId",
-                    ),
-                    riskNotes = listOf("Permanently removes the GGUF model binary from device storage."),
-                    confirmLabel = "Delete Model",
-                    destructive = true,
-                )
+                if (modelIdentity == null || modelIdentity.modelId != modelId.trim()) {
+                    base.copy(
+                        title = "Delete installed model?",
+                        summary = "Delete was not bound to a version, hash, and path.",
+                        changes = listOf("Model: $modelId"),
+                        riskNotes = listOf("This confirmation cannot delete a model."),
+                        confirmLabel = "Delete Model",
+                        destructive = true,
+                    )
+                } else {
+                    base.copy(
+                        title = "Delete installed model?",
+                        summary = "Delete only this GGUF file. A newer version of $modelId will not be deleted.",
+                        changes = listOf(
+                            "Model: ${modelIdentity.modelId}",
+                            "Version: ${modelIdentity.versionId}",
+                            "SHA-256: ${modelIdentity.sha256}",
+                            "Path: ${modelIdentity.path}",
+                        ),
+                        riskNotes = listOf(
+                            "Permanently removes this version only. The delete is refused if the installed version, hash, or path changes.",
+                        ),
+                        confirmLabel = "Delete Model",
+                        destructive = true,
+                    )
+                }
             }
             "switch_model" -> {
                 val target = call.arguments.optString("model_id")
@@ -470,6 +495,12 @@ class AgentToolConfirmation(
     private fun resolveToolChatSession(chatIdArg: String): ChatSession? {
         val chatId = if (chatIdArg == "current" || chatIdArg.isBlank()) currentChatId() else chatIdArg
         return uiState.chatSessions.value.firstOrNull { it.id == chatId }
+    }
+
+    private fun confirmedDeleteIdentity(call: AgentToolCall): ModelIdentity? {
+        val modelId = call.arguments.optString("model_id").trim()
+        if (modelId.isBlank()) return null
+        return resolveModelIdentity(modelId)?.takeIf { it.modelId == modelId }
     }
 
     private fun copyCall(call: AgentToolCall): AgentToolCall =

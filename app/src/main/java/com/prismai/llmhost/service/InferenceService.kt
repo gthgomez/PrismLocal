@@ -81,6 +81,7 @@ import com.prismai.llmhost.generation.GenerationIdleInputs
 import com.prismai.llmhost.generation.GenerationIdlePolicy
 import com.prismai.llmhost.generation.GenerationStartGate
 import com.prismai.llmhost.generation.BackgroundGenerationOwnership
+import com.prismai.llmhost.generation.ServiceGenerationOwnership
 import com.prismai.llmhost.generation.GenerationMetrics
 import com.prismai.llmhost.generation.GenerationOrchestrator
 import com.prismai.llmhost.generation.PromptBuilder
@@ -158,7 +159,8 @@ class InferenceService : Service() {
     private var generationForegroundActive = false
     private val operationMutex = Mutex()
     private val generationStartGate = GenerationStartGate()
-    private val backgroundGenerationOwnership = BackgroundGenerationOwnership()
+    private val serviceGenerationOwnership = ServiceGenerationOwnership()
+    private val backgroundGenerationOwnership = serviceGenerationOwnership.engine
     @Volatile
     private var activeGenerationSource: String = "user"
     @Volatile
@@ -392,8 +394,19 @@ class InferenceService : Service() {
                 } finally {
                     withContext(NonCancellable) {
                         operationMutex.withLock {
+                            val createChat = backgroundGenerationOwnership.takeDeferredChatCreation(bgTask.id)
                             val deferredChatId = backgroundGenerationOwnership.finish(bgTask.id)
-                            applyPendingBackgroundChatSwitchLocked(bgTask.sourceChatId, deferredChatId)
+                            val applied = applyPendingBackgroundChatSwitchLocked(
+                                bgTask.sourceChatId,
+                                deferredChatId,
+                                createChat,
+                            )
+                            if (!applied) {
+                                if (deferredChatId != null) {
+                                    backgroundGenerationOwnership.parkDeferredChatSwitch(deferredChatId)
+                                }
+                                if (createChat) backgroundGenerationOwnership.parkDeferredChatCreation()
+                            }
                         }
                     }
                 }
@@ -405,12 +418,14 @@ class InferenceService : Service() {
                 }
             },
             isDeviceBusyWithUserGeneration = {
-                BackgroundGenerationOwnership.shouldDeferBackgroundTask(
-                    generationRunning = _isGenerating.value,
-                    confirmationPending = _pendingAgentToolAction.value != null,
-                    followUpScheduled = agentFollowUpScheduled,
-                    agentToolJobActive = hasActiveAgentToolJobs(),
-                )
+                confirmedChatTransitionChain.get() != null ||
+                    generationStartGate.isStartInProgress() ||
+                    serviceGenerationOwnership.mustDeferBackgroundTask(
+                        generationRunning = _isGenerating.value,
+                        confirmationPending = _pendingAgentToolAction.value != null,
+                        followUpScheduled = agentFollowUpScheduled,
+                        agentToolJobActive = hasActiveAgentToolJobs(),
+                    )
             },
         )
 
@@ -426,6 +441,9 @@ class InferenceService : Service() {
             currentChatId = { _currentChatId.value },
             pendingActionKey = { chatId -> pendingAgentActionKey(chatId) },
             getDeviceProfile = { getDeviceCapabilityProfileCached() },
+            resolveModelIdentity = { modelId ->
+                modelStorageManager.activeModelInfo(modelId)?.let(ModelIdentity::from)
+            },
         )
         agentToolRouter = AgentToolRouter(
             uiState = uiState,
@@ -501,7 +519,7 @@ class InferenceService : Service() {
             chatDirectory = { chatDirectory() },
             benchmarkFileSize = { benchmarkRunsFile().sizeRecursive() },
             chatIndexFile = { chatIndexFile() },
-            deleteModelSafely = { modelId -> deleteModel(modelId) },
+            deleteModelSafely = { modelId, identity -> deleteModel(modelId, identity) },
         )
         runtimeTools = com.prismai.llmhost.agent.tools.RuntimeTools(
             uiState = uiState,
@@ -707,8 +725,18 @@ class InferenceService : Service() {
         }
     }
 
-    suspend fun deleteModel(modelId: String): Boolean {
+    suspend fun deleteModel(modelId: String, confirmedIdentity: ModelIdentity? = null): Boolean {
         val confirmedAuthorization = currentCoroutineContext()[ConfirmedAgentOperationContext]?.authorization
+        val identity = when {
+            confirmedAuthorization?.call?.name == "delete_model" -> {
+                val confirmed = confirmedAuthorization.confirmedModelIdentity
+                if (confirmed == null || confirmed.modelId != modelId) return false
+                if (confirmedIdentity != null && confirmedIdentity != confirmed) return false
+                confirmed
+            }
+            confirmedIdentity != null -> confirmedIdentity
+            else -> return false
+        }
         return operationMutex.withLock {
             if (confirmedAuthorization != null &&
                 !agentTrace.isCurrentChain(confirmedAuthorization.chainId)
@@ -724,7 +752,7 @@ class InferenceService : Service() {
                     finalizeActiveTrace = !preserveConfirmedChain,
                     preserveActiveTrace = preserveConfirmedChain,
                 )
-                modelManager.deleteModel(modelId)
+                modelManager.deleteModel(modelId, identity)
             } finally {
                 if (preserveConfirmedChain) {
                     agentTrace.releaseChainPreservation(confirmedAuthorization.chainId)
@@ -755,6 +783,11 @@ class InferenceService : Service() {
     }
 
     fun createChat(): String {
+        if (backgroundGenerationOwnership.hasOwner()) {
+            backgroundGenerationOwnership.deferChatCreation()
+            publishUiEvent("Chat creation queued until the background task finishes")
+            return _currentChatId.value.orEmpty()
+        }
         if (_isGenerating.value || generationStartGate.isStartInProgress()) {
             publishUiEvent("Cancel generation before creating a new chat")
             return _currentChatId.value.orEmpty()
@@ -763,6 +796,7 @@ class InferenceService : Service() {
             reason = "Chat changed before tool confirmation",
             afterCleanup = {
                 generationStartGate.runChatTransition {
+                    if (_isGenerating.value || backgroundGenerationOwnership.hasOwner()) return@runChatTransition
                     chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
                     resetNativeConversationAsync("new chat")
                 }
@@ -920,8 +954,16 @@ class InferenceService : Service() {
     }
 
     private fun resetNativeConversationAsync(reason: String) {
+        val scheduledSession = generationSession
         serviceScope.launch {
             operationMutex.withLock {
+                if (generationSession != scheduledSession ||
+                    _isGenerating.value ||
+                    backgroundGenerationOwnership.hasOwner() ||
+                    generationStartGate.isStartInProgress()
+                ) {
+                    return@withLock
+                }
                 runCatching {
                     engine.resetConversation()
                     Log.d(TAG, "native conversation reset reason=$reason")
@@ -982,7 +1024,7 @@ class InferenceService : Service() {
                 return "Background task owns the engine"
             }
             if (initiatedByBackground &&
-                BackgroundGenerationOwnership.shouldDeferBackgroundTask(
+                serviceGenerationOwnership.mustDeferBackgroundTask(
                     generationRunning = _isGenerating.value,
                     confirmationPending = _pendingAgentToolAction.value != null ||
                         confirmedChatTransitionChain.get() != null,
@@ -999,22 +1041,15 @@ class InferenceService : Service() {
             val startGateReserved = true
             try {
                 if (initiatedByBackground) {
-                    if (!backgroundGenerationOwnership.isOwner(backgroundTaskId)) {
-                        throw IllegalStateException("Background task generation ownership changed")
-                    }
-                    val ownerChatId = sourceChatId?.takeIf { it.isNotBlank() }
-                        ?: throw IllegalStateException("Background task has no source chat owner")
-                    if (_chatSessions.value.none { it.id == ownerChatId }) {
-                        throw IllegalStateException("Background task source chat was deleted")
-                    }
-                    val selectedChatId = _currentChatId.value
-                    if (selectedChatId != ownerChatId) {
-                        if (!chatManager.switchChat(ownerChatId)) {
-                            throw IllegalStateException("Could not restore background task source chat")
-                        }
-                        engine.resetConversation()
-                        restoreChatId = selectedChatId
-                    }
+                    val prepared = serviceGenerationOwnership.prepareBackgroundChat(
+                        taskId = backgroundTaskId,
+                        sourceChatId = sourceChatId,
+                        selectedChatId = _currentChatId.value,
+                        chatExists = { id -> _chatSessions.value.any { it.id == id } },
+                        switchToSource = { id -> chatManager.switchChat(id) },
+                    )
+                    if (prepared.switchedToSource) engine.resetConversation()
+                    restoreChatId = prepared.restoreChatId
                 }
                 activeGenerationSource = if (initiatedByBackground) "background" else "user"
                 cancelAndJoinGenerationLocked(
@@ -1049,6 +1084,9 @@ class InferenceService : Service() {
         try {
             if (!awaitGenerationSessionIdle()) {
                 if (initiatedByBackground) {
+                    withContext(NonCancellable) {
+                        cancelGenerationAndJoin("background generation wait timed out")
+                    }
                     throw IllegalStateException("Generation session exceeded its bounded wait")
                 }
                 return "Generation session wait timed out"
@@ -1073,20 +1111,18 @@ class InferenceService : Service() {
             if (restoreChatId != null || backgroundTaskId != null) {
                 withContext(NonCancellable) {
                     operationMutex.withLock {
-                        if (!_isGenerating.value && !shouldWaitForGenerationSession() &&
-                            _currentChatId.value == sourceChatId
-                        ) {
-                            val requestedChatId = if (backgroundTaskId != null) {
-                                backgroundGenerationOwnership.takeDeferredChatSwitch(backgroundTaskId)
-                                    ?: restoreChatId
-                            } else restoreChatId
-                            if (requestedChatId != null &&
-                                _chatSessions.value.any { it.id == requestedChatId } &&
-                                chatManager.switchChat(requestedChatId)
-                            ) {
-                                agentToolConfirmation.restore()
-                                engine.resetConversation()
-                            }
+                        val requestedChatId = serviceGenerationOwnership.chatToRestore(
+                            taskId = backgroundTaskId,
+                            restoreChatId = restoreChatId,
+                            generating = _isGenerating.value,
+                            sessionStillWaiting = shouldWaitForGenerationSession(),
+                            currentChatId = _currentChatId.value,
+                            sourceChatId = sourceChatId,
+                            chatExists = { id -> _chatSessions.value.any { it.id == id } },
+                        )
+                        if (requestedChatId != null && chatManager.switchChat(requestedChatId)) {
+                            agentToolConfirmation.restore()
+                            engine.resetConversation()
                         }
                     }
                 }
@@ -1105,16 +1141,24 @@ class InferenceService : Service() {
     private suspend fun applyPendingBackgroundChatSwitchLocked(
         sourceChatId: String?,
         targetChatId: String?,
-    ) {
+        createChat: Boolean,
+    ): Boolean {
+        if (!createChat && targetChatId == null) return true
         if (_isGenerating.value || shouldWaitForGenerationSession() ||
             (sourceChatId != null && _currentChatId.value != sourceChatId)
-        ) return
-        if (targetChatId == null) return
-        if (_chatSessions.value.none { it.id == targetChatId }) return
-        if (chatManager.switchChat(targetChatId)) {
-            agentToolConfirmation.restore()
-            engine.resetConversation()
+        ) {
+            return false
         }
+        if (createChat) {
+            chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+            resetNativeConversationAsync("new chat")
+            return true
+        }
+        if (targetChatId == null || _chatSessions.value.none { it.id == targetChatId }) return true
+        if (!chatManager.switchChat(targetChatId)) return false
+        agentToolConfirmation.restore()
+        engine.resetConversation()
+        return true
     }
 
     private fun generationIdleInputs(): GenerationIdleInputs {
@@ -1591,7 +1635,11 @@ class InferenceService : Service() {
             "list_curated_downloadable_models" -> modelTools.listCuratedDownloadableModels(call)
             "get_download_status" -> modelTools.getDownloadStatus(call)
             "download_model" -> modelTools.downloadModel(call, confirmed)
-            "delete_model" -> modelTools.deleteModel(call, confirmed)
+            "delete_model" -> modelTools.deleteModel(
+                call,
+                confirmed,
+                confirmedIdentity = authorization?.confirmedModelIdentity,
+            )
             "recommend_runtime_settings" -> modelTools.recommendRuntimeSettings(call)
             "explain_runtime_settings" -> modelTools.explainRuntimeSettings(call)
             // ── Runtime tools ────────────────────────────────────────────────

@@ -233,6 +233,7 @@ class AgentToolRouter(
             id = authorization.token,
             call = authorization.call,
             definition = definition,
+            modelIdentity = authorization.confirmedModelIdentity,
         )
         authorization
     }

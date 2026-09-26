@@ -4,6 +4,7 @@ package com.prismai.llmhost.generation
 class BackgroundGenerationOwnership {
     private var ownerTaskId: String? = null
     private var deferredChatId: String? = null
+    private var deferredChatCreation = false
     private var ownerAgentChainId: Long? = null
 
     companion object {
@@ -19,7 +20,6 @@ class BackgroundGenerationOwnership {
     fun begin(taskId: String): Boolean {
         if (taskId.isBlank() || ownerTaskId != null) return false
         ownerTaskId = taskId
-        deferredChatId = null
         ownerAgentChainId = null
         return true
     }
@@ -44,9 +44,34 @@ class BackgroundGenerationOwnership {
 
     @Synchronized
     fun deferChatSwitch(chatId: String): Boolean {
-        if (ownerTaskId == null) return false
+        if (ownerTaskId == null || chatId.isBlank()) return false
         deferredChatId = chatId
         return true
+    }
+
+    @Synchronized
+    fun deferChatCreation(): Boolean {
+        if (ownerTaskId == null) return false
+        deferredChatCreation = true
+        return true
+    }
+
+    @Synchronized
+    fun takeDeferredChatCreation(taskId: String): Boolean {
+        if (ownerTaskId != taskId || !deferredChatCreation) return false
+        deferredChatCreation = false
+        return true
+    }
+
+    /** Puts a switch back after release when it could not be applied yet. */
+    @Synchronized
+    fun parkDeferredChatSwitch(chatId: String) {
+        if (chatId.isNotBlank()) deferredChatId = chatId
+    }
+
+    @Synchronized
+    fun parkDeferredChatCreation() {
+        deferredChatCreation = true
     }
 
     @Synchronized

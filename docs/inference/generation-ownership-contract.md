@@ -26,8 +26,10 @@
   than recording a false completion. Deletion of an active source chat is
   rejected; queued tasks from a deleted chat are invalidated. Legacy queued
   records without an owner fail closed rather than adopting the selected chat.
-  Service integration coverage remains limited and must be completed before
-  claiming full acceptance.
+  Service admission, source-chat restore, deferred chat switch, and follow-up
+  ownership are covered by `ServiceGenerationOwnershipTest`. Connected
+  instrumentation of `InferenceService` is still required before device
+  qualification.
 - **Authorization revision** is a capability-policy revision captured with a
   confirmation. Revocation advances the revision. A confirmation must match the
   current revision and capabilities when consumed and when admitted for
@@ -48,18 +50,19 @@ they are not aliases for one global epoch.
   the chat ID. The current candidate CI is pending.
 - Model storage uses a process-wide mutation gate; matching WorkManager downloads
   are cancelled on deletion and stale in-process download revisions cannot
-  promote. Deletion is still ID-bound, not version/hash-bound. Android
-  instrumentation was added but is not yet compiled or executed.
+  promote. `delete_model` confirmation records version, SHA-256, and path, and
+  deletion under the storage gate refuses a different installed identity.
+  Android instrumentation source covers that refusal. It has been compiled in
+  CI and has not been executed on a device.
 - Trace minimization, owner binding, deletion suppression, and bounded retention
   are in the candidate. Trace artifacts have schema version 1, and cleanup
   runs both at initialization and publication. Exact latest-candidate review
   and checks are pending.
 - Waiters now receive session-specific output captured from their own stream
   callbacks, with latest-turn aggregation scoped to an agent-chain ID. The
-  bounded result store and exact-candidate tests still need independent review.
-  Source-owned background service orchestration is implemented in the current
-  worktree but awaits candidate review and CI. Model deletion still lacks the
-  required confirmation snapshot of version/hash/path.
+  bounded result store. Source-owned background admission is exercised through
+  the service ownership helper. Model deletion confirmation now snapshots
+  version, SHA-256, and path and revalidates that identity before removal.
 
 ## Persisted content privacy policy
 
@@ -106,9 +109,10 @@ they are not aliases for one global epoch.
    waiters retain their owner result until release. Adversarial interleaving
    review remains pending.
 4. Queued work keeps its source chat and never resolves transcript or result
-   destinations from the currently selected chat. Queue persistence and source
-   deletion invalidation are implemented; service orchestration still requires
-   exact-candidate review and CI.
+   destinations from the currently selected chat. Queue persistence, source
+   deletion invalidation, and the service helper that restores the source chat
+   and applies a deferred switch only after release are covered by JVM tests.
+   Connected service execution remains a device-qualification item.
 5. Capability validation and dispatch admission are serialized with revocation.
    A revocation that wins the ordering rejects the operation; an operation
    admitted first is considered in flight and may complete without implying
@@ -117,7 +121,9 @@ they are not aliases for one global epoch.
    before removing files. Older asynchronous writes cannot recreate the chat's
    content or artifacts.
 7. Model import/download promotion and deletion share a model-storage
-   lifecycle boundary and revalidate model identity inside it.
+   lifecycle boundary. A confirmed delete revalidates the reviewed version,
+   SHA-256, and path inside that boundary and does not remove a different
+   identity.
 
 ## Acceptance criteria
 

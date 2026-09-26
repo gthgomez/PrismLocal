@@ -8,6 +8,8 @@ import com.prismai.llmhost.CapabilityRegistry
 import com.prismai.llmhost.TranscriptRole
 import com.prismai.llmhost.tools.AgentToolCall
 import com.prismai.llmhost.tools.AgentToolResult
+import com.prismai.llmhost.storage.ModelIdentity
+import com.prismai.llmhost.storage.ModelStorageManager
 import com.prismai.llmhost.ui.ServiceUiState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -640,6 +642,68 @@ class AgentToolRouterTraceTest {
         assertEquals(newChainId, harness.trace.activeChainId)
         assertEquals(0, followUps.get())
         assertTrue(harness.artifacts.tryReceive().isFailure)
+    }
+
+    @Test
+    fun deleteConfirmationRecordsVersionHashAndPath() {
+        val modelFile = tempFolder.newFile("reviewed.gguf")
+        val installed = ModelStorageManager.ActiveModelInfo(
+            id = "reviewed-model",
+            versionId = "version-7",
+            file = modelFile,
+            fileName = "reviewed.gguf",
+            sha256 = "abc123",
+            bytes = 4L,
+            importedAt = "2026-09-26T00:00:00Z",
+            validation = ModelStorageManager.ModelValidation(
+                format = "GGUF",
+                ggufVersion = 3,
+                status = "imported",
+                validatedAt = "2026-09-26T00:00:00Z",
+            ),
+        )
+        val identity = checkNotNull(ModelIdentity.from(installed))
+        val uiState = ServiceUiState()
+        uiState._generationSettings.value = GenerationSettings(maxAgentIterations = 5)
+        val confirmation = AgentToolConfirmation(
+            uiState = uiState,
+            prefs = FakeSharedPreferences(),
+            currentChatId = { "chat-1" },
+            pendingActionKey = { "pending_$it" },
+            getDeviceProfile = { safeProfile() },
+            capabilityRegistry = agentEnabledRegistry(),
+            resolveModelIdentity = { modelId -> identity.takeIf { modelId == installed.id } },
+        )
+
+        assertNull(
+            confirmation.stagePending(
+                call = AgentToolCall("delete_model", JSONObject().put("model_id", "missing-model")),
+                originalPrompt = "delete it",
+                depth = 0,
+                chainId = 4L,
+                sourceChatId = "chat-1",
+            ),
+        )
+        val staged = checkNotNull(
+            confirmation.stagePending(
+                call = AgentToolCall("delete_model", JSONObject().put("model_id", installed.id)),
+                originalPrompt = "delete it",
+                depth = 0,
+                chainId = 4L,
+                sourceChatId = "chat-1",
+            ),
+        )
+
+        assertEquals(identity, staged.confirmedModelIdentity)
+        val card = confirmation.build(
+            id = staged.token,
+            call = staged.call,
+            definition = com.prismai.llmhost.tools.AgentToolRegistry.definitions.first { it.name == "delete_model" },
+            modelIdentity = staged.confirmedModelIdentity,
+        )
+        assertTrue(card.changes.any { it.contains(identity.versionId) })
+        assertTrue(card.changes.any { it.contains(identity.sha256) })
+        assertTrue(card.changes.any { it.contains(identity.path) })
     }
 
     private fun newHarness(

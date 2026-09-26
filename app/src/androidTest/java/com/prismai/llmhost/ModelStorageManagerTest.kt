@@ -227,6 +227,30 @@ class ModelStorageManagerTest {
     }
 
     @Test
+    fun deleteRejectsUnconfirmedIdentityAndRemovesTheReviewedModel() {
+        val manager = ModelStorageManager(context)
+        val modelId = "identity-model"
+        cleanup(modelId)
+        try {
+            val imported = manager.importModelFromStream(
+                displayName = "$modelId.gguf",
+                reportedSize = validGgufBytes().size.toLong(),
+                input = ByteArrayInputStream(validGgufBytes()),
+            )
+            assertTrue(imported is ModelStorageManager.ImportResult.Success)
+            val installed = (imported as ModelStorageManager.ImportResult.Success).model
+            val identity = checkNotNull(ModelIdentity.from(installed))
+
+            assertFalse(manager.deleteModel(modelId, identity.copy(sha256 = "f".repeat(64))))
+            assertTrue(installed.file.exists())
+            assertTrue(manager.deleteModel(modelId, identity))
+            assertFalse(File(modelsDir(), modelId).exists())
+        } finally {
+            cleanup(modelId)
+        }
+    }
+
+    @Test
     fun deletionRevisionRejectsDownloadPromotionThatStartedEarlier() {
         val manager = ModelStorageManager(context)
         val modelId = "download-delete-race"

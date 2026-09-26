@@ -628,7 +628,9 @@ fun ChatScreen(
                                     isGenerating = isGenerating,
                                     serviceAvailable = service != null,
                                     onSwitchModel = onSwitchModel,
-                                    onDeleteModel = { modelId -> scope.launch { service?.deleteModel(modelId) } },
+                                    onDeleteModel = { identity ->
+                                        scope.launch { service?.deleteModel(identity.modelId, identity) }
+                                    },
                                     onImportModel = {
                                         onImportPickerStarted()
                                         importLauncher.launch(arrayOf("*/*"))

@@ -166,7 +166,7 @@ class AgentToolRouterTraceTest {
 
     @Test
     fun stalePendingCancellationCannotFinalizeNewChain() = runBlocking {
-        val harness = newHarness()
+        val harness = newHarness(capabilityRegistry = agentEnabledRegistry())
         val oldChainId = harness.trace.beginChain("old prompt")
         val call = AgentToolCall("restore_previous_runtime_settings")
         harness.router.handleToolCall(call, "old prompt", depth = 0, chainId = oldChainId)

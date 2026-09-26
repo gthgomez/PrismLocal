@@ -48,14 +48,6 @@ class ModelStorageManager(private val context: Context) {
     private val modelsDir: File
         get() = context.getExternalFilesDir("models") ?: File(context.filesDir, "models")
 
-    companion object {
-        internal fun modelIdFromDisplayName(displayName: String): String {
-            val withoutExtension = displayName.removeSuffix(".gguf")
-            val cleaned = withoutExtension.replace(Regex("[^A-Za-z0-9._-]+"), "-").trim('-', '.', '_')
-            return cleaned.ifBlank { "imported-model" }
-        }
-    }
-
     data class ActiveModelInfo(
         val id: String,
         val versionId: String,
@@ -948,7 +940,13 @@ class ModelStorageManager(private val context: Context) {
         }
     }
 
-    private companion object {
+    companion object {
+        internal fun modelIdFromDisplayName(displayName: String): String {
+            val withoutExtension = displayName.removeSuffix(".gguf")
+            val cleaned = withoutExtension.replace(Regex("[^A-Za-z0-9._-]+"), "-").trim('-', '.', '_')
+            return cleaned.ifBlank { "imported-model" }
+        }
+
         const val TAG = "ModelStorageManager"
         const val MANIFEST_FILE = "manifest.json"
         const val MODEL_FILE = "model.gguf"

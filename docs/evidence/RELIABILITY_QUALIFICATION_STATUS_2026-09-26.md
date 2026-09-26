@@ -6,14 +6,14 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
 ## Evidence observed
 
 - **OBSERVED — current candidate:** PR #13 is open at
-  `020f88782466ab7262d3925c14fcc908b20a8363`. It contains native lifecycle
+  `fcc77f2` plus the pending status-document update. It contains native lifecycle
   gating, transactional batch acknowledgement, carrier version 2, trace
   minimization, transcript write invalidation, model storage lifecycle
   coordination, background-task persistence minimization, and the fix for a
-  duplicate Kotlin companion declaration. Exact-candidate Dev/Play JVM and
-  sanitized host CTest jobs passed. The DevDebug instrumentation APK compiled;
-  benchmark/release native builds are still running. No independent review has
-  covered this SHA.
+  duplicate Kotlin companion declaration. A further #16 fix binds confirmation
+  dispatch admission to agent-mode state and adds a test for a capability that
+  remains granted after disablement. Exact-candidate checks for this change and
+  fresh independent review are pending.
 - **VERIFIED — host contract:** standalone native host CMake build completed and
   CTest passed 9/9, including lifecycle-gate serialization and tail-checked
   acknowledgement validation. These tests compile portable production headers;
@@ -40,8 +40,8 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
   snapshots; deletion also retires the chat ID and serializes file removal
   against active publications. Deterministic production-gate barrier tests
   passed in both unit variants on candidate `2b9015c`; atomic-publication
-  refinement is included in the current candidate; both Dev/Play test suites
-  pass on `020f887`.
+  refinement is included in candidate `020f887`; both Dev/Play test suites
+  passed there.
 - **OBSERVED — model storage change:** a process-wide gate serializes import
   promotion and deletion. Download requests are tagged by model owner, deletion
   cancels matching work, and a captured revision rejects stale promotion. New
@@ -51,7 +51,13 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
 - **VERIFIED — background-task privacy:** queued/running prompts remain stored
   for restart recovery. Completed records omit prompts and cap saved result
   summaries at 120 characters. A regression assertion checks this file format;
-  the JVM suites pass on `020f887`.
+  the JVM suites passed on `020f887`.
+- **OBSERVED — authorization review/fix:** a fresh review of `eace9bf` found
+  that disabling agent mode could race between confirmation validation and
+  dispatch for capabilities that remain granted. The new snapshot records that
+  agent mode is required, mode changes advance the policy revision, and
+  settings updates revoke admission before publishing the disabled state.
+  Regression verification is pending on the current candidate.
 - **OBSERVED — remaining code gaps:** reset/session wait ownership (#15),
   version/hash-bound delete confirmation (#17), and source-chat execution and
   persistence for queued background tasks (#20) remain incomplete. The product
@@ -67,11 +73,13 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
 
 ## Qualification gaps
 
-- **OBSERVED — exact candidate CI:** on `020f88782466ab7262d3925c14fcc908b20a8363`,
+- **VERIFIED — prior exact candidate CI:** on `020f88782466ab7262d3925c14fcc908b20a8363`,
   both host CTest jobs and both Dev/Play JVM jobs passed. The DevDebug Android
   instrumentation APK compiled successfully. The unsigned benchmark/release
-  native build remains in progress. No connected instrumentation run is
-  recorded.
+  build was still running at the last observation. No connected instrumentation
+  run is recorded.
+- **OBSERVED — current candidate CI:** checks for `fcc77f2` are pending; these
+  must be rerun after the status-document commit changes the PR head.
 - **BLOCKED:** connected emulator execution of the new JNI schema, slow-consumer,
   cancellation/reset and stale-generation instrumentation. The current host has
   no attached ADB device and the local Gradle configuration stops at the

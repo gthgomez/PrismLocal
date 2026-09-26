@@ -212,7 +212,9 @@ class AgentTraceContinuationTest {
         val chain = trace.beginChain("retention fixture")
         trace.finalizeOwnedTrace(chain, success = true)
         withTimeout(2_000) {
-            while (tracesDir.listFiles()?.any { it.name.startsWith("agent_trace_") } != true) kotlinx.coroutines.delay(2)
+            while (expired.exists() || tracesDir.listFiles()?.any { it.name.startsWith("agent_trace_") } != true) {
+                kotlinx.coroutines.delay(2)
+            }
         }
 
         assertFalse(expired.exists())

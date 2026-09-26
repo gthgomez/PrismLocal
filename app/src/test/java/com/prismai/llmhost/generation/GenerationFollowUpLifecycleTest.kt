@@ -39,6 +39,7 @@ class GenerationFollowUpLifecycleTest {
             uiState = ServiceUiState(),
             filesDir = tempFolder.newFolder(),
             scope = scope,
+            rawContentOptIn = true,
             writeArtifact = { _, json -> artifacts.trySend(json) },
         )
         val chainId = trace.beginChain("original prompt")

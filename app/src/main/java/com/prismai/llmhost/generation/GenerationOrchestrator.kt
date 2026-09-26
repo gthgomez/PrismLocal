@@ -83,6 +83,8 @@ class GenerationOrchestrator(
     private val onBenchmarkComplete: () -> Unit = {},
     private val onBeforeChatIdentityChange: suspend (String, suspend () -> Unit) -> Unit = { _, mutation -> mutation() },
 ) {
+    private val generationResults = GenerationResultStore()
+
     companion object {
         private const val TAG = "GenOrchestrator"
         /** Soft warning threshold only — does not hard-block generation (B4). */
@@ -132,6 +134,15 @@ class GenerationOrchestrator(
             return resolved
         }
     }
+
+    fun outputForGeneration(sessionId: Long, agentChainId: Long? = null): String? =
+        generationResults.outputFor(sessionId, agentChainId)
+
+    fun retainGenerationOutput(sessionId: Long?, agentChainId: Long?) =
+        generationResults.retain(sessionId, agentChainId)
+
+    fun releaseGenerationOutput(sessionId: Long?, agentChainId: Long?) =
+        generationResults.release(sessionId, agentChainId)
 
     // ── Flow deduplication types ─────────────────────────────────────────
 
@@ -600,6 +611,7 @@ class GenerationOrchestrator(
         agentChainId: Long? = null,
         onComplete: (GenerationFlowResult) -> Unit,
     ): Job {
+        val sessionOutput = GenerationOutputAccumulator(uiState.streamState.snapshotText())
         var firstTokenAt: Long? = null
         var generatedTokens = 0
         var promptTokens = 0
@@ -622,6 +634,7 @@ class GenerationOrchestrator(
                     return@onEach
                 }
                 val uiChunk = Utf8TextPipeline.normalizeChunk(chunk)
+                if (uiChunk.text.isNotEmpty()) sessionOutput.append(uiChunk.text)
                 val now = SystemClock.elapsedRealtime()
                 if (promptTokens == 0 && chunk.promptTokens > 0) {
                     promptTokens = chunk.promptTokens
@@ -745,6 +758,8 @@ class GenerationOrchestrator(
                 }
             }
             .onCompletion { cause ->
+                val ownedOutput = sessionOutput.snapshot()
+                generationResults.record(session, agentChainId, ownedOutput)
                 val ownsAgentChain = agentChainId == null || agentTrace.isCurrentChain(agentChainId)
                 if (session != getActiveSession() || !ownsAgentChain) {
                     if (agentChainId != null && agentTrace.isCurrentChain(agentChainId)) {
@@ -790,7 +805,7 @@ class GenerationOrchestrator(
                     terminalReason = finalReason,
                     promptTokens = promptTokens,
                 )
-                val finalOutput = uiState.streamState.snapshotText()
+                val finalOutput = ownedOutput
 
                 onComplete(
                     GenerationFlowResult(

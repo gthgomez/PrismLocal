@@ -973,6 +973,9 @@ class InferenceService : Service() {
             return "Chat transition in progress"
         }
         var restoreChatId: String? = null
+        var resultSessionId: Long? = null
+        var resultAgentChainId: Long? = null
+        var resultRetained = false
         operationMutex.withLock {
             if (!initiatedByBackground && backgroundGenerationOwnership.hasOwner()) {
                 publishUiEvent("A background task currently owns the generation engine")
@@ -1021,7 +1024,18 @@ class InferenceService : Service() {
                 if (benchmarkPreset == null && _currentChatId.value == null) {
                     ensureChatForGeneration()
                 }
+                val previousSessionId = generationSession
+                val previousAgentChainId = agentTrace.activeChainId
                 generationOrchestrator.generate(prompt, benchmarkPreset)
+                if (generationSession != previousSessionId) resultSessionId = generationSession
+                val startedAgentChainId = agentTrace.activeChainId
+                if (startedAgentChainId != previousAgentChainId) {
+                    resultAgentChainId = startedAgentChainId
+                }
+                if (resultSessionId != null || resultAgentChainId != null) {
+                    generationOrchestrator.retainGenerationOutput(resultSessionId, resultAgentChainId)
+                    resultRetained = true
+                }
                 if (initiatedByBackground) {
                     backgroundGenerationOwnership.bindAgentChain(
                         backgroundTaskId.orEmpty(),
@@ -1042,13 +1056,20 @@ class InferenceService : Service() {
             if (initiatedByBackground && !backgroundGenerationOwnership.isOwner(backgroundTaskId)) {
                 throw IllegalStateException("Background task generation ownership changed")
             }
-            return streamState.snapshotText().takeIf { it.isNotBlank() } ?: "Background task completed"
+            val ownedOutput = generationOrchestrator.outputForGeneration(
+                sessionId = resultSessionId ?: -1L,
+                agentChainId = resultAgentChainId,
+            )
+            return ownedOutput?.takeIf { it.isNotBlank() } ?: "Background task completed"
         } catch (cancelled: CancellationException) {
             withContext(NonCancellable) {
                 cancelGenerationAndJoin("generation owner cancelled")
             }
             throw cancelled
         } finally {
+            if (resultRetained) {
+                generationOrchestrator.releaseGenerationOutput(resultSessionId, resultAgentChainId)
+            }
             if (restoreChatId != null || backgroundTaskId != null) {
                 withContext(NonCancellable) {
                     operationMutex.withLock {

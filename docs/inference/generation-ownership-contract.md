@@ -54,11 +54,12 @@ they are not aliases for one global epoch.
   are in the candidate. Trace artifacts have schema version 1, and cleanup
   runs both at initialization and publication. Exact latest-candidate review
   and checks are pending.
-- Waiters still need a session-specific result carrier and deterministic proof
-  that an older waiter cannot observe later stream text. Source-owned background
-  service orchestration is implemented in the current worktree but awaits
-  candidate review and CI. Model deletion still lacks the required confirmation
-  snapshot of version/hash/path.
+- Waiters now receive session-specific output captured from their own stream
+  callbacks, with latest-turn aggregation scoped to an agent-chain ID. The
+  bounded result store and exact-candidate tests still need independent review.
+  Source-owned background service orchestration is implemented in the current
+  worktree but awaits candidate review and CI. Model deletion still lacks the
+  required confirmation snapshot of version/hash/path.
 
 ## Persisted content privacy policy
 
@@ -100,8 +101,10 @@ they are not aliases for one global epoch.
    unacknowledged and discards it only after the cancelled producer joins under
    the lifecycle gate; it is never delivered as another generation's data.
 3. A waiter observes only its captured generation/task result and uses a
-   bounded deadline that includes joins. The bounded deadline is implemented;
-   session-specific result isolation remains open.
+   bounded deadline that includes joins. Result storage is keyed by generation
+   or agent-chain identity and bounded to recent completed outputs; active
+   waiters retain their owner result until release. Adversarial interleaving
+   review remains pending.
 4. Queued work keeps its source chat and never resolves transcript or result
    destinations from the currently selected chat. Queue persistence and source
    deletion invalidation are implemented; service orchestration still requires

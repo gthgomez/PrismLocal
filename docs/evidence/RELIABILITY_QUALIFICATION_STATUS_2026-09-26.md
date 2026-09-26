@@ -6,18 +6,22 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
 ## Evidence observed
 
 - **OBSERVED — current candidate:** PR #13 is open at
-  code candidate `12bb1db` (the current status-document update is a later
+  code candidate `3e1db88` (the current status-document update is a later
   documentation-only commit). It contains native lifecycle
   gating, transactional batch acknowledgement, carrier version 2, trace
   minimization, transcript write invalidation, model storage lifecycle
   coordination, background-task persistence minimization, and the fix for a
   duplicate Kotlin companion declaration. A further #16 fix binds confirmation
   dispatch admission to agent-mode state and adds a test for a capability that
-  remains granted after disablement. On `12bb1db`, Dev/Play JVM and sanitized
-  host CTest jobs passed. The DevDebug instrumentation compile and
-  benchmark/release builds are still running. A fresh review found the #16
-  admission fix sound; it recommends holding integration for remaining #15,
-  #17, #20, and #21 criteria.
+  remains granted after disablement. The final code commit `3e1db88` corrects
+  a test fixture so the stale pending cancellation case actually stages an
+  agent confirmation. On this exact candidate, both duplicated Dev/Play JVM
+  jobs and both sanitized host CTest jobs passed. The DevDebug instrumentation
+  compile and unsigned benchmark/release builds remain pending in both
+  duplicated CI runs. A fresh read-only review of
+  `3e1db8802c57d09f13342618ea17e7ba628268f2` confirms the fixture correction
+  and recommends holding integration for remaining #15, #17, #20, and #21
+  criteria.
 - **VERIFIED — host contract:** standalone native host CMake build completed and
   CTest passed 9/9, including lifecycle-gate serialization and tail-checked
   acknowledgement validation. These tests compile portable production headers;
@@ -84,11 +88,13 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
   instrumentation APK compiled successfully. The unsigned benchmark/release
   build was still running at the last observation. No connected instrumentation
   run is recorded.
-- **VERIFIED — current candidate CI:** on `12bb1dbed05124cc99b6187e3710ff643b62bb29`,
-  both host CTest jobs and both Dev/Play JVM jobs passed. The DevDebug Android
-  instrumentation APK compile and unsigned benchmark/release builds are still
-  running. This status-document commit changes the PR head, requiring exact-head
-  checks again.
+- **VERIFIED — current code candidate CI:** on
+  `3e1db8802c57d09f13342618ea17e7ba628268f2`, both host CTest jobs and both
+  Dev/Play JVM jobs passed. The DevDebug Android instrumentation APK compile
+  and unsigned benchmark/release builds are pending in both duplicated CI runs.
+  The preceding `d8f7351` candidate had one test-fixture failure; the fixture
+  correction is included in `3e1db88`. This status-document commit changes the
+  PR head, requiring exact-head checks again.
 - **BLOCKED:** connected emulator execution of the new JNI schema, slow-consumer,
   cancellation/reset and stale-generation instrumentation. The current host has
   no attached ADB device and the local Gradle configuration stops at the

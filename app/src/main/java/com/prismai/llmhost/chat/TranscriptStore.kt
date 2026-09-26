@@ -19,6 +19,7 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.util.UUID
 
 /**
  * File I/O for chat transcripts and the chat index.
@@ -79,6 +80,16 @@ class TranscriptStore(private val context: Context) {
         }.getOrDefault(emptyList())
 
     fun writeTranscriptFile(file: File, messages: List<TranscriptMessage>) {
+        val temp = prepareTranscriptFile(file, messages)
+        try {
+            promoteTempFile(temp, file)
+        } finally {
+            temp.delete()
+        }
+    }
+
+    /** Serializes to an owner-unique temporary file without publishing it. */
+    fun prepareTranscriptFile(file: File, messages: List<TranscriptMessage>): File {
         val array = JSONArray()
         messages.forEach { message ->
             val obj = JSONObject()
@@ -91,9 +102,14 @@ class TranscriptStore(private val context: Context) {
             array.put(obj)
         }
         file.parentFile?.mkdirs()
-        val temp = File(file.parentFile ?: context.filesDir, "${file.name}.tmp")
-        temp.writeText(array.toString())
-        promoteTempFile(temp, file)
+        val temp = File(file.parentFile ?: context.filesDir, "${file.name}.${UUID.randomUUID()}.tmp")
+        return try {
+            temp.writeText(array.toString())
+            temp
+        } catch (error: Throwable) {
+            temp.delete()
+            throw error
+        }
     }
 
     // ── Atomic temp-file promotion ──────────────────────────────────────

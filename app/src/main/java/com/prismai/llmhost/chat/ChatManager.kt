@@ -414,10 +414,17 @@ class ChatManager(
     ) {
         ioMutex.withLock {
             runCatching {
-                transcriptWriteGate.publish(chatId, expectedRevision) {
-                    val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == chatId }?.title
-                    searchIndex.update(chatId, messages, sessionTitle)
-                    transcriptStore.writeTranscriptFile(transcriptStore.transcriptFile(chatId), messages)
+                val target = transcriptStore.transcriptFile(chatId)
+                val temp = transcriptStore.prepareTranscriptFile(target, messages)
+                var promoted = false
+                try {
+                    promoted = transcriptWriteGate.publish(chatId, expectedRevision) {
+                        val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == chatId }?.title
+                        searchIndex.update(chatId, messages, sessionTitle)
+                        transcriptStore.promoteTempFile(temp, target)
+                    }
+                } finally {
+                    if (!promoted) temp.delete()
                 }
             }.onFailure { error ->
                 Log.w(TAG, "failed to persist transcript for $chatId", error)

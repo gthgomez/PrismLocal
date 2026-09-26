@@ -1682,12 +1682,13 @@ class InferenceService : Service() {
 
     private fun persistTranscriptNow() {
         val chatId = _currentChatId.value ?: return
+        val revision = chatManager.transcriptWriteRevision(chatId)
         val messages = synchronized(transcriptLock) {
             _transcript.value
         }
         serviceScope.launch(Dispatchers.IO) {
             runCatching {
-                chatManager.persistTranscript(chatId, messages)
+                chatManager.persistTranscript(chatId, messages, revision)
             }.onFailure { error ->
                 Log.w(TAG, "failed to persist transcript", error)
             }

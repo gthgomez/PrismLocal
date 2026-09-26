@@ -43,6 +43,7 @@ class ChatManager(
     private val scope: CoroutineScope,
 ) {
     private val ioMutex = Mutex()
+    private val transcriptWriteGate = TranscriptWriteGate()
 
     // ── Public fields — accessed from InferenceService via delegation props ──
     @Volatile
@@ -142,13 +143,26 @@ class ChatManager(
         }
 
         val remaining = uiState._chatSessions.value.filterNot { it.id == chatId }
-        runCatching { transcriptStore.transcriptFile(chatId).delete() }
+        runCatching {
+            transcriptWriteGate.invalidateAndRun(chatId, retireOwner = true) {
+                transcriptStore.transcriptFile(chatId).delete()
+            }
+        }
             .onFailure { error -> Log.w(TAG, "failed to delete chat transcript", error) }
 
         if (remaining.isEmpty()) {
-            uiState._chatSessions.value = emptyList()
-            // Create a new chat to replace the deleted one
-            createChat()
+            synchronized(lock) {
+                uiState._chatSessions.value = emptyList()
+                uiState._currentChatId.value = null
+                uiState._transcript.value = emptyList()
+                nextTranscriptId = 1L
+                activeAssistantTranscriptId = null
+                lastTranscriptPersistAt = 0L
+            }
+            uiState.streamState.clear()
+            // Clear the deleted owner before creating its replacement so no
+            // later snapshot can be attributed to the new chat.
+            createChatInternal(ChatTitles.DEFAULT_TITLE)
             return true
         }
 
@@ -186,8 +200,10 @@ class ChatManager(
         uiState.streamState.clear()
         touchCurrentChat(emptyList(), updateTitle = false)
         runCatching {
-            uiState._currentChatId.value?.let {
-                transcriptStore.transcriptFile(it).delete()
+            uiState._currentChatId.value?.let { chatId ->
+                transcriptWriteGate.invalidateAndRun(chatId) {
+                    transcriptStore.transcriptFile(chatId).delete()
+                }
             }
         }.onFailure { error ->
             Log.w(TAG, "failed to delete transcript", error)
@@ -388,12 +404,21 @@ class ChatManager(
     // ── Persist transcript to disk (thread-safe under ioMutex) ─────────────
 
     /** Persists transcript messages for [chatId] under [ioMutex] to avoid disk races. */
-    suspend fun persistTranscript(chatId: String, messages: List<TranscriptMessage>) {
+    fun transcriptWriteRevision(chatId: String): Long =
+        transcriptWriteGate.snapshotRevision(chatId)
+
+    suspend fun persistTranscript(
+        chatId: String,
+        messages: List<TranscriptMessage>,
+        expectedRevision: Long,
+    ) {
         ioMutex.withLock {
             runCatching {
-                val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == chatId }?.title
-                searchIndex.update(chatId, messages, sessionTitle)
-                transcriptStore.writeTranscriptFile(transcriptStore.transcriptFile(chatId), messages)
+                transcriptWriteGate.publish(chatId, expectedRevision) {
+                    val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == chatId }?.title
+                    searchIndex.update(chatId, messages, sessionTitle)
+                    transcriptStore.writeTranscriptFile(transcriptStore.transcriptFile(chatId), messages)
+                }
             }.onFailure { error ->
                 Log.w(TAG, "failed to persist transcript for $chatId", error)
             }
@@ -404,9 +429,10 @@ class ChatManager(
 
     private fun persistTranscriptNow() {
         val chatId = uiState._currentChatId.value ?: return
+        val revision = transcriptWriteRevision(chatId)
         val messages = uiState._transcript.value
         scope.launch(Dispatchers.IO) {
-            persistTranscript(chatId, messages)
+            persistTranscript(chatId, messages, revision)
         }
     }
 }

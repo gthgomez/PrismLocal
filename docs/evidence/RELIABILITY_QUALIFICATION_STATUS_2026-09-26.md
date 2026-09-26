@@ -6,14 +6,18 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
 ## Evidence observed
 
 - **OBSERVED — current candidate:** PR #13 is open at
-  `fcc77f2` plus the pending status-document update. It contains native lifecycle
+  code candidate `12bb1db` (the current status-document update is a later
+  documentation-only commit). It contains native lifecycle
   gating, transactional batch acknowledgement, carrier version 2, trace
   minimization, transcript write invalidation, model storage lifecycle
   coordination, background-task persistence minimization, and the fix for a
   duplicate Kotlin companion declaration. A further #16 fix binds confirmation
   dispatch admission to agent-mode state and adds a test for a capability that
-  remains granted after disablement. Exact-candidate checks for this change and
-  fresh independent review are pending.
+  remains granted after disablement. On `12bb1db`, Dev/Play JVM and sanitized
+  host CTest jobs passed. The DevDebug instrumentation compile and
+  benchmark/release builds are still running. A fresh review found the #16
+  admission fix sound; it recommends holding integration for remaining #15,
+  #17, #20, and #21 criteria.
 - **VERIFIED — host contract:** standalone native host CMake build completed and
   CTest passed 9/9, including lifecycle-gate serialization and tail-checked
   acknowledgement validation. These tests compile portable production headers;
@@ -57,7 +61,9 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
   dispatch for capabilities that remain granted. The new snapshot records that
   agent mode is required, mode changes advance the policy revision, and
   settings updates revoke admission before publishing the disabled state.
-  Regression verification is pending on the current candidate.
+  The regression test now stages and consumes a `rename_current_chat`
+  confirmation, disables agent mode while `CHAT_MANAGE` remains granted, and
+  verifies dispatch admission is denied. Exact-candidate unit tests passed.
 - **OBSERVED — remaining code gaps:** reset/session wait ownership (#15),
   version/hash-bound delete confirmation (#17), and source-chat execution and
   persistence for queued background tasks (#20) remain incomplete. The product
@@ -78,8 +84,11 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
   instrumentation APK compiled successfully. The unsigned benchmark/release
   build was still running at the last observation. No connected instrumentation
   run is recorded.
-- **OBSERVED — current candidate CI:** checks for `fcc77f2` are pending; these
-  must be rerun after the status-document commit changes the PR head.
+- **VERIFIED — current candidate CI:** on `12bb1dbed05124cc99b6187e3710ff643b62bb29`,
+  both host CTest jobs and both Dev/Play JVM jobs passed. The DevDebug Android
+  instrumentation APK compile and unsigned benchmark/release builds are still
+  running. This status-document commit changes the PR head, requiring exact-head
+  checks again.
 - **BLOCKED:** connected emulator execution of the new JNI schema, slow-consumer,
   cancellation/reset and stale-generation instrumentation. The current host has
   no attached ADB device and the local Gradle configuration stops at the

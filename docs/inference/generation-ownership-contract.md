@@ -13,10 +13,13 @@
 - **Native/model lifetime** is the loaded model runtime shared by generations
   serialized by the service. A generation keeps the runtime alive until its
   worker has stopped; unload/reset cannot replace a generation's stream state.
-- **Background task identity** is the task ID plus its source chat ID and
-  immutable prompt. Queue promotion preserves this owner. Per the product
-  decision on 2026-09-26, switching chats or backgrounding the app does not
-  cancel or retarget it; explicit cancellation or source-chat deletion does.
+- **Background task identity (target contract)** is the task ID plus its source
+  chat ID and immutable prompt. Queue promotion must preserve this owner. Per
+  the product decision on 2026-09-26, switching chats or backgrounding the app
+  does not cancel or retarget it; explicit cancellation or source-chat deletion
+  does. **Current implementation gap:** `BackgroundTask` and its persistence
+  still omit `sourceChatId`; execution still uses the selected chat. Issue #20
+  remains open.
 - **Authorization revision** is a capability-policy revision captured with a
   confirmation. Revocation advances the revision. A confirmation must match the
   current revision and capabilities when consumed and when admitted for
@@ -26,23 +29,50 @@
 These identities are related by explicit ownership fields and lifecycle rules;
 they are not aliases for one global epoch.
 
-## Trace privacy policy
+## Implementation status
+
+- Native generation drain ownership and acknowledgement changes are in PR #13;
+  connected JNI/device execution is not yet verified.
+- Capability revision checks and dispatch admission are in PR #13; exact latest
+  candidate checks and fresh independent review remain outstanding.
+- Transcript persistence uses per-chat revisions and a publication gate in the
+  current candidate. Clear invalidates older snapshots; deletion also retires
+  the chat ID. The current candidate CI is pending.
+- Model storage uses a process-wide mutation gate; matching WorkManager downloads
+  are cancelled on deletion and stale in-process download revisions cannot
+  promote. Deletion is still ID-bound, not version/hash-bound. Android
+  instrumentation was added but is not yet compiled or executed.
+- Trace minimization, owner binding, deletion suppression, and bounded retention
+  are in the candidate. Trace artifacts have schema version 1, and cleanup
+  runs both at initialization and publication. Exact latest-candidate review
+  and checks are pending.
+- Reset/wait session ownership, model import/download versus deletion, and
+  source-owned background execution remain incomplete. Model deletion still
+  lacks the required confirmation snapshot of version/hash/path.
+
+## Persisted content privacy policy
 
 - Persisted traces contain ownership, tool names, success/terminal metadata,
   token count, and timings by default. Prompts, tool arguments, and result text
-  are omitted. Raw content is included only when a caller explicitly opts in;
+  are omitted. Artifacts carry `schema_version: 1`. Raw content is included
+  only when a caller explicitly opts in;
   production construction currently uses the metadata-only default.
 - Each trace records its source chat ID. Chat deletion removes that chat's
   published traces and tombstones it against already queued trace writes.
 - Trace names include a random identifier and are published by same-directory
   atomic rename. Retention is capped at 20 artifacts and 30 days, enforced on
-  publication. Teardown persistence uses the service-owned teardown scope and
-  follows the same publication and deletion checks.
+  publication and on `AgentTrace` initialization. Teardown persistence uses
+  the service-owned teardown scope and follows the same publication and
+  deletion checks.
 - Trace files remain in app-private storage and are not encrypted by this
   change. The current threat model is protection against accidental exposure
   through diagnostics/exports; minimization, ownership, retention, and deletion
   are the controls. Device compromise or access by the app's own privileged
   process is not addressed by file encryption.
+- Background-task persistence keeps prompts only while a task is queued or
+  running, where they are needed for restart recovery. Completed records omit
+  prompts and cap persisted result summaries at 120 characters. Debug logs no
+  longer include prompt previews.
 
 ## Required invariants
 
@@ -62,7 +92,8 @@ they are not aliases for one global epoch.
 3. A waiter observes only its captured generation/task result and uses a
    bounded deadline that includes joins.
 4. Queued work keeps its source chat and never resolves transcript or result
-   destinations from the currently selected chat.
+   destinations from the currently selected chat. This remains an acceptance
+   requirement, not a claim about the current implementation.
 5. Capability validation and dispatch admission are serialized with revocation.
    A revocation that wins the ordering rejects the operation; an operation
    admitted first is considered in flight and may complete without implying

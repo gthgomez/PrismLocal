@@ -5,6 +5,7 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -116,10 +117,11 @@ class BackgroundAgentPersistenceTest {
     fun completedTasksPersistAndCanBeCleared() = runBlocking {
         val storageDir = tempFolder.newFolder("bg_tasks_3")
         val testContext = FakeTestContext()
+        val longResult = "R".repeat(240)
 
         val manager1 = BackgroundAgentManager(
             context = testContext,
-            executeTask = { "Generated summary output" },
+            executeTask = { longResult },
             storageDir = storageDir,
         )
 
@@ -139,7 +141,12 @@ class BackgroundAgentPersistenceTest {
             storageDir = storageDir,
         )
         assertEquals(1, manager2.state.value.completedTasks.size)
-        assertEquals("Generated summary output", manager2.state.value.completedTasks[0].resultSummary)
+        assertEquals(longResult.take(120), manager2.state.value.completedTasks[0].resultSummary)
+        val persisted = File(storageDir, BackgroundAgentManager.TASKS_FILE_NAME).readText()
+        assertFalse(persisted.contains("Execute benchmark"))
+        val completed = JSONObject(persisted).getJSONArray("completedTasks").getJSONObject(0)
+        assertFalse(completed.has("prompt"))
+        assertEquals(120, completed.getString("resultSummary").length)
 
         // Clear completed tasks
         manager2.clearCompletedTasks()

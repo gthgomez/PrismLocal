@@ -84,6 +84,7 @@ class BackgroundAgentManager(
         private const val NOTIFICATION_ID_BASE = 3000
         private const val MAX_QUEUED_TASKS = 5
         private const val MAX_COMPLETED_TASKS_SAVED = 20
+        private const val MAX_PERSISTED_RESULT_SUMMARY_CHARS = 120
         private const val LOW_BATTERY_THRESHOLD = 15
         private const val DEVICE_BUSY_RETRY_INTERVAL_MS = 2_000L
         const val TASKS_FILE_NAME = "background_tasks.json"
@@ -131,19 +132,21 @@ class BackgroundAgentManager(
         }
     }
 
-    private fun taskToJson(task: BackgroundTask): JSONObject = JSONObject().apply {
+    private fun taskToJson(task: BackgroundTask, includePrompt: Boolean): JSONObject = JSONObject().apply {
         put("id", task.id)
-        put("prompt", task.prompt)
+        if (includePrompt) put("prompt", task.prompt)
         put("createdAt", task.createdAt)
         put("status", task.status.name)
         if (task.resultSummary != null) {
-            put("resultSummary", task.resultSummary)
+            put("resultSummary", task.resultSummary.take(MAX_PERSISTED_RESULT_SUMMARY_CHARS))
         }
     }
 
-    private fun parseTask(json: JSONObject): BackgroundTask? {
+    private fun parseTask(json: JSONObject, includePrompt: Boolean = true): BackgroundTask? {
         val id = json.optString("id").takeIf { it.isNotBlank() } ?: return null
-        val prompt = json.optString("prompt").takeIf { it.isNotBlank() } ?: return null
+        val prompt = if (includePrompt) {
+            json.optString("prompt").takeIf { it.isNotBlank() } ?: return null
+        } else ""
         val createdAt = json.optLong("createdAt", System.currentTimeMillis())
         val statusStr = json.optString("status", BackgroundTaskStatus.QUEUED.name)
         val status = runCatching { BackgroundTaskStatus.valueOf(statusStr) }.getOrDefault(BackgroundTaskStatus.QUEUED)
@@ -200,7 +203,7 @@ class BackgroundAgentManager(
             if (completedArray != null) {
                 for (i in 0 until completedArray.length()) {
                     val obj = completedArray.optJSONObject(i) ?: continue
-                    val task = parseTask(obj) ?: continue
+                    val task = parseTask(obj, includePrompt = false) ?: continue
                     trackId(task.id)
                     completed.add(task)
                 }
@@ -211,6 +214,8 @@ class BackgroundAgentManager(
                 queuedTasks = queued.take(MAX_QUEUED_TASKS),
                 completedTasks = completed.takeLast(MAX_COMPLETED_TASKS_SAVED),
             )
+            // Rewrite legacy completed records without their formerly persisted prompts.
+            persistTasksLocked()
             logD(TAG, "Restored ${queued.size} queued tasks, ${completed.size} completed tasks from disk")
         }.onFailure { e ->
             logW(TAG, "Failed to load persisted background tasks: ${e.message}")
@@ -224,17 +229,18 @@ class BackgroundAgentManager(
             val root = JSONObject().apply {
                 put("version", 1)
                 val queuedArr = JSONArray()
-                current.queuedTasks.forEach { queuedArr.put(taskToJson(it)) }
+                current.queuedTasks.forEach { queuedArr.put(taskToJson(it, includePrompt = true)) }
                 put("queuedTasks", queuedArr)
 
                 if (current.activeTask != null) {
-                    put("activeTask", taskToJson(current.activeTask))
+                    put("activeTask", taskToJson(current.activeTask, includePrompt = true))
                 } else {
                     put("activeTask", JSONObject.NULL)
                 }
 
                 val completedArr = JSONArray()
-                current.completedTasks.takeLast(MAX_COMPLETED_TASKS_SAVED).forEach { completedArr.put(taskToJson(it)) }
+                current.completedTasks.takeLast(MAX_COMPLETED_TASKS_SAVED)
+                    .forEach { completedArr.put(taskToJson(it, includePrompt = false)) }
                 put("completedTasks", completedArr)
             }
 
@@ -267,7 +273,7 @@ class BackgroundAgentManager(
             task
         }
 
-        if (BuildConfig.DEBUG) logD(TAG, "Enqueued task ${queued.id}: ${prompt.take(80)}")
+        if (BuildConfig.DEBUG) logD(TAG, "Enqueued task ${queued.id}")
         processNextTask()
         return queued
     }

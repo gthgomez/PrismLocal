@@ -6,14 +6,14 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
 ## Evidence observed
 
 - **OBSERVED — current candidate:** PR #13 is open at
-  `39aba27a107b52afe6a5b632249786d33d183dcf`. It contains native lifecycle
+  `020f88782466ab7262d3925c14fcc908b20a8363`. It contains native lifecycle
   gating, transactional batch acknowledgement, carrier version 2, trace
   minimization, transcript write invalidation, model storage lifecycle
-  coordination, and background-task persistence minimization. Exact-candidate
-  CI failed Kotlin compilation in `ModelStorageManager.kt`; the compiler could
-  not resolve companion constants after a duplicate companion declaration was
-  introduced. The fix is in the current uncommitted work and needs a new exact
-  candidate run. No independent review has covered the failed SHA.
+  coordination, background-task persistence minimization, and the fix for a
+  duplicate Kotlin companion declaration. Exact-candidate Dev/Play JVM and
+  sanitized host CTest jobs passed. The DevDebug instrumentation APK compiled;
+  benchmark/release native builds are still running. No independent review has
+  covered this SHA.
 - **VERIFIED — host contract:** standalone native host CMake build completed and
   CTest passed 9/9, including lifecycle-gate serialization and tail-checked
   acknowledgement validation. These tests compile portable production headers;
@@ -35,22 +35,23 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
   suites and host CTest. Its native benchmark/release build was still pending
   when inspected; it does not contain the later model-storage or trace-schema
   changes.
-- **OBSERVED — transcript persistence change:** `ChatManager` now captures a
+- **VERIFIED — transcript persistence change:** `ChatManager` now captures a
   per-chat revision before asynchronous scheduling. Clear invalidates older
   snapshots; deletion also retires the chat ID and serializes file removal
   against active publications. Deterministic production-gate barrier tests
   passed in both unit variants on candidate `2b9015c`; atomic-publication
-  refinement is included in the current candidate; the candidate's JVM compile
-  failed before tests ran.
+  refinement is included in the current candidate; both Dev/Play test suites
+  pass on `020f887`.
 - **OBSERVED — model storage change:** a process-wide gate serializes import
   promotion and deletion. Download requests are tagged by model owner, deletion
   cancels matching work, and a captured revision rejects stale promotion. New
   Android instrumentation covers real import/delete barriers and stale download
-  promotion; it has not yet been compiled or run on a device.
-- **OBSERVED — background-task privacy:** queued/running prompts remain stored
+  promotion. The instrumentation APK compiled on `020f887`; it has not been
+  connected to a device.
+- **VERIFIED — background-task privacy:** queued/running prompts remain stored
   for restart recovery. Completed records omit prompts and cap saved result
   summaries at 120 characters. A regression assertion checks this file format;
-  exact-candidate CI did not reach these assertions because compilation failed.
+  the JVM suites pass on `020f887`.
 - **OBSERVED — remaining code gaps:** reset/session wait ownership (#15),
   version/hash-bound delete confirmation (#17), and source-chat execution and
   persistence for queued background tasks (#20) remain incomplete. The product
@@ -66,11 +67,11 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
 
 ## Qualification gaps
 
-- **OBSERVED — exact candidate CI:** on `39aba27a107b52afe6a5b632249786d33d183dcf`,
-  both host CTest jobs passed; both JVM jobs failed at Kotlin compilation in
-  `ModelStorageManager.kt`. Consequently the dependent native-build jobs were
-  skipped. The workflow includes instrumentation APK compilation; no connected
-  instrumentation run is recorded.
+- **OBSERVED — exact candidate CI:** on `020f88782466ab7262d3925c14fcc908b20a8363`,
+  both host CTest jobs and both Dev/Play JVM jobs passed. The DevDebug Android
+  instrumentation APK compiled successfully. The unsigned benchmark/release
+  native build remains in progress. No connected instrumentation run is
+  recorded.
 - **BLOCKED:** connected emulator execution of the new JNI schema, slow-consumer,
   cancellation/reset and stale-generation instrumentation. The current host has
   no attached ADB device and the local Gradle configuration stops at the

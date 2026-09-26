@@ -19,34 +19,34 @@ class GenerationResultStore(
 ) {
     private val sessionOutputs = LinkedHashMap<Long, String>()
     private val chainOutputs = LinkedHashMap<Long, Pair<Long, String>>()
-    private val retainedSessions = mutableSetOf<Long>()
-    private val retainedChains = mutableSetOf<Long>()
+    private val retainedSessions = mutableMapOf<Long, Int>()
+    private val retainedChains = mutableMapOf<Long, Int>()
 
     @Synchronized
     fun retain(sessionId: Long?, agentChainId: Long?) {
-        sessionId?.let(retainedSessions::add)
-        agentChainId?.let(retainedChains::add)
+        sessionId?.let { retainedSessions[it] = (retainedSessions[it] ?: 0) + 1 }
+        agentChainId?.let { retainedChains[it] = (retainedChains[it] ?: 0) + 1 }
     }
 
     @Synchronized
     fun release(sessionId: Long?, agentChainId: Long?) {
-        sessionId?.let(retainedSessions::remove)
-        agentChainId?.let(retainedChains::remove)
-        trimToLimit(sessionOutputs, maxSessionResults, retainedSessions)
-        trimToLimit(chainOutputs, maxChainResults, retainedChains)
+        sessionId?.let { releaseRetention(retainedSessions, it) }
+        agentChainId?.let { releaseRetention(retainedChains, it) }
+        trimToLimit(sessionOutputs, maxSessionResults, retainedSessions.keys)
+        trimToLimit(chainOutputs, maxChainResults, retainedChains.keys)
     }
 
     @Synchronized
     fun record(sessionId: Long, agentChainId: Long?, output: String) {
         sessionOutputs[sessionId] = output
-        trimToLimit(sessionOutputs, maxSessionResults, retainedSessions)
+        trimToLimit(sessionOutputs, maxSessionResults, retainedSessions.keys)
         if (agentChainId != null) {
             val previous = chainOutputs[agentChainId]
             if (previous == null || sessionId >= previous.first) {
                 chainOutputs.remove(agentChainId)
                 chainOutputs[agentChainId] = sessionId to output
             }
-            trimToLimit(chainOutputs, maxChainResults, retainedChains)
+            trimToLimit(chainOutputs, maxChainResults, retainedChains.keys)
         }
     }
 
@@ -65,5 +65,10 @@ class GenerationResultStore(
             val removable = values.keys.firstOrNull { it !in retained && it != newestKey } ?: return
             values.remove(removable)
         }
+    }
+
+    private fun <K> releaseRetention(retained: MutableMap<K, Int>, key: K) {
+        val count = retained[key] ?: return
+        if (count <= 1) retained.remove(key) else retained[key] = count - 1
     }
 }

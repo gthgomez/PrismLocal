@@ -74,4 +74,18 @@ class GenerationResultStoreTest {
         assertNull(results.outputFor(sessionId = 1L))
         assertEquals("new output", results.outputFor(sessionId = 2L))
     }
+
+    @Test
+    fun oneWaiterReleaseDoesNotDropAnotherWaitersLease() {
+        val results = GenerationResultStore(maxSessionResults = 1)
+        results.record(sessionId = 1L, agentChainId = null, output = "shared owner")
+        results.retain(sessionId = 1L, agentChainId = null)
+        results.retain(sessionId = 1L, agentChainId = null)
+        results.record(sessionId = 2L, agentChainId = null, output = "new owner")
+
+        results.release(sessionId = 1L, agentChainId = null)
+        assertEquals("shared owner", results.outputFor(sessionId = 1L))
+        results.release(sessionId = 1L, agentChainId = null)
+        assertNull(results.outputFor(sessionId = 1L))
+    }
 }

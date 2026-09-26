@@ -1115,17 +1115,17 @@ class InferenceService : Service() {
                 sessionId = resultSessionId ?: -1L,
                 agentChainId = resultAgentChainId,
             )
-            if (terminalReason == null ||
+            val failed = terminalReason == null ||
                 terminalReason == "ERROR" ||
                 terminalReason == "CANCELLED" ||
                 terminalReason == "QUALITY_ABORT" ||
                 ownedOutput.isNullOrBlank()
-            ) {
+            if (initiatedByBackground && failed) {
                 throw IllegalStateException(
                     "Generation ended without a successful response: ${terminalReason ?: "no result"}",
                 )
             }
-            return ownedOutput
+            return ownedOutput.orEmpty()
         } catch (cancelled: CancellationException) {
             withContext(NonCancellable) {
                 cancelGenerationAndJoin("generation owner cancelled")

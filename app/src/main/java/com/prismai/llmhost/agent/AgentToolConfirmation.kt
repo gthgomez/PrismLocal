@@ -32,6 +32,7 @@ class AgentToolConfirmation(
     private val currentChatId: () -> String?,
     private val pendingActionKey: (String) -> String,
     private val getDeviceProfile: () -> DeviceCapabilityProfile?,
+    private val capabilityRegistry: CapabilityRegistry = CapabilityRegistryHolder.registry,
 ) {
     companion object {
         private const val TAG = "AgentToolConfirm"
@@ -68,6 +69,7 @@ class AgentToolConfirmation(
         val sourceChatId: String,
         val resolvedTarget: String,
         val callFingerprint: String,
+        val capabilityAuthorization: CapabilityAuthorizationSnapshot,
     )
 
     // ── In-memory pending state ─────────────────────────────────────────
@@ -95,6 +97,11 @@ class AgentToolConfirmation(
         val source = sourceChatId?.takeIf { it.isNotBlank() } ?: return null
         if (chainId == null || currentChatId() != source) return null
         val safeCall = copyCall(call)
+        if (!ToolCapabilityMapping.isMapped(safeCall.name)) return null
+        val capabilityAuthorization = capabilityRegistry.snapshot(
+            ToolCapabilityMapping.capabilitiesFor(safeCall.name),
+        )
+        if (!capabilityAuthorization.grantedAtSnapshot) return null
         val authorization = PendingToolAuthorization(
             token = UUID.randomUUID().toString(),
             call = safeCall,
@@ -104,6 +111,7 @@ class AgentToolConfirmation(
             sourceChatId = source,
             resolvedTarget = resolveTarget(safeCall, source),
             callFingerprint = fingerprint(safeCall),
+            capabilityAuthorization = capabilityAuthorization,
         )
         synchronized(this) {
             if (consumedToken != null) return null
@@ -169,7 +177,26 @@ class AgentToolConfirmation(
             activeChatId == authorization.sourceChatId &&
             authorization.resolvedTarget.isNotBlank() &&
             authorization.resolvedTarget == resolveTarget(authorization.call, authorization.sourceChatId) &&
+            authorization.callFingerprint == fingerprint(authorization.call) &&
+            capabilityRegistry.isCurrent(authorization.capabilityAuthorization)
+
+    /** The owner stays valid for reporting work admitted before a later revocation. */
+    fun isOperationOwnerCurrent(
+        authorization: PendingToolAuthorization,
+        activeChainId: Long?,
+        activeChatId: String?,
+    ): Boolean =
+        authorization.token.isNotBlank() &&
+            authorization.chainId > 0L &&
+            activeChainId == authorization.chainId &&
+            activeChatId == authorization.sourceChatId &&
+            authorization.resolvedTarget.isNotBlank() &&
+            authorization.resolvedTarget == resolveTarget(authorization.call, authorization.sourceChatId) &&
             authorization.callFingerprint == fingerprint(authorization.call)
+
+    /** Linearize admission of this operation against concurrent policy changes. */
+    fun tryBeginDispatch(authorization: PendingToolAuthorization): Boolean =
+        capabilityRegistry.tryBeginDispatch(authorization.capabilityAuthorization)
 
     /** Clears the consumed card without clobbering a newer staged token. */
     fun clearConsumedAuthorization(authorization: PendingToolAuthorization) {
@@ -452,7 +479,12 @@ class AgentToolConfirmation(
         )
 
     private fun immutableCopy(authorization: PendingToolAuthorization): PendingToolAuthorization =
-        authorization.copy(call = copyCall(authorization.call))
+        authorization.copy(
+            call = copyCall(authorization.call),
+            capabilityAuthorization = authorization.capabilityAuthorization.copy(
+                required = authorization.capabilityAuthorization.required.toSet(),
+            ),
+        )
 
     private fun logDebug(message: String) {
         runCatching { Log.d(TAG, message) }

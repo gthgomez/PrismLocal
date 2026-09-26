@@ -69,9 +69,16 @@ data class CapabilityCheck(
     val reason: String = "",
 )
 
+data class CapabilityAuthorizationSnapshot(
+    val revision: Long,
+    val required: Set<Capability>,
+    val grantedAtSnapshot: Boolean,
+)
+
 class CapabilityRegistry {
     /** Capabilities available in the current session */
     private val enabled = mutableSetOf<Capability>()
+    @Volatile private var policyRevision = 0L
 
     init {
         // Auto-grant SAFE and CONFIRM capabilities.
@@ -80,14 +87,60 @@ class CapabilityRegistry {
         enabled.addAll(Capability.entries.filter { it.risk != AgentToolRisk.RESTRICTED })
     }
 
-    fun grant(capability: Capability) { enabled.add(capability) }
-    fun revoke(capability: Capability) { enabled.remove(capability) }
+    @Synchronized
+    fun grant(capability: Capability) {
+        if (enabled.add(capability)) policyRevision++
+    }
+
+    @Synchronized
+    fun revoke(capability: Capability) {
+        if (enabled.remove(capability)) policyRevision++
+    }
+
+    @Synchronized
+    fun setAgentModeEnabled(enabled: Boolean) {
+        val agentCapabilities = setOf(
+            Capability.MODEL_IMPORT,
+            Capability.MODEL_DOWNLOAD,
+            Capability.FILE_READ,
+            Capability.FILE_WRITE,
+        )
+        val changed = if (enabled) this.enabled.addAll(agentCapabilities)
+        else this.enabled.removeAll(agentCapabilities)
+        if (changed) policyRevision++
+    }
+
+    @Synchronized
+    fun snapshot(required: Set<Capability>): CapabilityAuthorizationSnapshot =
+        CapabilityAuthorizationSnapshot(
+            revision = policyRevision,
+            required = required.toSet(),
+            grantedAtSnapshot = required.all { it in enabled },
+        )
+
+    @Synchronized
+    fun isCurrent(snapshot: CapabilityAuthorizationSnapshot): Boolean =
+        snapshot.grantedAtSnapshot &&
+            snapshot.revision == policyRevision &&
+            snapshot.required.all { it in enabled }
+
+    /**
+     * Atomically admits a confirmed operation relative to revocation. Once this
+     * succeeds the operation is in flight; later policy changes prevent new
+     * admissions but cannot undo side effects already dispatched.
+     */
+    @Synchronized
+    fun tryBeginDispatch(snapshot: CapabilityAuthorizationSnapshot): Boolean =
+        isCurrent(snapshot)
+
+    @Synchronized
     fun isGranted(capability: Capability): Boolean = capability in enabled
 
     /**
      * Check if all required capabilities for a tool are available.
      * Returns CapabilityCheck with missing capabilities if not.
      */
+    @Synchronized
     fun check(required: Set<Capability>): CapabilityCheck {
         val missing = required - enabled
         return if (missing.isEmpty()) {
@@ -102,9 +155,11 @@ class CapabilityRegistry {
     }
 
     /** Grant all capabilities for a given risk level */
+    @Synchronized
     fun grantAllUpTo(maxRisk: AgentToolRisk) {
-        Capability.entries.filter { it.risk <= maxRisk }.forEach { enabled.add(it) }
+        if (enabled.addAll(Capability.entries.filter { it.risk <= maxRisk })) policyRevision++
     }
 
+    @Synchronized
     fun dump(): Set<Capability> = enabled.toSet()
 }

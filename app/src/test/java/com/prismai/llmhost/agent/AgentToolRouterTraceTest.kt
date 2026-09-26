@@ -3,6 +3,8 @@ package com.prismai.llmhost.agent
 import android.content.SharedPreferences
 import com.prismai.llmhost.DeviceCapabilityProfile
 import com.prismai.llmhost.GenerationSettings
+import com.prismai.llmhost.Capability
+import com.prismai.llmhost.CapabilityRegistry
 import com.prismai.llmhost.TranscriptRole
 import com.prismai.llmhost.tools.AgentToolCall
 import com.prismai.llmhost.tools.AgentToolResult
@@ -376,6 +378,56 @@ class AgentToolRouterTraceTest {
     }
 
     @Test
+    fun capabilityRevocationBetweenConsumptionAndDispatchRejectsTheOperation() {
+        val policy = CapabilityRegistry().apply { setAgentModeEnabled(true) }
+        val harness = newHarness(capabilityRegistry = policy)
+        val chainId = harness.trace.beginChain("download")
+        val authorization = harness.confirmation.stagePending(
+            call = AgentToolCall("download_model", JSONObject().put("entry_id", "small-model")),
+            originalPrompt = "download",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )
+        assertNotNull(authorization)
+        val staged = authorization!!
+        val consumed = harness.confirmation.consumePendingAndRevalidate(
+            token = staged.token,
+            activeChainId = chainId,
+            activeChatId = "chat-1",
+        )
+        assertNotNull(consumed)
+
+        policy.setAgentModeEnabled(false)
+
+        assertFalse(harness.confirmation.tryBeginDispatch(consumed!!))
+    }
+
+    @Test
+    fun agentDisablementInvalidatesPendingConfirmationBeforeConsumption() {
+        val policy = CapabilityRegistry().apply { setAgentModeEnabled(true) }
+        val harness = newHarness(capabilityRegistry = policy)
+        val chainId = harness.trace.beginChain("download")
+        val authorization = harness.confirmation.stagePending(
+            call = AgentToolCall("download_model", JSONObject().put("entry_id", "small-model")),
+            originalPrompt = "download",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )!!
+
+        policy.setAgentModeEnabled(false)
+
+        assertNull(
+            harness.confirmation.consumePendingAndRevalidate(
+                token = authorization.token,
+                activeChainId = chainId,
+                activeChatId = "chat-1",
+            ),
+        )
+    }
+
+    @Test
     fun pendingConfirmationRejectsNullChainOwner() = runBlocking {
         val harness = newHarness()
         val call = AgentToolCall("switch_model", JSONObject().put("model_id", "next-model"))
@@ -565,6 +617,7 @@ class AgentToolRouterTraceTest {
 
     private fun newHarness(
         followUps: AtomicInteger = AtomicInteger(0),
+        capabilityRegistry: CapabilityRegistry = CapabilityRegistry(),
         executeTool: suspend (AgentToolCall, Boolean) -> AgentToolResult = { call, _ ->
             AgentToolResult(call = call, success = true, summary = "ok")
         },
@@ -588,6 +641,7 @@ class AgentToolRouterTraceTest {
             currentChatId = { currentChatId.get() },
             pendingActionKey = { "pending_$it" },
             getDeviceProfile = { safeProfile() },
+            capabilityRegistry = capabilityRegistry,
         )
         val transcriptIds = AtomicLong(0L)
         val router = AgentToolRouter(
@@ -618,6 +672,7 @@ class AgentToolRouterTraceTest {
             currentChatId = { currentChatId.get() },
             switchChat = { chatId -> currentChatId.set(chatId) },
             resultAppends = resultAppends,
+            capabilityRegistry = capabilityRegistry,
         )
     }
 
@@ -649,6 +704,7 @@ class AgentToolRouterTraceTest {
         val currentChatId: () -> String?,
         val switchChat: (String) -> Unit,
         val resultAppends: AtomicInteger,
+        val capabilityRegistry: CapabilityRegistry,
     )
 }
 

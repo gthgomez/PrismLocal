@@ -1148,7 +1148,16 @@ class InferenceService : Service() {
                     activeChatId = _currentChatId.value,
                 )
             ) {
+                agentToolConfirmation.clearConsumedAuthorization(authorization)
                 agentToolRouter.failTrace(authorization.chainId, "Tool confirmation authorization is stale")
+                return@confirmedJob
+            }
+            if (!agentToolConfirmation.tryBeginDispatch(authorization)) {
+                agentToolConfirmation.clearConsumedAuthorization(authorization)
+                agentToolRouter.failTrace(
+                    authorization.chainId,
+                    "Tool confirmation was revoked before dispatch",
+                )
                 return@confirmedJob
             }
             val stepStart = SystemClock.elapsedRealtime()
@@ -1173,7 +1182,7 @@ class InferenceService : Service() {
             }
             val transitionApplied = result.details.optBoolean(CHAT_IDENTITY_RESULT_APPLIED, false)
             result.details.remove(CHAT_IDENTITY_RESULT_APPLIED)
-            if (!transitionApplied && !agentToolConfirmation.isAuthorizationCurrent(
+            if (!transitionApplied && !agentToolConfirmation.isOperationOwnerCurrent(
                     authorization = authorization,
                     activeChainId = agentTrace.activeChainId,
                     activeChatId = _currentChatId.value,
@@ -1358,7 +1367,7 @@ class InferenceService : Service() {
         authorization: AgentToolConfirmation.PendingToolAuthorization? = null,
     ): AgentToolResult {
         if (confirmed && authorization != null &&
-            !agentToolConfirmation.isAuthorizationCurrent(
+            !agentToolConfirmation.isOperationOwnerCurrent(
                 authorization = authorization,
                 activeChainId = agentTrace.activeChainId,
                 activeChatId = _currentChatId.value,
@@ -1595,16 +1604,10 @@ class InferenceService : Service() {
     private fun syncCapabilities(settings: GenerationSettings) {
         val registry = CapabilityRegistryHolder.registry
         if (settings.agentEnabled) {
-            registry.grant(Capability.MODEL_IMPORT)
-            registry.grant(Capability.MODEL_DOWNLOAD)
-            registry.grant(Capability.FILE_READ)
-            registry.grant(Capability.FILE_WRITE)
+            registry.setAgentModeEnabled(true)
             Log.d(TAG, "Restricted capabilities granted (Agent mode enabled)")
         } else {
-            registry.revoke(Capability.MODEL_IMPORT)
-            registry.revoke(Capability.MODEL_DOWNLOAD)
-            registry.revoke(Capability.FILE_READ)
-            registry.revoke(Capability.FILE_WRITE)
+            registry.setAgentModeEnabled(false)
             Log.d(TAG, "Restricted capabilities revoked (Agent mode disabled)")
         }
     }

@@ -5,9 +5,8 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
 
 ## Evidence observed
 
-- **OBSERVED — current candidate:** PR #13 is open at
-  code candidate `3e1db88` (the current status-document update is a later
-  documentation-only commit). It contains native lifecycle
+- **OBSERVED — current candidate:** PR #13 is open at code candidate
+  `6296ef8460d39c28145f3a41257e7203ab836f85`. It contains native lifecycle
   gating, transactional batch acknowledgement, carrier version 2, trace
   minimization, transcript write invalidation, model storage lifecycle
   coordination, background-task persistence minimization, and the fix for a
@@ -17,21 +16,26 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
   a test fixture so the stale pending cancellation case actually stages an
   agent confirmation. On this exact candidate, both duplicated Dev/Play JVM
   jobs and both sanitized host CTest jobs passed. The DevDebug instrumentation
-  compile and unsigned benchmark/release builds remain pending in both
-  duplicated CI runs. A fresh read-only review of
-  `3e1db8802c57d09f13342618ea17e7ba628268f2` confirms the fixture correction
-  and recommends holding integration for remaining #15, #17, #20, and #21
-  criteria.
+  APK compiled; unsigned benchmark/release builds are still running. Reviews of
+  `c1f81fc` and `be11cee` identified successive #20 scheduling races; the
+  current candidate adds retry-on-deferral and follow-up-chain ownership. A
+  fresh independent review of this exact SHA has not yet been recorded, so
+  merge remains on hold.
 - **VERIFIED — host contract:** standalone native host CMake build completed and
   CTest passed 9/9, including lifecycle-gate serialization and tail-checked
   acknowledgement validation. These tests compile portable production headers;
   they do not compile `Engine.cpp` or exercise Android JNI.
-- **OBSERVED — local Android build:** `:app:testDebugUnitTest` cannot configure
-  because the configured NDK directory lacks `source.properties`. This is a
-  blocked local build, not a test failure or pass.
+- **VERIFIED — local JVM checks:** with the already-installed SDK at
+  `C:\Users\icbag\AppData\Local\Android\Sdk` and its valid NDK 28.2, the
+  focused DevDebug tests for `BackgroundAgentManagerTest`,
+  `BackgroundGenerationOwnershipTest`, `GenerationResultStoreTest`, and
+  `GenerationSessionWaitTest` passed. The configured `D:\Dev\AndroidLab\Sdk`
+  NDK lacks `source.properties`; no dependency was installed.
 - **OBSERVED — connected devices:** `adb devices -l` returned no attached
-  devices. `emulator -list-avds` listed `Lab_Phone_API36` and `Lab_TV_API36`;
-  neither was booted for this run.
+  physical devices. `emulator -list-avds` listed `Lab_Phone_API36` and
+  `Lab_TV_API36`. A read-only `Lab_Phone_API36` boot using its existing system
+  image remained ADB-offline for more than three minutes; the launched emulator
+  was stopped, and no instrumentation ran.
 - **OBSERVED — fixture availability:** the source references
   `app/src/androidTest/assets/smoke-model/`, but that directory/model asset is
   absent in this checkout. A 6.75 MB TinyStories model exists in the original
@@ -68,14 +72,20 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
   The regression test now stages and consumes a `rename_current_chat`
   confirmation, disables agent mode while `CHAT_MANAGE` remains granted, and
   verifies dispatch admission is denied. Exact-candidate unit tests passed.
-- **OBSERVED — remaining code gaps:** reset/session wait ownership (#15),
-  version/hash-bound delete confirmation (#17), and source-chat execution and
-  persistence for queued background tasks (#20) remain incomplete. The product
-  decision is that queued work continues through chat switches and app
-  backgrounding unless explicitly cancelled; deleting its source chat must
-  invalidate it. Current `BackgroundTask` records do not retain a source chat
-  ID and service execution still resolves the active chat. Issues #14–#21
-  remain open.
+- **OBSERVED — remaining code gaps:** #15 now captures stream output by
+  generation ID and agent-chain ID, with active waiters retaining results; reset
+  ordering and production interleavings still need independent review. #20 now
+  persists source chat ownership, blocks conflicting follow-ups, defers UI chat
+  switching until the task releases the shared engine, and requeues a task when
+  user work wins admission. Service-level orchestration coverage remains
+  limited. #17 still lacks version/hash/path-bound deletion confirmation.
+  Queued work continues across chat switches and app backgrounding unless
+  explicitly cancelled; source-chat deletion invalidates queued work and is
+  rejected while its task is active. Issues #14–#21 remain open.
+- **UNKNOWN — exact independent review:** no review for current SHA `6296ef8`
+  is present in the PR review records. Fresh local reviewer delegation is
+  currently below the repository's 4 GiB free-memory floor; a GitHub Copilot
+  request also produced no recorded review.
 - **DOCUMENTED — earlier emulator work:**
   `docs/evidence/REAL_INFERENCE_EVIDENCE_2026-05-05.md` records a prior emulator
   smoke run and its historical model hash. It is not evidence for the current
@@ -89,21 +99,18 @@ fixtures are defined in `docs/inference/qualification-fixtures-v1.md`.
   build was still running at the last observation. No connected instrumentation
   run is recorded.
 - **VERIFIED — current code candidate CI:** on
-  `3e1db8802c57d09f13342618ea17e7ba628268f2`, both host CTest jobs and both
-  Dev/Play JVM jobs passed. The DevDebug Android instrumentation APK compile
-  and unsigned benchmark/release builds are pending in both duplicated CI runs.
-  The preceding `d8f7351` candidate had one test-fixture failure; the fixture
-  correction is included in `3e1db88`. This status-document commit changes the
-  PR head, requiring exact-head checks again.
+  `6296ef8460d39c28145f3a41257e7203ab836f85`, both host CTest jobs and both
+  Dev/Play JVM jobs passed, and the DevDebug Android instrumentation APK
+  compiled. Unsigned benchmark/release assembly is still in progress. No
+  connected instrumentation run is recorded.
 - **BLOCKED:** connected emulator execution of the new JNI schema, slow-consumer,
-  cancellation/reset and stale-generation instrumentation. The current host has
-  no attached ADB device and the local Gradle configuration stops at the
-  incomplete NDK installation. The tracked smoke-model asset is also missing.
-- **BLOCKED:** physical-device qualification. Next action: provision the pinned
-  Android NDK from an already approved local source, validate the model fixture's
-  provenance before staging it, attach a supported physical device, then run
-  `connectedDebugAndroidTest` and the small-model load → generate → cancel →
-  reset → generate smoke while recording the exact
+  cancellation/reset and stale-generation instrumentation. The AVD remained
+  ADB-offline; the physical device is unavailable. The tracked smoke-model asset
+  is also missing. Local JVM tests used the separate installed SDK/NDK override.
+- **BLOCKED:** physical-device qualification. Next action: attach a supported
+  physical device and validate the model fixture's provenance before staging
+  it; then run `connectedDevDebugAndroidTest` and the small-model load →
+  generate → cancel → reset → generate smoke while recording the exact
   app/native SHA, model SHA-256/quantization, Android build, settings, TTFT,
   throughput, peak memory, terminal reason, cancellation latency and thermal
   state.

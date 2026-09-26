@@ -3,6 +3,7 @@ package com.prismai.llmhost
 import android.content.Context
 import android.content.ContextWrapper
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -361,5 +362,48 @@ class BackgroundAgentManagerTest {
         assertEquals(BackgroundTaskStatus.COMPLETED, manager.state.value.completedTasks.first().status)
         assertEquals(0, manager.state.value.queuedTasks.size)
         assertNull(manager.state.value.activeTask)
+    }
+
+    @Test
+    fun taskDeferredAfterPromotionReturnsToQueueInsteadOfCompleting() = runBlocking {
+        val testContext = FakeTestContext()
+        val attempts = AtomicInteger()
+        val deviceBusy = AtomicBoolean(false)
+        val firstDeferred = CompletableDeferred<Unit>()
+        val manager = BackgroundAgentManager(
+            context = testContext,
+            executeTask = {
+                if (attempts.incrementAndGet() == 1) {
+                    deviceBusy.set(true)
+                    firstDeferred.complete(Unit)
+                    throw BackgroundTaskDeferredException()
+                }
+                "completed after retry"
+            },
+            isDeviceBusyWithUserGeneration = { deviceBusy.get() },
+        )
+
+        val task = manager.enqueue("retry after admission race", sourceChatId = "chat-a")!!
+        firstDeferred.await()
+        var attemptsToRequeue = 0
+        while (manager.state.value.activeTask != null && attemptsToRequeue < 40) {
+            delay(25)
+            attemptsToRequeue++
+        }
+        assertNull(manager.state.value.activeTask)
+        assertEquals(task.id, manager.state.value.queuedTasks.firstOrNull()?.id)
+        assertTrue(manager.state.value.completedTasks.none { it.id == task.id })
+
+        deviceBusy.set(false)
+        var attemptsToComplete = 0
+        while (manager.state.value.completedTasks.none { it.id == task.id } && attemptsToComplete < 100) {
+            delay(50)
+            attemptsToComplete++
+        }
+        assertEquals(2, attempts.get())
+        assertEquals(
+            BackgroundTaskStatus.COMPLETED,
+            manager.state.value.completedTasks.first { it.id == task.id }.status,
+        )
     }
 }

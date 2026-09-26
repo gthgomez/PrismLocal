@@ -45,6 +45,9 @@ data class BackgroundTask(
     val resultSummary: String? = null,
 )
 
+/** A temporary scheduling conflict; the task must remain queued for retry. */
+class BackgroundTaskDeferredException : Exception("Background task deferred until the device is idle")
+
 enum class BackgroundTaskStatus { QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED }
 
 data class BackgroundAgentState(
@@ -385,6 +388,19 @@ class BackgroundAgentManager(
             } catch (c: kotlinx.coroutines.CancellationException) {
                 logD(TAG, "Background task ${task.id} cancelled")
                 throw c
+            } catch (_: BackgroundTaskDeferredException) {
+                synchronized(stateLock) {
+                    val current = _state.value
+                    if (current.activeTask?.id == task.id) {
+                        _state.value = current.copy(
+                            activeTask = null,
+                            queuedTasks = listOf(
+                                task.copy(status = BackgroundTaskStatus.QUEUED),
+                            ) + current.queuedTasks,
+                        )
+                        persistTasksLocked()
+                    }
+                }
             } catch (e: Exception) {
                 logE(TAG, "Background task ${task.id} failed", e)
                 failCurrentTask(e.message ?: "Task execution error")

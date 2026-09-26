@@ -969,6 +969,7 @@ class InferenceService : Service() {
         backgroundTaskId: String? = null,
     ): String {
         if (confirmedChatTransitionChain.get() != null) {
+            if (initiatedByBackground) throw BackgroundTaskDeferredException()
             return "Chat transition in progress"
         }
         var restoreChatId: String? = null
@@ -978,11 +979,18 @@ class InferenceService : Service() {
                 return "Background task owns the engine"
             }
             if (initiatedByBackground &&
-                (_isGenerating.value || _pendingAgentToolAction.value != null)
+                BackgroundGenerationOwnership.shouldDeferBackgroundTask(
+                    generationRunning = _isGenerating.value,
+                    confirmationPending = _pendingAgentToolAction.value != null ||
+                        confirmedChatTransitionChain.get() != null,
+                    followUpScheduled = agentFollowUpScheduled,
+                    agentToolJobActive = hasActiveAgentToolJobs(),
+                )
             ) {
-                return "Background task deferred: device busy"
+                throw BackgroundTaskDeferredException()
             }
             if (!generationStartGate.beginStart()) {
+                if (initiatedByBackground) throw BackgroundTaskDeferredException()
                 return "Generation deferred while a chat transition completes"
             }
             val startGateReserved = true

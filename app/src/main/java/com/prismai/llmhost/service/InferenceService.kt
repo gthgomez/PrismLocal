@@ -31,6 +31,7 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -78,6 +79,7 @@ import com.prismai.llmhost.model.ModelManager
 import com.prismai.llmhost.model.ModelReadinessAssessor
 import com.prismai.llmhost.generation.GenerationIdleInputs
 import com.prismai.llmhost.generation.GenerationIdlePolicy
+import com.prismai.llmhost.generation.GenerationStartGate
 import com.prismai.llmhost.generation.GenerationMetrics
 import com.prismai.llmhost.generation.GenerationOrchestrator
 import com.prismai.llmhost.generation.PromptBuilder
@@ -154,6 +156,7 @@ class InferenceService : Service() {
     @Volatile
     private var generationForegroundActive = false
     private val operationMutex = Mutex()
+    private val generationStartGate = GenerationStartGate()
     @Volatile
     private var activeGenerationSource: String = "user"
     @Volatile
@@ -732,15 +735,17 @@ class InferenceService : Service() {
     }
 
     fun createChat(): String {
-        if (_isGenerating.value) {
+        if (_isGenerating.value || generationStartGate.isStartInProgress()) {
             publishUiEvent("Cancel generation before creating a new chat")
             return _currentChatId.value.orEmpty()
         }
         abandonPendingAgentTool(
             reason = "Chat changed before tool confirmation",
             afterCleanup = {
-                chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
-                resetNativeConversationAsync("new chat")
+                generationStartGate.runChatTransition {
+                    chatManager.createChatInternal(ChatTitles.DEFAULT_TITLE)
+                    resetNativeConversationAsync("new chat")
+                }
             },
         )
         // The UI does not use this value; identity mutation is intentionally
@@ -773,35 +778,41 @@ class InferenceService : Service() {
     }
 
     private fun performSwitchChat(chatId: String): Boolean {
-        if (_isGenerating.value) return false
-        if (_chatSessions.value.none { it.id == chatId }) return false
-        val switched = chatManager.switchChat(chatId)
-        if (switched) {
-            agentToolConfirmation.restore()
-            resetNativeConversationAsync("chat switch")
-        }
-        return switched
+        return generationStartGate.runChatTransition {
+            if (_isGenerating.value) return@runChatTransition false
+            if (_chatSessions.value.none { it.id == chatId }) return@runChatTransition false
+            val switched = chatManager.switchChat(chatId)
+            if (switched) {
+                agentToolConfirmation.restore()
+                resetNativeConversationAsync("chat switch")
+            }
+            switched
+        } ?: false
     }
 
     private fun performClearTranscript(): Boolean {
-        if (_isGenerating.value) return false
-        chatManager.clearTranscript()
-        resetNativeConversationAsync("clear transcript")
-        return true
+        return generationStartGate.runChatTransition {
+            if (_isGenerating.value) return@runChatTransition false
+            chatManager.clearTranscript()
+            resetNativeConversationAsync("clear transcript")
+            true
+        } ?: false
     }
 
     private fun performDeleteChat(chatId: String): Boolean {
-        if (_isGenerating.value) return false
-        val deleted = backgroundAgentManager.deleteChatAndInvalidateTasks(chatId) {
-            chatManager.deleteChat(chatId)
-        }
-        if (deleted) agentTrace.deleteForChat(chatId)
-        return deleted
+        return generationStartGate.runChatTransition {
+            if (_isGenerating.value) return@runChatTransition false
+            val deleted = backgroundAgentManager.deleteChatAndInvalidateTasks(chatId) {
+                chatManager.deleteChat(chatId)
+            }
+            if (deleted) agentTrace.deleteForChat(chatId)
+            deleted
+        } ?: false
     }
 
     fun switchChat(chatId: String): Boolean {
         if (confirmedChatTransitionThread.get() == true) return performSwitchChat(chatId)
-        if (_isGenerating.value) {
+        if (_isGenerating.value || generationStartGate.isStartInProgress()) {
             publishUiEvent("Cancel generation before switching chats")
             return false
         }
@@ -824,7 +835,7 @@ class InferenceService : Service() {
 
     fun deleteChat(chatId: String): Boolean {
         if (confirmedChatTransitionThread.get() == true) return performDeleteChat(chatId)
-        if (_isGenerating.value) {
+        if (_isGenerating.value || generationStartGate.isStartInProgress()) {
             publishUiEvent("Cancel generation before deleting a chat")
             return false
         }
@@ -930,7 +941,6 @@ class InferenceService : Service() {
         if (confirmedChatTransitionChain.get() != null) {
             return "Chat transition in progress"
         }
-        var activeJob: Job? = null
         var restoreChatId: String? = null
         operationMutex.withLock {
             if (initiatedByBackground &&
@@ -938,34 +948,43 @@ class InferenceService : Service() {
             ) {
                 return "Background task deferred: device busy"
             }
+            var startGateReserved = false
             if (initiatedByBackground) {
-                val ownerChatId = sourceChatId?.takeIf { it.isNotBlank() }
-                    ?: throw IllegalStateException("Background task has no source chat owner")
-                if (_chatSessions.value.none { it.id == ownerChatId }) {
-                    throw IllegalStateException("Background task source chat was deleted")
+                if (!generationStartGate.beginStart()) {
+                    return "Background task deferred: another generation is starting"
                 }
-                val selectedChatId = _currentChatId.value
-                if (selectedChatId != ownerChatId) {
-                    if (!chatManager.switchChat(ownerChatId)) {
-                        throw IllegalStateException("Could not restore background task source chat")
+                startGateReserved = true
+            }
+            try {
+                if (initiatedByBackground) {
+                    val ownerChatId = sourceChatId?.takeIf { it.isNotBlank() }
+                        ?: throw IllegalStateException("Background task has no source chat owner")
+                    if (_chatSessions.value.none { it.id == ownerChatId }) {
+                        throw IllegalStateException("Background task source chat was deleted")
                     }
-                    engine.resetConversation()
-                    restoreChatId = selectedChatId
+                    val selectedChatId = _currentChatId.value
+                    if (selectedChatId != ownerChatId) {
+                        if (!chatManager.switchChat(ownerChatId)) {
+                            throw IllegalStateException("Could not restore background task source chat")
+                        }
+                        engine.resetConversation()
+                        restoreChatId = selectedChatId
+                    }
                 }
+                activeGenerationSource = if (initiatedByBackground) "background" else "user"
+                cancelAndJoinGenerationLocked(
+                    reason = "new generation",
+                    clearQueuedBenchmarks = !preserveBenchmarkQueue,
+                )
+                if (benchmarkPreset == null && _currentChatId.value == null) {
+                    ensureChatForGeneration()
+                }
+                generationOrchestrator.generate(prompt, benchmarkPreset)
+            } finally {
+                if (startGateReserved) generationStartGate.finishStart()
             }
-            activeGenerationSource = if (initiatedByBackground) "background" else "user"
-            cancelAndJoinGenerationLocked(
-                reason = "new generation",
-                clearQueuedBenchmarks = !preserveBenchmarkQueue,
-            )
-            if (benchmarkPreset == null && _currentChatId.value == null) {
-                ensureChatForGeneration()
-            }
-            generationOrchestrator.generate(prompt, benchmarkPreset)
-            activeJob = generationJob
         }
         try {
-            activeJob?.join()
             if (!awaitGenerationSessionIdle()) {
                 if (initiatedByBackground) {
                     throw IllegalStateException("Generation session exceeded its bounded wait")
@@ -973,15 +992,22 @@ class InferenceService : Service() {
                 return "Generation session wait timed out"
             }
             return streamState.snapshotText().takeIf { it.isNotBlank() } ?: "Background task completed"
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) {
+                cancelGenerationAndJoin("generation owner cancelled")
+            }
+            throw cancelled
         } finally {
             if (restoreChatId != null) {
-                operationMutex.withLock {
-                    if (!_isGenerating.value && !shouldWaitForGenerationSession() &&
-                        _currentChatId.value == sourceChatId &&
-                        _chatSessions.value.any { it.id == restoreChatId }
-                    ) {
-                        if (chatManager.switchChat(restoreChatId!!)) {
-                            engine.resetConversation()
+                withContext(NonCancellable) {
+                    operationMutex.withLock {
+                        if (!_isGenerating.value && !shouldWaitForGenerationSession() &&
+                            _currentChatId.value == sourceChatId &&
+                            _chatSessions.value.any { it.id == restoreChatId }
+                        ) {
+                            if (chatManager.switchChat(restoreChatId!!)) {
+                                engine.resetConversation()
+                            }
                         }
                     }
                 }

@@ -167,6 +167,7 @@ class AgentTraceContinuationTest {
         trace.finalizeOwnedTrace(chain, success = true)
 
         val artifact = withTimeout(2_000) { artifacts.receive() }
+        assertEquals(1, artifact.getInt("schema_version"))
         assertEquals("metadata_only", artifact.getString("content_mode"))
         assertEquals("owner-chat", artifact.getString("owner_chat_id"))
         assertFalse(artifact.has("prompt"))

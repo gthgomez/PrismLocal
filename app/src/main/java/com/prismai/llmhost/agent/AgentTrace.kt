@@ -65,6 +65,20 @@ class AgentTrace(
     private val deletedChatIds = mutableSetOf<String>()
     private val preservedChainIds = mutableSetOf<Long>()
 
+    init {
+        val pruneExpiredArtifacts = {
+            val tracesDir = File(filesDir, "agent_traces")
+            synchronized(this) {
+                if (tracesDir.exists()) applyRetentionLocked(tracesDir)
+            }
+        }
+        if (scope.isActive) {
+            scope.launch(Dispatchers.IO) { pruneExpiredArtifacts() }
+        } else {
+            pruneExpiredArtifacts()
+        }
+    }
+
     /** Monotonic owner token for the currently active agent chain, if any. */
     val activeChainId: Long? get() = synchronized(this) { currentChainId }
 
@@ -209,6 +223,7 @@ class AgentTrace(
             abortReason = abortReason,
         )
         val json = JSONObject()
+            .put("schema_version", 1)
             .put("timestamp", trace.timestamp)
             .put("content_mode", if (rawContentOptIn) "raw_opt_in" else "metadata_only")
             .put("success", trace.success)

@@ -92,7 +92,7 @@ class AgentToolRouterTraceTest {
 
     @Test
     fun cancelledConfirmationFinalizesOwnedTrace() = runBlocking {
-        val harness = newHarness()
+        val harness = newHarness(capabilityRegistry = agentEnabledRegistry())
         val chainId = harness.trace.beginChain("prompt")
         val call = AgentToolCall("restore_previous_runtime_settings")
 
@@ -322,7 +322,7 @@ class AgentToolRouterTraceTest {
 
     @Test
     fun pendingConfirmationUsesOpaqueTokenAndRejectsStaleConsumption() = runBlocking {
-        val harness = newHarness()
+        val harness = newHarness(capabilityRegistry = agentEnabledRegistry())
         val chainId = harness.trace.beginChain("prompt")
         val call = AgentToolCall("switch_model", JSONObject().put("model_id", "next-model"))
 
@@ -404,6 +404,33 @@ class AgentToolRouterTraceTest {
     }
 
     @Test
+    fun agentDisablementBetweenConsumptionAndDispatchRejectsStillGrantedCapability() {
+        val policy = CapabilityRegistry().apply { setAgentModeEnabled(true) }
+        val harness = newHarness(capabilityRegistry = policy)
+        val chainId = harness.trace.beginChain("rename chat")
+        val authorization = harness.confirmation.stagePending(
+            call = AgentToolCall("rename_current_chat", JSONObject().put("title", "renamed")),
+            originalPrompt = "rename this chat",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )
+        assertNotNull(authorization)
+        val consumed = harness.confirmation.consumePendingAndRevalidate(
+            token = authorization!!.token,
+            activeChainId = chainId,
+            activeChatId = "chat-1",
+        )
+        assertNotNull(consumed)
+        assertTrue(policy.check(setOf(Capability.CHAT_MANAGE)).granted)
+
+        policy.setAgentModeEnabled(false)
+
+        assertFalse(harness.confirmation.tryBeginDispatch(consumed!!))
+        assertTrue(policy.check(setOf(Capability.CHAT_MANAGE)).granted)
+    }
+
+    @Test
     fun agentDisablementInvalidatesPendingConfirmationBeforeConsumption() {
         val policy = CapabilityRegistry().apply { setAgentModeEnabled(true) }
         val harness = newHarness(capabilityRegistry = policy)
@@ -446,7 +473,7 @@ class AgentToolRouterTraceTest {
 
     @Test
     fun staleTransitionTokenCannotClaimNewConfirmation() = runBlocking {
-        val harness = newHarness()
+        val harness = newHarness(capabilityRegistry = agentEnabledRegistry())
         val chainId = harness.trace.beginChain("prompt")
         val call = AgentToolCall("restore_previous_runtime_settings")
         harness.router.handleToolCall(call, "prompt", depth = 0, chainId = chainId)
@@ -675,6 +702,10 @@ class AgentToolRouterTraceTest {
             resultAppends = resultAppends,
             capabilityRegistry = capabilityRegistry,
         )
+    }
+
+    private fun agentEnabledRegistry() = CapabilityRegistry().apply {
+        setAgentModeEnabled(true)
     }
 
     private suspend fun RouterHarness.awaitArtifact(): JSONObject =

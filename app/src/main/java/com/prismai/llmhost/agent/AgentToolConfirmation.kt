@@ -100,6 +100,7 @@ class AgentToolConfirmation(
         if (!ToolCapabilityMapping.isMapped(safeCall.name)) return null
         val capabilityAuthorization = capabilityRegistry.snapshot(
             ToolCapabilityMapping.capabilitiesFor(safeCall.name),
+            requireAgentMode = true,
         )
         if (!capabilityAuthorization.grantedAtSnapshot) return null
         val authorization = PendingToolAuthorization(

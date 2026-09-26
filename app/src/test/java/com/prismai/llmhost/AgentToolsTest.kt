@@ -29,7 +29,10 @@ class AgentToolsTest {
     fun agentDisablementRevokesEveryAgentOnlyCapabilityAsOnePolicyChange() {
         val registry = CapabilityRegistry()
         registry.setAgentModeEnabled(true)
-        val pending = registry.snapshot(setOf(Capability.MODEL_DOWNLOAD, Capability.FILE_READ))
+        val pending = registry.snapshot(
+            setOf(Capability.MODEL_DOWNLOAD, Capability.FILE_READ, Capability.CHAT_MANAGE),
+            requireAgentMode = true,
+        )
 
         registry.setAgentModeEnabled(false)
 
@@ -37,6 +40,21 @@ class AgentToolsTest {
         assertFalse(registry.tryBeginDispatch(pending))
         assertFalse(registry.check(setOf(Capability.MODEL_DOWNLOAD)).granted)
         assertFalse(registry.check(setOf(Capability.FILE_READ)).granted)
+    }
+
+    @Test
+    fun disablingAgentModeRejectsConfirmedCapabilitiesThatRemainGranted() {
+        val registry = CapabilityRegistry().apply { setAgentModeEnabled(true) }
+        val pending = registry.snapshot(
+            setOf(Capability.CHAT_MANAGE),
+            requireAgentMode = true,
+        )
+
+        assertTrue(registry.tryBeginDispatch(pending))
+        registry.setAgentModeEnabled(false)
+
+        assertFalse(registry.tryBeginDispatch(pending))
+        assertTrue(registry.check(setOf(Capability.CHAT_MANAGE)).granted)
     }
 
     @Test

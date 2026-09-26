@@ -73,12 +73,14 @@ data class CapabilityAuthorizationSnapshot(
     val revision: Long,
     val required: Set<Capability>,
     val grantedAtSnapshot: Boolean,
+    val requireAgentMode: Boolean = false,
 )
 
 class CapabilityRegistry {
     /** Capabilities available in the current session */
     private val enabled = mutableSetOf<Capability>()
     @Volatile private var policyRevision = 0L
+    private var agentModeEnabled = false
 
     init {
         // Auto-grant SAFE and CONFIRM capabilities.
@@ -99,6 +101,8 @@ class CapabilityRegistry {
 
     @Synchronized
     fun setAgentModeEnabled(enabled: Boolean) {
+        val modeChanged = agentModeEnabled != enabled
+        agentModeEnabled = enabled
         val agentCapabilities = setOf(
             Capability.MODEL_IMPORT,
             Capability.MODEL_DOWNLOAD,
@@ -107,22 +111,28 @@ class CapabilityRegistry {
         )
         val changed = if (enabled) this.enabled.addAll(agentCapabilities)
         else this.enabled.removeAll(agentCapabilities)
-        if (changed) policyRevision++
+        if (changed || modeChanged) policyRevision++
     }
 
     @Synchronized
-    fun snapshot(required: Set<Capability>): CapabilityAuthorizationSnapshot =
+    fun snapshot(
+        required: Set<Capability>,
+        requireAgentMode: Boolean = false,
+    ): CapabilityAuthorizationSnapshot =
         CapabilityAuthorizationSnapshot(
             revision = policyRevision,
             required = required.toSet(),
-            grantedAtSnapshot = required.all { it in enabled },
+            grantedAtSnapshot = required.all { it in enabled } &&
+                (!requireAgentMode || agentModeEnabled),
+            requireAgentMode = requireAgentMode,
         )
 
     @Synchronized
     fun isCurrent(snapshot: CapabilityAuthorizationSnapshot): Boolean =
         snapshot.grantedAtSnapshot &&
             snapshot.revision == policyRevision &&
-            snapshot.required.all { it in enabled }
+            snapshot.required.all { it in enabled } &&
+            (!snapshot.requireAgentMode || agentModeEnabled)
 
     /**
      * Atomically admits a confirmed operation relative to revocation. Once this

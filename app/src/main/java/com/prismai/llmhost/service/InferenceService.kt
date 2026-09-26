@@ -852,8 +852,9 @@ class InferenceService : Service() {
     fun updateGenerationSettings(settings: GenerationSettings) {
         val previous = _generationSettings.value.clamped()
         val safeSettings = settings.clamped()
-        _generationSettings.value = safeSettings
+        // Close authorization admission before publishing agent mode as disabled.
         syncCapabilities(safeSettings)
+        _generationSettings.value = safeSettings
         if (previous.agentEnabled && !safeSettings.agentEnabled && ::agentTrace.isInitialized) {
             agentTrace.activeChainId?.let { chainId ->
                 agentTrace.abortTrace(chainId, "Agent mode disabled")

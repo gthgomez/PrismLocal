@@ -80,6 +80,7 @@ import com.prismai.llmhost.model.ModelReadinessAssessor
 import com.prismai.llmhost.generation.GenerationIdleInputs
 import com.prismai.llmhost.generation.GenerationIdlePolicy
 import com.prismai.llmhost.generation.GenerationStartGate
+import com.prismai.llmhost.generation.BackgroundGenerationOwnership
 import com.prismai.llmhost.generation.GenerationMetrics
 import com.prismai.llmhost.generation.GenerationOrchestrator
 import com.prismai.llmhost.generation.PromptBuilder
@@ -157,6 +158,7 @@ class InferenceService : Service() {
     private var generationForegroundActive = false
     private val operationMutex = Mutex()
     private val generationStartGate = GenerationStartGate()
+    private val backgroundGenerationOwnership = BackgroundGenerationOwnership()
     @Volatile
     private var activeGenerationSource: String = "user"
     @Volatile
@@ -376,12 +378,25 @@ class InferenceService : Service() {
         backgroundAgentManager = BackgroundAgentManager(
             context = this,
             executeTask = { bgTask ->
-                generateSafelyAndAwait(
-                    prompt = bgTask.prompt,
-                    preserveBenchmarkQueue = true,
-                    initiatedByBackground = true,
-                    sourceChatId = bgTask.sourceChatId,
-                )
+                check(backgroundGenerationOwnership.begin(bgTask.id)) {
+                    "Another background task already owns the generation engine"
+                }
+                try {
+                    generateSafelyAndAwait(
+                        prompt = bgTask.prompt,
+                        preserveBenchmarkQueue = true,
+                        initiatedByBackground = true,
+                        sourceChatId = bgTask.sourceChatId,
+                        backgroundTaskId = bgTask.id,
+                    )
+                } finally {
+                    withContext(NonCancellable) {
+                        operationMutex.withLock {
+                            val deferredChatId = backgroundGenerationOwnership.finish(bgTask.id)
+                            applyPendingBackgroundChatSwitchLocked(bgTask.sourceChatId, deferredChatId)
+                        }
+                    }
+                }
             },
             cancelNativeGeneration = {
                 val sourceIsBackground = operationMutex.withLock { activeGenerationSource == "background" }
@@ -779,7 +794,7 @@ class InferenceService : Service() {
 
     private fun performSwitchChat(chatId: String): Boolean {
         return generationStartGate.runChatTransition {
-            if (_isGenerating.value) return@runChatTransition false
+            if (_isGenerating.value || backgroundGenerationOwnership.hasOwner()) return@runChatTransition false
             if (_chatSessions.value.none { it.id == chatId }) return@runChatTransition false
             val switched = chatManager.switchChat(chatId)
             if (switched) {
@@ -792,7 +807,7 @@ class InferenceService : Service() {
 
     private fun performClearTranscript(): Boolean {
         return generationStartGate.runChatTransition {
-            if (_isGenerating.value) return@runChatTransition false
+            if (_isGenerating.value || backgroundGenerationOwnership.hasOwner()) return@runChatTransition false
             chatManager.clearTranscript()
             resetNativeConversationAsync("clear transcript")
             true
@@ -811,6 +826,15 @@ class InferenceService : Service() {
     }
 
     fun switchChat(chatId: String): Boolean {
+        if (_chatSessions.value.none { it.id == chatId }) {
+            publishUiEvent("Chat no longer exists")
+            return false
+        }
+        val backgroundSwitchQueued = backgroundGenerationOwnership.deferChatSwitch(chatId)
+        if (backgroundSwitchQueued) {
+            publishUiEvent("Chat switch queued until the background task finishes")
+            return true
+        }
         if (confirmedChatTransitionThread.get() == true) return performSwitchChat(chatId)
         if (_isGenerating.value || generationStartGate.isStartInProgress()) {
             publishUiEvent("Cancel generation before switching chats")
@@ -937,26 +961,31 @@ class InferenceService : Service() {
         preserveBenchmarkQueue: Boolean = false,
         initiatedByBackground: Boolean = false,
         sourceChatId: String? = null,
+        backgroundTaskId: String? = null,
     ): String {
         if (confirmedChatTransitionChain.get() != null) {
             return "Chat transition in progress"
         }
         var restoreChatId: String? = null
         operationMutex.withLock {
+            if (!initiatedByBackground && backgroundGenerationOwnership.hasOwner()) {
+                publishUiEvent("A background task currently owns the generation engine")
+                return "Background task owns the engine"
+            }
             if (initiatedByBackground &&
                 (_isGenerating.value || _pendingAgentToolAction.value != null)
             ) {
                 return "Background task deferred: device busy"
             }
-            var startGateReserved = false
-            if (initiatedByBackground) {
-                if (!generationStartGate.beginStart()) {
-                    return "Background task deferred: another generation is starting"
-                }
-                startGateReserved = true
+            if (!generationStartGate.beginStart()) {
+                return "Generation deferred while a chat transition completes"
             }
+            val startGateReserved = true
             try {
                 if (initiatedByBackground) {
+                    if (!backgroundGenerationOwnership.isOwner(backgroundTaskId)) {
+                        throw IllegalStateException("Background task generation ownership changed")
+                    }
                     val ownerChatId = sourceChatId?.takeIf { it.isNotBlank() }
                         ?: throw IllegalStateException("Background task has no source chat owner")
                     if (_chatSessions.value.none { it.id == ownerChatId }) {
@@ -991,6 +1020,9 @@ class InferenceService : Service() {
                 }
                 return "Generation session wait timed out"
             }
+            if (initiatedByBackground && !backgroundGenerationOwnership.isOwner(backgroundTaskId)) {
+                throw IllegalStateException("Background task generation ownership changed")
+            }
             return streamState.snapshotText().takeIf { it.isNotBlank() } ?: "Background task completed"
         } catch (cancelled: CancellationException) {
             withContext(NonCancellable) {
@@ -998,14 +1030,21 @@ class InferenceService : Service() {
             }
             throw cancelled
         } finally {
-            if (restoreChatId != null) {
+            if (restoreChatId != null || backgroundTaskId != null) {
                 withContext(NonCancellable) {
                     operationMutex.withLock {
                         if (!_isGenerating.value && !shouldWaitForGenerationSession() &&
-                            _currentChatId.value == sourceChatId &&
-                            _chatSessions.value.any { it.id == restoreChatId }
+                            _currentChatId.value == sourceChatId
                         ) {
-                            if (chatManager.switchChat(restoreChatId!!)) {
+                            val requestedChatId = if (backgroundTaskId != null) {
+                                backgroundGenerationOwnership.takeDeferredChatSwitch(backgroundTaskId)
+                                    ?: restoreChatId
+                            } else restoreChatId
+                            if (requestedChatId != null &&
+                                _chatSessions.value.any { it.id == requestedChatId } &&
+                                chatManager.switchChat(requestedChatId)
+                            ) {
+                                agentToolConfirmation.restore()
                                 engine.resetConversation()
                             }
                         }
@@ -1020,6 +1059,21 @@ class InferenceService : Service() {
         if (_generationPerformance.value?.terminalReason != "MAX_TOKENS") return false
         return _transcript.value.any { message ->
             message.role == TranscriptRole.ASSISTANT && message.text.isNotBlank()
+        }
+    }
+
+    private suspend fun applyPendingBackgroundChatSwitchLocked(
+        sourceChatId: String?,
+        targetChatId: String?,
+    ) {
+        if (_isGenerating.value || shouldWaitForGenerationSession() ||
+            (sourceChatId != null && _currentChatId.value != sourceChatId)
+        ) return
+        if (targetChatId == null) return
+        if (_chatSessions.value.none { it.id == targetChatId }) return
+        if (chatManager.switchChat(targetChatId)) {
+            agentToolConfirmation.restore()
+            engine.resetConversation()
         }
     }
 
@@ -1080,19 +1134,33 @@ class InferenceService : Service() {
 
     fun cancelGenerationSafely() {
         serviceScope.launch {
-            cancelGenerationAndJoin("user cancellation")
+            val backgroundTaskId = backgroundGenerationOwnership.ownerId()
+            if (backgroundTaskId != null) {
+                backgroundAgentManager.cancelTask(backgroundTaskId)
+            } else {
+                cancelGenerationAndJoin("user cancellation")
+            }
         }
     }
 
     fun continueGenerationSafely() {
         serviceScope.launch {
             operationMutex.withLock {
-                cancelAndJoinGenerationLocked(
-                    reason = "continue generation",
-                    finalizeActiveTrace = false,
-                    preserveActiveTrace = true,
-                )
-                generationOrchestrator.continueGeneration()
+                if (backgroundGenerationOwnership.hasOwner()) {
+                    publishUiEvent("A background task currently owns the generation engine")
+                    return@withLock
+                }
+                if (!generationStartGate.beginStart()) return@withLock
+                try {
+                    cancelAndJoinGenerationLocked(
+                        reason = "continue generation",
+                        finalizeActiveTrace = false,
+                        preserveActiveTrace = true,
+                    )
+                    generationOrchestrator.continueGeneration()
+                } finally {
+                    generationStartGate.finishStart()
+                }
             }
         }
     }
@@ -1656,7 +1724,12 @@ class InferenceService : Service() {
         serviceScope.launch {
             try {
                 operationMutex.withLock {
-                    generationOrchestrator.startFollowUp(originalPrompt, toolResult, depth, chainId)
+                    if (!generationStartGate.beginStart()) return@withLock
+                    try {
+                        generationOrchestrator.startFollowUp(originalPrompt, toolResult, depth, chainId)
+                    } finally {
+                        generationStartGate.finishStart()
+                    }
                 }
             } finally {
                 agentFollowUpScheduled = false

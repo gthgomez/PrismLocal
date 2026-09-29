@@ -29,9 +29,9 @@ class EngineConfigStore(private val prefs: SharedPreferences) {
         gpuLayers = prefs.getInt(KEY_GPU_LAYERS, GenerationSettings.DEFAULT_GPU_LAYERS),
         useVulkan = prefs.getBoolean(KEY_USE_VULKAN, true),
         agentEnabled = prefs.getBoolean(KEY_AGENT_ENABLED, false),
-        kvCacheTypeK = prefs.getString(KEY_KV_CACHE_TYPE_K, "q8_0") ?: "q8_0",
-        kvCacheTypeV = prefs.getString(KEY_KV_CACHE_TYPE_V, "q8_0") ?: "q8_0",
-        enableFlashAttn = prefs.getBoolean(KEY_ENABLE_FLASH_ATTN, true),
+        kvCacheTypeK = prefs.getString(KEY_KV_CACHE_TYPE_K, "f16") ?: "f16",
+        kvCacheTypeV = prefs.getString(KEY_KV_CACHE_TYPE_V, "f16") ?: "f16",
+        enableFlashAttn = prefs.getBoolean(KEY_ENABLE_FLASH_ATTN, false),
     ).clamped()
 
     fun save(settings: GenerationSettings) {

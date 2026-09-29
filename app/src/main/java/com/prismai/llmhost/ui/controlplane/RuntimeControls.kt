@@ -227,15 +227,48 @@ internal fun RuntimeControls(
                     onSettingsChange(settings.copy(repeatPenalty = value))
                 },
             )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                    Text(
+                        text = "Use Vulkan GPU",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "Enable Adreno GPU acceleration for offloaded layers",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = settings.useVulkan,
+                    onCheckedChange = { isChecked ->
+                        onSettingsChange(
+                            settings.copy(
+                                useVulkan = isChecked,
+                                gpuLayers = if (isChecked && settings.gpuLayers == 0) 8 else settings.gpuLayers,
+                            )
+                        )
+                    },
+                    enabled = enabled,
+                )
+            }
             SettingSlider(
                 label = "GPU layers",
                 valueText = settings.gpuLayers.toString(),
                 value = settings.gpuLayers.toFloat(),
                 valueRange = GenerationSettings.MIN_GPU_LAYERS.toFloat()..GenerationSettings.MAX_GPU_LAYERS.toFloat(),
                 steps = GenerationSettings.MAX_GPU_LAYERS - GenerationSettings.MIN_GPU_LAYERS - 1,
-                enabled = enabled,
+                enabled = enabled && settings.useVulkan,
                 onValueChange = { value ->
-                    onSettingsChange(settings.copy(gpuLayers = value.roundToInt()))
+                    val layers = value.roundToInt()
+                    onSettingsChange(settings.copy(gpuLayers = layers, useVulkan = if (layers > 0) true else settings.useVulkan))
                 },
             )
             Text(

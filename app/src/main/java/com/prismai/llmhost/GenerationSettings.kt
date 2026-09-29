@@ -22,11 +22,29 @@ data class GenerationSettings(
     val maxAgentIterations: Int = DEFAULT_MAX_AGENT_ITERATIONS,
     val autoSendVoice: Boolean = false,
     val autoReadResponse: Boolean = false,
-    val kvCacheTypeK: String = "q8_0",
-    val kvCacheTypeV: String = "q8_0",
-    val enableFlashAttn: Boolean = true,
+    val kvCacheTypeK: String = "f16",
+    val kvCacheTypeV: String = "f16",
+    val enableFlashAttn: Boolean = false,
     val loraAdapters: List<Pair<String, Float>> = emptyList(),
 ) {
+    fun toCompatibilityMode(): GenerationSettings = copy(
+        gpuLayers = 0,
+        useVulkan = false,
+        batchSize = 256.coerceAtMost(batchSize),
+        kvCacheTypeK = "f16",
+        kvCacheTypeV = "f16",
+        enableFlashAttn = false,
+    )
+
+    fun toMaxAccelerationMode(): GenerationSettings = copy(
+        gpuLayers = 99,
+        useVulkan = true,
+        batchSize = 512,
+        kvCacheTypeK = "q8_0",
+        kvCacheTypeV = "q8_0",
+        enableFlashAttn = true,
+    )
+
     fun clamped(): GenerationSettings =
         GenerationSettings(
             maxTokens = maxTokens.coerceIn(MIN_MAX_TOKENS, MAX_MAX_TOKENS),
@@ -45,8 +63,8 @@ data class GenerationSettings(
             maxAgentIterations = maxAgentIterations.coerceIn(MIN_MAX_AGENT_ITERATIONS, MAX_MAX_AGENT_ITERATIONS),
             autoSendVoice = autoSendVoice,
             autoReadResponse = autoReadResponse,
-            kvCacheTypeK = if (kvCacheTypeK in listOf("f16", "q8_0", "q4_0")) kvCacheTypeK else "q8_0",
-            kvCacheTypeV = if (kvCacheTypeV in listOf("f16", "q8_0", "q4_0")) kvCacheTypeV else "q8_0",
+            kvCacheTypeK = if (kvCacheTypeK in listOf("f16", "q8_0", "q4_0")) kvCacheTypeK else "f16",
+            kvCacheTypeV = if (kvCacheTypeV in listOf("f16", "q8_0", "q4_0")) kvCacheTypeV else "f16",
             enableFlashAttn = enableFlashAttn,
             loraAdapters = loraAdapters,
         )
@@ -67,7 +85,7 @@ data class GenerationSettings(
         const val CONTEXT_LENGTH_STEP = 512
 
         const val MIN_BATCH_SIZE = 128
-        const val DEFAULT_BATCH_SIZE = 512
+        const val DEFAULT_BATCH_SIZE = 256
         const val MAX_BATCH_SIZE = 2048
         const val BATCH_SIZE_STEP = 128
 
@@ -88,7 +106,7 @@ data class GenerationSettings(
         const val MAX_REPEAT_PENALTY = 1.50f
 
         const val MIN_GPU_LAYERS = 0
-        const val DEFAULT_GPU_LAYERS = 99
+        const val DEFAULT_GPU_LAYERS = 0
         const val MAX_GPU_LAYERS = 99
 
         const val MIN_MAX_AGENT_ITERATIONS = 1

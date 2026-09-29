@@ -74,9 +74,40 @@ class EngineConfigStoreTest {
         assertEquals(GenerationSettings.DEFAULT_BATCH_SIZE, loaded.batchSize)
         assertEquals(GenerationSettings.DEFAULT_GPU_LAYERS, loaded.gpuLayers)
         assertTrue(loaded.useVulkan)
-        assertEquals("q8_0", loaded.kvCacheTypeK)
-        assertEquals("q8_0", loaded.kvCacheTypeV)
-        assertTrue(loaded.enableFlashAttn)
+        assertEquals("f16", loaded.kvCacheTypeK)
+        assertEquals("f16", loaded.kvCacheTypeV)
+        assertFalse(loaded.enableFlashAttn)
+    }
+
+    @Test
+    fun toCompatibilityModeProducesConservativeSafeSettings() {
+        val aggressive = sampleSettings().copy(
+            gpuLayers = 99,
+            useVulkan = true,
+            batchSize = 512,
+            kvCacheTypeK = "q8_0",
+            kvCacheTypeV = "q8_0",
+            enableFlashAttn = true,
+        )
+        val compat = aggressive.toCompatibilityMode()
+        assertEquals(0, compat.gpuLayers)
+        assertFalse(compat.useVulkan)
+        assertEquals(256, compat.batchSize)
+        assertEquals("f16", compat.kvCacheTypeK)
+        assertEquals("f16", compat.kvCacheTypeV)
+        assertFalse(compat.enableFlashAttn)
+    }
+
+    @Test
+    fun toMaxAccelerationModeProducesMaxGpuSettings() {
+        val conservative = GenerationSettings()
+        val accelerated = conservative.toMaxAccelerationMode()
+        assertEquals(99, accelerated.gpuLayers)
+        assertTrue(accelerated.useVulkan)
+        assertEquals(512, accelerated.batchSize)
+        assertEquals("q8_0", accelerated.kvCacheTypeK)
+        assertEquals("q8_0", accelerated.kvCacheTypeV)
+        assertTrue(accelerated.enableFlashAttn)
     }
 
     @Test

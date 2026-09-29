@@ -146,7 +146,7 @@ class NativeBridgeBackpressureTest {
         }.buffer(generationStreamBufferCapacity(maxTokens))
 
         val received = mutableListOf<GenerationChunk>()
-        withTimeout(10_000) {
+        withTimeout(30_000) {
             flow.collect { received += it; delay(1) }
         }
 

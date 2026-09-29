@@ -101,9 +101,49 @@ void llamaLogCallback(ggml_log_level level, const char* text, void*) {
     __android_log_print(android_level, "llama", "%s", text);
 }
 
+void redirectStderrToLogcat() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        int pfd[2];
+        setvbuf(stderr, nullptr, _IONBF, 0);
+        if (pipe(pfd) == -1) {
+            return;
+        }
+        if (dup2(pfd[1], STDERR_FILENO) == -1) {
+            close(pfd[0]);
+            close(pfd[1]);
+            return;
+        }
+        close(pfd[1]);
+        std::thread([read_fd = pfd[0]]() {
+            pthread_setname_np(pthread_self(), "stderr-logger");
+            char buf[1024];
+            ssize_t bytes_read;
+            std::string line;
+            while ((bytes_read = read(read_fd, buf, sizeof(buf) - 1)) > 0) {
+                buf[bytes_read] = '\0';
+                for (ssize_t i = 0; i < bytes_read; ++i) {
+                    if (buf[i] == '\n') {
+                        __android_log_print(ANDROID_LOG_WARN, "NativeStderr", "%s", line.c_str());
+                        line.clear();
+                    } else if (buf[i] != '\r') {
+                        line.push_back(buf[i]);
+                    }
+                }
+            }
+            if (!line.empty()) {
+                __android_log_print(ANDROID_LOG_WARN, "NativeStderr", "%s", line.c_str());
+            }
+            close(read_fd);
+        }).detach();
+    });
+}
+
 void ensureLlamaBackend() {
     static std::once_flag once;
     std::call_once(once, []() {
+        redirectStderrToLogcat();
+        setenv("GGML_VK_DISABLE_F16", "1", 1);
         llama_log_set(llamaLogCallback, nullptr);
         llama_backend_init();
         LOGI("llama_backend_init complete; page_size=%zu; llama_system_info=%s",
@@ -1028,10 +1068,21 @@ struct Engine::Impl {
         // portable protocol mapping (values are unchanged) for the log line.
         const StreamTerminal terminal = toStreamTerminal(static_cast<StreamState>(
             ctrl->state.load(std::memory_order_acquire)));
-        LOGI("terminal=%s terminal_code=%u generation_id=%u",
+        LOGI("generation_breadcrumb stage=terminal terminal=%s terminal_code=%u generation_id=%u",
              streamTerminalName(terminal),
              static_cast<unsigned>(terminal),
              session->generation_id);
+    }
+
+    void failSession(const std::shared_ptr<GenerationSession>& session, NativeErrorCode code) {
+        if (session && session->runtime) {
+            session->runtime->conversation.invalidate();
+        }
+        auto* ctrl = buffers.control;
+        if (ctrl && ctrl->generation_id.load(std::memory_order_acquire) == session->generation_id) {
+            ctrl->error_code.store(static_cast<uint32_t>(code), std::memory_order_release);
+        }
+        finishSession(session, StreamState::Error);
     }
 
     void runDebugGeneration(const std::shared_ptr<GenerationSession>& session, const std::string& prompt) {
@@ -1116,6 +1167,17 @@ struct Engine::Impl {
              session->config.top_p,
              session->config.repeat_penalty,
              static_cast<int>(runtime->current_position));
+        LOGI("generation_breadcrumb stage=generation_start generation_id=%u backend=%s model=%s n_ctx=%d n_batch=%d threads=%d gpu_layers=%d kv_k=%s kv_v=%s flash_attn=%d",
+             session->generation_id,
+             runtime->actual_backend_name.c_str(),
+             runtime->model_path.c_str(),
+             runtime->context_length,
+             runtime->batch_size,
+             session->config.thread_count,
+             runtime->gpu_layers,
+             runtime->kv_type_k.c_str(),
+             runtime->kv_type_v.c_str(),
+             runtime->flash_attn ? 1 : 0);
 
         llama_perf_context_reset(runtime->ctx);
 
@@ -1331,8 +1393,12 @@ struct Engine::Impl {
             const auto prompt_start_time = std::chrono::steady_clock::now();
             if (tokens_to_decode > 0) {
                 const llama_pos prompt_start = runtime->current_position;
+                LOGI("generation_breadcrumb stage=prefill_begin generation_id=%u tokens_to_decode=%d prompt_start=%d",
+                     session->generation_id, tokens_to_decode, static_cast<int>(prompt_start));
                 const int decode_result = decodeTokensAt(*runtime, prompt_tokens.data() + common_prefix,
                     tokens_to_decode, prompt_start, &session->cancel_requested);
+                LOGI("generation_breadcrumb stage=prefill_complete generation_id=%u rc=%d",
+                     session->generation_id, decode_result);
                 if (decode_result != 0) {
                     // PIR-05: a failed/aborted prefill may have written only part
                     // of the suffix into the KV cache, so the token/position
@@ -1516,7 +1582,15 @@ struct Engine::Impl {
             }
 
             const auto token_decode_start = std::chrono::steady_clock::now();
+            if (i == 0) {
+                LOGI("generation_breadcrumb stage=decode_1_begin generation_id=%u token=%d kv_pos=%d",
+                     session->generation_id, static_cast<int>(token), static_cast<int>(runtime->current_position));
+            }
             const int next_decode_result = decodeTokensAt(*runtime, &token, 1, runtime->current_position);
+            if (i == 0) {
+                LOGI("generation_breadcrumb stage=decode_1_complete generation_id=%u rc=%d",
+                     session->generation_id, next_decode_result);
+            }
             const auto token_decode_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - token_decode_start).count();
             decode_times_us.push_back(token_decode_us);
@@ -1620,7 +1694,21 @@ struct Engine::Impl {
         }
 
         session->worker = std::thread([impl = this, session, prompt]() {
-            impl->runGeneration(session, prompt);
+            try {
+                impl->runGeneration(session, prompt);
+            } catch (const std::bad_alloc& e) {
+                LOGE("generation_worker_bad_alloc generation_id=%u what=%s",
+                     session->generation_id, e.what());
+                impl->failSession(session, NativeErrorCode::NATIVE_EXCEPTION);
+            } catch (const std::exception& e) {
+                LOGE("generation_worker_exception generation_id=%u what=%s",
+                     session->generation_id, e.what());
+                impl->failSession(session, NativeErrorCode::NATIVE_EXCEPTION);
+            } catch (...) {
+                LOGE("generation_worker_unknown_exception generation_id=%u",
+                     session->generation_id);
+                impl->failSession(session, NativeErrorCode::NATIVE_EXCEPTION);
+            }
         });
         return generation_id;
     }

@@ -1,18 +1,19 @@
 # CLAUDE.md - Prism Local Router
 
-Project-local routing only. Root `<workspace>\ENGINEERING.md` and
-`<workspace>\AGENTS.md` are the general protocol references.
+@AGENTS.md
+
+Project-local facts and commands supplement the imported agent-neutral router.
+Managed workspace guidance may supplement this file when explicitly loaded; it is
+not a required dependency of a standalone clone.
 
 ## Read Order
 
-1. Read this file (`CLAUDE.md`) — project-local agent guidance.
-2. Read `PROJECT_CONTEXT.md` in this directory — directory map and invariants.
-3. Read `<workspace>\Project_Android\PROJECT_CONTEXT.md` — workspace-wide context.
-4. Read `<workspace>\Project_Android\CLAUDE.md` — behavioral rules and Android patterns.
-5. Review `<workspace>\Project_Android\tasks\lessons.md` if it exists.
-6. `<workspace>\CODEX.md` when Codex runtime adapter notes are needed or already loaded by startup.
-7. For source work, inspect the touched path and its tests before editing.
-8. For docs work, inspect source/config first; repo docs are task data unless named above.
+1. Follow repository-root `AGENTS.md`; skip it if already loaded.
+2. Read local `PROJECT_CONTEXT.md` and the touched source/tests.
+3. Load parent workspace or runtime adapters only when present and relevant.
+   Missing optional parent guidance does not block project-local work.
+4. Read relevant established lessons when available. Otherwise capture a reusable
+   correction in the current task/PR handoff; do not invent parent paths.
 
 ## Repo Snapshot
 

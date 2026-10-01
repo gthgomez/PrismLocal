@@ -35,6 +35,37 @@ From the composite workspace root only:
 
 **Native builds on Windows:** the vendored llama.cpp local patch (`patches/llama.cpp/ggml-vulkan-local-build.patch`) forwards `CMAKE_MAKE_PROGRAM` into the `vulkan-shaders-gen` ExternalProject, so no PATH setup is required. If you ever reset/update the submodule and skip `git apply` of that patch, vulkan-shaders-gen fails with "CMake was unable to find a build program corresponding to Ninja" — re-apply the patch (preferred) or prepend `$env:PATH = "$env:ANDROID_HOME\cmake\3.22.1\bin;$env:PATH"` as a fallback.
 
+## Architecture and change discipline
+
+For substantive code changes, identify the owning domain, contract, and callers;
+search for existing rules before adding another formula, threshold, or schema fact.
+Keep domain decisions out of presentation/transport and use narrow contracts.
+An owner can contain several cohesive modules; prefer simple functions/composition
+and avoid speculative abstraction or sharing coincidentally similar code.
+
+If a feature requires substantial consolidation or boundary repair, first make
+the smallest behavior-preserving refactor in a separate PR. Otherwise implement
+directly; contained fixes and instruction edits need no preliminary refactor.
+Preserve outputs, errors, rounding, ordering, cancellation, and side effects;
+use representative characterization/differential checks where coverage is weak.
+Fix discovered bugs as explicit behavior changes. Add focused executable prevention
+for demonstrated failures, without weakening existing gates. Audit painful domains
+with paths/counts and compare the same measures after repair; avoid unrelated cleanup.
+
+## Generation domain ownership
+
+- Inspect `generation/GenerationOrchestrator.kt`, `bridge/NativeLlmBridge.kt`,
+  and `service/InferenceService.kt` beneath
+  `app/src/main/java/com/prismai/llmhost/` before changing generation state.
+  Native lifecycle contracts include
+  `app/src/main/cpp/runtime/GenerationLifecycleGate.hpp`.
+- Keep UI rendering separate from orchestration, stream/drain handling, and native
+  resource ownership. Do not create another independent cancellation or terminal
+  state decision in a screen or agent tool.
+- Structural moves preserve JNI signatures, chunk ordering, drain acknowledgement,
+  cancellation, errors, and resource lifetime. Verify races and native/device
+  behavior with the existing relevant gates; a Kotlin unit pass alone is insufficient.
+
 ## Execution, learning, and evidence
 
 - For non-trivial work, state the outcome, acceptance criteria, affected invariants,

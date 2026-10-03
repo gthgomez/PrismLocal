@@ -1,9 +1,11 @@
 # AGENTS.md — PrismLocal agent-neutral router
 
-Read [CLAUDE.md](./CLAUDE.md) for local invariants and commands, then
-[PROJECT_CONTEXT.md](./PROJECT_CONTEXT.md) for architecture. Skip already loaded
-instructions. Parent workspace policy is optional context when explicitly available;
-a standalone clone must not depend on an absent parent checkout.
+This file is the agent-neutral instruction authority for this repo. Read
+[PROJECT_CONTEXT.md](./PROJECT_CONTEXT.md) for architecture, commands, and
+factual context. Skip already loaded instructions. Parent workspace policy is
+optional context when explicitly available; a standalone clone must not depend
+on an absent parent checkout. The tree may be dirty; preserve in-progress user
+changes and avoid unrelated edits.
 
 ## Native interface risks
 - Hallucinated JNI method signatures — name mangling must match C++ function names exactly
@@ -34,6 +36,20 @@ From the composite workspace root only:
 **Verification gate:** from `PrismLocal/`, `.\gradlew.bat --no-daemon :app:assembleDevDebug` (quick loop). Before pushing anything touching native code, Gradle config, or ProGuard rules, run the full gate: `.\scripts\verify.ps1` — unit tests + `assembleDevBenchmark` + `assemblePlayRelease`. Debug-only builds never compile the RelWithDebInfo native config, R8/ProGuard rules, or the vulkan-shaders-gen host tool; CI enforces this via the `native-builds` job.
 
 **Native builds on Windows:** the vendored llama.cpp local patch (`patches/llama.cpp/ggml-vulkan-local-build.patch`) forwards `CMAKE_MAKE_PROGRAM` into the `vulkan-shaders-gen` ExternalProject, so no PATH setup is required. If you ever reset/update the submodule and skip `git apply` of that patch, vulkan-shaders-gen fails with "CMake was unable to find a build program corresponding to Ninja" — re-apply the patch (preferred) or prepend `$env:PATH = "$env:ANDROID_HOME\cmake\3.22.1\bin;$env:PATH"` as a fallback.
+
+## Done criteria
+
+- Source changes: run the narrowest relevant Gradle task, plus `assembleDevDebug`
+  or `.\scripts\verify.ps1` for Android/native changes (see the build gate above).
+- Native/JNI changes: also verify connected tests, or clearly mark device
+  verification as not run.
+- Manifest, signing, or release changes: include APK/build evidence and 16 KB /
+  native alignment checks when packaging is affected.
+- Model import/download changes: verify hash/manifest behavior and failure cleanup.
+- Docs-only changes: verify file existence, line budgets, links/paths, stale
+  phrases, and source traceability instead of heavy Gradle runs.
+- Real inference claims require current build/device evidence, not dated evidence
+  docs.
 
 ## Architecture and change discipline
 

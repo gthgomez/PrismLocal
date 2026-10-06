@@ -90,3 +90,69 @@ prism_add_native_test(handle_registry_test handle_registry_test.cpp)
 prism_add_native_test(native_error_code_test runtime/native_error_code_test.cpp)
 prism_add_native_test(generation_lifecycle_gate_test runtime/generation_lifecycle_gate_test.cpp)
 prism_add_native_test(generation_drain_ack_test runtime/generation_drain_ack_test.cpp)
+
+# ---------------------------------------------------------------------------
+# Engine mock-model qualification test.
+#
+# The tests above exercise only the header-only runtime helpers. This section
+# goes further: it compiles the REAL production Engine.cpp (the same source
+# Gradle compiles into libllmhost.so) against a host-built static llama.cpp,
+# with LLMHOST_DEBUG_HOOKS=1. That activates the DEBUG_MOCK_MODEL /
+# DEBUG_SIMULATE_RING paths, so the actual engine code — token ring,
+# backpressure, cancellation, reset, memory-pressure handling, drain
+# accounting, session lifecycle — executes on a plain Linux host WITHOUT a
+# model, a device, an NDK, or Gradle.
+#
+# The mock path performs no llama decode: runDebugGeneration writes a
+# deterministic token sequence into the real ring buffer with the real
+# cancellation and accounting logic. Everything asserted is production code,
+# not a simulation of it.
+#
+# Disable with -DPRISM_ENABLE_ENGINE_MOCK_TEST=OFF for a header-only run.
+# ---------------------------------------------------------------------------
+option(PRISM_ENABLE_ENGINE_MOCK_TEST
+       "Build the real Engine.cpp against host llama.cpp and run its mock-model qualification tests"
+       ON)
+
+if(PRISM_ENABLE_ENGINE_MOCK_TEST)
+    set(LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../main/cpp/third_party/llama.cpp")
+
+    # Same feature disables as the app's CMakeLists.txt: CPU-only, no Vulkan,
+    # no OpenCL, no KleidiAI, no BLAS, no tests/tools/examples/server.
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_WEBUI OFF CACHE BOOL "" FORCE)
+    set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
+    set(GGML_STATIC ON CACHE BOOL "" FORCE)
+    set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+    set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+    set(GGML_OPENCL OFF CACHE BOOL "" FORCE)
+    set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+    set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
+
+    add_subdirectory("${LLAMA_CPP_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp")
+
+    find_package(Threads REQUIRED)
+
+    add_executable(engine_mock_test
+        engine/engine_mock_test.cpp
+        "${PRISM_MAIN_CPP_DIR}/Engine.cpp"
+    )
+    target_include_directories(engine_mock_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/host_shim" # android/log.h host shim
+        "${PRISM_MAIN_CPP_DIR}"                      # Engine.hpp, runtime/, llama.h, common.h, sampling.h
+        "${LLAMA_CPP_DIR}/include"
+        "${LLAMA_CPP_DIR}/common"
+        "${LLAMA_CPP_DIR}/ggml/include"
+    )
+    target_compile_definitions(engine_mock_test PRIVATE LLMHOST_DEBUG_HOOKS=1)
+    target_compile_options(engine_mock_test PRIVATE -Wall -Wextra)
+    target_link_libraries(engine_mock_test PRIVATE llama ggml Threads::Threads)
+    add_test(NAME engine_mock_test COMMAND engine_mock_test)
+endif()

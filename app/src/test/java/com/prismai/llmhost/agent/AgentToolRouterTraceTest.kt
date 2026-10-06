@@ -456,6 +456,107 @@ class AgentToolRouterTraceTest {
         )
     }
 
+    /**
+     * Negative control for PL01 / issue #16: a direct capability revocation
+     * between confirmation and dispatch admits nothing and the tool executor
+     * observes zero side effects, even after the capability is re-granted,
+     * because the authorization epoch moved.
+     */
+    @Test
+    fun capabilityRevocationBetweenConfirmationAndDispatchAdmitsNothingAndRunsNoTool() {
+        val toolRuns = AtomicInteger(0)
+        val policy = agentEnabledRegistry()
+        val harness = newHarness(
+            capabilityRegistry = policy,
+            executeTool = { call, _ ->
+                toolRuns.incrementAndGet()
+                AgentToolResult(call = call, success = true, summary = "executed")
+            },
+        )
+        val chainId = harness.trace.beginChain("download")
+        val staged = harness.confirmation.stagePending(
+            call = AgentToolCall("download_model", JSONObject().put("entry_id", "small-model")),
+            originalPrompt = "download",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )!!
+        val consumed = harness.confirmation.consumePendingAndRevalidate(
+            token = staged.token,
+            activeChainId = chainId,
+            activeChatId = "chat-1",
+        )
+        assertNotNull(consumed)
+
+        policy.revoke(Capability.MODEL_DOWNLOAD)
+
+        assertFalse(harness.confirmation.tryBeginDispatch(consumed!!))
+        assertFalse(policy.isCurrent(consumed.capabilityAuthorization))
+        assertEquals(0, toolRuns.get())
+
+        // Re-granting the capability does not resurrect the stale epoch.
+        policy.grant(Capability.MODEL_DOWNLOAD)
+        assertFalse(harness.confirmation.tryBeginDispatch(consumed))
+        assertEquals(0, toolRuns.get())
+    }
+
+    /**
+     * Negative control for PL01 / issue #16: a changed tool request replaces
+     * the staged authorization; the stale token can neither be consumed nor
+     * dispatched, and no tool side effects occur.
+     */
+    @Test
+    fun changedToolRequestAfterConfirmationCannotDispatchStaleToken() = runBlocking {
+        val toolRuns = AtomicInteger(0)
+        val harness = newHarness(
+            capabilityRegistry = agentEnabledRegistry(),
+            executeTool = { call, _ ->
+                toolRuns.incrementAndGet()
+                AgentToolResult(call = call, success = true, summary = "executed")
+            },
+        )
+        val chainId = harness.trace.beginChain("prompt")
+        val original = AgentToolCall("switch_model", JSONObject().put("model_id", "model-a"))
+        val staged = harness.confirmation.stagePending(
+            call = original,
+            originalPrompt = "prompt",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )!!
+
+        // A changed tool request replaces the staged authorization.
+        val changed = AgentToolCall("switch_model", JSONObject().put("model_id", "model-b"))
+        val replacement = harness.confirmation.stagePending(
+            call = changed,
+            originalPrompt = "prompt",
+            depth = 0,
+            chainId = chainId,
+            sourceChatId = "chat-1",
+        )
+        assertNotNull(replacement)
+        org.junit.Assert.assertNotEquals(staged.callFingerprint, replacement!!.callFingerprint)
+
+        // The stale token can neither be consumed nor dispatched.
+        assertNull(
+            harness.confirmation.consumePendingAndRevalidate(
+                token = staged.token,
+                activeChainId = chainId,
+                activeChatId = "chat-1",
+            ),
+        )
+        assertEquals(0, toolRuns.get())
+
+        // The replacement request remains consumable under its own token.
+        val admitted = harness.confirmation.consumePendingAndRevalidate(
+            token = replacement.token,
+            activeChainId = chainId,
+            activeChatId = "chat-1",
+        )
+        assertEquals("model-b", admitted?.call?.arguments?.optString("model_id"))
+        assertEquals(0, toolRuns.get())
+    }
+
     @Test
     fun pendingConfirmationRejectsNullChainOwner() = runBlocking {
         val harness = newHarness()

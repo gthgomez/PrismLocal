@@ -205,6 +205,39 @@ class AgentTraceContinuationTest {
         assertTrue(unreadable.exists())
     }
 
+    /**
+     * Negative control for PL01 / issue #19: the source chat is deleted before
+     * its trace flush runs, and the owner-bound flush gate must not (re)create
+     * any artifact. Deletion is ordered before finalization so the gate check
+     * inside the persist block provably runs after `deletedChatIds` was
+     * populated — removing the gate makes this test fail.
+     */
+    @Test
+    fun deletingSourceChatBeforeQueuedTraceFlushPublishesNothing() = runBlocking {
+        val dir = tempFolder.newFolder()
+        val tracesDir = File(dir, "agent_traces")
+        val ui = ServiceUiState().also { it._currentChatId.value = "chat-queued" }
+        val trace = AgentTrace(ui, dir, CoroutineScope(SupervisorJob() + Dispatchers.Unconfined))
+
+        // Delete the source chat before its chain's trace flush runs.
+        trace.deleteForChat("chat-queued")
+
+        val chain = trace.beginChain("queued prompt", ownerChatId = "chat-queued")
+        assertTrue(trace.finalizeOwnedTrace(chain, success = true))
+
+        // Drain the asynchronously dispatched flush, then assert nothing was
+        // published: no JSON artifact, no temp residue, no last-trace pointer.
+        withTimeout(2_000) {
+            while (tracesDir.exists() && tracesDir.listFiles()?.any { it.name.endsWith(".tmp") } == true) {
+                kotlinx.coroutines.delay(2)
+            }
+        }
+        kotlinx.coroutines.delay(30)
+        assertTrue(tracesDir.listFiles()?.none { it.extension == "json" } ?: true)
+        assertTrue(tracesDir.listFiles()?.none { it.name.endsWith(".tmp") } ?: true)
+        assertNull(ui.lastAgentTracePath.value)
+    }
+
     @Test
     fun traceRetentionRemovesExpiredArtifacts() = runBlocking {
         val dir = tempFolder.newFolder()

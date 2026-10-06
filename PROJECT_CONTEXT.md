@@ -149,7 +149,11 @@ Dated evidence docs:
   snapshot commit `bbeb89d76c41bc250f16e4a6fefcc9b530d6e3f3`.
 
 Fresh build/test/log evidence is required before claiming the current tree
-passes.
+passes. Native builds compile/link `llama.cpp` and can be slow. Release builds
+are unsigned unless the external signing properties/env vars above are supplied.
+
+Runbook docs: `RUNTIME_LIMITS.md` and `SIGNING.md` are local runbooks, but
+verify them against source before relying on exact limits or paths.
 
 ## Signing
 
@@ -167,16 +171,28 @@ an older artifact path; adapt commands to this repo path before use.
 
 ## High-Risk Paths
 
-- Gradle, wrapper, NDK, CMake, build type, ABI, and dependency edits.
-- Manifest permission/activity/service/foreground-service changes.
+- `app/build.gradle.kts`, root Gradle files, wrapper files, NDK/CMake settings.
+- `app/src/main/AndroidManifest.xml` permissions, activity/service, and
+  foreground-service declarations.
+- `app/src/main/cpp/CMakeLists.txt`, `Engine.cpp`, `Engine.hpp`,
+  `llmhost_jni.cpp`, `app/src/main/cpp/third_party/llama.cpp/**`, and
+  `.gitmodules` (vendored llama.cpp).
+- `NativeLlmBridge.kt` and `InferenceService.kt`: JNI calls, cancellation,
+  memory pressure, and stream state.
 - JNI/native engine lifecycle, stream states, cancellation, memory pressure,
   model mmap fallback, and 16 KB linker flags.
-- Model import/download paths, manifest promotion, SHA-256 validation, storage
-  cleanup, and Hugging Face network behavior.
-- Agent tool validation and confirmation gates.
+- `ModelStorageManager.kt` model import, GGUF validation, manifests, and
+  SHA-256 checks.
+- `HuggingFaceDownloadWorker.kt` network downloads, resume, and checksum
+  validation.
+- `AgentTools.kt` validation and confirmation gates; network/model/tool actions
+  exposed through it require the app's confirmation path unless source proves
+  otherwise.
 - Chat transcript deletion/export and benchmark export paths.
-- Signing, release outputs, `local.properties`, model binaries, and validation
-  artifacts.
+- Signing surfaces: `SIGNING.md`, release build config, keystore env/property
+  names.
+- Machine/local artifacts: `local.properties`, `release/`, `validation/`,
+  `*.jks`, `*.keystore`, `*.apk`, `*.aab`, `*.gguf`.
 
 ## Current Limitations And Gaps
 
@@ -196,4 +212,4 @@ which commands are trusted, what paths are risky, which evidence is dated, what
 is unverified, and what done means by reading `AGENTS.md` plus this file.
 
 ---
-*Last updated: 2026-09-23 — P0 correctness train in progress*
+*Last updated: 2026-10-03 — P0 correctness train in progress*

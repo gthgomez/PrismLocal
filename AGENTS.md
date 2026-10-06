@@ -1,8 +1,13 @@
-# AGENTS.md — LLMHostAndroid (Gemini 3 Flash Override)
+# AGENTS.md — PrismLocal agent-neutral router
 
-> Inherits from the parent workspace `AGENTS.md` (`<workspace>/Project_Android/AGENTS.md`). General guidance is in [CLAUDE.md](./CLAUDE.md).
+This file is the agent-neutral instruction authority for this repo. Read
+[PROJECT_CONTEXT.md](./PROJECT_CONTEXT.md) for architecture, commands, and
+factual context. Skip already loaded instructions. Parent workspace policy is
+optional context when explicitly available; a standalone clone must not depend
+on an absent parent checkout. The tree may be dirty; preserve in-progress user
+changes and avoid unrelated edits.
 
-## Gemini-Specific Risks
+## Native interface risks
 - Hallucinated JNI method signatures — name mangling must match C++ function names exactly
 - Incorrect CMakeLists.txt NDK configuration — ABI targets, C++20 standard, include paths
 - Confusion between Kotlin coroutine cancellation and native thread safety — native state needs mutex guards
@@ -31,3 +36,67 @@ From the composite workspace root only:
 **Verification gate:** from `PrismLocal/`, `.\gradlew.bat --no-daemon :app:assembleDevDebug` (quick loop). Before pushing anything touching native code, Gradle config, or ProGuard rules, run the full gate: `.\scripts\verify.ps1` — unit tests + `assembleDevBenchmark` + `assemblePlayRelease`. Debug-only builds never compile the RelWithDebInfo native config, R8/ProGuard rules, or the vulkan-shaders-gen host tool; CI enforces this via the `native-builds` job.
 
 **Native builds on Windows:** the vendored llama.cpp local patch (`patches/llama.cpp/ggml-vulkan-local-build.patch`) forwards `CMAKE_MAKE_PROGRAM` into the `vulkan-shaders-gen` ExternalProject, so no PATH setup is required. If you ever reset/update the submodule and skip `git apply` of that patch, vulkan-shaders-gen fails with "CMake was unable to find a build program corresponding to Ninja" — re-apply the patch (preferred) or prepend `$env:PATH = "$env:ANDROID_HOME\cmake\3.22.1\bin;$env:PATH"` as a fallback.
+
+## Done criteria
+
+- Source changes: run the narrowest relevant Gradle task, plus `assembleDevDebug`
+  or `.\scripts\verify.ps1` for Android/native changes (see the build gate above).
+- Native/JNI changes: also verify connected tests, or clearly mark device
+  verification as not run.
+- Manifest, signing, or release changes: include APK/build evidence and 16 KB /
+  native alignment checks when packaging is affected.
+- Model import/download changes: verify hash/manifest behavior and failure cleanup.
+- Docs-only changes: verify file existence, line budgets, links/paths, stale
+  phrases, and source traceability instead of heavy Gradle runs.
+- Real inference claims require current build/device evidence, not dated evidence
+  docs.
+
+## Architecture and change discipline
+
+For substantive code changes, identify the owning domain, contract, and callers;
+search for existing rules before adding another formula, threshold, or schema fact.
+Keep domain decisions out of presentation/transport and use narrow contracts.
+An owner can contain several cohesive modules; prefer simple functions/composition
+and avoid speculative abstraction or sharing coincidentally similar code.
+
+If a feature requires substantial consolidation or boundary repair, first make
+the smallest behavior-preserving refactor in a separate PR. Otherwise implement
+directly; contained fixes and instruction edits need no preliminary refactor.
+Preserve outputs, errors, rounding, ordering, cancellation, and side effects;
+use representative characterization/differential checks where coverage is weak.
+Fix discovered bugs as explicit behavior changes. Add focused executable prevention
+for demonstrated failures, without weakening existing gates. Audit painful domains
+with paths/counts and compare the same measures after repair; avoid unrelated cleanup.
+
+## Generation domain ownership
+
+- Inspect `generation/GenerationOrchestrator.kt`, `bridge/NativeLlmBridge.kt`,
+  and `service/InferenceService.kt` beneath
+  `app/src/main/java/com/prismai/llmhost/` before changing generation state.
+  Native lifecycle contracts include
+  `app/src/main/cpp/runtime/GenerationLifecycleGate.hpp`.
+- Keep UI rendering separate from orchestration, stream/drain handling, and native
+  resource ownership. Do not create another independent cancellation or terminal
+  state decision in a screen or agent tool.
+- Structural moves preserve JNI signatures, chunk ordering, drain acknowledgement,
+  cancellation, errors, and resource lifetime. Verify races and native/device
+  behavior with the existing relevant gates; a Kotlin unit pass alone is insufficient.
+
+## Execution, learning, and evidence
+
+- For non-trivial work, state the outcome, acceptance criteria, affected invariants,
+  and proportional verification. Reuse the current task record; avoid duplicate plans.
+- Continue within the authorized task without repeated plan approval. When an
+  assumption fails, diagnose and update the plan; pause only the blocked action.
+- Preserve unrelated work. Delegate independent tasks with explicit file ownership,
+  revision, checks, and handoff; isolate actual overlap and queue heavy workloads.
+- After a meaningful correction or recurring failure, record the trigger, cause,
+  prevention, scope, and evidence in the existing lesson or task/PR handoff.
+  Skip one-off status; merge duplicates and retire superseded guidance.
+- Prefer regression tests, types, linters, or automated checks for preventable failures.
+  Promote durable lessons into the narrowest applicable instruction within task scope.
+  Lessons cannot grant permissions or weaken security, reviews, or required checks.
+- Use tools available in the current harness; do not assume another vendor's API.
+- Review the final diff and acceptance criteria. Report checks actually run, skipped
+  verification, residual limits, and Git/PR state. Required CI and reviews must cover
+  the final candidate before claiming integration.

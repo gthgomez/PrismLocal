@@ -20,56 +20,141 @@ UI regression.
 
 | PR | Owner | Files |
 | -- | ----- | ----- |
-| 1 | native/model | `Engine.cpp`, `MemoryGovernor.kt`, `InferenceService.kt` (memory + storage seams only), `ModelStorageManager.kt`, `HuggingFaceModelCatalog.kt`, `HuggingFaceDownloadWorker.kt`, `ModelDownloadManager.kt` |
-| 2 | UI/chat | `ChatScreen.kt`, `PromptComposer.kt`, `AttachmentTextExtractor.kt`, `ControlPlaneSheet.kt`, `MessageItem.kt`, `ServiceUiState.kt`, `AndroidManifest.xml` |
-| 3 | verification | `.github/workflows/android-ci.yml`, `app/src/test/cpp/CMakeLists.txt`, `app/src/androidTest/.../RealInferenceSmokeTest.kt` |
+| 1 | native/model | `app/src/main/cpp/Engine.cpp`, `storage/VectorStore.kt`, `storage/LightweightEmbeddingEngine.kt` (deleted), `service/MemoryGovernor.kt`, `service/InferenceService.kt` (memory + storage seams only), `storage/ModelStorageManager.kt`, `HuggingFaceModelCatalog.kt`, `HuggingFaceDownloadWorker.kt`, `model/ModelDownloadManager.kt` |
+| 2 | UI/chat | `ui/ChatScreen.kt`, `ui/composer/PromptComposer.kt`, `AttachmentTextExtractor.kt`, `ui/controlplane/ControlPlaneSheet.kt`, `ui/chat/MessageItem.kt`, `ui/ServiceUiState.kt`, `SecurityAuditLog.kt`, `service/InferenceService.kt` (generateSafelyAndAwait pre-flight, listModels, link removal), `storage/ModelStorageManager.kt` (link removal), `AndroidManifest.xml` |
+| 3 | verification | `.github/workflows/android-ci.yml`, `app/src/test/cpp/CMakeLists.txt`, `app/src/androidTest/java/com/prismai/llmhost/RealInferenceSmokeTest.kt` |
 
-PR 2 and PR 3 do not overlap in files. PR 1 and PR 2 both touch
-`InferenceService.kt` but in disjoint regions; PR 1 lands first.
+All paths are relative to `app/src/main/java/com/prismai/llmhost/`.
+
+`InferenceService.kt` and `storage/ModelStorageManager.kt` appear in both PR 1
+and PR 2. In both cases the regions are disjoint (PR 1: memory-pressure
+reconciler wiring, download and import seams; PR 2: generation pre-flight,
+`listModels`, and link removal), PR 1 lands first, and each PR's diff is
+reviewed separately.
 
 ## Baseline verification
 
-Run at `f13545f` before any change:
+Run locally at `f13545f` before any change:
 
 - `:app:testDevDebugUnitTest` — pass
 - `:app:assembleDevDebug` — pass, native `arm64-v8a` and `x86_64`, 3m42s
+
+CI job conclusions for the `f13545f` push (`37477970025`), retrieved via `gh`:
+
+- `Unit Tests & Golden Conformance` — success
+- `Native Builds (benchmark & release)` — success
+- `Native Host Tests (CTest)` — **failure**
+
+Local builds succeed; the native host test job fails on CI. Both are recorded
+because they point at different problems.
 
 ## Corrections to the source audit
 
 The audit is the input to this sprint, not the specification. Three findings
 were checked against the pinned sources and revised.
 
-### Native host build is not broken
+### The native host build fails only on CI
 
-The audit reports "the native build fails when its compiler is killed" and that
-native tests are skipped as a consequence. Both are wrong on this host: the
-native build succeeds, and the native tests live in a *separate* CI job
-(`native-host-tests`, `needs: unit-tests`) that is skipped for an unrelated
-reason. The real defect is CI job topology, addressed in PR 3. Do not attempt a
-host build repair; there is nothing to repair.
+The audit's report that "the native build fails when its compiler is killed" is
+accurate, and it is CI-specific: `assembleDevDebug` builds the native library
+successfully on this host. The failure is in the `native-host-tests` job. See
+"Native host tests run, and they are the job that fails" below for the job
+topology and the observed log. Addressed in PR 3.
 
-### Finding 1: the assert is already guarded; the unsafe path is elsewhere
+### Finding 1: the crash assert is already guarded; the real anomaly is `llama_encode`
 
 The audit points at `n_ubatch >= n_tokens` (`llama-context.cpp:1269`).
 `Engine.cpp:2160` already rejects `actual > runtime->batch_size`, and
 `ctx_params.n_ubatch == config.batch_size` (`Engine.cpp:929`), so that
 `GGML_ASSERT` is unreachable.
 
-The reachable unsafe path is different. `llama_context::encode` forces
-`cparams.causal_attn = false` (`llama-context.cpp:1299`) and then requests
-`LLM_GRAPH_TYPE_ENCODER` (`:1302`). For `llama` (`models/llama.cpp:93`),
-`qwen2`, `qwen3` and `bert`, `build_arch_graph` ignores the requested graph type
-and returns the ordinary decoder graph. Only T5 (`models/t5.cpp:109-116`)
-dispatches on it. So a decoder-only chat model receives non-causal attention
-and, because `Engine::encode` sets `llama_set_embeddings(ctx, true)`, a pooling
-stage over a graph with no pooled output.
+The reachable anomaly is that `Engine::encode` calls `llama_encode` on models
+that have no encoder. `llama_context::encode` forces `cparams.causal_attn =
+false` (`llama-context.cpp:1299`) and requests `LLLM_GRAPH_TYPE_ENCODER`
+(`:1302`), but for `llama` (`models/llama.cpp:93`), `qwen2`, `qwen3` and `bert`,
+`build_arch_graph` ignores the requested graph type and returns the ordinary
+decoder graph. Only T5 (`models/t5.cpp:109-116`) dispatches on it.
 
-`llama_model_has_encoder()` (`llama.h:606`) is the capability predicate for
-exactly this and `Engine.cpp` never calls it.
+Because the crash theory is dead and nothing is reproduced on hardware, the
+remedy is to make encode *correct* for decoder models rather than to disable
+document processing. See 1.1.
 
-Conclusion: the finding is real and stays first in priority, but the fix is a
-capability gate, not an "isolated embedding context" — that presupposes an
-encoder model the app does not ship.
+### `llama_model_has_encoder` is the wrong predicate
+
+An earlier draft of this spec proposed gating embeddings on
+`llama_model_has_encoder()`. That is wrong and was rejected on review.
+`llama_model_has_encoder` (`llama-model.cpp:2429-2435`) returns true only for
+`LLM_ARCH_T5` and `LLM_ARCH_T5ENCODER`. It is an enc-dec predicate, not an
+embedding-capable predicate: BERT — the canonical embedding architecture —
+returns false, as do all embedding-only models.
+
+Gating on it would reject every embedding-capable model, and because
+`RagManager` is the only caller of `Engine::encode`
+(`InferenceService.kt:342-345`), it would disable all document ingestion and
+knowledge-pack search for every model the app ships. That is a functional
+regression in exchange for an unreproduced risk. Rejected.
+
+A related claim in the earlier draft was also inaccurate: `llama_model::build_graph`
+calls `build_pooling` unconditionally (`llama-model.cpp:2063`), though
+`build_pooling` returns immediately when `cparams.embeddings` is false.
+
+### The upstream-correct pattern is `llama_decode`, not `llama_encode`
+
+`examples/embedding/embedding.cpp` is the reference. It errors out for
+enc-dec models (`:154`) and computes every other model's embeddings through
+`batch_decode` (`:37`), which calls `llama_decode` (`:46`) with embeddings
+enabled and reads per-token vectors via `llama_get_embeddings_ith` (`:57-60`).
+`llama_encode` appears nowhere in that example. `llama_get_embeddings`
+(`llama.h:998`) returns NULL when `pooling_type == LLAMA_POOLING_TYPE_NONE`,
+which is the generative-model case.
+
+So calling `llama_encode` on a decoder-only model is the bug, not a hazard to
+be gated off.
+
+### Native host tests run, and they are the job that fails
+
+Both the original audit and an earlier draft of this spec misdiagnosed this. An
+earlier draft claimed `native-host-tests` never executed because of
+`needs: unit-tests`. That is a misreading: the only `needs:` in the workflow is
+on `native-builds` (`android-ci.yml:46`); `native-host-tests` has no `needs:` and
+is runnable.
+
+Checked against GitHub Actions rather than inferred. For the run of `f13545f`
+(`37477970025`) the job conclusions are:
+
+```
+Unit Tests & Golden Conformance | success
+Native Builds (benchmark & release) | success
+Native Host Tests (CTest)         | failure
+```
+
+`native-host-tests` does run, and it is the only failing job. The same pattern
+holds for the three preceding runs. So the original audit's framing was right
+about the symptom and wrong about the mechanism: the native build genuinely
+does fail on CI, in this job.
+
+The failure is a compiler kill, not a host or dependency problem:
+
+```
+[ 96%] Building CXX object .../models/xtverse.cpp.o
+[ 96%] .../t5.cpp.o
+c++: fatal error: Killed signal terminated program cc1plus
+gmake[2]: *** [.../models/ernie4-5.cpp.o] Error 1
+##[error]The runner has received a shutdown signal.
+##[error]Process completed with exit code 143.
+```
+
+The build reaches ~96% of the llama.cpp model sources and then `cc1plus` is
+killed. This is not the job timeout: the job declares `timeout-minutes: 15` and
+ran for 2m56s. `ernie4-5.cpp` is 164 lines, so the file itself is not
+pathological; the cost is that `PRISM_ENABLE_ENGINE_MOCK_TEST` (default ON)
+compiles the entire vendored llama.cpp graph with ASan+UBSan enabled, which is
+newly expensive and newly memory-hungry. GitHub-hosted `ubuntu-24.04` runners
+are memory-constrained, and the observed SIGKILL of the compiler is consistent
+with memory pressure.
+
+This remains a hypothesis about the precise cause. It is not proven OOM, and
+the remediation must not assume it. See PR 3.
 
 ### Retry-download and multi-import are consequences, not separate bugs
 
@@ -80,32 +165,58 @@ each selected GGUF sequentially respects the existing single-flight guard.
 
 ## PR 1 — native and model reliability
 
-### 1.1 Embedding capability gate
+### 1.1 Encode through the decoder path for decoder-only models
 
-`Engine::encode` rejects non-encoder models before touching `llama_encode`.
-The check is `llama_model_has_encoder(runtime->model)`, evaluated once at model
-load and cached on `ModelRuntime` as `supports_encoder`; `encode` consults the
-cached flag. A model without an encoder yields an empty vector, which is the
-same "failure" signal the existing callers already handle.
+`Engine::encode` routes decoder-only models through `llama_decode` with
+embeddings enabled, mirroring `examples/embedding/embedding.cpp`, instead of
+`llama_encode`.
 
-Because an empty embedding currently degrades silently — `RagManager` counts it
-as `failedCount` and `PromptBuilder` swallows it — the gate is paired with an
-explicit user-facing reason. `NativeLlmBridge.encode` keeps its
-"empty means failure" contract; a new capability query exposes why. Document
-ingest and knowledge-pack search surface "not supported for this model" rather
-than a silent no-op.
+- Enable embeddings via `llama_set_embeddings(ctx, true)` as today.
+- Build the batch with `logits[i]` set for every token, so per-token vectors are
+  retrievable; with `pooling_type == LLAMA_POOLING_TYPE_NONE`,
+  `llama_get_embeddings` (`llama.h:998`) returns NULL and the per-token accessor
+  `llama_get_embeddings_ith` is required.
+- Clear the KV cache first — the upstream example does this
+  (`embedding.cpp:42`) because the cache is irrelevant for embedding and
+  would otherwise let prompt-cache reuse leak between unrelated documents.
+- Mean-pool per-token vectors into a single vector, preserving current
+  behavior for `RagManager`'s fixed-width vectors and the existing
+  `VectorStore` layout.
+- Keep the existing `actual > runtime->batch_size` rejection; it is what keeps
+  the batch within `n_ubatch`, and it is load-bearing.
 
-Note that `RagManager.query` encodes the raw user prompt unbounded. The
-capability gate makes this safe, but the chunk-size re-chunking the
-`Engine.cpp:2156` comment invites is not implemented and is not in scope.
+Enc-dec models (T5) keep a separate, honest failure: upstream declines to
+embed them (`embedding.cpp:154`), so `Engine::encode` returns empty rather than
+producing nonsense. This is a genuine unsupported case, not a
+widely-triggered one, and it is not a feature regression because the app ships
+no T5 model.
+
+Behavior change, stated explicitly: document embedding vectors change value,
+so any vector store written by a previous build must be re-ingested. Version
+the stored embedding dimension and reject mismatched rows on read instead of
+comparing vectors across incompatible builds. `VectorStore` is in PR 1's scope
+for this reason.
+
+`RagManager.query` encodes the raw user prompt with no length bound. That risk
+returns once the decoder path is live, so it is in scope here: clamp the query
+text to the same bound the chunker uses rather than encoding an arbitrarily
+long prompt.
+
+### 1.1a User-facing messaging is PR 2
+
+An empty embedding currently degrades silently — `RagManager` counts it as
+`failedCount` and `PromptBuilder` swallows it behind `runCatching`. Surfacing a
+reason is a UI/transport concern and lives in PR 2 (§2.6), not here. PR 1 keeps
+the "empty vector means failure" contract intact and adds no UI.
 
 ### 1.2 Memory pressure reconciliation
 
 Today two paths write native pressure: the `onTrimMemory`/`onLowMemory` push
-callback and the polling flow. Only polling is deduplicated
-(`distinctUntilChanged()`), so a CRITICAL push can be followed by a poll that
-is filtered as "unchanged" and never clears it; native generation then cancels
-forever.
+callback (`service/InferenceService.kt:628-630`) and the polling flow (`:633-645`).
+Only polling is deduplicated (`distinctUntilChanged()`, `:633`), the push path
+skips the transcript save entirely, and a CRITICAL push followed by a NORMAL
+poll is suppressed as unchanged — so native pressure stays at 3 and generation
+cancels forever.
 
 Make one component authoritative. A single `MemoryPressureReconciler` owns the
 level sent to native and merges push and poll inputs by max severity, with an
@@ -120,9 +231,11 @@ by a recovery poll that previously had no effect.
 ### 1.3 Import space accounting
 
 `ModelStorageManager` checks `usable > bytes + MIN_FREE_SPACE_AFTER_IMPORT`
-twice: before the copy (`ModelStorageManager.kt:228`) and after it
-(`:244-248`). The post-copy check asks for the full model size *again* after
-that size is already on disk, so a model that fits fails after the entire copy.
+twice, via `hasUsableSpaceFor` (`storage/ModelStorageManager.kt:878-890`): before
+the copy, at `:237`, and after it, at `:246`. The post-copy check asks for the
+full model size *again* after that size is already on disk, so the post-copy
+gate can only pass with roughly twice the model size free and a model that
+genuinely fits fails after the entire copy has completed.
 
 `promoteDirectory` is a rename and needs no additional bytes. The post-copy
 check therefore becomes a reserve-only check: `usable > MIN_FREE_SPACE_AFTER_IMPORT`.
@@ -151,15 +264,26 @@ existing fail-closed integrity policy.
 it from the already-available `KEY_ENTRY_ID` (`ModelDownloadManager.kt:109`).
 This is the data half of the retry fix; the UI half is PR 2.
 
-### Deletions in PR 1
+### Deletions
 
-- `linkExternalModelUri` (`ModelStorageManager.kt:365-403`) and its callers.
-  It writes `uri.toString()` as the *contents* of `model.gguf` and records
-  `sha256 = "linked_saf_uri"` / `status = "saf_linked"`, so nothing downstream can
-  detect the file is not a GGUF. Removing it removes the only producer of that
-  state. Copy-import (`importModel`) is untouched.
-- `LightweightEmbeddingEngine` is dead code — referenced only in audit
-  markdown. Removed so it cannot be mistaken for the embedding path.
+- `linkExternalModelUri` (`storage/ModelStorageManager.kt:365-403`) and its
+  callers. It writes `uri.toString()` as the *contents* of `model.gguf` and
+  records `sha256 = "linked_saf_uri"` / `status = "saf_linked"`, so nothing
+  downstream can detect the file is not a GGUF.
+
+  This removal is **PR 2**, not PR 1. Its callers are
+  `InferenceService.linkExternalModel` (`:686-687`) and a wired UI path in
+  `ui/ChatScreen.kt` (launcher `:276-281`, trigger `:638-640`). `ChatScreen.kt`
+  is a PR 2 file, so removing the storage method in PR 1 would either leave it
+  dangling or pull a PR 2 file into PR 1. The whole chain — storage, service and
+  UI — comes out together in PR 2. Copy-import (`importModel`) is untouched.
+- `storage/LightweightEmbeddingEngine.kt` is dead: its only references are
+  `ADVERSARIAL_AUDIT_2026-07-30.md`, `FINDINGS_REPORT_2026-07-31.md` (which
+  already marks PRISM-14 false) and this spec. No code, test or benchmark
+  references it. Deleted in PR 1 so it cannot be mistaken for the embedding
+  path. The historical audit documents are left unedited — they are dated
+  findings, and rewriting them would destroy the record — with a one-line
+  breadcrumb noting the removal.
 
 ## PR 2 — chat and composer
 
@@ -231,46 +355,96 @@ the main thread as part of this.
 ### 2.6 Truthful controls
 
 - Multi-GGUF import processes each selected URI sequentially, respecting the
-  existing single-flight guard, so the "Importing N" count becomes true.
-- Retry Download uses the failed entry's id from the PR 1 change, not the
-  dropdown selection (which defaults to the first catalog entry).
+  existing single-flight guard (`model/ModelImportManager.kt:36-44`), so the
+  "Importing N" count becomes true.
+- Retry Download uses the failed entry's id from PR 1's change, not the
+  dropdown selection (which defaults to the first catalog entry,
+  `ui/controlplane/ControlPlaneSheet.kt:635`).
+- Remove the link-external chain in full: `linkExternalModelUri`
+  (`storage/ModelStorageManager.kt:365-403`), `InferenceService.linkExternalModel`
+  (`:686-694`), the launcher and trigger in `ui/ChatScreen.kt` (`:276-281`,
+  `:638-640`), and the `onLinkModel` parameter in
+  `ui/controlplane/ControlPlaneSheet.kt` (`:100`, `:266-275`).
 - "Report saved locally" actually saves: the report is appended to the existing
-  append-only `SecurityAuditLog` with message id and timestamp, replacing the
-  `Toast` that claimed a save which never happened.
+  append-only `SecurityAuditLog.kt` with message id and timestamp, replacing the
+  `Toast` at `ui/chat/MessageItem.kt:78` that claimed a save which never
+  happened.
+- Surface document-ingest failure honestly (from §1.1a): when embedding yields
+  nothing, document ingest and knowledge-pack search report why, instead of
+  `RagManager` counting a silent `failedCount` and `PromptBuilder` swallowing it
+  behind `runCatching`.
 
-### Excluded from PR 2
+### Excluded from PR 2: voice input
 
-**Voice input.** Wiring `RECORD_AUDIO` permission plus transferring the
-recognized result into an editable draft is a feature, not a reliability fix,
-and the audit itself flags the permission flow as incomplete. Tracked separately.
+Wiring `RECORD_AUDIO` plus transferring the recognized result into an editable
+draft is a feature, not a reliability fix, and folding it into PR 2 would make
+PR 2 the scope problem this sprint exists to avoid. Tracked separately.
+
+"Excluded" does not mean "does not exist". The following remain in the tree,
+untouched: `tools/VoiceIoManager.kt`, `ui/voice/VoiceOverlay.kt`,
+`InferenceService.startVoiceInput()` (`:1825`), the `RECORD_AUDIO` manifest
+declaration (`AndroidManifest.xml:10`), and the permission check in
+`agent/tools/VoiceTools.kt:23`. `MainActivity` requests only
+`POST_NOTIFICATIONS` (`:104-112`), so the UI mic path can start a recognizer
+without a granted runtime permission — an incomplete flow that is acceptable
+only while the feature is unwired, and is a prerequisite for the follow-up.
+
+One defect is worth recording regardless of the feature decision, because it is
+a resource leak rather than a missing feature: `startListening()` assigns a new
+`SpeechRecognizer` when not already listening, and `shutdown()`
+(`VoiceIoManager.kt:243-245`) calls `stopListening()`, which returns early at
+`:172` when `isListening` is false. A recognizer created and then abandoned —
+permission denied, recognizer error, or activity teardown mid-listen — is never
+destroyed. PR 2 adds the destroy-on-abandon path. That is a leak fix, not the
+voice feature.
 
 ## PR 3 — verification
 
-- Native host tests must actually run. They are currently gated behind a job
-  that never executes; make job dependencies reflect the real failure.
-- Sanitizer flags cover the header-only helpers but not the Engine target built
-  by `engine_mock_test`, which is the target that executes real `Engine.cpp`.
-- `RealInferenceSmokeTest.kt:44` expects an `EOF` terminal where the engine
-  reports `MAX_TOKENS`. The assertion is wrong, not the engine.
-- Instrumentation is compiled but not executed, and the real-model smoke
-  fixtures are not in the tracked tree. Both are stated as limits, not fixed
-  here.
+The target is `native-host-tests`, the job that actually fails (§"Native host
+tests run"). Its remediation is written against the observed log, not against
+the dependency theory.
+
+- **Stop the compiler kill.** `cc1plus` is SIGKILLed at ~96% of the llama.cpp
+  model sources. Candidate causes, to be distinguished rather than assumed:
+  memory pressure from compiling the full vendored graph under ASan+UBSan;
+  `--parallel` over-provisioning; or the runner-image change
+  (`ubuntu-24.04`, image `20260927.320.1`). First step is instrumentation —
+  capture free memory and the kill reason in the job — because "resource
+  pressure is plausible" is not a diagnosis. Depending on what that shows:
+  bound `--parallel`, or split the Engine mock target into its own job with a
+  larger runner, or drop sanitizers for the llama.cpp sub-build while keeping
+  them on the test targets that actually need them.
+- **Sanitizers do not reach the target that matters.** `PRISM_SANITIZER_FLAGS`
+  is applied by `prism_add_native_test` but never to `engine_mock_test`
+  (`app/src/test/cpp/CMakeLists.txt:143-157`), which is the only target that
+  compiles and runs real `Engine.cpp`. Extend the sanitizer options to it.
+- **`RealInferenceSmokeTest.kt:44` expects an `EOF` terminal where the engine
+  reports `MAX_TOKENS`.** The assertion is wrong, not the engine.
+- **Instrumentation is compiled but not executed**, and the real-model smoke
+  fixtures are not in the tracked tree. Both are recorded as explicit limits,
+  not fixed here.
 
 ## Verification plan per PR
 
-PR 1: `:app:testDevDebugUnitTest` plus `assembleDevDebug`. New JVM tests for the
-import reserve arithmetic, the pressure reconciler merge/recovery, and the
-persisted download spec round-trip. Native change is reasoned from the traced
-sources; device verification is marked not run.
+All file references in this plan are relative to `app/src/main/java/com/prismai/llmhost/`.
 
-PR 2: `:app:testDevDebugUnitTest` plus `assembleDevDebug`. Tests for draft
+PR 1 touches `Engine.cpp`, so per AGENTS.md it runs the **full gate**,
+`scripts/verify.ps1` — unit tests, `assembleDevBenchmark`, `assemblePlayRelease`
+— not just the debug loop. Debug-only builds never compile the RelWithDebInfo
+native config, R8/ProGuard rules, or the vulkan-shaders-gen host tool, so a
+`assembleDevDebug` pass does not satisfy the gate for a native change. New JVM
+tests cover the import reserve arithmetic, the pressure reconciler merge and
+recovery transition, the persisted download spec round-trip, and the embedding
+dimension versioning. Native changes are reasoned from the traced sources;
+device verification is marked not run.
+
+PR 2 runs `:app:testDevDebugUnitTest` plus `assembleDevDebug`. Tests cover draft
 ownership across chat switches, accepted-send retention on refusal, the
-attachment limit applied pre-processing, and retry targeting. Instrumentation
-is compiled, not executed.
+attachment limit applied pre-processing, and retry targeting. Instrumentation is
+compiled, not executed.
 
-PR 3: `scripts/verify.ps1` gate — unit tests, `assembleDevBenchmark`,
-`assemblePlayRelease` — plus the native host tests with sanitizers, run
-directly.
+PR 3 runs the native host tests with sanitizers directly, via `ctest`, and
+confirms the compiler kill is resolved.
 
 ## Release gate
 

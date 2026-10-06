@@ -20,11 +20,15 @@ UI regression.
 
 | PR | Owner | Files |
 | -- | ----- | ----- |
-| 1 | native/model | `app/src/main/cpp/Engine.cpp`, `storage/VectorStore.kt`, `storage/LightweightEmbeddingEngine.kt` (deleted), `service/MemoryGovernor.kt`, `service/InferenceService.kt` (memory + storage seams only), `storage/ModelStorageManager.kt`, `HuggingFaceModelCatalog.kt`, `HuggingFaceDownloadWorker.kt`, `model/ModelDownloadManager.kt` |
-| 2 | UI/chat | `ui/ChatScreen.kt`, `ui/composer/PromptComposer.kt`, `AttachmentTextExtractor.kt`, `ui/controlplane/ControlPlaneSheet.kt`, `ui/chat/MessageItem.kt`, `ui/ServiceUiState.kt`, `SecurityAuditLog.kt`, `service/InferenceService.kt` (generateSafelyAndAwait pre-flight, listModels, link removal), `storage/ModelStorageManager.kt` (link removal), `AndroidManifest.xml` |
+| 1 | native/model | `app/src/main/cpp/Engine.cpp`, `storage/VectorStore.kt` (embedding versioning), `storage/RagManager.kt` (query clamp), `storage/DocumentChunker.kt` (shared query bound), `storage/LightweightEmbeddingEngine.kt` (deleted), `service/MemoryGovernor.kt`, `service/InferenceService.kt` (memory + storage seams only), `storage/ModelStorageManager.kt`, `HuggingFaceModelCatalog.kt`, `HuggingFaceDownloadWorker.kt`, `model/ModelDownloadManager.kt` |
+| 2 | UI/chat | `ui/ChatScreen.kt`, `ui/composer/PromptComposer.kt`, `AttachmentTextExtractor.kt`, `ui/controlplane/ControlPlaneSheet.kt`, `ui/chat/MessageItem.kt`, `ui/ServiceUiState.kt`, `SecurityAuditLog.kt`, `tools/VoiceIoManager.kt` (recognizer release), `service/InferenceService.kt` (generateSafelyAndAwait pre-flight, listModels, link removal), `storage/ModelStorageManager.kt` (link removal), `AndroidManifest.xml` |
 | 3 | verification | `.github/workflows/android-ci.yml`, `app/src/test/cpp/CMakeLists.txt`, `app/src/androidTest/java/com/prismai/llmhost/RealInferenceSmokeTest.kt` |
 
 All paths are relative to `app/src/main/java/com/prismai/llmhost/`.
+
+`RagManager.kt` and `DocumentChunker.kt` are both in PR 1 because §1.1 changes
+the query clamp in one and sources the shared bound from the other; the bound
+lives in `DocumentChunker` so ingest and query cannot drift apart.
 
 `InferenceService.kt` and `storage/ModelStorageManager.kt` appear in both PR 1
 and PR 2. In both cases the regions are disjoint (PR 1: memory-pressure
@@ -100,16 +104,33 @@ calls `build_pooling` unconditionally (`llama-model.cpp:2063`), though
 
 ### The upstream-correct pattern is `llama_decode`, not `llama_encode`
 
-`examples/embedding/embedding.cpp` is the reference. It errors out for
-enc-dec models (`:154`) and computes every other model's embeddings through
+`examples/embedding/embedding.cpp` is the reference. It errors out for enc-dec
+models (`:154`) and computes every other model's embeddings through
 `batch_decode` (`:37`), which calls `llama_decode` (`:46`) with embeddings
-enabled and reads per-token vectors via `llama_get_embeddings_ith` (`:57-60`).
-`llama_encode` appears nowhere in that example. `llama_get_embeddings`
-(`llama.h:998`) returns NULL when `pooling_type == LLAMA_POOLING_TYPE_NONE`,
-which is the generative-model case.
+enabled. `llama_encode` appears nowhere in that example. So calling
+`llama_encode` on a decoder-only model is the bug, not a hazard to be gated
+off.
 
-So calling `llama_encode` on a decoder-only model is the bug, not a hazard to
-be gated off.
+`batch_decode` then selects its accessor by pooling type (`:57-66`):
+
+- `pooling_type == LLAMA_POOLING_TYPE_NONE` — the generative/decoder-only case
+  the app actually runs — reads per-token vectors with
+  `llama_get_embeddings_ith(ctx, i)`.
+- otherwise reads sequence-pooled vectors with
+  `llama_get_embeddings_seq(ctx, batch.seq_id[i][0])`.
+
+The bulk accessor `llama_get_embeddings` (`llama.h:992-999`) is documented as
+returning the embeddings for tokens with `logits[i] != 0`, stored contiguously,
+**when** `pooling_type == LLAMA_POOLING_TYPE_NONE` or when using a generative
+model, and "Otherwise, returns NULL". So it is valid for exactly the case the
+example handles with `_ith`; the example prefers `_ith` per token, and the
+header marks the bulk form deprecated in favor of it.
+
+PR 1 implements only the `NONE` branch, which is what a decoder-only GGUF
+produces. The pooled branch is explicitly out of scope rather than silently
+dropped: if a model ever loads with a non-NONE pooling type, `Engine::encode`
+returns empty and PR 2 surfaces the reason, rather than mean-pooling sequence
+vectors that were already pooled and silently double-pooling them.
 
 ### Native host tests run, and they are the job that fails
 
@@ -133,28 +154,43 @@ holds for the three preceding runs. So the original audit's framing was right
 about the symptom and wrong about the mechanism: the native build genuinely
 does fail on CI, in this job.
 
-The failure is a compiler kill, not a host or dependency problem:
+The failure is a compiler kill, not a host or dependency problem. Verbatim from
+the job log, timestamps and ANSI stripped:
 
 ```
-[ 96%] Building CXX object .../models/xtverse.cpp.o
-[ 96%] .../t5.cpp.o
-c++: fatal error: Killed signal terminated program cc1plus
-gmake[2]: *** [.../models/ernie4-5.cpp.o] Error 1
-##[error]The runner has received a shutdown signal.
-##[error]Process completed with exit code 143.
+14:20:03.1568804Z  [ 97%] Building CXX object llama.cpp/src/CMakeFiles/llama.dir/models/wavtokenizer-dec.cpp.o
+14:20:03.1691902Z  [ 97%] Building CXX object llama.cpp/src/CMakeFiles/llama.dir/models/t5encoder.cpp.o
+14:20:03.2711330Z  [ 97%] Building CXX object llama.cpp/src/CMakeFiles/llama.dir/models/xverse.cpp.o
+14:22:15.3620348Z  c++: fatal error: Killed signal terminated program cc1plus
+14:22:15.3640860Z  compilation terminated.
+14:22:15.4504322Z  gmake[2]: *** [llama.cpp/src/CMakeFiles/llama.dir/build.make:821: llama.cpp/src/CMakeFiles/llama.dir/models/ernie4-5.cpp.o] Error 1
+14:22:15.8919354Z  ##[error]The runner has received a shutdown signal.
+14:22:15.8922235Z  ##[error]Process completed with exit code 143.
 ```
 
-The build reaches ~96% of the llama.cpp model sources and then `cc1plus` is
-killed. This is not the job timeout: the job declares `timeout-minutes: 15` and
-ran for 2m56s. `ernie4-5.cpp` is 164 lines, so the file itself is not
-pathological; the cost is that `PRISM_ENABLE_ENGINE_MOCK_TEST` (default ON)
-compiles the entire vendored llama.cpp graph with ASan+UBSan enabled, which is
-newly expensive and newly memory-hungry. GitHub-hosted `ubuntu-24.04` runners
-are memory-constrained, and the observed SIGKILL of the compiler is consistent
-with memory pressure.
+Note the gap: the last build line is at `14:20:03` and the kill at `14:22:15`,
+over two minutes later, with no intervening output.
 
-This remains a hypothesis about the precise cause. It is not proven OOM, and
-the remediation must not assume it. See PR 3.
+This is not the job timeout: the job declares `timeout-minutes: 15` and ran for
+2m56s. `ernie4-5.cpp` is 164 lines and is not itself pathological.
+
+**The killed compile is a plain Debug build.** Sanitizers are *not* in play on
+it. `PRISM_SANITIZER_FLAGS` is applied only inside `prism_add_native_test`
+(`app/src/test/cpp/CMakeLists.txt:77-80`), which wraps the header-only helper
+targets; `engine_mock_test` receives only `-Wall -Wextra` (`:155`), and the
+`llama.cpp` sub-build added at `:139` receives no sanitizer flags at all. The
+`-- PRISM: sanitizers enabled for native tests: ASan, UBSan` configure line
+refers to the helper targets only. So ASan/UBSan cannot be the cause of this
+kill, and a fix premised on removing them from the llama sub-build would
+address a cost that does not exist.
+
+What remains: `PRISM_ENABLE_ENGINE_MOCK_TEST` (default ON) compiles the entire
+vendored llama.cpp graph — every architecture in `src/models/`, ~1.4 MB of
+sources — with `--parallel` on a 4-vCPU, memory-constrained GitHub-hosted
+`ubuntu-24.04` runner. A SIGKILL of `cc1plus` is consistent with memory
+pressure, but the two-minute silent gap before the kill is also consistent with
+a different failure mode, and the precise cause is not established. This must be
+instrumented rather than assumed. See PR 3.
 
 ### Retry-download and multi-import are consequences, not separate bugs
 
@@ -172,10 +208,16 @@ embeddings enabled, mirroring `examples/embedding/embedding.cpp`, instead of
 `llama_encode`.
 
 - Enable embeddings via `llama_set_embeddings(ctx, true)` as today.
-- Build the batch with `logits[i]` set for every token, so per-token vectors are
-  retrievable; with `pooling_type == LLAMA_POOLING_TYPE_NONE`,
-  `llama_get_embeddings` (`llama.h:998`) returns NULL and the per-token accessor
-  `llama_get_embeddings_ith` is required.
+- Build the batch with `logits[i]` set for every token. For
+  `pooling_type == LLAMA_POOLING_TYPE_NONE` the per-token vectors are available
+  through `llama_get_embeddings_ith(ctx, i)`; the bulk `llama_get_embeddings`
+  is documented for the same case (`llama.h:992-999`) but is deprecated in
+  favor of `_ith`, so `_ith` is used per `embedding.cpp:57-60`.
+- Non-NONE pooling types are **out of scope**, stated explicitly rather than
+  dropped: upstream uses `llama_get_embeddings_seq` for them
+  (`embedding.cpp:62-66`), and mean-pooling an already-pooled sequence vector
+  would be wrong. `Engine::encode` returns empty for that case and PR 2 (§2.6)
+  surfaces why.
 - Clear the KV cache first — the upstream example does this
   (`embedding.cpp:42`) because the cache is irrelevant for embedding and
   would otherwise let prompt-cache reuse leak between unrelated documents.
@@ -390,13 +432,16 @@ without a granted runtime permission — an incomplete flow that is acceptable
 only while the feature is unwired, and is a prerequisite for the follow-up.
 
 One defect is worth recording regardless of the feature decision, because it is
-a resource leak rather than a missing feature: `startListening()` assigns a new
-`SpeechRecognizer` when not already listening, and `shutdown()`
-(`VoiceIoManager.kt:243-245`) calls `stopListening()`, which returns early at
-`:172` when `isListening` is false. A recognizer created and then abandoned —
-permission denied, recognizer error, or activity teardown mid-listen — is never
-destroyed. PR 2 adds the destroy-on-abandon path. That is a leak fix, not the
-voice feature.
+a resource leak rather than a missing feature. `startListening()` creates and
+assigns a new `SpeechRecognizer` when not already listening. Both
+`onResults` (`:130`) and `onError` (`:105-109`) then set `isListening = false`
+**without destroying it**, and `stopListening()` early-returns at `:172` when
+`isListening` is false. So the recognizer is leaked on the normal success path
+as well as on the error path, not only on abandonment; `shutdown()`
+(`:243-245`) calls `stopListening()` and therefore cannot clean it up. Activity
+teardown mid-listen is in fact the one case that *does* destroy, since
+`isListening` is still true. PR 2 adds the destroy-on-release path. That is a
+leak fix, not the voice feature.
 
 ## PR 3 — verification
 
@@ -404,20 +449,30 @@ The target is `native-host-tests`, the job that actually fails (§"Native host
 tests run"). Its remediation is written against the observed log, not against
 the dependency theory.
 
-- **Stop the compiler kill.** `cc1plus` is SIGKILLed at ~96% of the llama.cpp
-  model sources. Candidate causes, to be distinguished rather than assumed:
-  memory pressure from compiling the full vendored graph under ASan+UBSan;
-  `--parallel` over-provisioning; or the runner-image change
-  (`ubuntu-24.04`, image `20260927.320.1`). First step is instrumentation —
-  capture free memory and the kill reason in the job — because "resource
-  pressure is plausible" is not a diagnosis. Depending on what that shows:
-  bound `--parallel`, or split the Engine mock target into its own job with a
-  larger runner, or drop sanitizers for the llama.cpp sub-build while keeping
-  them on the test targets that actually need them.
+- **Stop the compiler kill.** `cc1plus` is SIGKILLed at ~97% of the llama.cpp
+  model sources. The build is a plain Debug build with no sanitizer flags on the
+  llama sub-build, so the remaining candidates are: memory pressure from
+  compiling the full vendored graph with `--parallel` on a 4-vCPU runner;
+  `--parallel` over-provisioning specifically; or the runner-image change
+  (`ubuntu-24.04`, image `20260927.320.1`). There is also an unexplained gap —
+  the last build line is at `14:20:03` and the kill at `14:22:15`, over two
+  minutes with no output — which instrumentation must account for.
+
+  First step is instrumentation, not a fix: record free memory around the build
+  and capture the kill reason, because "resource pressure is plausible" is not a
+  diagnosis and the fix differs by cause. Candidate remediations, to be chosen
+  only on that evidence: bound `--parallel`; split the Engine mock target into
+  its own job; or reduce what the mock build compiles.
+
+  Removing sanitizers from the llama sub-build is **not** a candidate — it is
+  already unsanitized, so there is no such cost to remove.
 - **Sanitizers do not reach the target that matters.** `PRISM_SANITIZER_FLAGS`
-  is applied by `prism_add_native_test` but never to `engine_mock_test`
-  (`app/src/test/cpp/CMakeLists.txt:143-157`), which is the only target that
-  compiles and runs real `Engine.cpp`. Extend the sanitizer options to it.
+  is applied inside `prism_add_native_test`
+  (`app/src/test/cpp/CMakeLists.txt:77-80`) and never to `engine_mock_test`,
+  which receives only `-Wall -Wextra` (`:155`) despite being the only target
+  that compiles and runs real `Engine.cpp`. Extend the sanitizer options to it.
+  This is a coverage gap in the opposite direction from the kill above, and the
+  two items are independent: fixing one does not address the other.
 - **`RealInferenceSmokeTest.kt:44` expects an `EOF` terminal where the engine
   reports `MAX_TOKENS`.** The assertion is wrong, not the engine.
 - **Instrumentation is compiled but not executed**, and the real-model smoke

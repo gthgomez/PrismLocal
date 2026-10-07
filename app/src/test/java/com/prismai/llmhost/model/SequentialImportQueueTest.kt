@@ -124,4 +124,25 @@ class SequentialImportQueueTest {
         queue.drain()
         assertEquals(emptyList<String>(), done)
     }
+
+    @Test
+    fun isEmptyReflectsPendingWork() {
+        val queue = SequentialImportQueue { }
+        assertTrue("a fresh queue is empty", queue.isEmpty())
+        queue.enqueueAll(listOf("a", "b"))
+        assertTrue("enqueued URIs make the queue non-empty", !queue.isEmpty())
+    }
+
+    @Test
+    fun clearDropsEverythingPending() = runBlocking {
+        val done = mutableListOf<String>()
+        val queue = SequentialImportQueue { done += it }
+        queue.enqueueAll(listOf("a", "b", "c"))
+
+        queue.clear()
+
+        assertTrue("clear() must empty the queue", queue.isEmpty())
+        queue.drain()
+        assertEquals("cleared URIs must never import", emptyList<String>(), done)
+    }
 }

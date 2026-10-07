@@ -24,6 +24,16 @@ class SequentialImportQueue(private val importOne: suspend (String) -> Unit) {
         pending += uris
     }
 
+    /** True when nothing is queued. Used by the drain loop under its lock. */
+    @Synchronized
+    fun isEmpty(): Boolean = pending.isEmpty()
+
+    /** Discard everything queued. Used by cancelImport() so cancelled files cannot import later. */
+    @Synchronized
+    fun clear() {
+        pending.clear()
+    }
+
     /**
      * Import everything queued, one at a time, continuing past ordinary
      * failures. Cancellation is NOT an ordinary failure: it is rethrown so the

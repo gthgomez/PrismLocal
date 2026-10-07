@@ -190,6 +190,10 @@ class InferenceService : Service() {
     private val importQueue = SequentialImportQueue { uriString ->
         importUriByString[uriString]?.let { uri -> importModel(uri)?.join() }
     }
+    // Owns the atomic enqueue/ensure-drain and the drain loop's terminal check.
+    // See ImportBatchDrainer for why the old batchImportJob?.isActive gate
+    // dropped a batch that arrived during the post-drain refresh.
+    private val importBatchDrainer = ImportBatchDrainer(importQueue) { refreshInstalledModels() }
     private var downloadObserverJob: Job? = null
     @Volatile
     private var generationForegroundActive = false
@@ -750,16 +754,13 @@ class InferenceService : Service() {
     fun importModels(uris: List<Uri>) {
         if (uris.isEmpty()) return
         // Persist the URIs and append to the shared queue. A second multi-select
-        // while a drain is running must enqueue into that drain, not cancel it.
+        // while a drain is running must enqueue into that drain, not cancel it,
+        // and a batch that arrives during the post-drain refresh must still be
+        // drained rather than silently dropped.
         uris.forEach { importUriByString[it.toString()] = it }
-        importQueue.enqueueAll(uris.map { it.toString() })
-        if (batchImportJob?.isActive == true) return
+        val token = importBatchDrainer.enqueue(uris.map { it.toString() }) ?: return
         batchImportJob = serviceScope.launch {
-            importQueue.drain()
-            // Republish once the whole queue finishes: per-file imports already
-            // refresh through onRefreshReadiness, but this guarantees the list is
-            // settled even if the last item failed or was skipped.
-            refreshInstalledModels()
+            importBatchDrainer.drainAll(token)
         }
     }
 
@@ -780,12 +781,16 @@ class InferenceService : Service() {
     }
 
     fun cancelImport() {
-        // Cancel the whole batch first so the queue cannot start the next file,
-        // then the file currently in flight.
+        // Invalidate the drain and discard the persistent queue first, so a
+        // cancelled file cannot be imported later or duplicated when the same
+        // files are re-selected. Then cancel the whole batch coroutine and the
+        // file currently in flight.
+        importBatchDrainer.cancel()
         batchImportJob?.cancel()
         batchImportJob = null
         importJob?.cancel()
         importJob = null
+        importUriByString.clear()
         WorkManager.getInstance(this).cancelUniqueWork(HuggingFaceDownloadWork.UNIQUE_WORK_NAME)
         modelImportManager.cancelImport()
     }

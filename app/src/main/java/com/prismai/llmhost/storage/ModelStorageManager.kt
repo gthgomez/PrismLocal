@@ -243,7 +243,10 @@ class ModelStorageManager(
             copyStream(input, stagedModel, reportedSize, onProgress)
             val bytes = stagedModel.length()
             validateSize(bytes)?.let { return ImportResult.Failure(it).also { cleanup(stagingDir) } }
-            if (!hasUsableSpaceFor(bytes)) {
+            // The model bytes are already on disk at this point and promotion is a
+            // rename, so only the reserve must remain. Requiring the full size again
+            // made a fitting model fail after the entire copy completed.
+            if (!hasReserveSpace()) {
                 return ImportResult.Failure(insufficientSpaceError(bytes)).also { cleanup(stagingDir) }
             }
             val validation = validateGguf(stagedModel)
@@ -875,12 +878,16 @@ class ModelStorageManager(
         return digest.digest().toHex()
     }
 
-    private fun hasUsableSpaceFor(bytes: Long): Boolean {
+    private fun freeSpaceBytes(): Long {
         val dir = modelsDir.also { it.mkdirs() }
-        val stat = StatFs(dir.absolutePath)
-        val usable = stat.availableBytes
-        return usable > bytes + MIN_FREE_SPACE_AFTER_IMPORT
+        return StatFs(dir.absolutePath).availableBytes
     }
+
+    private fun hasUsableSpaceFor(bytes: Long): Boolean =
+        hasUsableSpaceFor(freeSpaceBytes(), bytes)
+
+    private fun hasReserveSpace(): Boolean =
+        hasReserveAfterCopy(freeSpaceBytes())
 
     private fun insufficientSpaceError(bytes: Long): ModelStorageError =
         ModelStorageError(
@@ -966,6 +973,23 @@ class ModelStorageManager(
             val cleaned = withoutExtension.replace(Regex("[^A-Za-z0-9._-]+"), "-").trim('-', '.', '_')
             return cleaned.ifBlank { "imported-model" }
         }
+
+        /**
+         * True when [freeBytes] covers a model of [modelBytes] plus the post-import
+         * reserve. Used before the copy, where the model's bytes are still to be
+         * written.
+         */
+        fun hasUsableSpaceFor(freeBytes: Long, modelBytes: Long): Boolean =
+            freeBytes > modelBytes + MIN_FREE_SPACE_AFTER_IMPORT
+
+        /**
+         * True when [freeBytes] still covers the post-import reserve. Used after the
+         * staged copy has landed: those bytes are already on disk, and
+         * promoteDirectory is a rename that consumes no additional space, so
+         * requiring the model size again rejected models that genuinely fit.
+         */
+        fun hasReserveAfterCopy(freeBytes: Long): Boolean =
+            freeBytes > MIN_FREE_SPACE_AFTER_IMPORT
 
         const val TAG = "ModelStorageManager"
         const val MANIFEST_FILE = "manifest.json"

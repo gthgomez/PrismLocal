@@ -47,7 +47,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
@@ -147,6 +146,12 @@ class InferenceService : Service() {
     // defensive double-destroy). destroySafely() is itself idempotent, but this
     // avoids enqueuing redundant cancellation work.
     private val teardownStarted = AtomicBoolean(false)
+
+    // Single owner of the native memory-pressure level. Declared after
+    // serviceScope so the apply lambda can launch onto an initialized scope.
+    private val memoryPressureReconciler = MemoryPressureReconciler { level ->
+        serviceScope.launch { engine.setMemoryPressure(level) }
+    }
 
     private lateinit var engine: NativeLlmBridge
     private lateinit var memoryGovernor: MemoryGovernor
@@ -626,24 +631,26 @@ class InferenceService : Service() {
                     switchModel(savedModel)
                 }
         }
-        // Register push-based trim callback (instant notification)
+        // Push-based trim callback (instant notification). Routed through the
+        // reconciler so it cannot race the polling flow into native.
         memoryGovernor.register { state ->
-            serviceScope.launch { engine.setMemoryPressure(state.level) }
-        }
-        // Keep polling flow as fallback (gradual pressure detection)
-        memoryGovernor.monitorMemory()
-            .distinctUntilChanged()
-            .onEach { state ->
-                engine.setMemoryPressure(state.level)
-                if (state == MemoryState.CRITICAL) {
-                    saveTranscriptSafely()
-                    if (!criticalMemoryAlertActive) {
-                        publishUiEvent("Memory critical; transcript saved")
-                    }
-                    criticalMemoryAlertActive = true
-                } else {
-                    criticalMemoryAlertActive = false
+            memoryPressureReconciler.onPush(state)
+            if (state == MemoryState.CRITICAL) {
+                // The push path previously skipped this entirely.
+                saveTranscriptSafely()
+                if (!criticalMemoryAlertActive) {
+                    publishUiEvent("Memory critical; transcript saved")
                 }
+                criticalMemoryAlertActive = true
+            }
+        }
+        // Polling is the fallback for gradual pressure. distinctUntilChanged()
+        // is removed: the reconciler owns dedup, and it must be able to write an
+        // explicit recovery after a push escalation.
+        memoryGovernor.monitorMemory()
+            .onEach { state ->
+                memoryPressureReconciler.onPoll(state)
+                criticalMemoryAlertActive = memoryPressureReconciler.isCritical()
             }
             .launchIn(serviceScope)
     }

@@ -18,6 +18,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -72,6 +75,7 @@ internal fun PromptComposer(
     isGenerating: Boolean,
     performance: GenerationPerformance?,
     attachments: List<PromptAttachment>,
+    isShortHeight: Boolean,
     canContinue: Boolean,
     onPromptChange: (String) -> Unit,
     onAddAttachment: () -> Unit,
@@ -144,10 +148,19 @@ internal fun PromptComposer(
                     )
                 }
             }
-            AttachmentTray(
-                attachments = attachments,
-                onRemove = onRemoveAttachment,
-            )
+            if (LayoutPolicy.trayVisible(attachments.size, isShortHeight)) {
+                AttachmentTray(
+                    attachments = attachments,
+                    onRemove = onRemoveAttachment,
+                )
+            } else if (attachments.isNotEmpty()) {
+                // Keep removal reachable even when the tray is collapsed.
+                Text(
+                    text = "${attachments.size} attachment(s)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = PrismOnDark.copy(alpha = 0.7f),
+                )
+            }
             if (!imeVisible) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ComposerChip(label = "Local & Private", accent = PrismGreen)
@@ -168,10 +181,12 @@ private fun AttachmentTray(
     onRemove: (PromptAttachment) -> Unit,
 ) {
     if (attachments.isEmpty()) return
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        attachments.forEach { attachment ->
+    // A LazyRow bounds the tray to a single card height; the old Column of
+    // full-width cards could consume the space the input needs.
+    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        items(attachments, key = { it.uriString }) { attachment ->
             Surface(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.widthIn(max = 280.dp),
                 shape = RoundedCornerShape(16.dp),
                 color = Color.White.copy(alpha = 0.54f),
                 contentColor = PrismText,
@@ -214,15 +229,15 @@ private fun AttachmentTray(
                 }
             }
         }
-        if (attachments.any { it.isImage }) {
-            Text(
-                text = "Images are attached as metadata in this build; true vision needs the native multimodal image bridge.",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
+    }
+    if (attachments.any { it.isImage }) {
+        Text(
+            text = "Images are attached as metadata in this build; true vision needs the native multimodal image bridge.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

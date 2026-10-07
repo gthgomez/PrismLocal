@@ -167,7 +167,12 @@ fun ChatScreen(
             Surface(modifier = Modifier.fillMaxSize(), color = prismCanvasColor()) {
                 PrismBackdrop(modifier = Modifier.fillMaxSize())
                 BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                    val minChatHeight = maxHeight * 0.70f
+                    val isShortHeight = LayoutPolicy.isShortHeight(maxHeight)
+                    val headerCompact = LayoutPolicy.headerCompact(maxHeight)
+                    // The old maxHeight * 0.70f floor fought the IME: with the
+                    // keyboard open the list could not shrink below 70% of a
+                    // window that had already shrunk.
+                    val minChatHeight = 0.dp
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
@@ -270,6 +275,7 @@ fun ChatScreen(
                         var importStatus by remember { mutableStateOf("") }
                         var pendingBenchmarkCsv by remember { mutableStateOf<String?>(null) }
                         var pendingBenchmarkJson by remember { mutableStateOf<String?>(null) }
+                        val scrollFollowPolicy = remember { ScrollFollowPolicy() }
                         val listState = rememberLazyListState()
                         val bottomAnchorIndex = if (transcript.isEmpty()) 0 else transcript.size
                         val isAtBottomAnchor by remember(transcript.size) {
@@ -278,9 +284,8 @@ fun ChatScreen(
                                     listState.layoutInfo.visibleItemsInfo.any { item -> item.index == bottomAnchorIndex }
                             }
                         }
-                        // stickToBottom: pin while streaming. Detach only on user-driven scroll away
-                        // from bottom; content growth alone must not clear the flag (would fight follow).
-                        var stickToBottom by remember { mutableStateOf(true) }
+                        // scrollFollowPolicy: pin while streaming. Detach only on user-driven
+                        // scroll away from bottom; content growth alone must not clear follow.
                         var suppressStickDetach by remember { mutableStateOf(false) }
                         LaunchedEffect(listState, transcript.size) {
                             snapshotFlow {
@@ -292,8 +297,8 @@ fun ChatScreen(
                                 listState.isScrollInProgress to atBottom
                             }.collect { (scrolling, atBottom) ->
                                 when {
-                                    atBottom -> stickToBottom = true
-                                    scrolling && !suppressStickDetach -> stickToBottom = false
+                                    atBottom -> scrollFollowPolicy.onUserScrolledToBottom()
+                                    scrolling && !suppressStickDetach -> scrollFollowPolicy.onUserScrolledAway()
                                 }
                             }
                         }
@@ -462,9 +467,8 @@ fun ChatScreen(
                             isGenerating,
                             generatedTokenCount,
                             activeAssistantTextLength,
-                            stickToBottom,
                         ) {
-                            if (transcript.isNotEmpty() && stickToBottom) {
+                            if (transcript.isNotEmpty() && scrollFollowPolicy.shouldAutoScroll()) {
                                 suppressStickDetach = true
                                 try {
                                     listState.scrollToItem(bottomAnchorIndex)
@@ -481,6 +485,7 @@ fun ChatScreen(
                             importStatus = importStatus,
                             importState = importState,
                             collapsed = headerCollapsed,
+                            isShortHeight = isShortHeight,
                             thermalGovernorState = thermalGovernorState,
                             generationPerformance = generationPerformance,
                             onOpenChats = { chatsVisible = true },
@@ -489,7 +494,11 @@ fun ChatScreen(
                             onOpenRag = { ragBrowserVisible = true },
                         )
 
-                        Spacer(modifier = Modifier.height(22.dp))
+                        Spacer(
+                            modifier = Modifier.height(
+                                if (headerCompact) 8.dp else 22.dp
+                            )
+                        )
 
                         val activeAssistantMessageId by remember(transcript.size, isGenerating) {
                             derivedStateOf {
@@ -583,7 +592,7 @@ fun ChatScreen(
                                     role = Role.Button
                                 },
                                 onClick = {
-                                    stickToBottom = true
+                                    scrollFollowPolicy.onUserScrolledToBottom()
                                     scope.launch {
                                         suppressStickDetach = true
                                         try {
@@ -613,6 +622,28 @@ fun ChatScreen(
                             }
                         }
 
+                        // Inside the IME-padded region: the old placement aligned to the
+                        // outer Box, so refusals were invisible behind the keyboard.
+                        (snackbarMessage ?: uiMessage)?.let { message ->
+                            Snackbar(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                                containerColor = PrismSlate,
+                                contentColor = PrismOnDark,
+                                action = {
+                                    TextButton(onClick = {
+                                        if (snackbarMessage != null) {
+                                            snackbarMessage = null
+                                        }
+                                        onClearUiMessage(message)
+                                    }) {
+                                        Text("Dismiss", color = PrismBlue)
+                                    }
+                                },
+                            ) {
+                                Text(message)
+                            }
+                        }
+
                         PromptComposer(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -624,6 +655,7 @@ fun ChatScreen(
                             isGenerating = isGenerating,
                             performance = generationPerformance,
                             attachments = attachments,
+                            isShortHeight = isShortHeight,
                             canContinue = generationPerformance?.terminalReason == "MAX_TOKENS" &&
                                 transcript.lastOrNull()?.role == TranscriptRole.ASSISTANT,
                             onPromptChange = { prompt = it },
@@ -805,15 +837,6 @@ fun ChatScreen(
                             )
                         }
                     }
-                }
-            }
-            (snackbarMessage ?: uiMessage)?.let { message ->
-                Snackbar(
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
-                    containerColor = PrismSlate,
-                    contentColor = PrismOnDark,
-                ) {
-                    Text(message)
                 }
             }
         }

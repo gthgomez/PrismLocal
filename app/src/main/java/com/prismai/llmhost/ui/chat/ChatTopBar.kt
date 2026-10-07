@@ -65,6 +65,7 @@ internal fun ChatTopBar(
     importStatus: String,
     importState: ImportState,
     collapsed: Boolean,
+    isShortHeight: Boolean = false,
     thermalGovernorState: com.prismai.llmhost.util.ThermalGovernorState? = null,
     generationPerformance: GenerationPerformance? = null,
     onOpenChats: () -> Unit,
@@ -75,7 +76,7 @@ internal fun ChatTopBar(
     GlassSurface(modifier = Modifier.fillMaxWidth(), radius = 32.dp) {
         BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp)) {
             val compact = maxWidth < 520.dp
-            if (collapsed) {
+            if (collapsed || isShortHeight) {
                 Row(
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     verticalAlignment = Alignment.CenterVertically,

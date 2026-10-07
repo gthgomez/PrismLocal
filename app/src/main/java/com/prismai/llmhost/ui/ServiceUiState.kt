@@ -138,6 +138,12 @@ class ServiceUiState {
     internal val _vectorChunks = MutableStateFlow<List<com.prismai.llmhost.storage.VectorChunk>>(emptyList())
     val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunk>> = _vectorChunks.asStateFlow()
 
+    // Rows written by an older embedding revision. They are unreachable by
+    // search() but remain on disk until the user runs cleanup; exposing the
+    // count lets the UI offer that cleanup.
+    internal val _staleVectorChunkCount = MutableStateFlow(0)
+    val staleVectorChunkCount: StateFlow<Int> = _staleVectorChunkCount.asStateFlow()
+
     // ── Voice ──────────────────────────────────────────────────────────
 
     internal val _voiceInputResult = MutableStateFlow<String?>(null)

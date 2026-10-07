@@ -1979,7 +1979,20 @@ class InferenceService : Service() {
         // The document browser is a retrieval view: show only chunks that
         // search() can actually return. getAllChunks() is reserved for deletion
         // (it must still see stale rows so they can be removed).
-        runCatching { uiState._vectorChunks.value = vectorStore.getCurrentChunks() }
+        runCatching {
+            uiState._vectorChunks.value = vectorStore.getCurrentChunks()
+            uiState._staleVectorChunkCount.value = vectorStore.countStaleChunks()
+        }
+    }
+
+    /**
+     * Delete rows left behind by an older embedding revision. Returns the number
+     * of rows removed and refreshes the observable chunk/stale-count state.
+     */
+    fun deleteStaleVectorChunks(): Int {
+        val deleted = vectorStore.deleteStaleChunks()
+        refreshVectorChunksList()
+        return deleted
     }
 
     private fun startAgentFollowUpGeneration(

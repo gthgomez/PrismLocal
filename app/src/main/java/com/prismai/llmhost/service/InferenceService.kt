@@ -1022,13 +1022,19 @@ class InferenceService : Service() {
     fun generationRefusalReason(prompt: String): String? =
         generationAcceptance(prompt).reason
 
-    private fun generationAcceptance(prompt: String): SendAcceptance.Result =
-        SendAcceptance.evaluate(
+    private fun generationAcceptance(prompt: String): SendAcceptance.Result {
+        // Same inputs as the orchestrator's normal-chat acceptance: clamped
+        // settings, real retrieved memory, and the agent instruction block when
+        // agents are enabled. buildMemoryContext is non-suspending.
+        val settings = _generationSettings.value.clamped()
+        return SendAcceptance.forChat(
             currentModel = uiState.currentModel.value,
-            contextLength = _generationSettings.value.contextLength,
-            maxTokens = _generationSettings.value.maxTokens,
+            settings = settings,
             prompt = prompt,
+            memoryContext = promptBuilder.buildMemoryContext(prompt),
+            enforceBudget = true,
         )
+    }
 
     fun generateSafely(
         prompt: String,

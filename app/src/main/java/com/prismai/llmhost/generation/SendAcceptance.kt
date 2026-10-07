@@ -1,5 +1,8 @@
 package com.prismai.llmhost.generation
 
+import com.prismai.llmhost.GenerationSettings
+import com.prismai.llmhost.tools.AgentToolProtocol
+
 /**
  * The single rule deciding whether a send is accepted.
  *
@@ -14,6 +17,31 @@ object SendAcceptance {
 
     data class Result(val accepted: Boolean, val reason: String?)
 
+    /**
+     * Acceptance for a chat turn, deriving the agent instruction block from
+     * [settings]. The screen pre-flight and the orchestrator both call this with
+     * the same prompt and memory context, so their inputs (including whether the
+     * agent instruction block counts) cannot drift apart.
+     *
+     * [enforceBudget] is false for benchmark presets, which were never
+     * budget-checked and must not be newly refused; the model check always runs.
+     */
+    fun forChat(
+        currentModel: String?,
+        settings: GenerationSettings,
+        prompt: String,
+        memoryContext: String,
+        enforceBudget: Boolean = true,
+    ): Result = evaluate(
+        currentModel = currentModel,
+        contextLength = settings.contextLength,
+        maxTokens = settings.maxTokens,
+        prompt = prompt,
+        memoryContext = memoryContext,
+        instructionText = if (settings.agentEnabled) AgentToolProtocol.instructionBlock() else "",
+        enforceBudget = enforceBudget,
+    )
+
     fun evaluate(
         currentModel: String?,
         contextLength: Int,
@@ -21,11 +49,12 @@ object SendAcceptance {
         prompt: String,
         memoryContext: String = "",
         instructionText: String = "",
+        enforceBudget: Boolean = true,
     ): Result {
         if (currentModel.isNullOrBlank()) {
             return Result(false, "Select a model before sending a prompt")
         }
-        if (!GenerationBudget.userTurnFits(
+        if (enforceBudget && !GenerationBudget.userTurnFits(
                 contextLength = contextLength,
                 maxTokens = maxTokens,
                 userPrompt = prompt,

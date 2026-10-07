@@ -1095,11 +1095,22 @@ class InferenceService : Service() {
     fun benchmarkJson(): String = benchmarkStore.json()
 
     /** Non-suspending pre-flight so the UI can decide whether to clear its draft. */
+    @Deprecated("Use preflightSend; this runs generationAcceptance (SQLite memory read) on the caller thread")
     fun acceptsGeneration(prompt: String): Boolean =
         generationAcceptance(prompt).accepted
 
+    @Deprecated("Use preflightSend; this runs generationAcceptance (SQLite memory read) on the caller thread")
     fun generationRefusalReason(prompt: String): String? =
         generationAcceptance(prompt).reason
+
+    /**
+     * Off-main pre-flight: [generationAcceptance] reads active memories from
+     * SQLite, so running it on the UI thread would block a frame. The UI calls
+     * this from a coroutine instead of [acceptsGeneration] /
+     * [generationRefusalReason].
+     */
+    suspend fun preflightSend(prompt: String): SendAcceptance.Result =
+        withContext(Dispatchers.Default) { generationAcceptance(prompt) }
 
     private fun generationAcceptance(prompt: String): SendAcceptance.Result {
         // Same inputs as the orchestrator's normal-chat acceptance: clamped

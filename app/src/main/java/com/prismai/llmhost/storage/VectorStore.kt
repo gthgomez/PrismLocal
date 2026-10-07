@@ -320,6 +320,37 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
         }
     }
 
+    /**
+     * Number of rows written by an older [EMBEDDING_REVISION]. Such rows are
+     * unreachable by [search] and can be reclaimed with [deleteStaleChunks].
+     */
+    fun countStaleChunks(): Int {
+        lock.withLock {
+            val cursor = dbHelper.readableDatabase.rawQuery(
+                "SELECT COUNT(*) FROM $TABLE WHERE $COL_EMBEDDING_REVISION != ?",
+                arrayOf(EMBEDDING_REVISION.toString()),
+            )
+            try {
+                cursor.moveToFirst()
+                return cursor.getInt(0)
+            } finally {
+                cursor.close()
+            }
+        }
+    }
+
+    /**
+     * Delete rows written by an older [EMBEDDING_REVISION], which [search]
+     * can no longer return. Returns the number of rows deleted.
+     */
+    fun deleteStaleChunks(): Int {
+        lock.withLock {
+            return dbHelper.writableDatabase.delete(
+                TABLE, "$COL_EMBEDDING_REVISION != ?", arrayOf(EMBEDDING_REVISION.toString())
+            )
+        }
+    }
+
     // ---- Column / table constants ----
 
     companion object {

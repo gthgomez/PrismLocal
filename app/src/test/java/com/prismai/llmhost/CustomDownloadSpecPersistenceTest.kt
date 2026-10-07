@@ -40,10 +40,10 @@ class CustomDownloadSpecPersistenceTest {
     }
 
     /**
-     * Locks in the worker's real dependency: `HuggingFaceDownloadWorker.doWork` calls
-     * `HuggingFaceModelCatalog.find(entryId)` after a restart, with only the durable store
-     * (not the curated in-memory list) able to resolve a custom id. Exercised through the
-     * serialize/deserialize round-trip the durable store actually performs.
+     * Covers the durable store's own round-trip: a custom entry's id, repo and file
+     * survive the serialize/deserialize the persisted row actually performs. The
+     * worker's `HuggingFaceModelCatalog.find(id)` lookup that consumes such a row is
+     * covered separately by [find_resolvesPersistedCustomEntryThatIsNotInTheCuratedList].
      */
     @Test
     fun aRoundTrippedCustomEntryResolvesByItsPersistedId() {
@@ -58,6 +58,26 @@ class CustomDownloadSpecPersistenceTest {
             "sanity: the custom id must not be a curated entry",
             HuggingFaceModelCatalog.entries.none { it.id == entry.id },
         )
+    }
+
+    /**
+     * Locks in the worker's real dependency: `HuggingFaceDownloadWorker.doWork` calls
+     * `HuggingFaceModelCatalog.find(entryId)` after a restart. A custom id is not in the
+     * curated in-memory list, so only the custom-store fallback can resolve it.
+     */
+    @Test
+    fun find_resolvesPersistedCustomEntryThatIsNotInTheCuratedList() {
+        val entry = HuggingFaceModelCatalog.createCustomEntry("user/persisted", "persisted.gguf")
+
+        assertNull(
+            "sanity: the custom id must not be a curated entry",
+            HuggingFaceModelCatalog.entries.firstOrNull { it.id == entry.id },
+        )
+
+        val found = HuggingFaceModelCatalog.find(entry.id)
+        assertNotNull("worker must resolve a persisted custom entry by id", found)
+        assertEquals(entry.id, found!!.id)
+        assertEquals("user/persisted", found.repoId)
     }
 
     // --- D2: expectedSha256 must survive the round-trip ---

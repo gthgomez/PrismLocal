@@ -312,6 +312,8 @@ class InferenceService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Wire durable custom-download storage before anything resolves catalog entries.
+        HuggingFaceModelCatalog.initialize(this)
         configStore = EngineConfigStore(getSharedPreferences(PREFS_NAME, MODE_PRIVATE))
         chatManager = ChatManager(this, transcriptStore, chatSearchIndex, uiState, eventBus, serviceScope)
         createNotificationChannel()

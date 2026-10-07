@@ -322,8 +322,14 @@ fun ChatScreen(
 
                             // Apply the limit before reading anything: the old path read
                             // every provider stream on the UI thread and then discarded
-                            // all but the last six.
-                            val capped = uris.take(AttachmentSelection.MAX_PROMPT_ATTACHMENTS)
+                            // all but the last six. takeUpTo dedups by id and caps, so
+                            // the helper on the production path is what the unit test
+                            // actually guards.
+                            val cappedIds = AttachmentSelection.takeUpTo(
+                                uris.map { it.toString() },
+                                AttachmentSelection.MAX_PROMPT_ATTACHMENTS,
+                            )
+                            val capped = cappedIds.mapNotNull { id -> uris.firstOrNull { it.toString() == id } }
                             val dropped = uris.size - capped.size
 
                             scope.launch {
@@ -357,8 +363,16 @@ fun ChatScreen(
                                 }
                                 // Task 4 imports every selected GGUF, not just the first.
                                 ggufUris.forEach { service?.importModel(it) }
-                                if (dropped > 0) {
-                                    snackbarMessage = "Added $dropped fewer attachment(s) (limit ${AttachmentSelection.MAX_PROMPT_ATTACHMENTS})"
+                                snackbarMessage = when {
+                                    dropped > 0 ->
+                                        "Added $dropped fewer attachment(s) (limit ${AttachmentSelection.MAX_PROMPT_ATTACHMENTS})"
+                                    importedModels.isNotEmpty() && attached.isNotEmpty() ->
+                                        "Importing ${importedModels.size} model(s), attached ${attached.size} file(s)"
+                                    importedModels.isNotEmpty() ->
+                                        "Importing ${importedModels.size} model(s)"
+                                    attached.isNotEmpty() ->
+                                        "Attached ${attached.size} file(s)"
+                                    else -> null
                                 }
                             }
                         }

@@ -130,10 +130,14 @@ class BackgroundAgentPersistenceTest {
         val task = manager1.enqueue("Execute benchmark")
         assertNotNull(task)
 
-        var attempts = 0
-        while (manager1.state.value.completedTasks.isEmpty() && attempts < 20) {
-            delay(50)
-            attempts++
+        // Completion runs on bgScope (Dispatchers.Default); on a loaded CI
+        // runner its dispatch alone can exceed a fixed attempt budget, so
+        // wait on the condition itself with a wall-clock deadline.
+        val completionDeadline = System.currentTimeMillis() + 10_000L
+        while (manager1.state.value.completedTasks.isEmpty() &&
+            System.currentTimeMillis() < completionDeadline
+        ) {
+            delay(10)
         }
         assertEquals(1, manager1.state.value.completedTasks.size)
 

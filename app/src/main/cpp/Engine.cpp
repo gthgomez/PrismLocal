@@ -2153,10 +2153,10 @@ std::vector<float> Engine::encode(const std::string& text) {
         add_special, true);
     if (actual < 0) return {};
 
-    // llama_encode runs the encoder graph, which hard-requires
-    // n_ubatch >= n_tokens (GGML_ABORT otherwise) and would crash the whole
-    // process on oversized inputs. Reject them instead; callers treat an empty
-    // result as failure and can re-chunk.
+    // The decode batch must fit the context's configured batch size. llama_decode
+    // asserts n_tokens_all <= cparams.n_batch (llama-context.cpp:1599), so an
+    // oversized input would abort the whole process. Reject it instead; callers
+    // treat an empty result as failure and can re-chunk.
     if (actual > runtime->batch_size) {
         LOGW("encode_input_too_large tokens=%d batch_size=%d", actual, runtime->batch_size);
         return {};
@@ -2171,6 +2171,15 @@ std::vector<float> Engine::encode(const std::string& text) {
     // state between unrelated documents, so clear it first (embedding.cpp:41).
     llama_memory_clear(llama_get_memory(runtime->ctx), true);
     llama_set_embeddings(runtime->ctx, true);
+
+    // Pooled models write sequence vectors to embd_seq, not embd.data, so the
+    // per-token accessor below would read an allocated-but-unwritten buffer and
+    // return garbage as success. Only the NONE pooling case is supported.
+    if (llama_pooling_type(runtime->ctx) != LLAMA_POOLING_TYPE_NONE) {
+        LOGW("encode_unsupported_pooling tokens=%d", actual);
+        llama_set_embeddings(runtime->ctx, false);
+        return {};
+    }
 
     // logits[i] must be set for EVERY token: with pooling_type == NONE the
     // per-token vectors live at the indices marked as outputs, and
@@ -2203,9 +2212,13 @@ std::vector<float> Engine::encode(const std::string& text) {
     // Read the vectors BEFORE restoring non-embeddings mode.
     // llama_context::get_embeddings_ith indexes into embd.data, and
     // set_embeddings may reserve or release that buffer, so reading after
-    // disabling it risks a stale pointer. It also throws std::runtime_error
-    // (rather than returning null) when embd.data is null, so the read is
-    // guarded.
+    // disabling it risks a stale pointer.
+    //
+    // get_embeddings_ith handles the null-buffer case itself and never
+    // propagates an exception: in release builds (NDEBUG) it returns null, and
+    // in a debug build it calls GGML_ABORT internally. GGML_ABORT cannot be
+    // caught, so the null check below covers the release case and a debug build
+    // is intentionally not guarded.
     //
     // pooling_type == NONE is the only branch implemented: for pooled models
     // upstream reads llama_get_embeddings_seq, and mean-pooling an already-pooled
@@ -2213,19 +2226,13 @@ std::vector<float> Engine::encode(const std::string& text) {
     const int32_t n_embd = llama_model_n_embd(runtime->model);
     std::vector<float> result(static_cast<size_t>(n_embd), 0.0f);
     int32_t pooled = 0;
-    try {
-        for (int32_t t = 0; t < actual; t++) {
-            const float* token_emb = llama_get_embeddings_ith(runtime->ctx, t);
-            if (token_emb == nullptr) continue;
-            for (int32_t e = 0; e < n_embd; e++) {
-                result[static_cast<size_t>(e)] += token_emb[e];
-            }
-            pooled++;
+    for (int32_t t = 0; t < actual; t++) {
+        const float* token_emb = llama_get_embeddings_ith(runtime->ctx, t);
+        if (token_emb == nullptr) continue;
+        for (int32_t e = 0; e < n_embd; e++) {
+            result[static_cast<size_t>(e)] += token_emb[e];
         }
-    } catch (const std::exception&) {
-        LOGW("encode_read_embeddings_failed tokens=%d", actual);
-        llama_set_embeddings(runtime->ctx, false);
-        return {};
+        pooled++;
     }
 
     llama_set_embeddings(runtime->ctx, false);

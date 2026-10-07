@@ -61,6 +61,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import org.json.JSONObject
@@ -182,9 +183,14 @@ class InferenceService : Service() {
     // current file's job) so cancelImport() stops the whole batch instead of
     // letting the queue immediately start the next file.
     private var batchImportJob: Job? = null
+    // Persistent import queue + URI lookup. A second multi-select must join the
+    // running drain rather than overwrite [batchImportJob]; otherwise it races
+    // ModelImportManager's single-flight guard and silently skips files.
+    private val importUriByString = ConcurrentHashMap<String, Uri>()
+    private val importQueue = SequentialImportQueue { uriString ->
+        importUriByString[uriString]?.let { uri -> importModel(uri)?.join() }
+    }
     private var downloadObserverJob: Job? = null
-    @Volatile
-    private var criticalMemoryAlertActive = false
     @Volatile
     private var generationForegroundActive = false
     private val operationMutex = Mutex()
@@ -742,16 +748,13 @@ class InferenceService : Service() {
      */
     fun importModels(uris: List<Uri>) {
         if (uris.isEmpty()) return
-        val byString = uris.associateBy { it.toString() }
-        // Track the drain coroutine so cancelImport() can stop the whole batch.
-        // Without this, cancelling only the current file's [importJob] lets the
-        // queue start the next file immediately.
+        // Persist the URIs and append to the shared queue. A second multi-select
+        // while a drain is running must enqueue into that drain, not cancel it.
+        uris.forEach { importUriByString[it.toString()] = it }
+        importQueue.enqueueAll(uris.map { it.toString() })
+        if (batchImportJob?.isActive == true) return
         batchImportJob = serviceScope.launch {
-            val queue = SequentialImportQueue { uriString ->
-                byString[uriString]?.let { uri -> importModel(uri)?.join() }
-            }
-            queue.enqueueAll(uris.map { it.toString() })
-            queue.drain()
+            importQueue.drain()
             // Republish once the whole queue finishes: per-file imports already
             // refresh through onRefreshReadiness, but this guarantees the list is
             // settled even if the last item failed or was skipped.

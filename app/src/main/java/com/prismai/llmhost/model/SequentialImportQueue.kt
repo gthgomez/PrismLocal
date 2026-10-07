@@ -1,5 +1,6 @@
 package com.prismai.llmhost.model
 
+import android.util.Log
 import kotlinx.coroutines.CancellationException
 
 /**
@@ -11,6 +12,10 @@ import kotlinx.coroutines.CancellationException
  * first rejected with "A model import is already running".
  */
 class SequentialImportQueue(private val importOne: suspend (String) -> Unit) {
+
+    private companion object {
+        const val TAG = "SequentialImportQueue"
+    }
 
     private val pending = mutableListOf<String>()
 
@@ -33,7 +38,9 @@ class SequentialImportQueue(private val importOne: suspend (String) -> Unit) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
-                // Continue past ordinary import failures.
+                // Continue past ordinary import failures, but record them:
+                // silently swallowing a programming error hides broken imports.
+                Log.w(TAG, "import failed for $next", e)
             }
         }
     }

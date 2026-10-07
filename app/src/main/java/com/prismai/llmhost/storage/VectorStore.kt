@@ -77,6 +77,20 @@ data class VectorChunk(
 }
 
 /**
+ * The subset of [VectorStore] that [RagManager] depends on. Extracted so the
+ * manager can be exercised in JVM unit tests without a SQLite database or an
+ * Android [Context]; [VectorStore] is the production implementation.
+ */
+interface VectorIndex {
+    fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk>
+    fun search(queryEmbedding: FloatArray, topK: Int = 5, minScore: Float = 0.0f): List<Pair<VectorChunk, Float>>
+    fun deleteByDocument(documentId: String): Int
+    fun documentCount(): Int
+    fun chunkCount(): Int
+    fun clear()
+}
+
+/**
  * SQLite-backed vector store for embedding chunks.
  * Thread-safe via ReentrantLock.
  *
@@ -84,7 +98,7 @@ data class VectorChunk(
  * in the companion object. Search performs brute-force cosine similarity
  * (suitable for on-device use with up to thousands of chunks).
  */
-class VectorStore(context: Context) {
+class VectorStore(context: Context) : VectorIndex {
 
     private val dbHelper = VectorDbHelper(context)
     private val lock = ReentrantLock()
@@ -104,7 +118,7 @@ class VectorStore(context: Context) {
     /**
      * Insert multiple chunks in a single transaction.
      */
-    fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk> {
+    override fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk> {
         lock.withLock {
             val db = dbHelper.writableDatabase
             db.beginTransaction()
@@ -125,7 +139,7 @@ class VectorStore(context: Context) {
     /**
      * Delete all chunks for a given document. Returns number of rows deleted.
      */
-    fun deleteByDocument(documentId: String): Int {
+    override fun deleteByDocument(documentId: String): Int {
         lock.withLock {
             return dbHelper.writableDatabase.delete(
                 TABLE, "$COL_DOCUMENT_ID = ?", arrayOf(documentId)
@@ -142,7 +156,7 @@ class VectorStore(context: Context) {
      * [topK] chunks are retained, so the full table (text + embedding BLOBs) is
      * never materialized on the heap.
      */
-    fun search(queryEmbedding: FloatArray, topK: Int = 5, minScore: Float = 0.0f): List<Pair<VectorChunk, Float>> {
+    override fun search(queryEmbedding: FloatArray, topK: Int, minScore: Float): List<Pair<VectorChunk, Float>> {
         if (topK <= 0 || queryEmbedding.isEmpty()) return emptyList()
         lock.withLock {
             val cursor = dbHelper.readableDatabase.query(
@@ -207,7 +221,7 @@ class VectorStore(context: Context) {
     /**
      * Number of unique documents stored.
      */
-    fun documentCount(): Int {
+    override fun documentCount(): Int {
         lock.withLock {
             val sql = "SELECT COUNT(DISTINCT $COL_DOCUMENT_ID) FROM $TABLE"
             val cursor = dbHelper.readableDatabase.rawQuery(sql, null)
@@ -223,7 +237,7 @@ class VectorStore(context: Context) {
     /**
      * Total number of chunks stored.
      */
-    fun chunkCount(): Int {
+    override fun chunkCount(): Int {
         lock.withLock {
             val sql = "SELECT COUNT(*) FROM $TABLE"
             val cursor = dbHelper.readableDatabase.rawQuery(sql, null)
@@ -239,7 +253,7 @@ class VectorStore(context: Context) {
     /**
      * Remove all chunks from the store.
      */
-    fun clear() {
+    override fun clear() {
         lock.withLock {
             dbHelper.writableDatabase.delete(TABLE, null, null)
         }

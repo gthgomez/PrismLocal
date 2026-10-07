@@ -15,21 +15,38 @@ package com.prismai.llmhost.service
  * CRITICAL is never masked by a milder observation of the other kind.
  */
 class MemoryPressureReconciler(
+    /**
+     * Invoked exactly once each time an observation transitions the reconciler
+     * INTO CRITICAL, from either the push or the poll path. The service uses it
+     * to save the transcript and raise the UI alert on a real transition rather
+     * than on every repeated CRITICAL observation. Declared first so [apply]
+     * remains the trailing lambda.
+     */
+    private val onCriticalTransition: () -> Unit = {},
     private val apply: (Int) -> Unit,
 ) {
+    // Guards lastApplied/critical and the order in which levels are handed to
+    // apply(). The transition callback runs OUTSIDE this lock so a slow
+    // transcript save on one path can never block the other (including the main
+    // thread, which receives the push callback).
+    private val stateLock = Any()
     private var lastApplied: Int? = null
     private var critical = false
 
     /** Push-based trim/low-memory callback. Escalates immediately. */
     fun onPush(state: MemoryState) {
-        if (state.level >= MemoryState.CRITICAL.level) {
-            critical = true
-            write(state.level)
-            return
+        val transitioned = synchronized(stateLock) {
+            if (state.level >= MemoryState.CRITICAL.level) {
+                escalateLocked()
+            } else if (critical) {
+                // A push that is milder than an active CRITICAL must not clear it.
+                false
+            } else {
+                write(state.level)
+                false
+            }
         }
-        // A push that is milder than an active CRITICAL must not clear it.
-        if (critical) return
-        write(state.level)
+        if (transitioned) onCriticalTransition()
     }
 
     /**
@@ -39,24 +56,39 @@ class MemoryPressureReconciler(
      * is sticky and is not written.
      */
     fun onPoll(state: MemoryState) {
-        if (state.level >= MemoryState.CRITICAL.level) {
-            critical = true
-            write(state.level)
-            return
-        }
-        if (critical) {
-            if (state.level == MemoryState.NORMAL.level) {
-                critical = false
-                write(MemoryState.NORMAL.level)
+        val transitioned = synchronized(stateLock) {
+            when {
+                state.level >= MemoryState.CRITICAL.level -> escalateLocked()
+                critical && state.level == MemoryState.NORMAL.level -> {
+                    critical = false
+                    write(MemoryState.NORMAL.level)
+                    false
+                }
+                critical -> false
+                else -> {
+                    write(state.level)
+                    false
+                }
             }
-            return
         }
-        write(state.level)
+        if (transitioned) onCriticalTransition()
     }
 
-    fun currentLevel(): Int = lastApplied ?: MemoryState.NORMAL.level
+    fun currentLevel(): Int = synchronized(stateLock) { lastApplied ?: MemoryState.NORMAL.level }
 
-    fun isCritical(): Boolean = critical
+    fun isCritical(): Boolean = synchronized(stateLock) { critical }
+
+    /**
+     * Enter CRITICAL while holding [stateLock]. Returns true only on the
+     * transition edge, so repeated CRITICAL observations do not re-run the
+     * transition work.
+     */
+    private fun escalateLocked(): Boolean {
+        val wasCritical = critical
+        critical = true
+        write(MemoryState.CRITICAL.level)
+        return !wasCritical
+    }
 
     private fun write(level: Int) {
         if (lastApplied == level) return

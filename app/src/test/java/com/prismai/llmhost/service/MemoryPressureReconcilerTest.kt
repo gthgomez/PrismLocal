@@ -71,4 +71,43 @@ class MemoryPressureReconcilerTest {
 
         assertEquals(3, r.currentLevel())
     }
+
+    @Test
+    fun criticalTransitionFiresOncePerTransitionFromPush() {
+        var transitions = 0
+        val r = MemoryPressureReconciler(apply = {}, onCriticalTransition = { transitions++ })
+
+        r.onPush(MemoryState.CRITICAL)
+        r.onPush(MemoryState.CRITICAL)
+        r.onPush(MemoryState.CRITICAL)
+        assertEquals("repeated CRITICAL pushes must not re-fire", 1, transitions)
+
+        r.onPoll(MemoryState.NORMAL)
+        r.onPush(MemoryState.CRITICAL)
+        assertEquals("a new transition after recovery must fire again", 2, transitions)
+    }
+
+    @Test
+    fun criticalTransitionFiresWhenCriticalIsObservedOnlyByPolling() {
+        var transitions = 0
+        val r = MemoryPressureReconciler(apply = {}, onCriticalTransition = { transitions++ })
+
+        r.onPoll(MemoryState.CRITICAL)
+        assertEquals("a poll-only CRITICAL must still fire the transition", 1, transitions)
+
+        r.onPoll(MemoryState.CRITICAL)
+        assertEquals("repeated CRITICAL polls must not re-fire", 1, transitions)
+    }
+
+    @Test
+    fun mildObservationAfterCriticalDoesNotFireATransition() {
+        var transitions = 0
+        val r = MemoryPressureReconciler(apply = {}, onCriticalTransition = { transitions++ })
+
+        r.onPush(MemoryState.CRITICAL)
+        r.onPoll(MemoryState.WATCH)
+        r.onPush(MemoryState.WATCH)
+        assertEquals(1, transitions)
+        assertEquals(3, r.currentLevel())
+    }
 }

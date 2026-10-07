@@ -38,6 +38,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -149,18 +150,39 @@ class InferenceService : Service() {
     // avoids enqueuing redundant cancellation work.
     private val teardownStarted = AtomicBoolean(false)
 
-    // Single owner of the native memory-pressure level. Declared after
-    // serviceScope so the apply lambda can launch onto an initialized scope.
-    private val memoryPressureReconciler = MemoryPressureReconciler { level ->
-        serviceScope.launch { engine.setMemoryPressure(level) }
-    }
+    // Single owner of the native memory-pressure level. Writes are funneled
+    // through an unbounded channel consumed by exactly one coroutine, so the
+    // levels reach native in the same order the reconciler decided them. A
+    // per-write serviceScope.launch would let a CRITICAL(3) push and a NORMAL(0)
+    // poll race on Dispatchers.Default and leave native pinned at 3. The channel
+    // is unbounded (not conflated) so a transient escalation is never dropped:
+    // native must still observe CRITICAL to cancel generation.
+    private val memoryPressureWrites = Channel<Int>(Channel.UNLIMITED)
+
+    private val memoryPressureReconciler = MemoryPressureReconciler(
+        apply = { level -> memoryPressureWrites.trySend(level) },
+        onCriticalTransition = {
+            // Fires once per transition into CRITICAL from either the push or
+            // the poll path. The guard stays as the single dedup state.
+            if (!criticalMemoryAlertActive) {
+                criticalMemoryAlertActive = true
+                saveTranscriptSafely()
+                publishUiEvent("Memory critical; transcript saved")
+            }
+        },
+    )
 
     private lateinit var engine: NativeLlmBridge
     private lateinit var memoryGovernor: MemoryGovernor
     private lateinit var modelStorageManager: ModelStorageManager
     private var generationJob: Job? = null
     private var importJob: Job? = null
+    // The multi-file drain coroutine. Tracked separately from [importJob] (the
+    // current file's job) so cancelImport() stops the whole batch instead of
+    // letting the queue immediately start the next file.
+    private var batchImportJob: Job? = null
     private var downloadObserverJob: Job? = null
+    @Volatile
     private var criticalMemoryAlertActive = false
     @Volatile
     private var generationForegroundActive = false
@@ -640,18 +662,25 @@ class InferenceService : Service() {
                     switchModel(savedModel)
                 }
         }
+        // Serialized consumer: applies memory levels to native in the exact
+        // order the reconciler decided them. Started before the reconciler can
+        // receive any observation.
+        serviceScope.launch {
+            for (level in memoryPressureWrites) {
+                // A failed native write must not kill the single consumer and
+                // stall every later level; log and continue, as the previous
+                // independent launches effectively did.
+                runCatching { engine.setMemoryPressure(level) }
+                    .onFailure { Log.w(TAG, "Failed to apply memory pressure $level", it) }
+            }
+        }
         // Push-based trim callback (instant notification). Routed through the
         // reconciler so it cannot race the polling flow into native.
         memoryGovernor.register { state ->
             memoryPressureReconciler.onPush(state)
-            if (state == MemoryState.CRITICAL) {
-                // The push path previously skipped this entirely.
-                saveTranscriptSafely()
-                if (!criticalMemoryAlertActive) {
-                    publishUiEvent("Memory critical; transcript saved")
-                }
-                criticalMemoryAlertActive = true
-            }
+            // The reconciler fires the transition callback once per entry into
+            // CRITICAL, so no per-observation save/alert logic lives here.
+            criticalMemoryAlertActive = memoryPressureReconciler.isCritical()
         }
         // Polling is the fallback for gradual pressure. distinctUntilChanged()
         // is removed: the reconciler owns dedup, and it must be able to write an
@@ -717,7 +746,10 @@ class InferenceService : Service() {
     fun importModels(uris: List<Uri>) {
         if (uris.isEmpty()) return
         val byString = uris.associateBy { it.toString() }
-        serviceScope.launch {
+        // Track the drain coroutine so cancelImport() can stop the whole batch.
+        // Without this, cancelling only the current file's [importJob] lets the
+        // queue start the next file immediately.
+        batchImportJob = serviceScope.launch {
             val queue = SequentialImportQueue { uriString ->
                 byString[uriString]?.let { uri -> importModel(uri)?.join() }
             }
@@ -747,6 +779,10 @@ class InferenceService : Service() {
     }
 
     fun cancelImport() {
+        // Cancel the whole batch first so the queue cannot start the next file,
+        // then the file currently in flight.
+        batchImportJob?.cancel()
+        batchImportJob = null
         importJob?.cancel()
         importJob = null
         WorkManager.getInstance(this).cancelUniqueWork(HuggingFaceDownloadWork.UNIQUE_WORK_NAME)
@@ -1929,7 +1965,10 @@ class InferenceService : Service() {
     }
 
     private fun refreshVectorChunksList() {
-        runCatching { uiState._vectorChunks.value = vectorStore.getAllChunks() }
+        // The document browser is a retrieval view: show only chunks that
+        // search() can actually return. getAllChunks() is reserved for deletion
+        // (it must still see stale rows so they can be removed).
+        runCatching { uiState._vectorChunks.value = vectorStore.getCurrentChunks() }
     }
 
     private fun startAgentFollowUpGeneration(
@@ -2195,6 +2234,8 @@ class InferenceService : Service() {
 
     override fun onDestroy() {
         saveTranscriptSafely()
+        batchImportJob?.cancel()
+        batchImportJob = null
         importJob?.cancel()
         importJob = null
 

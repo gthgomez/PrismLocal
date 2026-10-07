@@ -93,7 +93,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -176,8 +175,6 @@ fun ChatScreen(
                             .padding(horizontal = 16.dp, vertical = 12.dp),
                     ) {
                         val context = LocalContext.current
-                        var refreshKey by remember { mutableIntStateOf(0) }
-                        var models by remember(service) { mutableStateOf(service?.listModels() ?: emptyList()) }
                         var hfCatalog by remember(service) { mutableStateOf(service?.huggingFaceCatalog() ?: emptyList()) }
                         val currentModel by (service?.currentModel ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
                         val activeModelInfo by (service?.activeModelInfo ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
@@ -208,6 +205,12 @@ fun ChatScreen(
                             initialValue = null
                         )
                         val modelReadiness by (service?.modelReadiness ?: emptyFlow()).collectAsStateWithLifecycle(
+                            initialValue = emptyList()
+                        )
+                        // One observable installed-model state, owned by the
+                        // service, replaces the old remember snapshot that only
+                        // refreshed on ImportState.Success.
+                        val models by (service?.installedModels ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
                         val pendingAgentToolAction by (service?.pendingAgentToolAction ?: emptyFlow()).collectAsStateWithLifecycle(
@@ -414,9 +417,8 @@ fun ChatScreen(
                             }
                         }
 
-                        LaunchedEffect(service, refreshKey, importState) {
+                        LaunchedEffect(service, importState) {
                             service?.refreshDeviceAndModelReadiness()
-                            models = service?.listModels() ?: emptyList()
                             hfCatalog = service?.huggingFaceCatalog() ?: emptyList()
                         }
 
@@ -437,7 +439,6 @@ fun ChatScreen(
                                     }
                                 }
                                 is ImportState.Success -> {
-                                    refreshKey++
                                     importStatus = "Imported ${state.modelId}"
                                     snackbarMessage = "Imported ${state.modelId}"
                                 }

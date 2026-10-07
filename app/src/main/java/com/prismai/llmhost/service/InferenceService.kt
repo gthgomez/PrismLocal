@@ -295,6 +295,7 @@ class InferenceService : Service() {
     val voiceState: StateFlow<VoiceState> get() = uiState.voiceState
     val currentModel: StateFlow<String?> get() = uiState.currentModel
     val activeModelInfo: StateFlow<ModelStorageManager.ActiveModelInfo?> get() = uiState.activeModelInfo
+    val installedModels: StateFlow<List<String>> get() = uiState.installedModels
     val isGenerating: StateFlow<Boolean> get() = uiState.isGenerating
     val runtimeStatus: StateFlow<RuntimeStatus> get() = uiState.runtimeStatus
     val importState: StateFlow<ImportState> get() = uiState.importState
@@ -667,6 +668,21 @@ class InferenceService : Service() {
         _deviceCapabilityProfile.value = profile
         _modelReadiness.value = modelStorageManager.listInstalledModelInfos()
             .map { info -> modelReadinessAssessor.buildReadiness(info, profile) }
+        // Every mutation path (import, download, delete, link) funnels through
+        // this refresh, so republish the observable installed list here too.
+        serviceScope.launch { refreshInstalledModels() }
+    }
+
+    /**
+     * Republish the observable installed-model list from disk.
+     *
+     * [ModelManager.listModels] does synchronous filesystem I/O and a manifest
+     * parse per model, so it is moved off the caller's thread. Writing through
+     * [ServiceUiState.installedModelsStore] dedups an unchanged list.
+     */
+    private suspend fun refreshInstalledModels() {
+        val models = withContext(Dispatchers.IO) { modelManager.listModels() }
+        uiState.installedModelsStore.set(models)
     }
 
     fun importModel(uri: Uri): Job? {
@@ -695,6 +711,10 @@ class InferenceService : Service() {
             }
             queue.enqueueAll(uris.map { it.toString() })
             queue.drain()
+            // Republish once the whole queue finishes: per-file imports already
+            // refresh through onRefreshReadiness, but this guarantees the list is
+            // settled even if the last item failed or was skipped.
+            refreshInstalledModels()
         }
     }
 

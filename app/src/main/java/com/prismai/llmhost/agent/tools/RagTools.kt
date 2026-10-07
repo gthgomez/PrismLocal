@@ -80,7 +80,7 @@ class RagTools(
 
     suspend fun listDocuments(call: AgentToolCall): AgentToolResult {
         val allChunks = try {
-            vectorStore.getAllChunks()
+            vectorStore.getCurrentChunks()
         } catch (e: Exception) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "Failed to list documents: ${(e.message ?: e::class.java.simpleName).compactForAgent(160)}")

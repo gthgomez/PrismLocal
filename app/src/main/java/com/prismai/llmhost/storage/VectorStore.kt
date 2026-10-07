@@ -91,6 +91,20 @@ interface VectorIndex {
 }
 
 /**
+ * The subset of [VectorStore] that [KnowledgePackManager] depends on.
+ *
+ * [getAllChunks] is the maintenance read: it returns every row, including rows
+ * written at an older [VectorStore.EMBEDDING_REVISION], so deletion can still
+ * remove them. [getCurrentChunks] is the retrieval read: it never returns a row
+ * that [search] would refuse to score.
+ */
+interface KnowledgePackChunkStore {
+    fun getAllChunks(): List<VectorChunk>
+    fun getCurrentChunks(): List<VectorChunk>
+    fun deleteByDocument(documentId: String): Int
+}
+
+/**
  * SQLite-backed vector store for embedding chunks.
  * Thread-safe via ReentrantLock.
  *
@@ -98,7 +112,7 @@ interface VectorIndex {
  * in the companion object. Search performs brute-force cosine similarity
  * (suitable for on-device use with up to thousands of chunks).
  */
-class VectorStore(context: Context) : VectorIndex {
+class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     private val dbHelper = VectorDbHelper(context)
     private val lock = ReentrantLock()
@@ -260,13 +274,33 @@ class VectorStore(context: Context) : VectorIndex {
     }
 
     /**
-     * Return every stored chunk. Materializes the whole table, so prefer targeted
-     * queries; retained for callers that genuinely need the full set.
+     * Return every stored chunk, including rows written at an older
+     * [EMBEDDING_REVISION]. This is the maintenance/deletion read: it lets
+     * callers find and remove stale rows that [search] can no longer reach.
+     * Retrieval and status paths must use [getCurrentChunks] instead.
+     *
+     * Materializes the whole table, so prefer targeted queries.
      */
-    fun getAllChunks(): List<VectorChunk> {
+    override fun getAllChunks(): List<VectorChunk> {
         lock.withLock {
             val cursor = dbHelper.readableDatabase.query(
                 TABLE, null, null, null, null, null, "$COL_CREATED ASC"
+            )
+            return cursorToList(cursor)
+        }
+    }
+
+    /**
+     * Chunks at [EMBEDDING_REVISION] only. Rows written by an older build are
+     * unreachable by [search] and must not be counted as indexed knowledge.
+     * Unlike [getAllChunks], this is safe to use for retrieval or status decisions.
+     */
+    override fun getCurrentChunks(): List<VectorChunk> {
+        lock.withLock {
+            val cursor = dbHelper.readableDatabase.query(
+                TABLE, null,
+                "$COL_EMBEDDING_REVISION = ?", arrayOf(EMBEDDING_REVISION.toString()),
+                null, null, "$COL_CREATED ASC"
             )
             return cursorToList(cursor)
         }

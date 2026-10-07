@@ -21,6 +21,7 @@ import com.prismai.llmhost.ui.rag.*
 import com.prismai.llmhost.ui.voice.*
 import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -130,8 +131,6 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
-
-private const val MAX_PROMPT_ATTACHMENTS = 6
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -319,46 +318,48 @@ fun ChatScreen(
                         }
                         val attachmentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
                             onImportPickerFinished()
-                            if (uris.isEmpty()) {
-                                return@rememberLauncherForActivityResult
-                            }
-                            val importedModels = mutableListOf<String>()
-                            val attached = mutableListOf<PromptAttachment>()
-                            val ggufUris = mutableListOf<Uri>()
-                            uris.forEach { uri ->
-                                runCatching {
-                                    context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                }
-                                val name = AttachmentTextExtractor.displayName(context, uri)
-                                if (name.endsWith(".gguf", ignoreCase = true)) {
-                                    ggufUris += uri
-                                    importedModels += name
-                                } else {
-                                    attached += AttachmentTextExtractor.fromUri(context, uri)
-                                }
-                            }
-                            if (ggufUris.isNotEmpty()) {
-                                scope.launch {
-                                    val targetUri = ggufUris.firstOrNull()
-                                    if (targetUri != null) {
-                                        service?.importModel(targetUri)
+                            if (uris.isEmpty()) return@rememberLauncherForActivityResult
+
+                            // Apply the limit before reading anything: the old path read
+                            // every provider stream on the UI thread and then discarded
+                            // all but the last six.
+                            val capped = uris.take(AttachmentSelection.MAX_PROMPT_ATTACHMENTS)
+                            val dropped = uris.size - capped.size
+
+                            scope.launch {
+                                val attached = mutableListOf<PromptAttachment>()
+                                val ggufUris = mutableListOf<Uri>()
+                                val importedModels = mutableListOf<String>()
+
+                                for (uri in capped) {
+                                    ensureActive()
+                                    runCatching {
+                                        context.contentResolver.takePersistableUriPermission(
+                                            uri,
+                                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                                        )
+                                    }
+                                    val name = AttachmentTextExtractor.displayName(context, uri)
+                                    if (name.endsWith(".gguf", ignoreCase = true)) {
+                                        ggufUris += uri
+                                        importedModels += name
+                                    } else {
+                                        AttachmentTextExtractor.fromUriAsync(context, uri)
+                                            ?.let { attached += it }
                                     }
                                 }
-                            }
-                            if (attached.isNotEmpty()) {
-                                savedAttachments = (attachments + attached)
-                                    .distinctBy { it.uriString }
-                                    .takeLast(MAX_PROMPT_ATTACHMENTS)
-                                    .map(AttachmentTextCodec::encode)
-                            }
-                            snackbarMessage = when {
-                                importedModels.isNotEmpty() && attached.isNotEmpty() ->
-                                    "Importing ${importedModels.size} model(s), attached ${attached.size} file(s)"
-                                importedModels.isNotEmpty() ->
-                                    "Importing ${importedModels.size} model(s)"
-                                attached.isNotEmpty() ->
-                                    "Attached ${attached.size} file(s)"
-                                else -> null
+
+                                if (attached.isNotEmpty()) {
+                                    savedAttachments = (attachments + attached)
+                                        .distinctBy { it.uriString }
+                                        .takeLast(AttachmentSelection.MAX_PROMPT_ATTACHMENTS)
+                                        .map(AttachmentTextCodec::encode)
+                                }
+                                // Task 4 imports every selected GGUF, not just the first.
+                                ggufUris.forEach { service?.importModel(it) }
+                                if (dropped > 0) {
+                                    snackbarMessage = "Added $dropped fewer attachment(s) (limit ${AttachmentSelection.MAX_PROMPT_ATTACHMENTS})"
+                                }
                             }
                         }
                         val benchmarkExportLauncher = rememberLauncherForActivityResult(

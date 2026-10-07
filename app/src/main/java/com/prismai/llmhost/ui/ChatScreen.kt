@@ -232,6 +232,8 @@ fun ChatScreen(
                         val vectorChunks by (service?.vectorChunks ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
+                        val staleVectorChunkCount by (service?.staleVectorChunkCount ?: emptyFlow())
+                            .collectAsStateWithLifecycle(initialValue = 0)
                         val voiceState by (service?.voiceState ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = com.prismai.llmhost.tools.VoiceState()
                         )
@@ -251,7 +253,10 @@ fun ChatScreen(
                         // effect can move away from it. On the first frame after
                         // recreation `service`/`currentChatId` are still unknown, so the
                         // saved chat id is what attributes the restored draft.
-                        val draftStore = remember {
+                        // `rememberSaveable` (not plain `remember`): the whole store
+                        // carries every keyed draft through process death, not only
+                        // the active chat's prompt/attachments.
+                        val draftStore = rememberSaveable(saver = DraftStore.Saver) {
                             DraftStore(savedChatId).apply {
                                 restore(savedChatId, prompt, attachments)
                             }
@@ -418,7 +423,11 @@ fun ChatScreen(
                             }
                         }
 
+                        // Refresh readiness only when an import reaches a terminal
+                        // state. Running emits on every progress tick, and each
+                        // refresh re-reads installed models on the main thread.
                         LaunchedEffect(service, importState) {
+                            if (importState is ImportState.Running) return@LaunchedEffect
                             service?.refreshDeviceAndModelReadiness()
                             hfCatalog = service?.huggingFaceCatalog() ?: emptyList()
                         }
@@ -675,17 +684,22 @@ fun ChatScreen(
                             onSend = {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 if (text.isNotEmpty()) {
-                                    // Ask the service before destroying anything. A refusal
-                                    // must leave the composed text and attachments intact.
-                                    if (service?.acceptsGeneration(text) == true) {
-                                        prompt = ""
-                                        savedAttachments = emptyList()
-                                        draftStore.clear()
-                                        service?.generateSafely(text)
-                                    } else {
-                                        snackbarMessage =
-                                            service?.generationRefusalReason(text)
-                                                ?: "Message refused; draft kept"
+                                    // Ask the service before destroying anything, off the
+                                    // main thread because acceptance reads SQLite memory.
+                                    // A refusal must leave the composed text and
+                                    // attachments intact.
+                                    scope.launch {
+                                        val result = service?.preflightSend(text)
+                                        if (result == null) {
+                                            snackbarMessage = "Service unavailable"
+                                        } else if (result.accepted) {
+                                            prompt = ""
+                                            savedAttachments = emptyList()
+                                            draftStore.clear()
+                                            service?.generateSafely(text)
+                                        } else {
+                                            snackbarMessage = result.reason ?: "Message refused; draft kept"
+                                        }
                                     }
                                 }
                             },
@@ -820,7 +834,9 @@ fun ChatScreen(
                             ) {
                                 DocumentBrowser(
                                     chunks = vectorChunks,
+                                    staleDocumentCount = staleVectorChunkCount,
                                     ingestStatus = ingestStatus,
+                                    onDeleteStaleDocuments = { service?.deleteStaleVectorChunks() },
                                     onIngestDocument = { id, title, text ->
                                         ingestStatus = null
                                         scope.launch {

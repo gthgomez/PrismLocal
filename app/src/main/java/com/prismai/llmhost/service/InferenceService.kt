@@ -326,6 +326,7 @@ class InferenceService : Service() {
     val lastAgentTracePath: StateFlow<String?> get() = uiState.lastAgentTracePath
     val memories: StateFlow<List<MemoryFact>> get() = uiState.memories
     val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunk>> get() = uiState.vectorChunks
+    val staleVectorChunkCount: StateFlow<Int> get() = uiState.staleVectorChunkCount
     val thermalGovernorState: StateFlow<com.prismai.llmhost.util.ThermalGovernorState> get() = uiState.thermalGovernorState
     val voiceInputResult: StateFlow<String?> get() = uiState.voiceInputResult
     val voiceState: StateFlow<VoiceState> get() = uiState.voiceState
@@ -1094,20 +1095,10 @@ class InferenceService : Service() {
     fun benchmarkCsv(): String = benchmarkStore.csv()
     fun benchmarkJson(): String = benchmarkStore.json()
 
-    /** Non-suspending pre-flight so the UI can decide whether to clear its draft. */
-    @Deprecated("Use preflightSend; this runs generationAcceptance (SQLite memory read) on the caller thread")
-    fun acceptsGeneration(prompt: String): Boolean =
-        generationAcceptance(prompt).accepted
-
-    @Deprecated("Use preflightSend; this runs generationAcceptance (SQLite memory read) on the caller thread")
-    fun generationRefusalReason(prompt: String): String? =
-        generationAcceptance(prompt).reason
-
     /**
      * Off-main pre-flight: [generationAcceptance] reads active memories from
      * SQLite, so running it on the UI thread would block a frame. The UI calls
-     * this from a coroutine instead of [acceptsGeneration] /
-     * [generationRefusalReason].
+     * this from a coroutine before it decides whether to clear its draft.
      */
     suspend fun preflightSend(prompt: String): SendAcceptance.Result =
         withContext(Dispatchers.Default) { generationAcceptance(prompt) }

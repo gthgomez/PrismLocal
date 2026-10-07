@@ -122,4 +122,34 @@ class DraftStoreTest {
 
         assertEquals("chat b keeps its own draft", "b text", store.snapshotFor("chat_b").first)
     }
+
+    /**
+     * The whole store must survive process death, not only the active draft.
+     * `encodeState`/`decodeState` back the Compose `Saver`, so the round trip
+     * has to carry every keyed draft (active and inactive) and its attachments.
+     */
+    @Test
+    fun stateRoundTripsEveryKeyedDraftIncludingInactiveOnes() {
+        val store = DraftStore("chat_a")
+        store.restore("chat_b", "b text", listOf(attachment("b.txt")))
+        store.text = "a live edit"
+        store.attachments = listOf(attachment("a.txt"))
+
+        val restored = DraftStore.decodeState(store.encodeState())
+
+        assertEquals("a live edit", restored.snapshotFor("chat_a").first)
+        assertEquals("content://x/a.txt", restored.snapshotFor("chat_a").second.single().uriString)
+        assertEquals("b text", restored.snapshotFor("chat_b").first)
+        assertEquals("content://x/b.txt", restored.snapshotFor("chat_b").second.single().uriString)
+    }
+
+    @Test
+    fun stateRoundTripsTheNullChatBucket() {
+        val store = DraftStore(null)
+        store.text = "no chat yet"
+
+        val restored = DraftStore.decodeState(store.encodeState())
+
+        assertEquals("no chat yet", restored.snapshotFor(null).first)
+    }
 }

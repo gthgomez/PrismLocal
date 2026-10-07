@@ -41,7 +41,22 @@ class RealInferenceSmokeTest {
 
             assertTrue("expected at least one real token", tokenCount >= 1)
             assertTrue("expected non-empty decoded text", decodedText.isNotBlank())
-            assertTrue("expected EOF terminal", chunks.any { it.isTerminal && it.terminalReason == "EOF" })
+            // maxTokens = 1 means the engine stops on the token budget and emits
+            // MAX_TOKENS. EOF only occurs if the model produces a stop token
+            // first, which this budget does not allow. Assert the real contract.
+            assertTrue(
+                "expected MAX_TOKENS terminal when the token budget is reached",
+                chunks.any { it.isTerminal && it.terminalReason == "MAX_TOKENS" },
+            )
+            assertTrue(
+                "generation must end with a terminal chunk",
+                chunks.any { it.isTerminal },
+            )
+            assertTrue(
+                "terminal reason must be a known value",
+                chunks.filter { it.isTerminal }
+                    .all { it.terminalReason == "EOF" || it.terminalReason == "MAX_TOKENS" },
+            )
         } finally {
             engine.destroySafely()
         }

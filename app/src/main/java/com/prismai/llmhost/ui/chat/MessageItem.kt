@@ -58,6 +58,9 @@ internal fun MessageBubble(
     isUser: Boolean,
     showLoading: Boolean,
     performance: GenerationPerformance? = null,
+    // Optional so existing call sites compile unchanged; defaults to the
+    // bubble label, but callers should pass the real message id when known.
+    messageId: String = label,
 ) {
     val bubbleColor = if (isUser) {
         userBubbleColor()
@@ -79,7 +82,7 @@ internal fun MessageBubble(
                 // claiming a local save that never happened.
                 runCatching {
                     CapabilityRegistryHolder.auditLog.appendReport(
-                        messageId = label,
+                        messageId = messageId,
                         reason = reason,
                         excerpt = text.take(500),
                     )

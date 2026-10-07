@@ -164,6 +164,12 @@ class InferenceService : Service() {
     @Volatile
     private var generationForegroundActive = false
     private val operationMutex = Mutex()
+    // Serializes the read+write of the observable installed-model list. The
+    // refresh is fire-and-forget from refreshDeviceAndModelReadiness(), so two
+    // overlapping refreshes could otherwise let an older on-disk snapshot be
+    // written after a newer one. The Mutex must guard the listModels() read as
+    // well as the set(): synchronizing only the setter cannot order the reads.
+    private val installedModelsRefresh = Mutex()
     private val generationStartGate = GenerationStartGate()
     private val serviceGenerationOwnership = ServiceGenerationOwnership()
     private val backgroundGenerationOwnership = serviceGenerationOwnership.engine
@@ -677,12 +683,17 @@ class InferenceService : Service() {
      * Republish the observable installed-model list from disk.
      *
      * [ModelManager.listModels] does synchronous filesystem I/O and a manifest
-     * parse per model, so it is moved off the caller's thread. Writing through
+     * parse per model, so it is moved off the caller's thread. The read and the
+     * write are serialized by [installedModelsRefresh]: without it, overlapping
+     * refreshes could let a refresh that read an older snapshot win the write
+     * after a newer one, leaving the picker stale. Writing through
      * [ServiceUiState.installedModelsStore] dedups an unchanged list.
      */
     private suspend fun refreshInstalledModels() {
-        val models = withContext(Dispatchers.IO) { modelManager.listModels() }
-        uiState.installedModelsStore.set(models)
+        installedModelsRefresh.withLock {
+            val models = withContext(Dispatchers.IO) { modelManager.listModels() }
+            uiState.installedModelsStore.set(models)
+        }
     }
 
     fun importModel(uri: Uri): Job? {

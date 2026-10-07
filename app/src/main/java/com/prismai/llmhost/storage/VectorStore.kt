@@ -77,6 +77,34 @@ data class VectorChunk(
 }
 
 /**
+ * The subset of [VectorStore] that [RagManager] depends on. Extracted so the
+ * manager can be exercised in JVM unit tests without a SQLite database or an
+ * Android [Context]; [VectorStore] is the production implementation.
+ */
+interface VectorIndex {
+    fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk>
+    fun search(queryEmbedding: FloatArray, topK: Int = 5, minScore: Float = 0.0f): List<Pair<VectorChunk, Float>>
+    fun deleteByDocument(documentId: String): Int
+    fun documentCount(): Int
+    fun chunkCount(): Int
+    fun clear()
+}
+
+/**
+ * The subset of [VectorStore] that [KnowledgePackManager] depends on.
+ *
+ * [getAllChunks] is the maintenance read: it returns every row, including rows
+ * written at an older [VectorStore.EMBEDDING_REVISION], so deletion can still
+ * remove them. [getCurrentChunks] is the retrieval read: it never returns a row
+ * that [search] would refuse to score.
+ */
+interface KnowledgePackChunkStore {
+    fun getAllChunks(): List<VectorChunk>
+    fun getCurrentChunks(): List<VectorChunk>
+    fun deleteByDocument(documentId: String): Int
+}
+
+/**
  * SQLite-backed vector store for embedding chunks.
  * Thread-safe via ReentrantLock.
  *
@@ -84,7 +112,7 @@ data class VectorChunk(
  * in the companion object. Search performs brute-force cosine similarity
  * (suitable for on-device use with up to thousands of chunks).
  */
-class VectorStore(context: Context) {
+class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     private val dbHelper = VectorDbHelper(context)
     private val lock = ReentrantLock()
@@ -104,7 +132,7 @@ class VectorStore(context: Context) {
     /**
      * Insert multiple chunks in a single transaction.
      */
-    fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk> {
+    override fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk> {
         lock.withLock {
             val db = dbHelper.writableDatabase
             db.beginTransaction()
@@ -125,7 +153,7 @@ class VectorStore(context: Context) {
     /**
      * Delete all chunks for a given document. Returns number of rows deleted.
      */
-    fun deleteByDocument(documentId: String): Int {
+    override fun deleteByDocument(documentId: String): Int {
         lock.withLock {
             return dbHelper.writableDatabase.delete(
                 TABLE, "$COL_DOCUMENT_ID = ?", arrayOf(documentId)
@@ -142,7 +170,7 @@ class VectorStore(context: Context) {
      * [topK] chunks are retained, so the full table (text + embedding BLOBs) is
      * never materialized on the heap.
      */
-    fun search(queryEmbedding: FloatArray, topK: Int = 5, minScore: Float = 0.0f): List<Pair<VectorChunk, Float>> {
+    override fun search(queryEmbedding: FloatArray, topK: Int, minScore: Float): List<Pair<VectorChunk, Float>> {
         if (topK <= 0 || queryEmbedding.isEmpty()) return emptyList()
         lock.withLock {
             val cursor = dbHelper.readableDatabase.query(
@@ -170,10 +198,19 @@ class VectorStore(context: Context) {
         val chunkIndex = cursor.getColumnIndexOrThrow(COL_CHUNK_INDEX)
         val textIndex = cursor.getColumnIndexOrThrow(COL_TEXT)
         val embeddingIndex = cursor.getColumnIndexOrThrow(COL_EMBEDDING)
+        val revisionIndex = cursor.getColumnIndexOrThrow(COL_EMBEDDING_REVISION)
         val createdIndex = cursor.getColumnIndexOrThrow(COL_CREATED)
 
         return object : Iterator<Pair<VectorChunk, Float>> {
-            private var hasNextRow = cursor.moveToFirst()
+            private var hasNextRow = advanceToCurrentRevision()
+
+            /** Skips rows written by an older embedding revision. */
+            private fun advanceToCurrentRevision(): Boolean {
+                while (cursor.moveToNext()) {
+                    if (isCurrentRevision(cursor.getInt(revisionIndex))) return true
+                }
+                return false
+            }
 
             override fun hasNext(): Boolean = hasNextRow
 
@@ -189,7 +226,7 @@ class VectorStore(context: Context) {
                     embedding = embedding,
                     createdAt = cursor.getLong(createdIndex),
                 )
-                hasNextRow = cursor.moveToNext()
+                hasNextRow = advanceToCurrentRevision()
                 return chunk to score
             }
         }
@@ -198,7 +235,7 @@ class VectorStore(context: Context) {
     /**
      * Number of unique documents stored.
      */
-    fun documentCount(): Int {
+    override fun documentCount(): Int {
         lock.withLock {
             val sql = "SELECT COUNT(DISTINCT $COL_DOCUMENT_ID) FROM $TABLE"
             val cursor = dbHelper.readableDatabase.rawQuery(sql, null)
@@ -214,7 +251,7 @@ class VectorStore(context: Context) {
     /**
      * Total number of chunks stored.
      */
-    fun chunkCount(): Int {
+    override fun chunkCount(): Int {
         lock.withLock {
             val sql = "SELECT COUNT(*) FROM $TABLE"
             val cursor = dbHelper.readableDatabase.rawQuery(sql, null)
@@ -230,20 +267,40 @@ class VectorStore(context: Context) {
     /**
      * Remove all chunks from the store.
      */
-    fun clear() {
+    override fun clear() {
         lock.withLock {
             dbHelper.writableDatabase.delete(TABLE, null, null)
         }
     }
 
     /**
-     * Return every stored chunk. Materializes the whole table, so prefer targeted
-     * queries; retained for callers that genuinely need the full set.
+     * Return every stored chunk, including rows written at an older
+     * [EMBEDDING_REVISION]. This is the maintenance/deletion read: it lets
+     * callers find and remove stale rows that [search] can no longer reach.
+     * Retrieval and status paths must use [getCurrentChunks] instead.
+     *
+     * Materializes the whole table, so prefer targeted queries.
      */
-    fun getAllChunks(): List<VectorChunk> {
+    override fun getAllChunks(): List<VectorChunk> {
         lock.withLock {
             val cursor = dbHelper.readableDatabase.query(
                 TABLE, null, null, null, null, null, "$COL_CREATED ASC"
+            )
+            return cursorToList(cursor)
+        }
+    }
+
+    /**
+     * Chunks at [EMBEDDING_REVISION] only. Rows written by an older build are
+     * unreachable by [search] and must not be counted as indexed knowledge.
+     * Unlike [getAllChunks], this is safe to use for retrieval or status decisions.
+     */
+    override fun getCurrentChunks(): List<VectorChunk> {
+        lock.withLock {
+            val cursor = dbHelper.readableDatabase.query(
+                TABLE, null,
+                "$COL_EMBEDDING_REVISION = ?", arrayOf(EMBEDDING_REVISION.toString()),
+                null, null, "$COL_CREATED ASC"
             )
             return cursorToList(cursor)
         }
@@ -267,15 +324,28 @@ class VectorStore(context: Context) {
 
     companion object {
         const val DB_NAME = "prism_vector_store.db"
-        const val DB_VERSION = 1
+        const val DB_VERSION = 2
         const val TABLE = "vector_chunks"
+
+        /**
+         * Revision of the embedding values stored by this build. Bump this
+         * whenever the embedding computation changes, even if the vector width
+         * stays the same: a dimension check would miss a same-width re-embedding
+         * and reject valid models whose width differs. Rows written at an older
+         * revision are never returned by [search].
+         */
+        const val EMBEDDING_REVISION = 2
 
         const val COL_ID = "id"
         const val COL_DOCUMENT_ID = "document_id"
         const val COL_CHUNK_INDEX = "chunk_index"
         const val COL_TEXT = "text"
         const val COL_EMBEDDING = "embedding"
+        const val COL_EMBEDDING_REVISION = "embedding_revision"
         const val COL_CREATED = "created_at"
+
+        /** True when a row written at [rowRevision] is comparable with this build. */
+        fun isCurrentRevision(rowRevision: Int): Boolean = rowRevision == EMBEDDING_REVISION
 
         val CREATE_TABLE_SQL: String = """
             CREATE TABLE IF NOT EXISTS $TABLE (
@@ -284,9 +354,13 @@ class VectorStore(context: Context) {
                 $COL_CHUNK_INDEX INTEGER NOT NULL,
                 $COL_TEXT TEXT NOT NULL,
                 $COL_EMBEDDING BLOB NOT NULL,
+                $COL_EMBEDDING_REVISION INTEGER NOT NULL DEFAULT 1,
                 $COL_CREATED INTEGER NOT NULL
             )
         """.trimIndent()
+
+        val ADD_EMBEDDING_REVISION_SQL: String =
+            "ALTER TABLE $TABLE ADD COLUMN $COL_EMBEDDING_REVISION INTEGER NOT NULL DEFAULT 1"
 
         val CREATE_DOCUMENT_INDEX_SQL: String = """
             CREATE INDEX IF NOT EXISTS idx_vector_chunks_document_id
@@ -362,12 +436,13 @@ class VectorStore(context: Context) {
 
     // ---- Value mapping ----
 
-    private fun toValues(chunk: VectorChunk): ContentValues = ContentValues(6).apply {
+    private fun toValues(chunk: VectorChunk): ContentValues = ContentValues(7).apply {
         put(COL_ID, chunk.id)
         put(COL_DOCUMENT_ID, chunk.documentId)
         put(COL_CHUNK_INDEX, chunk.chunkIndex)
         put(COL_TEXT, chunk.text)
         put(COL_EMBEDDING, floatArrayToBytes(chunk.embedding))
+        put(COL_EMBEDDING_REVISION, EMBEDDING_REVISION)
         put(COL_CREATED, chunk.createdAt)
     }
 
@@ -382,7 +457,11 @@ class VectorStore(context: Context) {
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            // No schema upgrades yet — database version 1
+            if (oldVersion < 2) {
+                // Rows that predate embedding revisioning become revision 1 and
+                // are therefore never returned by search().
+                db.execSQL(ADD_EMBEDDING_REVISION_SQL)
+            }
         }
     }
 

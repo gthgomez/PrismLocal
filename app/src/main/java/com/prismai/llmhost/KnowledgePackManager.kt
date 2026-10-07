@@ -55,7 +55,7 @@ data class KnowledgePack(
  */
 class KnowledgePackManager(
     private val grokipediaClient: GrokipediaClient,
-    private val vectorStore: VectorStore,
+    private val vectorStore: KnowledgePackChunkStore,
     private val ragManager: RagManager,
     private val chunker: DocumentChunker = DocumentChunker,
 ) {
@@ -377,7 +377,7 @@ class KnowledgePackManager(
      */
     private fun checkPackAlreadyIndexed(pack: KnowledgePack): KnowledgePackStatus? {
         val prefix = "$GROKIPEDIA_DOC_ID_PREFIX:${pack.id}:"
-        val allChunks = vectorStore.getAllChunks()
+        val allChunks = vectorStore.getCurrentChunks()
         val packChunks = allChunks.filter { it.documentId.startsWith(prefix) }
 
         if (packChunks.isEmpty()) return null

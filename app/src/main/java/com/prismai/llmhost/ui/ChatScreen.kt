@@ -834,7 +834,7 @@ fun ChatScreen(
                             ) {
                                 DocumentBrowser(
                                     chunks = vectorChunks,
-                                    staleDocumentCount = staleVectorChunkCount,
+                                    staleChunkCount = staleVectorChunkCount,
                                     ingestStatus = ingestStatus,
                                     onDeleteStaleDocuments = { service?.deleteStaleVectorChunks() },
                                     onIngestDocument = { id, title, text ->

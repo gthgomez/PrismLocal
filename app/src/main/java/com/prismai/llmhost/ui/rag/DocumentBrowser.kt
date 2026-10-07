@@ -50,7 +50,7 @@ import java.util.Locale
 @Composable
 fun DocumentBrowser(
     chunks: List<VectorChunk>,
-    staleDocumentCount: Int,
+    staleChunkCount: Int,
     ingestStatus: String?,
     onIngestDocument: (id: String, title: String, text: String) -> Unit,
     onDeleteDocument: (documentId: String) -> Unit,
@@ -106,7 +106,7 @@ fun DocumentBrowser(
         // Chunks indexed by an older embedding revision are filtered out of
         // search, so they are invisible in the list above. Without this the user
         // had no way to reclaim their storage.
-        if (staleDocumentCount > 0) {
+        if (staleChunkCount > 0) {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(10.dp),
@@ -122,8 +122,8 @@ fun DocumentBrowser(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     Text(
-                        text = "$staleDocumentCount document(s) were indexed by an older app " +
-                            "version and can no longer be searched",
+                        text = "$staleChunkCount stale vector chunk(s) were indexed by an older " +
+                            "app version and can no longer be searched",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.weight(1f),

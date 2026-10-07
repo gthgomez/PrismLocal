@@ -226,42 +226,43 @@ fun ChatScreen(
                         val voiceState by (service?.voiceState ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = com.prismai.llmhost.tools.VoiceState()
                         )
-                        // Drafts are chat-owned (DraftStore) and the active draft is
-                        // saveable, so rotation does not lose it and switching chats
-                        // does not carry it into another conversation.
-                        val draftStore = remember(service) { DraftStore(currentChatId) }
-                        var prompt by rememberSaveable(currentChatId) { mutableStateOf(draftStore.text) }
-                        var savedAttachments by rememberSaveable(currentChatId) {
-                            mutableStateOf(emptyList<String>())
-                        }
+                        // The active chat's draft is the live state here and is saveable,
+                        // so rotation and activity recreation restore it even though the
+                        // service is not yet bound on the first frame. DraftStore holds
+                        // the drafts of chats that are not active, keyed by chat id.
+                        var prompt by rememberSaveable { mutableStateOf("") }
+                        var savedAttachments by rememberSaveable { mutableStateOf(emptyList<String>()) }
+                        var savedChatId by rememberSaveable { mutableStateOf<String?>(null) }
                         val attachments: List<PromptAttachment> =
                             remember(savedAttachments) {
                                 savedAttachments.mapNotNull(AttachmentTextCodec::decode)
                             }
 
-                        // Follow chat switches: save the outgoing draft and load the
-                        // incoming one. Declared before the persist effect so the move
-                        // captures the outgoing draft before the live state is synced.
-                        LaunchedEffect(currentChatId) {
-                            if (draftStore.chatId != currentChatId) {
-                                draftStore.moveTo(currentChatId)
-                                prompt = draftStore.text
-                                savedAttachments = draftStore.attachments.map(AttachmentTextCodec::encode)
+                        // Rebuild the store around the restored active draft before any
+                        // effect can move away from it. On the first frame after
+                        // recreation `service`/`currentChatId` are still unknown, so the
+                        // saved chat id is what attributes the restored draft.
+                        val draftStore = remember {
+                            DraftStore(savedChatId).apply {
+                                restore(savedChatId, prompt, attachments)
                             }
                         }
 
-                        // Persist the live draft back into the store on every change so a
-                        // chat switch or activity recreation can restore it.
-                        LaunchedEffect(prompt, attachments, currentChatId) {
-                            draftStore.text = prompt
-                            draftStore.attachments = attachments
-                            draftStore.persist()
-                        }
-
-                        // Re-encode after a restore so any entry that failed to decode is
-                        // dropped and the saveable form stays canonical.
-                        LaunchedEffect(attachments) {
-                            savedAttachments = attachments.map(AttachmentTextCodec::encode)
+                        // Follow chat switches. Wait for the bound service; by then the
+                        // store already owns the restored draft under its saved chat id,
+                        // so the service reporting that same id is a no-op. The live
+                        // draft is read here, never captured from a previous composition,
+                        // so a switch cannot clobber the incoming chat with stale values.
+                        LaunchedEffect(currentChatId, service) {
+                            if (service == null) return@LaunchedEffect
+                            val loaded = draftStore.applyLiveDraft(
+                                currentChatId = currentChatId,
+                                liveText = prompt,
+                                liveAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode),
+                            ) ?: return@LaunchedEffect
+                            prompt = loaded.first
+                            savedAttachments = loaded.second.map(AttachmentTextCodec::encode)
+                            savedChatId = draftStore.chatId
                         }
 
                         var importStatus by remember { mutableStateOf("") }

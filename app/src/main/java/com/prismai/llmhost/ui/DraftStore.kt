@@ -31,6 +31,34 @@ class DraftStore(initialChatId: String?) {
         attachments = restored?.attachments ?: emptyList()
     }
 
+    /**
+     * Attribute the live draft to the chat the service now reports.
+     *
+     * After an activity recreation the service is not bound on the first frame,
+     * so the active draft is restored into a store seeded with the *saved* chat
+     * id before any switch is observed. When the service then reports that same
+     * id this is a no-op and the restored draft survives. When it reports a
+     * different id, the live draft is saved under the old id (never under a
+     * placeholder) and the incoming chat's draft is loaded.
+     *
+     * The outgoing draft's id is the store's own [chatId], not [currentChatId],
+     * so a chat switch can never attribute a draft to the wrong conversation.
+     *
+     * @return the draft that is now live when the id changed, or null when it did
+     *   not change (the caller keeps its current live draft).
+     */
+    fun applyLiveDraft(
+        currentChatId: String?,
+        liveText: String,
+        liveAttachments: List<PromptAttachment>,
+    ): Pair<String, List<PromptAttachment>>? {
+        if (currentChatId == chatId) return null
+        text = liveText
+        attachments = liveAttachments
+        moveTo(currentChatId)
+        return text to attachments
+    }
+
     /** Erase the active chat's draft. Other chats are untouched. */
     fun clear() {
         text = ""

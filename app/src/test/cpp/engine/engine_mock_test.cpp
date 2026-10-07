@@ -328,6 +328,15 @@ int testDoubleStartCancelsPreviousSession() {
     return 0;
 }
 
+// The mock runtime has no loaded model, so encode must return empty rather
+// than fabricate a vector. RagManager treats empty as failure.
+int testEncodeWithoutModelReturnsEmpty() {
+    llmhost::Engine engine(true);
+    CHECK(engine.encode("hello world").empty());
+    std::puts("  encode without a loaded model returns an empty vector");
+    return 0;
+}
+
 int testMockModelLoadTwiceAndBackendTelemetry() {
     g_engine = new llmhost::Engine(true);
     CHECK(g_engine->loadModel("DEBUG_MOCK_MODEL"));
@@ -362,6 +371,7 @@ int main() {
         {"ack_eof_tombstones_drained_generation", testAckEofTombstonesFullyDrainedGeneration},
         {"ack_eof_before_terminal_no_tombstone", testAckEofBeforeTerminalDoesNotTombstone},
         {"double_start_cancels_previous_session", testDoubleStartCancelsPreviousSession},
+        {"encode_without_model_returns_empty", testEncodeWithoutModelReturnsEmpty},
         {"mock_model_reload_and_telemetry", testMockModelLoadTwiceAndBackendTelemetry},
     };
 

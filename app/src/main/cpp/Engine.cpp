@@ -2162,44 +2162,82 @@ std::vector<float> Engine::encode(const std::string& text) {
         return {};
     }
 
-    // Enable embeddings mode
+    // Embeddings for a decoder-only model go through llama_decode, matching
+    // examples/embedding/embedding.cpp. llama_encode would request
+    // LLM_GRAPH_TYPE_ENCODER, which build_arch_graph ignores for llama/qwen/bert,
+    // forcing non-causal attention through a causal decoder graph.
+    //
+    // The KV cache is irrelevant here and reusing it would leak prompt-cache
+    // state between unrelated documents, so clear it first (embedding.cpp:41).
+    llama_memory_clear(llama_get_memory(runtime->ctx), true);
     llama_set_embeddings(runtime->ctx, true);
 
-    // Build batch and encode
-    llama_batch batch = llama_batch_get_one(tokens.data(), actual);
-    const int32_t rc = llama_encode(runtime->ctx, batch);
+    // logits[i] must be set for EVERY token: with pooling_type == NONE the
+    // per-token vectors live at the indices marked as outputs, and
+    // llama_get_embeddings is documented to return NULL otherwise.
+    // llama_context::decode sets output_all = cparams.embeddings, so the
+    // allocator would mark all tokens for us, but we set them explicitly so the
+    // intent survives a change to that default.
+    llama_batch batch = llama_batch_init(actual, 0, 1);
+    bool batch_ok = batch.token != nullptr && batch.logits != nullptr;
+    if (batch_ok) {
+        for (int32_t i = 0; i < actual; i++) {
+            batch.token[i] = tokens[static_cast<size_t>(i)];
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = 1;
+        }
+        batch.n_tokens = actual;
+    }
+
+    const int32_t rc = batch_ok ? llama_decode(runtime->ctx, batch) : -1;
+    llama_batch_free(batch);
+
     if (rc != 0) {
         llama_set_embeddings(runtime->ctx, false);
+        LOGW("encode_decode_failed tokens=%d rc=%d", actual, rc);
         return {};
     }
 
-    // Retrieve embeddings
+    // Read the vectors BEFORE restoring non-embeddings mode.
+    // llama_context::get_embeddings_ith indexes into embd.data, and
+    // set_embeddings may reserve or release that buffer, so reading after
+    // disabling it risks a stale pointer. It also throws std::runtime_error
+    // (rather than returning null) when embd.data is null, so the read is
+    // guarded.
+    //
+    // pooling_type == NONE is the only branch implemented: for pooled models
+    // upstream reads llama_get_embeddings_seq, and mean-pooling an already-pooled
+    // vector would be wrong, so those return empty and PR 2 surfaces the reason.
     const int32_t n_embd = llama_model_n_embd(runtime->model);
-    float* embeddings = llama_get_embeddings(runtime->ctx);
-    if (embeddings == nullptr) {
+    std::vector<float> result(static_cast<size_t>(n_embd), 0.0f);
+    int32_t pooled = 0;
+    try {
+        for (int32_t t = 0; t < actual; t++) {
+            const float* token_emb = llama_get_embeddings_ith(runtime->ctx, t);
+            if (token_emb == nullptr) continue;
+            for (int32_t e = 0; e < n_embd; e++) {
+                result[static_cast<size_t>(e)] += token_emb[e];
+            }
+            pooled++;
+        }
+    } catch (const std::exception&) {
+        LOGW("encode_read_embeddings_failed tokens=%d", actual);
         llama_set_embeddings(runtime->ctx, false);
         return {};
     }
 
-    // Mean-pool across all token embeddings for a single representative vector.
-    // llama_get_embeddings returns a flat array of shape [n_tokens × n_embd].
-    // Using only the first token (as before) discards 85%+ of semantic signal
-    // for multi-token chunks. Mean pooling is the standard approach for
-    // sentence/paragraph embedding extraction from causal LMs.
-    std::vector<float> result(n_embd, 0.0f);
-    for (int32_t t = 0; t < actual; t++) {
-        const float* token_emb = embeddings + static_cast<size_t>(t) * static_cast<size_t>(n_embd);
-        for (int32_t e = 0; e < n_embd; e++) {
-            result[e] += token_emb[e];
-        }
-    }
-    const float inv_n = 1.0f / static_cast<float>(actual);
-    for (int32_t e = 0; e < n_embd; e++) {
-        result[e] *= inv_n;
-    }
-
-    // Restore non-embeddings mode
     llama_set_embeddings(runtime->ctx, false);
+
+    if (pooled == 0) {
+        LOGW("encode_no_token_embeddings tokens=%d n_embd=%d", actual, n_embd);
+        return {};
+    }
+    const float inv_n = 1.0f / static_cast<float>(pooled);
+    for (int32_t e = 0; e < n_embd; e++) {
+        result[static_cast<size_t>(e)] *= inv_n;
+    }
 
     return result;
 }

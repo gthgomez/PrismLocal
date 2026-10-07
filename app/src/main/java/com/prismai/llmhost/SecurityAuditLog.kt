@@ -8,6 +8,7 @@ import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
 import java.io.File
+import org.json.JSONObject
 
 data class SecurityEvent(
     val timestamp: Long = System.currentTimeMillis(),
@@ -68,11 +69,50 @@ class SecurityAuditLog(private val maxEvents: Int = 200) {
 
     fun clear() { synchronized(events) { events.clear() } }
 
+    /**
+     * A user-submitted AI-content report.
+     *
+     * The report dialog previously showed "Report saved locally" from a Toast
+     * while persisting nothing. This is the record it claimed to write.
+     */
+    data class ReportEntry(
+        val messageId: String,
+        val reason: String,
+        val excerpt: String,
+        val timestampMs: Long = System.currentTimeMillis(),
+    ) {
+        fun toJson(): JSONObject = JSONObject().apply {
+            put("type", "ai_content_report")
+            put("messageId", messageId)
+            put("reason", reason)
+            put("excerpt", excerpt.take(500))
+            put("timestampMs", timestampMs)
+        }
+    }
+
+    /**
+     * Persist a user-submitted AI-content report as one JSON line, reusing the
+     * same append-and-truncate policy as [record]. Failure-isolated like every
+     * other entry point: a no-op before [init], and it never throws.
+     */
+    fun appendReport(messageId: String, reason: String, excerpt: String) {
+        runCatching {
+            val line = ReportEntry(messageId, reason, excerpt).toJson().toString()
+            synchronized(events) {
+                auditFile?.let { persistLineLocked(it, line) }
+            }
+        }
+    }
+
     // Called under the buffer monitor so file order always matches memory order.
     private fun persistLocked(file: File, event: SecurityEvent) {
+        persistLineLocked(file, jsonLine(event))
+    }
+
+    private fun persistLineLocked(file: File, line: String) {
         runCatching {
             if (file.length() > MAX_LOG_BYTES) file.writeText("")
-            file.appendText(jsonLine(event) + "\n")
+            file.appendText(line + "\n")
         }
     }
 

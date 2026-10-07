@@ -58,6 +58,9 @@ internal fun MessageBubble(
     isUser: Boolean,
     showLoading: Boolean,
     performance: GenerationPerformance? = null,
+    // Optional so existing call sites compile unchanged; defaults to the
+    // bubble label, but callers should pass the real message id when known.
+    messageId: String = label,
 ) {
     val bubbleColor = if (isUser) {
         userBubbleColor()
@@ -75,7 +78,15 @@ internal fun MessageBubble(
         ReportAiContentDialog(
             onDismiss = { showReportDialog = false },
             onSubmitReport = { reason ->
-                Toast.makeText(context, "Report saved locally: $reason", Toast.LENGTH_SHORT).show()
+                // Actually persist it. The previous handler showed a Toast
+                // claiming a local save that never happened.
+                runCatching {
+                    CapabilityRegistryHolder.auditLog.appendReport(
+                        messageId = messageId,
+                        reason = reason,
+                        excerpt = text.take(500),
+                    )
+                }
             }
         )
     }

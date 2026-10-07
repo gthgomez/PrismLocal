@@ -1,5 +1,7 @@
 package com.prismai.llmhost.model
 
+import kotlinx.coroutines.CancellationException
+
 /**
  * Runs model imports strictly one at a time.
  *
@@ -17,11 +19,22 @@ class SequentialImportQueue(private val importOne: suspend (String) -> Unit) {
         pending += uris
     }
 
-    /** Import everything queued, one at a time, continuing past failures. */
+    /**
+     * Import everything queued, one at a time, continuing past ordinary
+     * failures. Cancellation is NOT an ordinary failure: it is rethrown so the
+     * surrounding [CoroutineScope] unwinds instead of continuing to import on a
+     * cancelled scope and leaving `_importState` stuck at `Running`.
+     */
     suspend fun drain() {
         while (true) {
             val next = synchronized(this) { pending.removeFirstOrNull() } ?: return
-            runCatching { importOne(next) }
+            try {
+                importOne(next)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // Continue past ordinary import failures.
+            }
         }
     }
 }

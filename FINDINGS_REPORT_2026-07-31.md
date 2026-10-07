@@ -199,3 +199,8 @@ VERIFICATION:
 - Result: pass
 - Evidence: FINDINGS_REPORT_2026-07-31.md accurately reflects re-evaluated audit findings and corrections against commit 3de358c.
 ```
+
+> 2026-10-06: `storage/LightweightEmbeddingEngine.kt` referenced above was
+> deleted as dead code. No code, test, or benchmark referenced it; the only
+> callers are in this document. Document ingestion uses `RagManager` with
+> `NativeLlmBridge.encode`.

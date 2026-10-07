@@ -161,11 +161,12 @@ class InferenceService : Service() {
 
     private val memoryPressureReconciler = MemoryPressureReconciler(
         apply = { level -> memoryPressureWrites.trySend(level) },
+        // Fires exactly once per transition into CRITICAL from either the push
+        // or the poll path — the reconciler is the sole dedup owner. The disk
+        // write (transcript save) is dispatched off the caller's thread because
+        // the push path (MemoryGovernor.onTrimMemory) runs on the main thread.
         onCriticalTransition = {
-            // Fires once per transition into CRITICAL from either the push or
-            // the poll path. The guard stays as the single dedup state.
-            if (!criticalMemoryAlertActive) {
-                criticalMemoryAlertActive = true
+            serviceScope.launch {
                 saveTranscriptSafely()
                 publishUiEvent("Memory critical; transcript saved")
             }
@@ -678,9 +679,6 @@ class InferenceService : Service() {
         // reconciler so it cannot race the polling flow into native.
         memoryGovernor.register { state ->
             memoryPressureReconciler.onPush(state)
-            // The reconciler fires the transition callback once per entry into
-            // CRITICAL, so no per-observation save/alert logic lives here.
-            criticalMemoryAlertActive = memoryPressureReconciler.isCritical()
         }
         // Polling is the fallback for gradual pressure. distinctUntilChanged()
         // is removed: the reconciler owns dedup, and it must be able to write an
@@ -688,7 +686,6 @@ class InferenceService : Service() {
         memoryGovernor.monitorMemory()
             .onEach { state ->
                 memoryPressureReconciler.onPoll(state)
-                criticalMemoryAlertActive = memoryPressureReconciler.isCritical()
             }
             .launchIn(serviceScope)
     }

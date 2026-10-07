@@ -1,0 +1,76 @@
+package com.prismai.llmhost.ui
+
+import com.prismai.llmhost.AttachmentExtractionStatus
+import com.prismai.llmhost.PromptAttachment
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class DraftStoreTest {
+
+    private fun attachment(name: String) = PromptAttachment(
+        uriString = "content://x/$name",
+        name = name,
+        mimeType = "text/plain",
+        sizeBytes = 10L,
+        extractionStatus = AttachmentExtractionStatus.EXTRACTED,
+        promptText = "body",
+    )
+
+    @Test
+    fun draftIsScopedToItsChat() {
+        val store = DraftStore("chat_a")
+        store.text = "hello"
+        store.moveTo("chat_b")
+
+        assertEquals("switching chats must not carry a draft", "", store.text)
+    }
+
+    @Test
+    fun returningToAChatRestoresItsDraft() {
+        val store = DraftStore("chat_a")
+        store.text = "draft for a"
+        store.moveTo("chat_b")
+        store.text = "draft for b"
+        store.moveTo("chat_a")
+
+        assertEquals("draft for a", store.text)
+    }
+
+    @Test
+    fun attachmentsFollowTheSameScoping() {
+        val store = DraftStore("chat_a")
+        store.attachments = listOf(attachment("a.txt"))
+        store.moveTo("chat_b")
+        assertTrue(store.attachments.isEmpty())
+        store.moveTo("chat_a")
+        assertEquals(1, store.attachments.size)
+    }
+
+    @Test
+    fun clearEmptiesTheActiveDraftOnly() {
+        val store = DraftStore("chat_a")
+        store.text = "keep me"
+        store.moveTo("chat_b")
+        store.clear()
+        store.moveTo("chat_a")
+        assertEquals("keep me", store.text)
+    }
+
+    @Test
+    fun snapshotIsValueCopied() {
+        val store = DraftStore("chat_a")
+        store.text = "original"
+        val (text, _) = store.snapshotFor("chat_a")
+        store.text = "mutated"
+        assertEquals("snapshot must not alias live state", "original", text)
+    }
+
+    @Test
+    fun nullChatIdIsTreatedAsItsOwnBucket() {
+        val store = DraftStore(null)
+        store.text = "no chat yet"
+        store.moveTo(null)
+        assertEquals("no chat yet", store.text)
+    }
+}

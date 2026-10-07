@@ -95,6 +95,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -225,8 +226,44 @@ fun ChatScreen(
                         val voiceState by (service?.voiceState ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = com.prismai.llmhost.tools.VoiceState()
                         )
-                        var prompt by remember { mutableStateOf("") }
-                        var attachments by remember { mutableStateOf<List<PromptAttachment>>(emptyList()) }
+                        // Drafts are chat-owned (DraftStore) and the active draft is
+                        // saveable, so rotation does not lose it and switching chats
+                        // does not carry it into another conversation.
+                        val draftStore = remember(service) { DraftStore(currentChatId) }
+                        var prompt by rememberSaveable(currentChatId) { mutableStateOf(draftStore.text) }
+                        var savedAttachments by rememberSaveable(currentChatId) {
+                            mutableStateOf(emptyList<String>())
+                        }
+                        val attachments: List<PromptAttachment> =
+                            remember(savedAttachments) {
+                                savedAttachments.mapNotNull(AttachmentTextCodec::decode)
+                            }
+
+                        // Follow chat switches: save the outgoing draft and load the
+                        // incoming one. Declared before the persist effect so the move
+                        // captures the outgoing draft before the live state is synced.
+                        LaunchedEffect(currentChatId) {
+                            if (draftStore.chatId != currentChatId) {
+                                draftStore.moveTo(currentChatId)
+                                prompt = draftStore.text
+                                savedAttachments = draftStore.attachments.map(AttachmentTextCodec::encode)
+                            }
+                        }
+
+                        // Persist the live draft back into the store on every change so a
+                        // chat switch or activity recreation can restore it.
+                        LaunchedEffect(prompt, attachments, currentChatId) {
+                            draftStore.text = prompt
+                            draftStore.attachments = attachments
+                            draftStore.persist()
+                        }
+
+                        // Re-encode after a restore so any entry that failed to decode is
+                        // dropped and the saveable form stays canonical.
+                        LaunchedEffect(attachments) {
+                            savedAttachments = attachments.map(AttachmentTextCodec::encode)
+                        }
+
                         var importStatus by remember { mutableStateOf("") }
                         var pendingBenchmarkCsv by remember { mutableStateOf<String?>(null) }
                         var pendingBenchmarkJson by remember { mutableStateOf<String?>(null) }
@@ -308,9 +345,10 @@ fun ChatScreen(
                                 }
                             }
                             if (attached.isNotEmpty()) {
-                                attachments = (attachments + attached)
+                                savedAttachments = (attachments + attached)
                                     .distinctBy { it.uriString }
                                     .takeLast(MAX_PROMPT_ATTACHMENTS)
+                                    .map(AttachmentTextCodec::encode)
                             }
                             snackbarMessage = when {
                                 importedModels.isNotEmpty() && attached.isNotEmpty() ->
@@ -495,6 +533,7 @@ fun ChatScreen(
                                                     isUser = isUser,
                                                     showLoading = isActiveAssistant,
                                                     performance = generationPerformance.takeIf { isActiveAssistant },
+                                                    messageId = message.id.toString(),
                                                 )
                                             }
                                         }
@@ -581,7 +620,9 @@ fun ChatScreen(
                                 attachmentLauncher.launch(arrayOf("*/*"))
                             },
                             onRemoveAttachment = { attachment ->
-                                attachments = attachments.filterNot { it.uriString == attachment.uriString }
+                                savedAttachments = attachments
+                                    .filterNot { it.uriString == attachment.uriString }
+                                    .map(AttachmentTextCodec::encode)
                             },
                             onCancel = { service?.cancelGeneration() },
                             onContinue = { service?.continueGenerationSafely() },
@@ -589,7 +630,7 @@ fun ChatScreen(
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 if (text.isNotEmpty()) {
                                     prompt = ""
-                                    attachments = emptyList()
+                                    savedAttachments = emptyList()
                                     service?.generateSafely(text)
                                 }
                             },

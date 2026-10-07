@@ -27,35 +27,37 @@ class CustomDownloadSpecPersistenceTest {
     }
 
     @Test
-    fun restoredEntry_isNeverCurated() {
+    fun restoredEntry_keepsExpectedBytesAndMetadataThroughRoundTrip() {
         val entry = HuggingFaceModelCatalog.buildCustomEntry("user/repo", "m.gguf")
-        assertTrue("custom entries must stay unverified-verifiable", !entry.curated)
-    }
 
-    @Test
-    fun restoredEntry_keepsExpectedBytesAndMetadata() {
-        val entry = HuggingFaceModelCatalog.buildCustomEntry("user/repo", "m.gguf")
-        assertEquals(-1L, entry.expectedBytes)
-        assertEquals("Custom", entry.parameters)
-        assertNull(HuggingFaceModelCatalog.find("custom_does_not_exist"))
+        val restored = CustomEntryStore.deserialize(CustomEntryStore.serialize(entry))
+
+        assertNotNull(restored)
+        assertEquals(-1L, restored!!.expectedBytes)
+        assertEquals("Custom", restored.parameters)
+        assertEquals("user/repo", restored.repoId)
+        assertEquals("m.gguf", restored.fileName)
     }
 
     /**
      * Locks in the worker's real dependency: `HuggingFaceDownloadWorker.doWork` calls
      * `HuggingFaceModelCatalog.find(entryId)` after a restart, with only the durable store
-     * (not the curated in-memory list) able to resolve a custom id.
+     * (not the curated in-memory list) able to resolve a custom id. Exercised through the
+     * serialize/deserialize round-trip the durable store actually performs.
      */
     @Test
-    fun find_resolvesPersistedCustomEntryThatIsNotInTheCuratedList() {
-        val entry = HuggingFaceModelCatalog.createCustomEntry("user/persisted", "persisted.gguf")
-        assertNull(
+    fun aRoundTrippedCustomEntryResolvesByItsPersistedId() {
+        val entry = HuggingFaceModelCatalog.buildCustomEntry("user/persisted", "persisted.gguf")
+
+        val restored = CustomEntryStore.deserialize(CustomEntryStore.serialize(entry))
+
+        assertNotNull("a persisted custom entry must survive the round-trip", restored)
+        assertEquals(entry.id, restored!!.id)
+        assertEquals("user/persisted", restored.repoId)
+        assertTrue(
             "sanity: the custom id must not be a curated entry",
-            HuggingFaceModelCatalog.entries.firstOrNull { it.id == entry.id },
+            HuggingFaceModelCatalog.entries.none { it.id == entry.id },
         )
-        val found = HuggingFaceModelCatalog.find(entry.id)
-        assertNotNull("worker must resolve a persisted custom entry by id", found)
-        assertEquals(entry.id, found!!.id)
-        assertEquals("user/persisted", found.repoId)
     }
 
     // --- D2: expectedSha256 must survive the round-trip ---

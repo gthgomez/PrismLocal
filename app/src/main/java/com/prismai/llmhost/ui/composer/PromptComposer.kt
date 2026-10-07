@@ -154,11 +154,13 @@ internal fun PromptComposer(
                     onRemove = onRemoveAttachment,
                 )
             } else if (attachments.isNotEmpty()) {
-                // Keep removal reachable even when the tray is collapsed.
-                Text(
-                    text = "${attachments.size} attachment(s)",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = PrismOnDark.copy(alpha = 0.7f),
+                // Removal must stay reachable even when the tray is collapsed.
+                // The same LazyRow is height-constrained so the compact tray
+                // cannot consume the input space in a short (keyboard-open) layout.
+                AttachmentTray(
+                    attachments = attachments,
+                    onRemove = onRemoveAttachment,
+                    modifier = Modifier.heightIn(max = 56.dp),
                 )
             }
             if (!imeVisible) {
@@ -179,11 +181,12 @@ internal fun PromptComposer(
 private fun AttachmentTray(
     attachments: List<PromptAttachment>,
     onRemove: (PromptAttachment) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     if (attachments.isEmpty()) return
     // A LazyRow bounds the tray to a single card height; the old Column of
     // full-width cards could consume the space the input needs.
-    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    LazyRow(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         items(attachments, key = { it.uriString }) { attachment ->
             Surface(
                 modifier = Modifier.widthIn(max = 280.dp),

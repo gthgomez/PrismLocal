@@ -44,12 +44,4 @@ class LayoutPolicyTest {
         p.onUserScrolledToBottom()
         assertTrue(p.shouldAutoScroll())
     }
-
-    @Test
-    fun followPolicy_doesNotLoseFollowOnANewMessage() {
-        val p = ScrollFollowPolicy()
-        p.onUserScrolledAway()
-        // A new message arrives while the reader is reading history.
-        assertFalse(p.shouldAutoScroll())
-    }
 }

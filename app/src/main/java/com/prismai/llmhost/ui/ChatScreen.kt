@@ -251,7 +251,10 @@ fun ChatScreen(
                         // effect can move away from it. On the first frame after
                         // recreation `service`/`currentChatId` are still unknown, so the
                         // saved chat id is what attributes the restored draft.
-                        val draftStore = remember {
+                        // `rememberSaveable` (not plain `remember`): the whole store
+                        // carries every keyed draft through process death, not only
+                        // the active chat's prompt/attachments.
+                        val draftStore = rememberSaveable(saver = DraftStore.Saver) {
                             DraftStore(savedChatId).apply {
                                 restore(savedChatId, prompt, attachments)
                             }

@@ -1,6 +1,9 @@
 package com.prismai.llmhost.ui
 
+import androidx.compose.runtime.saveable.Saver
 import com.prismai.llmhost.PromptAttachment
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Draft text and attachments, owned by the chat they belong to.
@@ -89,7 +92,62 @@ class DraftStore(initialChatId: String?) {
 
     private fun key(id: String?): String = id ?: NEW_CHAT_KEY
 
-    private companion object {
-        const val NEW_CHAT_KEY = "__no_chat__"
+    /**
+     * Serialize the whole store — every keyed draft, active and inactive — so a
+     * Compose [Saver] can carry it through process death. The active draft is
+     * persisted first so no edit made since the last [moveTo] is lost.
+     */
+    fun encodeState(): String {
+        persist()
+        val draftsJson = JSONObject()
+        drafts.forEach { (key, draft) -> draftsJson.put(key, encodeDraft(draft)) }
+        return JSONObject().apply {
+            put("chatId", chatId ?: JSONObject.NULL)
+            put("drafts", draftsJson)
+        }.toString()
+    }
+
+    private fun encodeDraft(draft: Draft): JSONObject = JSONObject().apply {
+        put("text", draft.text)
+        put("attachments", JSONArray(draft.attachments.map(AttachmentTextCodec::encode)))
+    }
+
+    companion object {
+        private const val NEW_CHAT_KEY = "__no_chat__"
+
+        /**
+         * Backs `rememberSaveable(saver = DraftStore.Saver)` in ChatScreen. The
+         * shared screen store previously used plain `remember`, so only the
+         * active chat's draft survived recreation.
+         */
+        val Saver: Saver<DraftStore, String> = Saver(
+            save = { store -> store.encodeState() },
+            restore = { encoded -> decodeState(encoded) },
+        )
+
+        /** Inverse of [encodeState]. A corrupt payload yields an empty store. */
+        internal fun decodeState(encoded: String): DraftStore {
+            val json = runCatching { JSONObject(encoded) }.getOrNull()
+                ?: return DraftStore(null)
+            val chatId = if (json.isNull("chatId")) null else json.getString("chatId")
+            val store = DraftStore(chatId)
+            val draftsJson = json.optJSONObject("drafts") ?: return store
+            val keys = draftsJson.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                val entry = draftsJson.optJSONObject(key) ?: continue
+                val id = if (key == NEW_CHAT_KEY) null else key
+                store.restore(id, entry.optString("text"), decodeAttachments(entry.optJSONArray("attachments")))
+            }
+            return store
+        }
+
+        private fun decodeAttachments(array: JSONArray?): List<PromptAttachment> {
+            if (array == null) return emptyList()
+            return (0 until array.length()).mapNotNull { index ->
+                runCatching { array.getString(index) }.getOrNull()
+                    ?.let(AttachmentTextCodec::decode)
+            }
+        }
     }
 }

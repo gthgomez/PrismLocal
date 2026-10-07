@@ -84,6 +84,9 @@ class HuggingFaceDownloadWorker(
     )
 
     override suspend fun doWork(): Result {
+        // A WorkManager restart can run this worker without InferenceService.onCreate, so wire
+        // durable custom-entry storage from the context we already hold before resolving ids.
+        HuggingFaceModelCatalog.initialize(appContext)
         val entryId = inputData.getString(HuggingFaceDownloadWork.KEY_ENTRY_ID)
             ?: return Result.failure(workDataOf(HuggingFaceDownloadWork.KEY_MESSAGE to "Missing catalog entry id"))
         val entry = HuggingFaceModelCatalog.find(entryId)

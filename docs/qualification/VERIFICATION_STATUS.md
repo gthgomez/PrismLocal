@@ -32,8 +32,17 @@ them.
 ## Compiled but NOT executed
 
 - **Android instrumentation.** `assembleDevDebugAndroidTest` compiles
-  `app/src/androidTest`, including `RealInferenceSmokeTest`. No emulator or
-  device runs them in CI.
+  `app/src/androidTest`, including `RealInferenceSmokeTest` and the new
+  `storage/VectorStoreRevisionMigrationTest`. No emulator or device runs them in
+  CI.
+- **Vector-store v1→v2 migration and revision-filtered reads.**
+  `VectorStoreRevisionMigrationTest` seeds a pre-revision database at
+  `user_version = 1`, opens it through `VectorStore` to exercise the
+  `ALTER TABLE … embedding_revision` upgrade, and asserts `search` /
+  `getCurrentChunks` exclude the stale revision-1 row while `getAllChunks`
+  still returns it. It is compiled by `assembleDevDebugAndroidTest` but has not
+  been executed: Robolectric is not on the unit-test classpath, so the real
+  SQLite behavior is only verified on a device/emulator.
 - **Real-model smoke fixtures are not in the tracked tree.** The tiny GGUF the
   smoke test requires is not committed, so `RealInferenceSmokeTest` cannot pass
   in CI even after its terminal assertion was corrected. The strict

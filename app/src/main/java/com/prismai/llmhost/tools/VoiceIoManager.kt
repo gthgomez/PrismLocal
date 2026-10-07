@@ -39,6 +39,7 @@ class VoiceIoManager(private val context: Context) {
     private var speechRecognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var isListening = false
+    private val recognizerLifecycle = RecognizerLifecycle()
     private var ttsInitialized = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -83,6 +84,7 @@ class VoiceIoManager(private val context: Context) {
         }
 
         speechRecognizer = recognizer
+        recognizerLifecycle.onRecognizerCreated()
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
                 Log.d(TAG, "onReadyForSpeech")
@@ -107,6 +109,7 @@ class VoiceIoManager(private val context: Context) {
 
             override fun onError(error: Int) {
                 isListening = false
+                releaseRecognizer()
                 val errorMessage = when (error) {
                     SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
                     SpeechRecognizer.ERROR_CLIENT -> "Client-side error"
@@ -128,6 +131,7 @@ class VoiceIoManager(private val context: Context) {
 
             override fun onResults(results: Bundle?) {
                 isListening = false
+                releaseRecognizer()
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val text = matches?.firstOrNull()
                 if (text != null) {
@@ -172,9 +176,16 @@ class VoiceIoManager(private val context: Context) {
         if (!isListening) return
         isListening = false
         speechRecognizer?.stopListening()
-        speechRecognizer?.destroy()
-        speechRecognizer = null
+        releaseRecognizer()
         Log.d(TAG, "stopListening")
+    }
+
+    /** Release the recognizer. Safe to call repeatedly and when none is held. */
+    internal fun releaseRecognizer() {
+        if (!recognizerLifecycle.isCreated) return
+        runCatching { speechRecognizer?.destroy() }
+        speechRecognizer = null
+        recognizerLifecycle.shutdown()
     }
 
     /** Speak text aloud. Returns false if TTS unavailable. */
@@ -243,6 +254,7 @@ class VoiceIoManager(private val context: Context) {
     /** Shutdown and release resources */
     fun shutdown() {
         stopListening()
+        releaseRecognizer()
         stopSpeaking()
         tts?.shutdown()
         tts = null

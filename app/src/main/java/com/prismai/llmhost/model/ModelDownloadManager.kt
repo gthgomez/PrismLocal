@@ -181,7 +181,8 @@ class ModelDownloadManager(
             }
             WorkInfo.State.FAILED -> {
                 val failure = message.ifBlank { "Download failed" }
-                uiState._modelDownloadState.value = ModelDownloadState.Failure(entryName, failure)
+                uiState._modelDownloadState.value =
+                    ModelDownloadState.Failure(entryId, entryName, failure)
                 uiState._importState.value = ImportState.Failure(message = failure, code = "DOWNLOAD_FAILED")
                 uiState._runtimeStatus.value = RuntimeStatus.ERROR
                 eventBus.publish("Download failed: $failure")

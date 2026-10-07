@@ -58,7 +58,12 @@ sealed class ModelDownloadState {
         val entryName: String,
         val integrityVerified: Boolean = true,
     ) : ModelDownloadState()
-    data class Failure(val entryName: String, val message: String) : ModelDownloadState()
+    data class Failure(
+        /** Catalog id of the model that failed. Nullable only for legacy states. */
+        val entryId: String?,
+        val entryName: String,
+        val message: String,
+    ) : ModelDownloadState()
     data object Cancelled : ModelDownloadState()
 }
 

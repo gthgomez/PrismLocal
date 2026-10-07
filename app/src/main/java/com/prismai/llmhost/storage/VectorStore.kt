@@ -170,10 +170,19 @@ class VectorStore(context: Context) {
         val chunkIndex = cursor.getColumnIndexOrThrow(COL_CHUNK_INDEX)
         val textIndex = cursor.getColumnIndexOrThrow(COL_TEXT)
         val embeddingIndex = cursor.getColumnIndexOrThrow(COL_EMBEDDING)
+        val revisionIndex = cursor.getColumnIndexOrThrow(COL_EMBEDDING_REVISION)
         val createdIndex = cursor.getColumnIndexOrThrow(COL_CREATED)
 
         return object : Iterator<Pair<VectorChunk, Float>> {
-            private var hasNextRow = cursor.moveToFirst()
+            private var hasNextRow = advanceToCurrentRevision()
+
+            /** Skips rows written by an older embedding revision. */
+            private fun advanceToCurrentRevision(): Boolean {
+                while (cursor.moveToNext()) {
+                    if (isCurrentRevision(cursor.getInt(revisionIndex))) return true
+                }
+                return false
+            }
 
             override fun hasNext(): Boolean = hasNextRow
 
@@ -189,7 +198,7 @@ class VectorStore(context: Context) {
                     embedding = embedding,
                     createdAt = cursor.getLong(createdIndex),
                 )
-                hasNextRow = cursor.moveToNext()
+                hasNextRow = advanceToCurrentRevision()
                 return chunk to score
             }
         }
@@ -267,15 +276,28 @@ class VectorStore(context: Context) {
 
     companion object {
         const val DB_NAME = "prism_vector_store.db"
-        const val DB_VERSION = 1
+        const val DB_VERSION = 2
         const val TABLE = "vector_chunks"
+
+        /**
+         * Revision of the embedding values stored by this build. Bump this
+         * whenever the embedding computation changes, even if the vector width
+         * stays the same: a dimension check would miss a same-width re-embedding
+         * and reject valid models whose width differs. Rows written at an older
+         * revision are never returned by [search].
+         */
+        const val EMBEDDING_REVISION = 2
 
         const val COL_ID = "id"
         const val COL_DOCUMENT_ID = "document_id"
         const val COL_CHUNK_INDEX = "chunk_index"
         const val COL_TEXT = "text"
         const val COL_EMBEDDING = "embedding"
+        const val COL_EMBEDDING_REVISION = "embedding_revision"
         const val COL_CREATED = "created_at"
+
+        /** True when a row written at [rowRevision] is comparable with this build. */
+        fun isCurrentRevision(rowRevision: Int): Boolean = rowRevision == EMBEDDING_REVISION
 
         val CREATE_TABLE_SQL: String = """
             CREATE TABLE IF NOT EXISTS $TABLE (
@@ -284,9 +306,13 @@ class VectorStore(context: Context) {
                 $COL_CHUNK_INDEX INTEGER NOT NULL,
                 $COL_TEXT TEXT NOT NULL,
                 $COL_EMBEDDING BLOB NOT NULL,
+                $COL_EMBEDDING_REVISION INTEGER NOT NULL DEFAULT 1,
                 $COL_CREATED INTEGER NOT NULL
             )
         """.trimIndent()
+
+        val ADD_EMBEDDING_REVISION_SQL: String =
+            "ALTER TABLE $TABLE ADD COLUMN $COL_EMBEDDING_REVISION INTEGER NOT NULL DEFAULT 1"
 
         val CREATE_DOCUMENT_INDEX_SQL: String = """
             CREATE INDEX IF NOT EXISTS idx_vector_chunks_document_id
@@ -362,12 +388,13 @@ class VectorStore(context: Context) {
 
     // ---- Value mapping ----
 
-    private fun toValues(chunk: VectorChunk): ContentValues = ContentValues(6).apply {
+    private fun toValues(chunk: VectorChunk): ContentValues = ContentValues(7).apply {
         put(COL_ID, chunk.id)
         put(COL_DOCUMENT_ID, chunk.documentId)
         put(COL_CHUNK_INDEX, chunk.chunkIndex)
         put(COL_TEXT, chunk.text)
         put(COL_EMBEDDING, floatArrayToBytes(chunk.embedding))
+        put(COL_EMBEDDING_REVISION, EMBEDDING_REVISION)
         put(COL_CREATED, chunk.createdAt)
     }
 
@@ -382,7 +409,11 @@ class VectorStore(context: Context) {
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            // No schema upgrades yet — database version 1
+            if (oldVersion < 2) {
+                // Rows that predate embedding revisioning become revision 1 and
+                // are therefore never returned by search().
+                db.execSQL(ADD_EMBEDDING_REVISION_SQL)
+            }
         }
     }
 

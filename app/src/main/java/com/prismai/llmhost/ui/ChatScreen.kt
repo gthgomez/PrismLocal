@@ -675,17 +675,22 @@ fun ChatScreen(
                             onSend = {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 if (text.isNotEmpty()) {
-                                    // Ask the service before destroying anything. A refusal
-                                    // must leave the composed text and attachments intact.
-                                    if (service?.acceptsGeneration(text) == true) {
-                                        prompt = ""
-                                        savedAttachments = emptyList()
-                                        draftStore.clear()
-                                        service?.generateSafely(text)
-                                    } else {
-                                        snackbarMessage =
-                                            service?.generationRefusalReason(text)
-                                                ?: "Message refused; draft kept"
+                                    // Ask the service before destroying anything, off the
+                                    // main thread because acceptance reads SQLite memory.
+                                    // A refusal must leave the composed text and
+                                    // attachments intact.
+                                    scope.launch {
+                                        val result = service?.preflightSend(text)
+                                        if (result == null) {
+                                            snackbarMessage = "Service unavailable"
+                                        } else if (result.accepted) {
+                                            prompt = ""
+                                            savedAttachments = emptyList()
+                                            draftStore.clear()
+                                            service?.generateSafely(text)
+                                        } else {
+                                            snackbarMessage = result.reason ?: "Message refused; draft kept"
+                                        }
                                     }
                                 }
                             },

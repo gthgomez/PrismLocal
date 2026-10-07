@@ -103,6 +103,9 @@ class VoiceIoManager(private val context: Context) {
             }
 
             override fun onRmsChanged(rmsdB: Float) {
+                // A superseded recognizer may still deliver callbacks after a
+                // restart; drop them so its RMS cannot drive the new session.
+                if (speechRecognizer !== recognizer) return
                 mainHandler.post { onRmsDbChanged?.invoke(rmsdB) }
             }
 
@@ -153,6 +156,9 @@ class VoiceIoManager(private val context: Context) {
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
+                // A superseded recognizer may still deliver partial text after a
+                // restart; drop it so stale words cannot overwrite the new UI.
+                if (speechRecognizer !== recognizer) return
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val text = matches?.firstOrNull()
                 if (text != null) {

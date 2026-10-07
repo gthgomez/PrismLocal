@@ -669,12 +669,33 @@ class InferenceService : Service() {
             .map { info -> modelReadinessAssessor.buildReadiness(info, profile) }
     }
 
-    fun importModel(uri: Uri) {
+    fun importModel(uri: Uri): Job? {
         if (importJob?.isActive == true) {
             publishUiEvent("A model import is already running")
-            return
+            return null
         }
-        importJob = modelImportManager.importModel(uri)
+        return modelImportManager.importModel(uri).also { importJob = it }
+    }
+
+    /**
+     * Import several GGUFs in order, one at a time, continuing past failures.
+     *
+     * The multi-select picker's "Importing N" message was previously a lie: the
+     * old per-URI loop called [importModel] once and ModelImportManager's
+     * single-flight guard rejected every call after the first. Drain the queue
+     * sequentially and await each returned job so the guard sees the previous
+     * import finish before the next one starts.
+     */
+    fun importModels(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val byString = uris.associateBy { it.toString() }
+        serviceScope.launch {
+            val queue = SequentialImportQueue { uriString ->
+                byString[uriString]?.let { uri -> importModel(uri)?.join() }
+            }
+            queue.enqueueAll(uris.map { it.toString() })
+            queue.drain()
+        }
     }
 
     fun downloadHuggingFaceModel(entryId: String) {

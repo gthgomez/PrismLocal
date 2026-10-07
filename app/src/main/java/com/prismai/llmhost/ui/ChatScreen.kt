@@ -335,7 +335,6 @@ fun ChatScreen(
                             scope.launch {
                                 val attached = mutableListOf<PromptAttachment>()
                                 val ggufUris = mutableListOf<Uri>()
-                                val importedModels = mutableListOf<String>()
 
                                 for (uri in capped) {
                                     ensureActive()
@@ -348,7 +347,6 @@ fun ChatScreen(
                                     val name = AttachmentTextExtractor.displayName(context, uri)
                                     if (name.endsWith(".gguf", ignoreCase = true)) {
                                         ggufUris += uri
-                                        importedModels += name
                                     } else {
                                         AttachmentTextExtractor.fromUriAsync(context, uri)
                                             ?.let { attached += it }
@@ -361,15 +359,18 @@ fun ChatScreen(
                                         .takeLast(AttachmentSelection.MAX_PROMPT_ATTACHMENTS)
                                         .map(AttachmentTextCodec::encode)
                                 }
-                                // Task 4 imports every selected GGUF, not just the first.
-                                ggufUris.forEach { service?.importModel(it) }
+                                // Task 4 imports every selected GGUF, one at a time,
+                                // rather than dropping all but the first.
+                                if (ggufUris.isNotEmpty()) {
+                                    service?.importModels(ggufUris)
+                                }
                                 snackbarMessage = when {
                                     dropped > 0 ->
                                         "Added $dropped fewer attachment(s) (limit ${AttachmentSelection.MAX_PROMPT_ATTACHMENTS})"
-                                    importedModels.isNotEmpty() && attached.isNotEmpty() ->
-                                        "Importing ${importedModels.size} model(s), attached ${attached.size} file(s)"
-                                    importedModels.isNotEmpty() ->
-                                        "Importing ${importedModels.size} model(s)"
+                                    ggufUris.isNotEmpty() && attached.isNotEmpty() ->
+                                        "Importing ${ggufUris.size} model(s), attached ${attached.size} file(s)"
+                                    ggufUris.isNotEmpty() ->
+                                        "Importing ${ggufUris.size} model(s)"
                                     attached.isNotEmpty() ->
                                         "Attached ${attached.size} file(s)"
                                     else -> null

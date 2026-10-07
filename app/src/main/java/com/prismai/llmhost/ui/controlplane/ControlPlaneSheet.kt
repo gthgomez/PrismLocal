@@ -653,10 +653,12 @@ private fun HuggingFaceDownloadPanel(
                         style = MaterialTheme.typography.bodySmall,
                         color = PrismRed,
                     )
-                    selectedEntry?.let { entry ->
+                    // Retry the model that failed, not the dropdown selection,
+                    // which defaults to the first catalog entry.
+                    state.entryId?.let { failedId ->
                         TextButton(
                             contentPadding = PaddingValues(0.dp),
-                            onClick = { onDownload(entry.id) },
+                            onClick = { onDownload(failedId) },
                         ) {
                             Text("Retry Download", color = PrismBlue, style = MaterialTheme.typography.labelSmall)
                         }

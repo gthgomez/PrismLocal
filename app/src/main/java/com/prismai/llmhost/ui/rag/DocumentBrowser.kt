@@ -50,7 +50,8 @@ import java.util.Locale
 @Composable
 fun DocumentBrowser(
     chunks: List<VectorChunk>,
-    onIngestDocument: suspend (id: String, title: String, text: String) -> String,
+    ingestStatus: String?,
+    onIngestDocument: (id: String, title: String, text: String) -> Unit,
     onDeleteDocument: (documentId: String) -> Unit,
     onQueryVectorStore: suspend (query: String) -> List<Pair<VectorChunk, Float>>,
     onRefresh: () -> Unit,
@@ -67,7 +68,6 @@ fun DocumentBrowser(
     var ingestText by remember { mutableStateOf("") }
 
     var deleteTargetDocId by remember { mutableStateOf<String?>(null) }
-    var ingestStatus by remember { mutableStateOf<String?>(null) }
 
     // Group stored chunks by documentId
     val docSummaryMap by remember(chunks) {
@@ -271,10 +271,7 @@ fun DocumentBrowser(
                         ingestTitle = ""
                         ingestText = ""
                         showIngestDialog = false
-                        ingestStatus = null
-                        coroutineScope.launch {
-                            ingestStatus = onIngestDocument(docId, title, body)
-                        }
+                        onIngestDocument(docId, title, body)
                     },
                 ) {
                     Text("Ingest & Embed")

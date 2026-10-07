@@ -148,6 +148,7 @@ fun ChatScreen(
         var chatsVisible by remember { mutableStateOf(false) }
         var memoriesVisible by remember { mutableStateOf(false) }
         var ragBrowserVisible by remember { mutableStateOf(false) }
+        var ingestStatus by remember { mutableStateOf<String?>(null) }
         val controlSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val chatSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val memoriesSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -819,10 +820,14 @@ fun ChatScreen(
                             ) {
                                 DocumentBrowser(
                                     chunks = vectorChunks,
+                                    ingestStatus = ingestStatus,
                                     onIngestDocument = { id, title, text ->
-                                        withContext(Dispatchers.IO) {
-                                            service?.ingestDocument(id, title, text)
-                                        } ?: "Indexing unavailable"
+                                        ingestStatus = null
+                                        scope.launch {
+                                            ingestStatus = withContext(Dispatchers.IO) {
+                                                service?.ingestDocument(id, title, text)
+                                            } ?: "Indexing unavailable"
+                                        }
                                     },
                                     onDeleteDocument = { id -> service?.deleteDocument(id) },
                                     onQueryVectorStore = { query ->

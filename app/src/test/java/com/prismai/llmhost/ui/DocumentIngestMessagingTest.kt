@@ -2,6 +2,7 @@ package com.prismai.llmhost.ui
 
 import com.prismai.llmhost.ui.rag.DocumentIngestMessaging
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -11,6 +12,16 @@ class DocumentIngestMessagingTest {
     fun allChunksFailed_isExplainedNotSilent() {
         val message = DocumentIngestMessaging.describe(inserted = 0, failed = 12, total = 12)
         assertTrue("a total failure must be explained", message.contains("could not"))
+    }
+
+    @Test
+    fun allChunksFailed_pinsTheWording() {
+        // Pins the exact total-failure message so an unrelated phrase (e.g. "could not parse")
+        // cannot satisfy the substring assertion above.
+        assertEquals(
+            "Could not index this document: 12 of 12 chunks could not be embedded",
+            DocumentIngestMessaging.describe(inserted = 0, failed = 12, total = 12),
+        )
     }
 
     @Test
@@ -24,7 +35,7 @@ class DocumentIngestMessagingTest {
     fun fullSuccess_isNotOverExplained() {
         val message = DocumentIngestMessaging.describe(inserted = 12, failed = 0, total = 12)
         assertTrue(message.contains("12"))
-        assertTrue(!message.contains("could not"))
+        assertFalse(message.contains("could not"))
     }
 
     @Test

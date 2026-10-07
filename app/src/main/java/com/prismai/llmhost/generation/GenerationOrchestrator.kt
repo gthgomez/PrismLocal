@@ -204,11 +204,6 @@ class GenerationOrchestrator(
             }
         }
 
-        if (uiState.currentModel.value == null) {
-            eventBus.publish("Select a model before sending a prompt")
-            return
-        }
-
         // Soft preflight: do not block, but surface low-RAM risk (B4).
         val freeMb = deviceProfiler.deviceMemorySnapshot().availableMb
         if (freeMb in 1 until SOFT_LOW_RAM_MB) {
@@ -246,18 +241,19 @@ class GenerationOrchestrator(
         }
 
         val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
-        if (benchmarkPreset == null && !GenerationBudget.userTurnFits(
-                contextLength = settings.contextLength,
-                maxTokens = settings.maxTokens,
-                userPrompt = prompt,
-                memoryContext = memoryContext,
-                instructionText = if (agentEnabled) AgentToolProtocol.instructionBlock() else "",
-            )
-        ) {
+        val acceptance = SendAcceptance.evaluate(
+            currentModel = uiState.currentModel.value,
+            contextLength = settings.contextLength,
+            maxTokens = settings.maxTokens,
+            prompt = prompt,
+            memoryContext = memoryContext,
+            instructionText = if (agentEnabled) AgentToolProtocol.instructionBlock() else "",
+        )
+        if (!acceptance.accepted) {
             if (agentChainId != null) {
-                agentTrace.abortTrace(agentChainId, "Prompt exceeds context window")
+                agentTrace.abortTrace(agentChainId, acceptance.reason ?: "refused")
             }
-            eventBus.publish("This message is too long for the context window")
+            eventBus.publish(acceptance.reason ?: "Request refused")
             return
         }
         // Structured, role-preserving messages for normal chat. The legacy string

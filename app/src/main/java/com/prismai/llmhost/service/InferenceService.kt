@@ -84,6 +84,7 @@ import com.prismai.llmhost.generation.ServiceGenerationOwnership
 import com.prismai.llmhost.generation.GenerationMetrics
 import com.prismai.llmhost.generation.GenerationOrchestrator
 import com.prismai.llmhost.generation.PromptBuilder
+import com.prismai.llmhost.generation.SendAcceptance
 import com.prismai.llmhost.agent.AgentTrace
 import com.prismai.llmhost.agent.AgentToolConfirmation
 import com.prismai.llmhost.agent.AgentToolRouter
@@ -1013,6 +1014,21 @@ class InferenceService : Service() {
 
     fun benchmarkCsv(): String = benchmarkStore.csv()
     fun benchmarkJson(): String = benchmarkStore.json()
+
+    /** Non-suspending pre-flight so the UI can decide whether to clear its draft. */
+    fun acceptsGeneration(prompt: String): Boolean =
+        generationAcceptance(prompt).accepted
+
+    fun generationRefusalReason(prompt: String): String? =
+        generationAcceptance(prompt).reason
+
+    private fun generationAcceptance(prompt: String): SendAcceptance.Result =
+        SendAcceptance.evaluate(
+            currentModel = uiState.currentModel.value,
+            contextLength = _generationSettings.value.contextLength,
+            maxTokens = _generationSettings.value.maxTokens,
+            prompt = prompt,
+        )
 
     fun generateSafely(
         prompt: String,

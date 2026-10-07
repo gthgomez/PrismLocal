@@ -630,9 +630,18 @@ fun ChatScreen(
                             onSend = {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 if (text.isNotEmpty()) {
-                                    prompt = ""
-                                    savedAttachments = emptyList()
-                                    service?.generateSafely(text)
+                                    // Ask the service before destroying anything. A refusal
+                                    // must leave the composed text and attachments intact.
+                                    if (service?.acceptsGeneration(text) == true) {
+                                        prompt = ""
+                                        savedAttachments = emptyList()
+                                        draftStore.clear()
+                                        service?.generateSafely(text)
+                                    } else {
+                                        snackbarMessage =
+                                            service?.generationRefusalReason(text)
+                                                ?: "Message refused; draft kept"
+                                    }
                                 }
                             },
                             onVoiceClick = { service?.startVoiceInput() },

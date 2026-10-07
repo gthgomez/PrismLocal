@@ -53,6 +53,45 @@ class ImportBatchDrainerTest {
     }
 
     @Test
+    fun uriEnqueuedDuringAFailingRefreshIsStillDrained() = runBlocking {
+        val processed = mutableListOf<String>()
+        val queue = SequentialImportQueue { processed += it }
+        val refreshGate = CompletableDeferred<Unit>()
+        var refreshCalls = 0
+        val drainer = ImportBatchDrainer(queue) {
+            refreshCalls++
+            if (refreshCalls == 1) {
+                // The first post-drain refresh is held open, then fails. This
+                // is the exact window where a second batch could be stranded.
+                refreshGate.await()
+                throw IllegalStateException("refresh blew up")
+            }
+        }
+
+        val token = drainer.enqueue(listOf("a"))
+        assertNotNull(token)
+        val job = launch { drainer.drainAll(token!!) }
+
+        // Wait until "a" is imported and the drain is suspended in the failing
+        // refresh, then enqueue "b": it must be absorbed by the running drain
+        // (enqueue returns null) rather than starting a second drain.
+        while (refreshCalls == 0) yield()
+        assertEquals(listOf("a"), processed)
+        assertNull("a running drain must absorb the new batch", drainer.enqueue(listOf("b")))
+
+        refreshGate.complete(Unit)
+        job.join()
+
+        // The refresh failure must not strand "b": the loop re-checks the queue
+        // and drains it without another external enqueue call.
+        assertEquals(
+            "a URI queued during a failing refresh must not be stranded",
+            listOf("a", "b"),
+            processed,
+        )
+    }
+
+    @Test
     fun cancelClearsPendingWorkSoCancelledFilesCannotImportLater() = runBlocking {
         val processed = mutableListOf<String>()
         val firstImportGate = CompletableDeferred<Unit>()
@@ -93,14 +132,12 @@ class ImportBatchDrainerTest {
 
         val first = drainer.enqueue(listOf("a"))
         assertNotNull(first)
-        try {
-            drainer.drainAll(first!!)
-        } catch (expected: IllegalStateException) {
-            // The refresh failure must surface...
-        }
+        // A refresh failure is logged, not propagated: the drain loop keeps
+        // running, so the drainer never finishes with `draining` still set.
+        drainer.drainAll(first!!)
 
-        // ...but must not wedge the drainer: a later batch has to start a new
-        // drain instead of being silently dropped because `draining` stayed true.
+        // And a later batch still starts a new drain instead of being silently
+        // dropped because `draining` stayed true.
         val second = drainer.enqueue(listOf("b"))
         assertNotNull("a refresh failure must not wedge the drainer", second)
         drainer.drainAll(second!!)

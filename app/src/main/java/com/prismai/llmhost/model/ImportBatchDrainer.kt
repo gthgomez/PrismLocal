@@ -1,5 +1,8 @@
 package com.prismai.llmhost.model
 
+import android.util.Log
+import kotlinx.coroutines.CancellationException
+
 /**
  * Coordinates a single batch-import drain over a [SequentialImportQueue].
  *
@@ -18,7 +21,9 @@ package com.prismai.llmhost.model
  *    `null`, relying on the running drain to observe the new work.
  *  - [drainAll] loops `drain()` -> `refresh()` -> re-check. It clears
  *    `draining` and stops only when the queue is empty *under the lock*;
- *    otherwise it loops again. Any URI enqueued during `refresh()` is caught.
+ *    otherwise it loops again. Any URI enqueued during `refresh()` is caught,
+ *    even when that refresh fails: ordinary refresh failures are logged and the
+ *    loop continues, and only cancellation unwinds it.
  *  - [cancel] invalidates the current drain token, clears the queue, and resets
  *    `draining`, so cancelled files cannot be resurrected or duplicated.
  */
@@ -26,6 +31,10 @@ class ImportBatchDrainer(
     private val queue: SequentialImportQueue,
     private val refresh: suspend () -> Unit,
 ) {
+    private companion object {
+        const val TAG = "ImportBatchDrainer"
+    }
+
     private val lock = Any()
     private var draining = false
     private var generation = 0L
@@ -56,7 +65,7 @@ class ImportBatchDrainer(
             while (true) {
                 if (!isCurrent(token)) return
                 queue.drain()
-                refresh()
+                refreshNonFatal()
                 val finished = synchronized(lock) {
                     if (generation != token) return
                     if (queue.isEmpty()) {
@@ -70,16 +79,39 @@ class ImportBatchDrainer(
                 if (finished) return
             }
         } finally {
-            // A non-cancellation failure (e.g. refresh() throwing) must not leave
-            // `draining` set, or every later enqueue returns null and silently
-            // drops batches until the service is recreated. A normal finish has
-            // already cleared it, and cancel() bumped the generation, so both of
+            // Raw cancellation must not leave `draining` set, or every later
+            // enqueue returns null and silently drops batches until the service
+            // is recreated. Ordinary refresh failures are handled in-loop by
+            // refreshNonFatal(), so this is the safety net for cancellation (and
+            // anything else that escapes the loop). A normal finish has already
+            // cleared `draining`, and cancel() bumped the generation, so both of
             // those paths are no-ops here.
             synchronized(lock) {
                 if (generation == token && draining) {
                     draining = false
                 }
             }
+        }
+    }
+
+    /**
+     * Refresh installed models without letting a failure strand queued work.
+     *
+     * If [refresh] throws while a batch arrived during the same pass, that batch
+     * is still in the queue but [draining] is set — so [enqueue] returned null
+     * and no new drain was started. Propagating the failure would clear
+     * `draining` in the `finally` and leave the queued URIs stranded until some
+     * later `enqueue`. Swallowing ordinary failures here keeps the loop alive so
+     * it re-checks `queue.isEmpty()` and drains the new work. Cancellation is
+     * not an ordinary failure and is rethrown so the scope unwinds normally.
+     */
+    private suspend fun refreshNonFatal() {
+        try {
+            refresh()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.w(TAG, "refresh after import drain failed; continuing", e)
         }
     }
 

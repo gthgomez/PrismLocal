@@ -75,7 +75,15 @@ internal fun MessageBubble(
         ReportAiContentDialog(
             onDismiss = { showReportDialog = false },
             onSubmitReport = { reason ->
-                Toast.makeText(context, "Report saved locally: $reason", Toast.LENGTH_SHORT).show()
+                // Actually persist it. The previous handler showed a Toast
+                // claiming a local save that never happened.
+                runCatching {
+                    CapabilityRegistryHolder.auditLog.appendReport(
+                        messageId = label,
+                        reason = reason,
+                        excerpt = text.take(500),
+                    )
+                }
             }
         )
     }

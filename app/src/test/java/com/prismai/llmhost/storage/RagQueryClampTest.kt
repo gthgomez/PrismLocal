@@ -15,6 +15,11 @@ class RagQueryClampTest {
     private class FakeVectorStore : VectorIndex {
         override fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk> = chunks
 
+        override fun replaceDocument(
+            documentId: String,
+            chunks: List<VectorChunk>,
+        ): List<VectorChunk> = chunks
+
         override fun search(
             queryEmbedding: FloatArray,
             topK: Int,

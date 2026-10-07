@@ -83,6 +83,14 @@ data class VectorChunk(
  */
 interface VectorIndex {
     fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk>
+
+    /**
+     * Atomically replace a document's rows with [chunks]: delete the existing
+     * rows and insert the new batch in a single transaction, so a concurrent
+     * [search] never observes the document missing and a failed insert cannot
+     * leave the previous index destroyed.
+     */
+    fun replaceDocument(documentId: String, chunks: List<VectorChunk>): List<VectorChunk>
     fun search(queryEmbedding: FloatArray, topK: Int = 5, minScore: Float = 0.0f): List<Pair<VectorChunk, Float>>
     fun deleteByDocument(documentId: String): Int
     fun documentCount(): Int
@@ -137,6 +145,33 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
             val db = dbHelper.writableDatabase
             db.beginTransaction()
             try {
+                for (chunk in chunks) {
+                    db.insertWithOnConflict(
+                        TABLE, null, toValues(chunk), SQLiteDatabase.CONFLICT_REPLACE
+                    )
+                }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+            return chunks
+        }
+    }
+
+    /**
+     * Atomically replace a document's rows with [chunks].
+     *
+     * The delete and the inserts share one DB transaction under [lock], so a
+     * concurrent search cannot observe the document's rows missing, and a
+     * failure before the transaction commits rolls back instead of destroying
+     * the previously indexed rows.
+     */
+    override fun replaceDocument(documentId: String, chunks: List<VectorChunk>): List<VectorChunk> {
+        lock.withLock {
+            val db = dbHelper.writableDatabase
+            db.beginTransaction()
+            try {
+                db.delete(TABLE, "$COL_DOCUMENT_ID = ?", arrayOf(documentId))
                 for (chunk in chunks) {
                     db.insertWithOnConflict(
                         TABLE, null, toValues(chunk), SQLiteDatabase.CONFLICT_REPLACE

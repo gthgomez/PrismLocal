@@ -29,6 +29,7 @@ class KnowledgePackStatusTest {
 
     private class FakeVectorIndex : VectorIndex {
         override fun insertBatch(chunks: List<VectorChunk>) = chunks
+        override fun replaceDocument(documentId: String, chunks: List<VectorChunk>) = chunks
         override fun search(queryEmbedding: FloatArray, topK: Int, minScore: Float) =
             emptyList<Pair<VectorChunk, Float>>()
         override fun deleteByDocument(documentId: String) = 0

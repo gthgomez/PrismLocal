@@ -232,6 +232,8 @@ fun ChatScreen(
                         val vectorChunks by (service?.vectorChunks ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
+                        val staleVectorChunkCount by (service?.staleVectorChunkCount ?: emptyFlow())
+                            .collectAsStateWithLifecycle(initialValue = 0)
                         val voiceState by (service?.voiceState ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = com.prismai.llmhost.tools.VoiceState()
                         )
@@ -832,7 +834,9 @@ fun ChatScreen(
                             ) {
                                 DocumentBrowser(
                                     chunks = vectorChunks,
+                                    staleDocumentCount = staleVectorChunkCount,
                                     ingestStatus = ingestStatus,
+                                    onDeleteStaleDocuments = { service?.deleteStaleVectorChunks() },
                                     onIngestDocument = { id, title, text ->
                                         ingestStatus = null
                                         scope.launch {

@@ -326,6 +326,7 @@ class InferenceService : Service() {
     val lastAgentTracePath: StateFlow<String?> get() = uiState.lastAgentTracePath
     val memories: StateFlow<List<MemoryFact>> get() = uiState.memories
     val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunk>> get() = uiState.vectorChunks
+    val staleVectorChunkCount: StateFlow<Int> get() = uiState.staleVectorChunkCount
     val thermalGovernorState: StateFlow<com.prismai.llmhost.util.ThermalGovernorState> get() = uiState.thermalGovernorState
     val voiceInputResult: StateFlow<String?> get() = uiState.voiceInputResult
     val voiceState: StateFlow<VoiceState> get() = uiState.voiceState

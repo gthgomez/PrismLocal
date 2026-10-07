@@ -313,12 +313,6 @@ fun ChatScreen(
                             }
                             service?.importModel(uri)
                         }
-                        val linkLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-                            onImportPickerFinished()
-                            if (uri != null) {
-                                service?.linkExternalModel(uri)
-                            }
-                        }
                         val attachmentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
                             onImportPickerFinished()
                             if (uris.isEmpty()) return@rememberLauncherForActivityResult
@@ -702,10 +696,6 @@ fun ChatScreen(
                                     onImportModel = {
                                         onImportPickerStarted()
                                         importLauncher.launch(arrayOf("*/*"))
-                                    },
-                                    onLinkModel = {
-                                        onImportPickerStarted()
-                                        linkLauncher.launch(arrayOf("*/*"))
                                     },
                                     onCancelImport = { service?.cancelImport() },
                                     onDownloadModel = { entryId -> service?.downloadHuggingFaceModel(entryId) },

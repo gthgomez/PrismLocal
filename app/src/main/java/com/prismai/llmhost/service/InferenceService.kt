@@ -745,16 +745,6 @@ class InferenceService : Service() {
         modelDownloadManager.downloadCustomHuggingFaceModel(repoId, fileName)
     }
 
-    fun linkExternalModel(uri: Uri) {
-        val result = modelStorageManager.linkExternalModelUri(uri)
-        if (result is ModelStorageManager.ImportResult.Success) {
-            refreshDeviceAndModelReadiness()
-            publishUiEvent("Linked external GGUF ${result.model.id}")
-        } else if (result is ModelStorageManager.ImportResult.Failure) {
-            publishUiEvent("Failed to link GGUF: ${result.error.userMessage}")
-        }
-    }
-
     fun cancelImport() {
         importJob?.cancel()
         importJob = null

@@ -97,7 +97,6 @@ internal fun ControlPlaneSheet(
     onSwitchModel: (String) -> Unit,
     onDeleteModel: ((ModelIdentity) -> Unit)? = null,
     onImportModel: () -> Unit,
-    onLinkModel: (() -> Unit)? = null,
     onCancelImport: () -> Unit,
     onDownloadModel: (String) -> Unit,
     onDownloadCustomHfModel: ((String, String) -> Unit)? = null,
@@ -262,15 +261,6 @@ internal fun ControlPlaneSheet(
                                     onClick = onImportModel,
                                 ) {
                                     Text("Import GGUF", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                }
-                                if (onLinkModel != null) {
-                                    OutlinedButton(
-                                        modifier = Modifier.weight(1f),
-                                        enabled = controlsEnabled && serviceAvailable,
-                                        onClick = onLinkModel,
-                                    ) {
-                                        Text("Link (No Copy)", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    }
                                 }
                             }
                         }

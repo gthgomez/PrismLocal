@@ -421,7 +421,11 @@ fun ChatScreen(
                             }
                         }
 
+                        // Refresh readiness only when an import reaches a terminal
+                        // state. Running emits on every progress tick, and each
+                        // refresh re-reads installed models on the main thread.
                         LaunchedEffect(service, importState) {
+                            if (importState is ImportState.Running) return@LaunchedEffect
                             service?.refreshDeviceAndModelReadiness()
                             hfCatalog = service?.huggingFaceCatalog() ?: emptyList()
                         }

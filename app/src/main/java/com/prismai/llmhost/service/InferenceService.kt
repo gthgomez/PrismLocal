@@ -65,6 +65,7 @@ import kotlin.coroutines.CoroutineContext
 import org.json.JSONObject
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.ui.UiEventBus
+import com.prismai.llmhost.ui.rag.DocumentIngestMessaging
 import com.prismai.llmhost.engine.EngineConfigStore
 import com.prismai.llmhost.chat.ChatManager
 import com.prismai.llmhost.chat.ChatSearchIndex
@@ -1870,11 +1871,23 @@ class InferenceService : Service() {
         refreshMemoriesList()
     }
 
-    /** Public API for the document browser UI. Ingests a text document into local SQLite VectorStore. */
-    suspend fun ingestDocument(id: String, title: String, text: String): Int {
-        val count = ragManager.ingestDocument(id, title, text)
+    /**
+     * Public API for the document browser UI. Ingests a text document into local SQLite VectorStore.
+     *
+     * Returns the user-facing status message (see [DocumentIngestMessaging.describe]) so the
+     * browser can show it in its status line, and publishes the same message on the UI event bus
+     * so the chat snackbar reports it too.
+     */
+    suspend fun ingestDocument(id: String, title: String, text: String): String {
+        val result = ragManager.ingestDocumentWithResult(id, title, text)
         refreshVectorChunksList()
-        return count
+        val message = DocumentIngestMessaging.describe(
+            inserted = result.storedCount,
+            failed = result.failedCount,
+            total = result.totalChunks,
+        )
+        publishUiEvent(message)
+        return message
     }
 
     /** Public API for the document browser UI. Deletes all chunks for a document id. */

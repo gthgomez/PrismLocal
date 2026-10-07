@@ -23,6 +23,7 @@ import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -819,7 +820,9 @@ fun ChatScreen(
                                 DocumentBrowser(
                                     chunks = vectorChunks,
                                     onIngestDocument = { id, title, text ->
-                                        scope.launch(Dispatchers.IO) { service?.ingestDocument(id, title, text) }
+                                        withContext(Dispatchers.IO) {
+                                            service?.ingestDocument(id, title, text)
+                                        } ?: "Indexing unavailable"
                                     },
                                     onDeleteDocument = { id -> service?.deleteDocument(id) },
                                     onQueryVectorStore = { query ->

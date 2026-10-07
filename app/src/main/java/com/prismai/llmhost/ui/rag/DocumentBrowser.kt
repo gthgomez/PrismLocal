@@ -50,7 +50,7 @@ import java.util.Locale
 @Composable
 fun DocumentBrowser(
     chunks: List<VectorChunk>,
-    onIngestDocument: (id: String, title: String, text: String) -> Unit,
+    onIngestDocument: suspend (id: String, title: String, text: String) -> String,
     onDeleteDocument: (documentId: String) -> Unit,
     onQueryVectorStore: suspend (query: String) -> List<Pair<VectorChunk, Float>>,
     onRefresh: () -> Unit,
@@ -67,6 +67,7 @@ fun DocumentBrowser(
     var ingestText by remember { mutableStateOf("") }
 
     var deleteTargetDocId by remember { mutableStateOf<String?>(null) }
+    var ingestStatus by remember { mutableStateOf<String?>(null) }
 
     // Group stored chunks by documentId
     val docSummaryMap by remember(chunks) {
@@ -88,6 +89,16 @@ fun DocumentBrowser(
                 }
             },
         )
+
+        // ── Ingest Status Line ──
+        ingestStatus?.let { status ->
+            Text(
+                text = status,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 2.dp),
+            )
+        }
 
         // ── Semantic Search Tester ──
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -253,15 +264,17 @@ fun DocumentBrowser(
                 TextButton(
                     enabled = ingestDocId.isNotBlank() && ingestText.isNotBlank(),
                     onClick = {
-                        onIngestDocument(
-                            ingestDocId.trim(),
-                            ingestTitle.ifBlank { ingestDocId }.trim(),
-                            ingestText.trim(),
-                        )
+                        val docId = ingestDocId.trim()
+                        val title = ingestTitle.ifBlank { ingestDocId }.trim()
+                        val body = ingestText.trim()
                         ingestDocId = ""
                         ingestTitle = ""
                         ingestText = ""
                         showIngestDialog = false
+                        ingestStatus = null
+                        coroutineScope.launch {
+                            ingestStatus = onIngestDocument(docId, title, body)
+                        }
                     },
                 ) {
                     Text("Ingest & Embed")

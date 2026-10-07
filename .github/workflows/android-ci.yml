@@ -89,7 +89,16 @@ jobs:
             -DPRISM_REQUIRE_SANITIZERS=ON
 
       - name: Build Native Host Tests
-        run: cmake --build build/prism-native-tests --parallel
+        run: ./scripts/instrument_native_build.sh build/prism-native-tests
+
+      - name: Collect build diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-build-diagnostics
+          path: build/ci-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Run CTest
         run: ctest --test-dir build/prism-native-tests --output-on-failure

@@ -1,6 +1,8 @@
 package com.prismai.llmhost
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -54,6 +56,77 @@ class CustomDownloadSpecPersistenceTest {
         assertNotNull("worker must resolve a persisted custom entry by id", found)
         assertEquals(entry.id, found!!.id)
         assertEquals("user/persisted", found.repoId)
+    }
+
+    // --- D2: expectedSha256 must survive the round-trip ---
+
+    @Test
+    fun expectedSha256_roundTripsThroughSerializeDeserialize() {
+        val sha = "a".repeat(64)
+        val entry = HuggingFaceModelCatalog.buildCustomEntry("user/repo", "m.gguf")
+            .copy(expectedSha256 = sha)
+
+        val restored = CustomEntryStore.deserialize(CustomEntryStore.serialize(entry))
+
+        assertNotNull("entry must deserialize", restored)
+        assertEquals("integrity pin must survive process death", sha, restored!!.expectedSha256)
+    }
+
+    @Test
+    fun invalidExpectedSha256_isRestoredAsNull() {
+        val entry = HuggingFaceModelCatalog.buildCustomEntry("user/repo", "m.gguf")
+            .copy(expectedSha256 = "not-a-valid-sha")
+
+        val restored = CustomEntryStore.deserialize(CustomEntryStore.serialize(entry))
+
+        assertNotNull(restored)
+        assertNull("a malformed pin must fail closed, not be trusted", restored!!.expectedSha256)
+    }
+
+    // --- D3: restored id / fileName must be re-sanitized ---
+
+    @Test
+    fun restoredEntry_rejectsBlankFileName() {
+        val row = JSONObject()
+            .put("id", "custom_user_repo_m.gguf")
+            .put("repoId", "user/repo")
+            .put("fileName", "")
+            .toString()
+
+        assertNull(CustomEntryStore.deserialize(row))
+    }
+
+    @Test
+    fun restoredEntry_rejectsIdWithPathSeparator() {
+        val row = JSONObject()
+            .put("id", "custom/../escape")
+            .put("repoId", "user/repo")
+            .put("fileName", "m.gguf")
+            .toString()
+
+        assertNull("an id that escapes its filename slot must be rejected", CustomEntryStore.deserialize(row))
+    }
+
+    @Test
+    fun restoredEntry_rejectsDotDotId() {
+        val row = JSONObject()
+            .put("id", "..")
+            .put("repoId", "user/repo")
+            .put("fileName", "m.gguf")
+            .toString()
+
+        assertNull("a bare '..' id must be rejected", CustomEntryStore.deserialize(row))
+    }
+
+    @Test
+    fun restoredEntry_isNeverCurated_evenWhenRowClaimsOtherwise() {
+        val entry = HuggingFaceModelCatalog.buildCustomEntry("user/repo", "m.gguf")
+        val row = JSONObject(CustomEntryStore.serialize(entry)).put("curated", true).toString()
+
+        val restored = CustomEntryStore.deserialize(row)
+
+        assertNotNull(restored)
+        assertFalse("a restored custom entry must never become curated", restored!!.curated)
     }
 }
 

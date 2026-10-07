@@ -118,6 +118,10 @@ class RagManager(
             }
 
             if (vectorChunks.isNotEmpty()) {
+                // Replace rather than mix: a re-ingest must not leave the
+                // document's previous rows (e.g. an older chunking or embedding
+                // revision) alongside the new batch.
+                vectorStore.deleteByDocument(documentId)
                 vectorStore.insertBatch(vectorChunks)
             }
 

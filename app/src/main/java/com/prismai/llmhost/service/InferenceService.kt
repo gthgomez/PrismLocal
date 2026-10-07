@@ -61,6 +61,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import org.json.JSONObject
@@ -161,11 +162,12 @@ class InferenceService : Service() {
 
     private val memoryPressureReconciler = MemoryPressureReconciler(
         apply = { level -> memoryPressureWrites.trySend(level) },
+        // Fires exactly once per transition into CRITICAL from either the push
+        // or the poll path — the reconciler is the sole dedup owner. The disk
+        // write (transcript save) is dispatched off the caller's thread because
+        // the push path (MemoryGovernor.onTrimMemory) runs on the main thread.
         onCriticalTransition = {
-            // Fires once per transition into CRITICAL from either the push or
-            // the poll path. The guard stays as the single dedup state.
-            if (!criticalMemoryAlertActive) {
-                criticalMemoryAlertActive = true
+            serviceScope.launch {
                 saveTranscriptSafely()
                 publishUiEvent("Memory critical; transcript saved")
             }
@@ -181,9 +183,14 @@ class InferenceService : Service() {
     // current file's job) so cancelImport() stops the whole batch instead of
     // letting the queue immediately start the next file.
     private var batchImportJob: Job? = null
+    // Persistent import queue + URI lookup. A second multi-select must join the
+    // running drain rather than overwrite [batchImportJob]; otherwise it races
+    // ModelImportManager's single-flight guard and silently skips files.
+    private val importUriByString = ConcurrentHashMap<String, Uri>()
+    private val importQueue = SequentialImportQueue { uriString ->
+        importUriByString[uriString]?.let { uri -> importModel(uri)?.join() }
+    }
     private var downloadObserverJob: Job? = null
-    @Volatile
-    private var criticalMemoryAlertActive = false
     @Volatile
     private var generationForegroundActive = false
     private val operationMutex = Mutex()
@@ -678,9 +685,6 @@ class InferenceService : Service() {
         // reconciler so it cannot race the polling flow into native.
         memoryGovernor.register { state ->
             memoryPressureReconciler.onPush(state)
-            // The reconciler fires the transition callback once per entry into
-            // CRITICAL, so no per-observation save/alert logic lives here.
-            criticalMemoryAlertActive = memoryPressureReconciler.isCritical()
         }
         // Polling is the fallback for gradual pressure. distinctUntilChanged()
         // is removed: the reconciler owns dedup, and it must be able to write an
@@ -688,7 +692,6 @@ class InferenceService : Service() {
         memoryGovernor.monitorMemory()
             .onEach { state ->
                 memoryPressureReconciler.onPoll(state)
-                criticalMemoryAlertActive = memoryPressureReconciler.isCritical()
             }
             .launchIn(serviceScope)
     }
@@ -745,16 +748,13 @@ class InferenceService : Service() {
      */
     fun importModels(uris: List<Uri>) {
         if (uris.isEmpty()) return
-        val byString = uris.associateBy { it.toString() }
-        // Track the drain coroutine so cancelImport() can stop the whole batch.
-        // Without this, cancelling only the current file's [importJob] lets the
-        // queue start the next file immediately.
+        // Persist the URIs and append to the shared queue. A second multi-select
+        // while a drain is running must enqueue into that drain, not cancel it.
+        uris.forEach { importUriByString[it.toString()] = it }
+        importQueue.enqueueAll(uris.map { it.toString() })
+        if (batchImportJob?.isActive == true) return
         batchImportJob = serviceScope.launch {
-            val queue = SequentialImportQueue { uriString ->
-                byString[uriString]?.let { uri -> importModel(uri)?.join() }
-            }
-            queue.enqueueAll(uris.map { it.toString() })
-            queue.drain()
+            importQueue.drain()
             // Republish once the whole queue finishes: per-file imports already
             // refresh through onRefreshReadiness, but this guarantees the list is
             // settled even if the last item failed or was skipped.
@@ -1095,11 +1095,22 @@ class InferenceService : Service() {
     fun benchmarkJson(): String = benchmarkStore.json()
 
     /** Non-suspending pre-flight so the UI can decide whether to clear its draft. */
+    @Deprecated("Use preflightSend; this runs generationAcceptance (SQLite memory read) on the caller thread")
     fun acceptsGeneration(prompt: String): Boolean =
         generationAcceptance(prompt).accepted
 
+    @Deprecated("Use preflightSend; this runs generationAcceptance (SQLite memory read) on the caller thread")
     fun generationRefusalReason(prompt: String): String? =
         generationAcceptance(prompt).reason
+
+    /**
+     * Off-main pre-flight: [generationAcceptance] reads active memories from
+     * SQLite, so running it on the UI thread would block a frame. The UI calls
+     * this from a coroutine instead of [acceptsGeneration] /
+     * [generationRefusalReason].
+     */
+    suspend fun preflightSend(prompt: String): SendAcceptance.Result =
+        withContext(Dispatchers.Default) { generationAcceptance(prompt) }
 
     private fun generationAcceptance(prompt: String): SendAcceptance.Result {
         // Same inputs as the orchestrator's normal-chat acceptance: clamped
@@ -1968,7 +1979,20 @@ class InferenceService : Service() {
         // The document browser is a retrieval view: show only chunks that
         // search() can actually return. getAllChunks() is reserved for deletion
         // (it must still see stale rows so they can be removed).
-        runCatching { uiState._vectorChunks.value = vectorStore.getCurrentChunks() }
+        runCatching {
+            uiState._vectorChunks.value = vectorStore.getCurrentChunks()
+            uiState._staleVectorChunkCount.value = vectorStore.countStaleChunks()
+        }
+    }
+
+    /**
+     * Delete rows left behind by an older embedding revision. Returns the number
+     * of rows removed and refreshes the observable chunk/stale-count state.
+     */
+    fun deleteStaleVectorChunks(): Int {
+        val deleted = vectorStore.deleteStaleChunks()
+        refreshVectorChunksList()
+        return deleted
     }
 
     private fun startAgentFollowUpGeneration(

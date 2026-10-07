@@ -80,6 +80,35 @@ class ImportBatchDrainerTest {
     }
 
     @Test
+    fun refreshFailureDoesNotWedgeTheDrainer() = runBlocking {
+        val processed = mutableListOf<String>()
+        val queue = SequentialImportQueue { processed += it }
+        var failNextRefresh = true
+        val drainer = ImportBatchDrainer(queue) {
+            if (failNextRefresh) {
+                failNextRefresh = false
+                throw IllegalStateException("refresh blew up")
+            }
+        }
+
+        val first = drainer.enqueue(listOf("a"))
+        assertNotNull(first)
+        try {
+            drainer.drainAll(first!!)
+        } catch (expected: IllegalStateException) {
+            // The refresh failure must surface...
+        }
+
+        // ...but must not wedge the drainer: a later batch has to start a new
+        // drain instead of being silently dropped because `draining` stayed true.
+        val second = drainer.enqueue(listOf("b"))
+        assertNotNull("a refresh failure must not wedge the drainer", second)
+        drainer.drainAll(second!!)
+
+        assertEquals(listOf("a", "b"), processed)
+    }
+
+    @Test
     fun enqueueAfterCancelStartsAFreshDrain() = runBlocking {
         val processed = mutableListOf<String>()
         val queue = SequentialImportQueue { processed += it }

@@ -52,21 +52,34 @@ class ImportBatchDrainer(
      *   drain) makes this a no-op, so a stale coroutine cannot steal work.
      */
     suspend fun drainAll(token: Long) {
-        while (true) {
-            if (!isCurrent(token)) return
-            queue.drain()
-            refresh()
-            val finished = synchronized(lock) {
-                if (generation != token) return
-                if (queue.isEmpty()) {
+        try {
+            while (true) {
+                if (!isCurrent(token)) return
+                queue.drain()
+                refresh()
+                val finished = synchronized(lock) {
+                    if (generation != token) return
+                    if (queue.isEmpty()) {
+                        draining = false
+                        true
+                    } else {
+                        // URIs arrived during refresh(); loop and drain them.
+                        false
+                    }
+                }
+                if (finished) return
+            }
+        } finally {
+            // A non-cancellation failure (e.g. refresh() throwing) must not leave
+            // `draining` set, or every later enqueue returns null and silently
+            // drops batches until the service is recreated. A normal finish has
+            // already cleared it, and cancel() bumped the generation, so both of
+            // those paths are no-ops here.
+            synchronized(lock) {
+                if (generation == token && draining) {
                     draining = false
-                    true
-                } else {
-                    // URIs arrived during refresh(); loop and drain them.
-                    false
                 }
             }
-            if (finished) return
         }
     }
 

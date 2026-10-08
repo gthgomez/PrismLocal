@@ -329,7 +329,7 @@ class InferenceService : Service() {
     // ── Public StateFlow/SharedFlow exposures — delegated to extracted classes ──
     val lastAgentTracePath: StateFlow<String?> get() = uiState.lastAgentTracePath
     val memories: StateFlow<List<MemoryFact>> get() = uiState.memories
-    val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunk>> get() = uiState.vectorChunks
+    val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunkSummary>> get() = uiState.vectorChunks
     val staleVectorChunkCount: StateFlow<Int> get() = uiState.staleVectorChunkCount
     val thermalGovernorState: StateFlow<com.prismai.llmhost.util.ThermalGovernorState> get() = uiState.thermalGovernorState
     val voiceInputResult: StateFlow<String?> get() = uiState.voiceInputResult
@@ -390,6 +390,9 @@ class InferenceService : Service() {
         refreshMemoriesList()
         // Phase 2 — RAG vector store + manager
         vectorStore = VectorStore(this)
+        // Resolve the encoder identity from the currently loaded model on demand, so vector rows are
+        // stamped and filtered against whatever encoder can actually produce embeddings right now.
+        vectorStore.setEmbeddingIdentityProvider { currentEncoderIdentity() }
         ragManager = RagManager(vectorStore, DocumentChunker) { text ->
             engine.encode(text)
         }
@@ -1925,9 +1928,10 @@ class InferenceService : Service() {
         val result = ragManager.ingestDocumentWithResult(id, title, text)
         refreshVectorChunksList()
         val message = DocumentIngestMessaging.describe(
-            inserted = result.storedCount,
+            embedded = result.embeddedCount,
             failed = result.failedCount,
             total = result.totalChunks,
+            committed = result.committed,
         )
         publishUiEvent(message)
         return message
@@ -1971,18 +1975,30 @@ class InferenceService : Service() {
         _voiceState.value = _voiceState.value.copy(isSpeaking = false)
     }
 
+    /**
+     * Encoder identity of the currently loaded model, used to stamp and filter vector rows.
+     * When no model is loaded this is [EmbeddingIdentity.UNKNOWN_ENCODER], which matches no row
+     * stamped by a real model, so an unloaded state never falsely reports documents as searchable.
+     */
+    private fun currentEncoderIdentity(): EmbeddingIdentity =
+        EmbeddingIdentity.of(
+            uiState._activeModelInfo.value?.sha256,
+            VectorStore.EMBEDDING_REVISION,
+        )
+
+    /** Refreshes the observable retrieval view; the store resolves the current encoder itself. */
     private fun refreshVectorChunksList() {
         // The document browser is a retrieval view: show only chunks that
-        // search() can actually return. getAllChunks() is reserved for deletion
-        // (it must still see stale rows so they can be removed).
+        // search() can actually return for the current encoder. getAllChunks() is
+        // reserved for deletion (it must still see stale rows so they can be removed).
         runCatching {
-            uiState._vectorChunks.value = vectorStore.getCurrentChunks()
+            uiState._vectorChunks.value = vectorStore.getCurrentChunkSummaries()
             uiState._staleVectorChunkCount.value = vectorStore.countStaleChunks()
         }
     }
 
     /**
-     * Delete rows left behind by an older embedding revision. Returns the number
+     * Delete rows left behind by an older embedding identity. Returns the number
      * of rows removed and refreshes the observable chunk/stale-count state.
      */
     fun deleteStaleVectorChunks(): Int {

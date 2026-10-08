@@ -77,6 +77,50 @@ data class VectorChunk(
 }
 
 /**
+ * Metadata-only projection of a stored chunk for list/retrieval views. It never carries the
+ * embedding, so browsing documents does not materialize the whole vector table.
+ */
+data class VectorChunkSummary(
+    val id: String,
+    val documentId: String,
+    val chunkIndex: Int,
+    val text: String,
+    val createdAt: Long,
+)
+
+/**
+ * Compatibility identity for stored embeddings.
+ *
+ * Two embeddings may only be compared when their identity matches. Vectors from different encoder
+ * artifacts (different models), a different embedding algorithm revision, or the same algorithm
+ * with incompatible dimensions are numerically incomparable even when their width matches, so a
+ * global revision alone is not a sufficient contract.
+ *
+ * The token deliberately excludes the dimension: the dimension is implied by [encoderId] plus
+ * [algorithmRevision] and is additionally validated against the query width at score time
+ * (`cosineSimilarity` returns 0 on a length mismatch). Keeping it out of the token lets listing
+ * paths reason about compatibility without having to run an encoder.
+ */
+data class EmbeddingIdentity(
+    /** Identity of the encoder artifact, e.g. the loaded model's SHA-256. */
+    val encoderId: String,
+    /** Revision of the embedding computation (pooling/normalization included). */
+    val algorithmRevision: Int,
+) {
+    val token: String get() = "rev=$algorithmRevision;enc=$encoderId"
+
+    companion object {
+        const val UNKNOWN_ENCODER = "unknown"
+
+        /** Identity for when no encoder/model is loaded: matches nothing that was ever stamped. */
+        val UNKNOWN = EmbeddingIdentity(UNKNOWN_ENCODER, 0)
+
+        fun of(encoderId: String?, algorithmRevision: Int): EmbeddingIdentity =
+            EmbeddingIdentity(encoderId?.takeIf { it.isNotBlank() } ?: UNKNOWN_ENCODER, algorithmRevision)
+    }
+}
+
+/**
  * The subset of [VectorStore] that [RagManager] depends on. Extracted so the
  * manager can be exercised in JVM unit tests without a SQLite database or an
  * Android [Context]; [VectorStore] is the production implementation.
@@ -96,6 +140,12 @@ interface VectorIndex {
     fun documentCount(): Int
     fun chunkCount(): Int
     fun clear()
+
+    /**
+     * Sets how the current encoder identity is resolved. It is consulted when stamping new rows and
+     * when filtering retrieval, so rows produced by an incompatible encoder are never scored.
+     */
+    fun setEmbeddingIdentityProvider(provider: () -> EmbeddingIdentity)
 }
 
 /**
@@ -124,6 +174,20 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     private val dbHelper = VectorDbHelper(context)
     private val lock = ReentrantLock()
+
+    /**
+     * Resolves the encoder identity used to stamp new rows and filter retrieval. Rows stamped with
+     * a different identity are never scored, so switching models cannot silently reuse vectors
+     * produced by an incompatible encoder.
+     */
+    @Volatile
+    private var identityProvider: () -> EmbeddingIdentity = { EmbeddingIdentity.UNKNOWN }
+
+    override fun setEmbeddingIdentityProvider(provider: () -> EmbeddingIdentity) {
+        identityProvider = provider
+    }
+
+    private fun currentIdentity(): EmbeddingIdentity = identityProvider()
 
     /**
      * Insert a single chunk. Returns the chunk with its assigned id.
@@ -208,8 +272,12 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
     override fun search(queryEmbedding: FloatArray, topK: Int, minScore: Float): List<Pair<VectorChunk, Float>> {
         if (topK <= 0 || queryEmbedding.isEmpty()) return emptyList()
         lock.withLock {
+            val current = currentIdentity()
             val cursor = dbHelper.readableDatabase.query(
-                TABLE, null, null, null, null, null, "$COL_CREATED ASC"
+                TABLE, null,
+                "$COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ? AND $COL_EMBEDDING_DIM = ?",
+                arrayOf(EMBEDDING_REVISION.toString(), current.token, queryEmbedding.size.toString()),
+                null, null, "$COL_CREATED ASC"
             )
             try {
                 return selectTopK(chunkScoreIterator(cursor, queryEmbedding), topK, minScore)
@@ -221,8 +289,8 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     /**
      * Lazily yields `(chunk, cosineSimilarity)` for each row of [cursor], decoding
-     * one embedding/chunk at a time. Callers must keep [cursor] open until the
-     * iterator is exhausted.
+     * one embedding/chunk at a time. The cursor is already filtered to the current
+     * encoder identity. Callers must keep [cursor] open until the iterator is exhausted.
      */
     private fun chunkScoreIterator(
         cursor: Cursor,
@@ -233,19 +301,10 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
         val chunkIndex = cursor.getColumnIndexOrThrow(COL_CHUNK_INDEX)
         val textIndex = cursor.getColumnIndexOrThrow(COL_TEXT)
         val embeddingIndex = cursor.getColumnIndexOrThrow(COL_EMBEDDING)
-        val revisionIndex = cursor.getColumnIndexOrThrow(COL_EMBEDDING_REVISION)
         val createdIndex = cursor.getColumnIndexOrThrow(COL_CREATED)
 
         return object : Iterator<Pair<VectorChunk, Float>> {
-            private var hasNextRow = advanceToCurrentRevision()
-
-            /** Skips rows written by an older embedding revision. */
-            private fun advanceToCurrentRevision(): Boolean {
-                while (cursor.moveToNext()) {
-                    if (isCurrentRevision(cursor.getInt(revisionIndex))) return true
-                }
-                return false
-            }
+            private var hasNextRow = cursor.moveToNext()
 
             override fun hasNext(): Boolean = hasNextRow
 
@@ -261,7 +320,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                     embedding = embedding,
                     createdAt = cursor.getLong(createdIndex),
                 )
-                hasNextRow = advanceToCurrentRevision()
+                hasNextRow = cursor.moveToNext()
                 return chunk to score
             }
         }
@@ -334,10 +393,45 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
         lock.withLock {
             val cursor = dbHelper.readableDatabase.query(
                 TABLE, null,
-                "$COL_EMBEDDING_REVISION = ?", arrayOf(EMBEDDING_REVISION.toString()),
+                "$COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ?",
+                arrayOf(EMBEDDING_REVISION.toString(), currentIdentity().token),
                 null, null, "$COL_CREATED ASC"
             )
             return cursorToList(cursor)
+        }
+    }
+
+    /**
+     * Retrieval-view projection of the current chunks: metadata and text only, with the embedding
+     * BLOB never decoded. Use this for listing/browsing so the whole vector table is not retained
+     * in application memory.
+     */
+    fun getCurrentChunkSummaries(): List<VectorChunkSummary> {
+        lock.withLock {
+            val columns = arrayOf(COL_ID, COL_DOCUMENT_ID, COL_CHUNK_INDEX, COL_TEXT, COL_CREATED)
+            val cursor = dbHelper.readableDatabase.query(
+                TABLE, columns,
+                "$COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ?",
+                arrayOf(EMBEDDING_REVISION.toString(), currentIdentity().token),
+                null, null, "$COL_CREATED ASC"
+            )
+            try {
+                val summaries = mutableListOf<VectorChunkSummary>()
+                while (cursor.moveToNext()) {
+                    summaries.add(
+                        VectorChunkSummary(
+                            id = cursor.getString(0),
+                            documentId = cursor.getString(1),
+                            chunkIndex = cursor.getInt(2),
+                            text = cursor.getString(3),
+                            createdAt = cursor.getLong(4),
+                        )
+                    )
+                }
+                return summaries
+            } finally {
+                cursor.close()
+            }
         }
     }
 
@@ -362,8 +456,8 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
     fun countStaleChunks(): Int {
         lock.withLock {
             val cursor = dbHelper.readableDatabase.rawQuery(
-                "SELECT COUNT(*) FROM $TABLE WHERE $COL_EMBEDDING_REVISION != ?",
-                arrayOf(EMBEDDING_REVISION.toString()),
+                "SELECT COUNT(*) FROM $TABLE WHERE $COL_EMBEDDING_REVISION != ? OR $COL_ENCODER_IDENTITY != ?",
+                arrayOf(EMBEDDING_REVISION.toString(), currentIdentity().token),
             )
             try {
                 cursor.moveToFirst()
@@ -375,13 +469,15 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
     }
 
     /**
-     * Delete rows written by an older [EMBEDDING_REVISION], which [search]
-     * can no longer return. Returns the number of rows deleted.
+     * Delete rows written by an older [EMBEDDING_REVISION] or a different encoder
+     * identity, which [search] can no longer return. Returns the number of rows deleted.
      */
     fun deleteStaleChunks(): Int {
         lock.withLock {
             return dbHelper.writableDatabase.delete(
-                TABLE, "$COL_EMBEDDING_REVISION != ?", arrayOf(EMBEDDING_REVISION.toString())
+                TABLE,
+                "$COL_EMBEDDING_REVISION != ? OR $COL_ENCODER_IDENTITY != ?",
+                arrayOf(EMBEDDING_REVISION.toString(), currentIdentity().token),
             )
         }
     }
@@ -390,15 +486,16 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     companion object {
         const val DB_NAME = "prism_vector_store.db"
-        const val DB_VERSION = 2
+        const val DB_VERSION = 3
         const val TABLE = "vector_chunks"
 
         /**
          * Revision of the embedding values stored by this build. Bump this
-         * whenever the embedding computation changes, even if the vector width
-         * stays the same: a dimension check would miss a same-width re-embedding
-         * and reject valid models whose width differs. Rows written at an older
-         * revision are never returned by [search].
+         * whenever the embedding computation (including pooling/normalization)
+         * changes, even if the vector width stays the same: a dimension check
+         * would miss a same-width re-embedding. Combined with [COL_ENCODER_IDENTITY],
+         * which names the encoder artifact, rows written by a different encoder
+         * are never returned by [search].
          */
         const val EMBEDDING_REVISION = 2
 
@@ -408,10 +505,18 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
         const val COL_TEXT = "text"
         const val COL_EMBEDDING = "embedding"
         const val COL_EMBEDDING_REVISION = "embedding_revision"
+        /** Encoder artifact + algorithm identity token; see [EmbeddingIdentity.token]. */
+        const val COL_ENCODER_IDENTITY = "encoder_identity"
+        /** Width of the stored embedding, validated against the query width at score time. */
+        const val COL_EMBEDDING_DIM = "embedding_dim"
         const val COL_CREATED = "created_at"
 
         /** True when a row written at [rowRevision] is comparable with this build. */
         fun isCurrentRevision(rowRevision: Int): Boolean = rowRevision == EMBEDDING_REVISION
+
+        /** True when a row stamped with [rowIdentity] is comparable with [current]. */
+        fun isCompatibleIdentity(rowIdentity: String?, current: EmbeddingIdentity): Boolean =
+            rowIdentity == current.token
 
         val CREATE_TABLE_SQL: String = """
             CREATE TABLE IF NOT EXISTS $TABLE (
@@ -421,12 +526,20 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                 $COL_TEXT TEXT NOT NULL,
                 $COL_EMBEDDING BLOB NOT NULL,
                 $COL_EMBEDDING_REVISION INTEGER NOT NULL DEFAULT 1,
+                $COL_ENCODER_IDENTITY TEXT NOT NULL DEFAULT '',
+                $COL_EMBEDDING_DIM INTEGER NOT NULL DEFAULT 0,
                 $COL_CREATED INTEGER NOT NULL
             )
         """.trimIndent()
 
         val ADD_EMBEDDING_REVISION_SQL: String =
             "ALTER TABLE $TABLE ADD COLUMN $COL_EMBEDDING_REVISION INTEGER NOT NULL DEFAULT 1"
+
+        val ADD_ENCODER_IDENTITY_SQL: String =
+            "ALTER TABLE $TABLE ADD COLUMN $COL_ENCODER_IDENTITY TEXT NOT NULL DEFAULT ''"
+
+        val ADD_EMBEDDING_DIM_SQL: String =
+            "ALTER TABLE $TABLE ADD COLUMN $COL_EMBEDDING_DIM INTEGER NOT NULL DEFAULT 0"
 
         val CREATE_DOCUMENT_INDEX_SQL: String = """
             CREATE INDEX IF NOT EXISTS idx_vector_chunks_document_id
@@ -502,13 +615,15 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     // ---- Value mapping ----
 
-    private fun toValues(chunk: VectorChunk): ContentValues = ContentValues(7).apply {
+    private fun toValues(chunk: VectorChunk): ContentValues = ContentValues(9).apply {
         put(COL_ID, chunk.id)
         put(COL_DOCUMENT_ID, chunk.documentId)
         put(COL_CHUNK_INDEX, chunk.chunkIndex)
         put(COL_TEXT, chunk.text)
         put(COL_EMBEDDING, floatArrayToBytes(chunk.embedding))
         put(COL_EMBEDDING_REVISION, EMBEDDING_REVISION)
+        put(COL_ENCODER_IDENTITY, currentIdentity().token)
+        put(COL_EMBEDDING_DIM, chunk.embedding.size)
         put(COL_CREATED, chunk.createdAt)
     }
 
@@ -527,6 +642,12 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                 // Rows that predate embedding revisioning become revision 1 and
                 // are therefore never returned by search().
                 db.execSQL(ADD_EMBEDDING_REVISION_SQL)
+            }
+            if (oldVersion < 3) {
+                // Rows that predate the encoder-identity contract carry an empty
+                // identity and are treated as incompatible with every encoder.
+                db.execSQL(ADD_ENCODER_IDENTITY_SQL)
+                db.execSQL(ADD_EMBEDDING_DIM_SQL)
             }
         }
     }

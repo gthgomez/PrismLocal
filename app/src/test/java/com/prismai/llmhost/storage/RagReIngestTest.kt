@@ -2,6 +2,7 @@ package com.prismai.llmhost.storage
 
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -55,6 +56,7 @@ class RagReIngestTest {
         override fun documentCount(): Int = 0
         override fun chunkCount(): Int = 0
         override fun clear() {}
+        override fun setEmbeddingIdentityProvider(provider: () -> EmbeddingIdentity) = Unit
     }
 
     @Test
@@ -89,10 +91,64 @@ class RagReIngestTest {
         val result = rag.ingestDocumentWithResult("doc-1", "title", "some document body text")
 
         assertEquals("doc-1", store.replacedDocumentId)
-        assertEquals(result.storedCount, store.replacedChunks.size)
+        assertEquals(result.embeddedCount, store.replacedChunks.size)
         assertTrue(
             "every replaced chunk must belong to the document",
             store.replacedChunks.all { it.documentId == "doc-1" },
         )
     }
+
+    @Test
+    fun failingReIngestLeavesAnExistingCompleteIndexUntouched() = runBlocking {
+        val store = RecordingVectorIndex()
+        var fail = false
+        val rag = RagManager(store, DocumentChunker) { _ ->
+            if (fail) FloatArray(0) else FloatArray(4) { 0.1f }
+        }
+
+        rag.ingestDocumentWithResult("doc-1", "title", longBody())
+        assertEquals("doc-1", store.replacedDocumentId)
+        store.events.clear()
+
+        fail = true
+        val result = rag.ingestDocumentWithResult("doc-1", "title", longBody())
+
+        assertTrue("a failed re-ingest must not touch the store", store.events.isEmpty())
+        assertFalse("a partial set must not report success", result.success)
+        assertTrue("the result must say the previous index was preserved", result.preservedPrevious)
+        assertTrue(result.failedCount > 0)
+        assertEquals(0, result.embeddedCount)
+    }
+
+    @Test
+    fun oneMismatchedDimensionAbortsTheWholeCommit() = runBlocking {
+        val store = RecordingVectorIndex()
+        var calls = 0
+        val rag = RagManager(store, DocumentChunker) { _ ->
+            calls++
+            if (calls == 2) FloatArray(3) { 0.1f } else FloatArray(4) { 0.1f }
+        }
+
+        val result = rag.ingestDocumentWithResult("doc-1", "title", longBody())
+
+        assertTrue("the body must produce multiple chunks", result.totalChunks >= 2)
+        assertEquals(1, result.failedCount)
+        assertFalse(result.committed)
+        assertTrue("no rows may be written when the set is incomplete", store.events.isEmpty())
+    }
+
+    @Test
+    fun fullyEmbeddedReIngestCommitsAndMarksSuccess() = runBlocking {
+        val store = RecordingVectorIndex()
+        val rag = RagManager(store, DocumentChunker) { FloatArray(4) { 0.1f } }
+
+        val result = rag.ingestDocumentWithResult("doc-1", "title", longBody())
+
+        assertTrue(result.success)
+        assertTrue(result.committed)
+        assertEquals(0, result.failedCount)
+        assertEquals(listOf("replaceDocument:doc-1"), store.events)
+    }
+
+    private fun longBody(): String = "Sentence number one is reasonably long. ".repeat(40)
 }

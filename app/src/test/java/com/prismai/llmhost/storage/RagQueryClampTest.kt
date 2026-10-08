@@ -30,6 +30,7 @@ class RagQueryClampTest {
         override fun documentCount(): Int = 0
         override fun chunkCount(): Int = 0
         override fun clear() = Unit
+        override fun setEmbeddingIdentityProvider(provider: () -> EmbeddingIdentity) = Unit
     }
 
     @Test

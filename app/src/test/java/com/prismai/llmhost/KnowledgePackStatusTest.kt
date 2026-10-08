@@ -1,6 +1,7 @@
 package com.prismai.llmhost
 
 import com.prismai.llmhost.storage.DocumentChunker
+import com.prismai.llmhost.storage.EmbeddingIdentity
 import com.prismai.llmhost.storage.KnowledgePackChunkStore
 import com.prismai.llmhost.storage.RagManager
 import com.prismai.llmhost.storage.VectorChunk
@@ -36,6 +37,7 @@ class KnowledgePackStatusTest {
         override fun documentCount() = 0
         override fun chunkCount() = 0
         override fun clear() {}
+        override fun setEmbeddingIdentityProvider(provider: () -> EmbeddingIdentity) {}
     }
 
     private val pack = KnowledgePackManager.CURATED_PACKS.first { it.id == "python-ref" }

@@ -1,6 +1,7 @@
 package com.prismai.llmhost.ui.rag
 
 import com.prismai.llmhost.storage.VectorChunk
+import com.prismai.llmhost.storage.VectorChunkSummary
 import com.prismai.llmhost.ui.components.DashboardCard
 import com.prismai.llmhost.ui.components.InfoBadge
 import com.prismai.llmhost.ui.components.SectionHeader
@@ -49,7 +50,7 @@ import java.util.Locale
 
 @Composable
 fun DocumentBrowser(
-    chunks: List<VectorChunk>,
+    chunks: List<VectorChunkSummary>,
     staleChunkCount: Int,
     ingestStatus: String?,
     onIngestDocument: (id: String, title: String, text: String) -> Unit,

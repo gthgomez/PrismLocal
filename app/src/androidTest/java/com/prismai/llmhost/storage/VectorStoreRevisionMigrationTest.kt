@@ -80,6 +80,62 @@ class VectorStoreRevisionMigrationTest {
         )
     }
 
+    @Test
+    fun encoderIdentity_filteringExcludesRowsFromAnotherEncoder() {
+        val store = VectorStore(context)
+        var encoderId = "sha-a"
+        store.setEmbeddingIdentityProvider { EmbeddingIdentity(encoderId, VectorStore.EMBEDDING_REVISION) }
+        store.insert(
+            VectorChunk(
+                id = "a-1",
+                documentId = "doc-a",
+                chunkIndex = 0,
+                text = "chunk from encoder a",
+                embedding = floatArrayOf(1f, 0f, 0f),
+            )
+        )
+
+        // Same encoder: the row is searchable and current.
+        assertEquals(
+            listOf("a-1"),
+            store.search(floatArrayOf(1f, 0f, 0f), topK = 10, minScore = -1f).map { it.first.id },
+        )
+        assertEquals(listOf("a-1"), store.getCurrentChunks().map { it.id })
+
+        // Switching model/encoder must not silently reuse the old vectors.
+        encoderId = "sha-b"
+        assertTrue(
+            "rows from another encoder must not be scored",
+            store.search(floatArrayOf(1f, 0f, 0f), topK = 10, minScore = -1f).isEmpty(),
+        )
+        assertTrue("rows from another encoder must not be reported current", store.getCurrentChunks().isEmpty())
+        assertEquals("the incompatible row must be surfaced as stale", 1, store.countStaleChunks())
+
+        // Deleting stale rows reclaims it.
+        assertEquals(1, store.deleteStaleChunks())
+        assertEquals(0, store.countStaleChunks())
+    }
+
+    @Test
+    fun search_doesNotMatchRowsOfADifferentDimension() {
+        val store = VectorStore(context)
+        store.setEmbeddingIdentityProvider { EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION) }
+        store.insert(
+            VectorChunk(
+                id = "dim-3",
+                documentId = "doc-a",
+                chunkIndex = 0,
+                text = "3-wide",
+                embedding = floatArrayOf(1f, 0f, 0f),
+            )
+        )
+
+        assertTrue(
+            "a query of another width must not match stored rows",
+            store.search(floatArrayOf(1f, 0f), topK = 10, minScore = -1f).isEmpty(),
+        )
+    }
+
     /**
      * Recreate the pre-revision schema at user_version 1, exactly as an upgraded
      * install would have it, and insert one row.

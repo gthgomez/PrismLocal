@@ -135,8 +135,9 @@ class ServiceUiState {
 
     // ── RAG / Vector Store ─────────────────────────────────────────────
 
-    internal val _vectorChunks = MutableStateFlow<List<com.prismai.llmhost.storage.VectorChunk>>(emptyList())
-    val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunk>> = _vectorChunks.asStateFlow()
+    // Metadata-only summaries: the document browser must not retain the whole embedding table.
+    internal val _vectorChunks = MutableStateFlow<List<com.prismai.llmhost.storage.VectorChunkSummary>>(emptyList())
+    val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunkSummary>> = _vectorChunks.asStateFlow()
 
     // Rows written by an older embedding revision. They are unreachable by
     // search() but remain on disk until the user runs cleanup; exposing the

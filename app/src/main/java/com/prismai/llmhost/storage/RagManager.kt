@@ -28,22 +28,28 @@ class RagManager(
     private val encode: suspend (String) -> FloatArray,
 ) {
     /**
-     * Outcome of an ingestion. [failedCount] counts chunks that could not be
-     * embedded (e.g. oversized chunks rejected by the native size guard), which
-     * would otherwise be silently dropped.
+     * Outcome of an ingestion.
+     *
+     * [committed] is false when any chunk could not be embedded: the new chunk set is discarded and
+     * the document's previous index is left untouched, so a partial failure can never destroy a
+     * previously complete index.
      */
     data class IngestResult(
-        val storedCount: Int,
+        /** Chunks that embedded successfully. */
+        val embeddedCount: Int,
+        /** Chunks that could not be embedded. */
         val failedCount: Int,
+        /** True when the whole set embedded and the document's rows were replaced atomically. */
+        val committed: Boolean,
     ) {
-        /** True only when at least one chunk stored and none failed. */
-        val success: Boolean get() = storedCount > 0 && failedCount == 0
+        /** Total chunks attempted (embedded + failed). */
+        val totalChunks: Int get() = embeddedCount + failedCount
 
-        /** True when some chunks stored but others failed. */
-        val partial: Boolean get() = storedCount > 0 && failedCount > 0
+        /** True only when every chunk embedded and was committed. */
+        val success: Boolean get() = committed && failedCount == 0 && embeddedCount > 0
 
-        /** Total chunks attempted (stored + failed). */
-        val totalChunks: Int get() = storedCount + failedCount
+        /** True when an incomplete chunk set was discarded and the previous index was preserved. */
+        val preservedPrevious: Boolean get() = !committed && failedCount > 0
     }
 
     companion object {
@@ -69,67 +75,72 @@ class RagManager(
      * @param documentId unique identifier for the source document
      * @param title      human-readable title (logged but not currently stored)
      * @param text       full document text
-     * @return number of chunks stored
+     * @return number of chunks committed
      */
     suspend fun ingestDocument(documentId: String, title: String, text: String): Int =
-        ingestDocumentWithResult(documentId, title, text).storedCount
+        ingestDocumentWithResult(documentId, title, text).embeddedCount
 
     /**
-     * Ingest a document and report both stored and failed chunk counts.
+     * Ingest a document and report both embedded and failed chunk counts.
      *
-     * Chunks whose embedding is empty (e.g. rejected by the native size guard)
-     * are counted in [IngestResult.failedCount] instead of being silently dropped.
+     * The whole chunk set is embedded and validated first; the store is replaced in one transaction
+     * only when every chunk embedded successfully. If any chunk fails (e.g. the native size guard
+     * rejects an oversized chunk), nothing is committed and the document's previous index is
+     * retained.
      */
     suspend fun ingestDocumentWithResult(documentId: String, title: String, text: String): IngestResult =
         withContext(Dispatchers.IO) {
             if (text.isBlank()) {
                 Log.w(TAG, "ingestDocument skipped: empty text documentId=$documentId")
-                return@withContext IngestResult(storedCount = 0, failedCount = 0)
+                return@withContext IngestResult(embeddedCount = 0, failedCount = 0, committed = false)
             }
 
             val chunks = chunker.chunk(text)
             if (chunks.isEmpty()) {
                 Log.w(TAG, "ingestDocument no chunks produced documentId=$documentId")
-                return@withContext IngestResult(storedCount = 0, failedCount = 0)
+                return@withContext IngestResult(embeddedCount = 0, failedCount = 0, committed = false)
             }
 
-            val vectorChunks = mutableListOf<VectorChunk>()
-            var failedCount = 0
+            // Generate the full chunk set first, then validate completeness and dimensions before
+            // touching the store.
+            val embeddings = chunks.map { chunk ->
+                runCatching { encode(chunk.text) }.getOrNull()
+            }
+            val dimension = embeddings.firstOrNull { it != null && it.isNotEmpty() }?.size ?: 0
+            val failedCount = embeddings.count { it == null || it.isEmpty() || it.size != dimension }
 
-            for (chunk in chunks) {
-                val embedding = runCatching {
-                    encode(chunk.text)
-                }.getOrNull()
-
-                if (embedding == null || embedding.isEmpty()) {
-                    failedCount++
-                    continue
-                }
-
-                vectorChunks.add(
-                    VectorChunk(
-                        id = UUID.randomUUID().toString().take(12),
-                        documentId = documentId,
-                        chunkIndex = chunk.index,
-                        text = chunk.text,
-                        embedding = embedding,
-                    )
+            if (failedCount > 0) {
+                // Retain the previous index: replacing it with an incomplete set would destroy a
+                // previously complete (and still usable) index.
+                Log.w(
+                    TAG,
+                    "ingestDocument aborted documentId=$documentId chunks=${chunks.size} failed=$failedCount " +
+                        "previousIndexPreserved=true",
+                )
+                return@withContext IngestResult(
+                    embeddedCount = chunks.size - failedCount,
+                    failedCount = failedCount,
+                    committed = false,
                 )
             }
 
-            if (vectorChunks.isNotEmpty()) {
-                // Replace rather than mix: a re-ingest must not leave the
-                // document's previous rows (e.g. an older chunking or embedding
-                // revision) alongside the new batch. The delete+insert is one
-                // transaction inside the store, so a concurrent search never
-                // sees the document missing and a failed insert cannot lose the
-                // previous index.
-                vectorStore.replaceDocument(documentId, vectorChunks)
+            val vectorChunks = chunks.mapIndexed { index, chunk ->
+                VectorChunk(
+                    id = UUID.randomUUID().toString().take(12),
+                    documentId = documentId,
+                    chunkIndex = chunk.index,
+                    text = chunk.text,
+                    embedding = checkNotNull(embeddings[index]),
+                )
             }
+            // Replace rather than mix: a re-ingest must not leave the document's previous rows
+            // (e.g. an older chunking or embedding identity) alongside the new batch. The
+            // delete+insert is one transaction inside the store, so a concurrent search never sees
+            // the document missing and a failed insert cannot lose the previous index.
+            vectorStore.replaceDocument(documentId, vectorChunks)
 
-            val stored = vectorChunks.size
-            Log.i(TAG, "ingestDocument documentId=$documentId chunks=$stored failed=$failedCount")
-            IngestResult(storedCount = stored, failedCount = failedCount)
+            Log.i(TAG, "ingestDocument documentId=$documentId chunks=${vectorChunks.size} committed=true")
+            IngestResult(embeddedCount = vectorChunks.size, failedCount = 0, committed = true)
         }
 
     /**

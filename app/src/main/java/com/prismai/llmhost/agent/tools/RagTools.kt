@@ -29,31 +29,21 @@ class RagTools(
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "Ingestion failed: ${(e.message ?: e::class.java.simpleName).compactForAgent(160)}")
         }
-        if (result.storedCount == 0) {
-            val reason = if (result.failedCount > 0) {
-                "No chunks could be embedded (${result.failedCount} failed)"
-            } else {
-                "No chunks produced from document"
-            }
-            return toolFailure(call, AgentToolErrorCode.FAILED, reason,
-                if (result.failedCount > 0) {
-                    JSONObject().put("stored", false).put("failed_count", result.failedCount).put("document_id", documentId)
-                } else {
-                    JSONObject()
-                })
+        if (result.totalChunks == 0) {
+            return toolFailure(call, AgentToolErrorCode.FAILED, "No chunks produced from document",
+                JSONObject().put("stored", false).put("document_id", documentId))
         }
-        if (result.partial) {
+        if (!result.committed) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
-                "Ingested ${result.storedCount} of ${result.totalChunks} chunks from '$title' (${result.failedCount} failed)",
+                "Could not embed all ${result.totalChunks} chunks from '$title' (${result.failedCount} failed); the previous index was preserved",
                 JSONObject()
-                    .put("stored", true)
-                    .put("partial", true)
-                    .put("chunk_count", result.storedCount)
+                    .put("stored", false)
+                    .put("preserved_previous", result.preservedPrevious)
                     .put("failed_count", result.failedCount)
                     .put("document_id", documentId))
         }
-        return toolSuccess(call, "Ingested ${result.storedCount} chunks from '$title'",
-            JSONObject().put("stored", true).put("chunk_count", result.storedCount).put("document_id", documentId))
+        return toolSuccess(call, "Ingested ${result.embeddedCount} chunks from '$title'",
+            JSONObject().put("stored", true).put("chunk_count", result.embeddedCount).put("document_id", documentId))
     }
 
     suspend fun searchDocuments(call: AgentToolCall): AgentToolResult {
@@ -80,7 +70,7 @@ class RagTools(
 
     suspend fun listDocuments(call: AgentToolCall): AgentToolResult {
         val allChunks = try {
-            vectorStore.getCurrentChunks()
+            vectorStore.getCurrentChunkSummaries()
         } catch (e: Exception) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "Failed to list documents: ${(e.message ?: e::class.java.simpleName).compactForAgent(160)}")

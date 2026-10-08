@@ -136,6 +136,33 @@ class VectorStoreRevisionMigrationTest {
         )
     }
 
+    @Test
+    fun unknownEncoderFallsBackToRevisionInsteadOfReportingEverythingStale() {
+        val store = VectorStore(context)
+        // No provider set: identity is UNKNOWN, as when no model is loaded yet.
+        store.insert(
+            VectorChunk(
+                id = "pre-model",
+                documentId = "doc-a",
+                chunkIndex = 0,
+                text = "indexed while a model was loaded earlier",
+                embedding = floatArrayOf(1f, 0f, 0f),
+            )
+        )
+
+        assertEquals(
+            "rows must not be hidden (or offered for destructive cleanup) merely because no model is loaded",
+            listOf("pre-model"),
+            store.getCurrentChunks().map { it.id },
+        )
+        assertEquals(0, store.countStaleChunks())
+
+        // Once a real encoder is known, the same row is judged against it.
+        store.setEmbeddingIdentityProvider { EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION) }
+        assertTrue(store.getCurrentChunks().isEmpty())
+        assertEquals(1, store.countStaleChunks())
+    }
+
     /**
      * Recreate the pre-revision schema at user_version 1, exactly as an upgraded
      * install would have it, and insert one row.

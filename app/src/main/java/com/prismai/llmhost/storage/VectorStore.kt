@@ -190,6 +190,33 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
     private fun currentIdentity(): EmbeddingIdentity = identityProvider()
 
     /**
+     * Selection for the retrieval view. When no encoder is loaded the current identity is
+     * [EmbeddingIdentity.UNKNOWN], so a row's encoder cannot be judged: fall back to the revision
+     * contract rather than reporting every stored document as stale (which would offer a destructive
+     * cleanup of still-valid vectors). Once a model is loaded the encoder identity is enforced.
+     */
+    private fun currentChunkSelection(): Pair<String, Array<String>> {
+        val identity = currentIdentity()
+        val revisionArg = EMBEDDING_REVISION.toString()
+        return if (identity.encoderId == EmbeddingIdentity.UNKNOWN_ENCODER) {
+            "$COL_EMBEDDING_REVISION = ?" to arrayOf(revisionArg)
+        } else {
+            "$COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ?" to arrayOf(revisionArg, identity.token)
+        }
+    }
+
+    /** Selection for rows that [search] can no longer reach; see [currentChunkSelection]. */
+    private fun staleChunkSelection(): Pair<String, Array<String>> {
+        val identity = currentIdentity()
+        val revisionArg = EMBEDDING_REVISION.toString()
+        return if (identity.encoderId == EmbeddingIdentity.UNKNOWN_ENCODER) {
+            "$COL_EMBEDDING_REVISION != ?" to arrayOf(revisionArg)
+        } else {
+            "$COL_EMBEDDING_REVISION != ? OR $COL_ENCODER_IDENTITY != ?" to arrayOf(revisionArg, identity.token)
+        }
+    }
+
+    /**
      * Insert a single chunk. Returns the chunk with its assigned id.
      */
     fun insert(chunk: VectorChunk): VectorChunk {
@@ -391,11 +418,9 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
      */
     override fun getCurrentChunks(): List<VectorChunk> {
         lock.withLock {
+            val (selection, args) = currentChunkSelection()
             val cursor = dbHelper.readableDatabase.query(
-                TABLE, null,
-                "$COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ?",
-                arrayOf(EMBEDDING_REVISION.toString(), currentIdentity().token),
-                null, null, "$COL_CREATED ASC"
+                TABLE, null, selection, args, null, null, "$COL_CREATED ASC"
             )
             return cursorToList(cursor)
         }
@@ -408,12 +433,10 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
      */
     fun getCurrentChunkSummaries(): List<VectorChunkSummary> {
         lock.withLock {
+            val (selection, args) = currentChunkSelection()
             val columns = arrayOf(COL_ID, COL_DOCUMENT_ID, COL_CHUNK_INDEX, COL_TEXT, COL_CREATED)
             val cursor = dbHelper.readableDatabase.query(
-                TABLE, columns,
-                "$COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ?",
-                arrayOf(EMBEDDING_REVISION.toString(), currentIdentity().token),
-                null, null, "$COL_CREATED ASC"
+                TABLE, columns, selection, args, null, null, "$COL_CREATED ASC"
             )
             try {
                 val summaries = mutableListOf<VectorChunkSummary>()
@@ -455,9 +478,10 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
      */
     fun countStaleChunks(): Int {
         lock.withLock {
+            val (selection, args) = staleChunkSelection()
             val cursor = dbHelper.readableDatabase.rawQuery(
-                "SELECT COUNT(*) FROM $TABLE WHERE $COL_EMBEDDING_REVISION != ? OR $COL_ENCODER_IDENTITY != ?",
-                arrayOf(EMBEDDING_REVISION.toString(), currentIdentity().token),
+                "SELECT COUNT(*) FROM $TABLE WHERE $selection",
+                args,
             )
             try {
                 cursor.moveToFirst()
@@ -474,11 +498,8 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
      */
     fun deleteStaleChunks(): Int {
         lock.withLock {
-            return dbHelper.writableDatabase.delete(
-                TABLE,
-                "$COL_EMBEDDING_REVISION != ? OR $COL_ENCODER_IDENTITY != ?",
-                arrayOf(EMBEDDING_REVISION.toString(), currentIdentity().token),
-            )
+            val (selection, args) = staleChunkSelection()
+            return dbHelper.writableDatabase.delete(TABLE, selection, args)
         }
     }
 

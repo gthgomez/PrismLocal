@@ -278,6 +278,56 @@ class ModelStorageManagerTest {
         assertTrue(HuggingFaceDownloadWork.request(entry.id).tags.contains(ownerTag))
     }
 
+    @Test
+    fun activationVerifiesTheInstalledArtifact() {
+        val manager = ModelStorageManager(context)
+        cleanup("activation-model")
+        try {
+            val imported = manager.importModelFromStream(
+                displayName = "activation-model.gguf",
+                reportedSize = validGgufBytes().size.toLong(),
+                input = ByteArrayInputStream(validGgufBytes()),
+            )
+            assertTrue(imported is ModelStorageManager.ImportResult.Success)
+            val installed = (imported as ModelStorageManager.ImportResult.Success).model
+
+            val activated = manager.resolveActiveModelForActivation("activation-model")
+            assertTrue("freshly verified artifact must activate, got $activated", activated is ModelStorageManager.ModelResolveResult.Success)
+            assertEquals(installed.sha256, (activated as ModelStorageManager.ModelResolveResult.Success).model.sha256)
+        } finally {
+            cleanup("activation-model")
+        }
+    }
+
+    @Test
+    fun activationRejectsWeightsReplacedAfterVerification() {
+        val manager = ModelStorageManager(context)
+        cleanup("tampered-model")
+        try {
+            val imported = manager.importModelFromStream(
+                displayName = "tampered-model.gguf",
+                reportedSize = validGgufBytes().size.toLong(),
+                input = ByteArrayInputStream(validGgufBytes()),
+            )
+            assertTrue(imported is ModelStorageManager.ImportResult.Success)
+            val file = (imported as ModelStorageManager.ImportResult.Success).model.file
+
+            // Same length and a valid GGUF header, but different weights: the manifest hash no
+            // longer describes these bytes.
+            file.writeBytes(validGgufBytes(seed = 9))
+            check(file.setLastModified(file.lastModified() + 5_000))
+
+            val activated = manager.resolveActiveModelForActivation("tampered-model")
+            assertTrue("tampered weights must be rejected, got $activated", activated is ModelStorageManager.ModelResolveResult.Failure)
+            assertEquals(
+                ModelStorageManager.ModelStorageError.Code.HASH_MISMATCH,
+                (activated as ModelStorageManager.ModelResolveResult.Failure).error.code,
+            )
+        } finally {
+            cleanup("tampered-model")
+        }
+    }
+
     private fun validGgufBytes(seed: Int = 1): ByteArray {
         val bytes = ByteArray(64) { index -> (seed + index).toByte() }
         bytes[0] = 'G'.code.toByte()

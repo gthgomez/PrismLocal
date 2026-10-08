@@ -56,7 +56,7 @@ sealed class ModelDownloadState {
     data class Success(
         val modelId: String,
         val entryName: String,
-        val integrityVerified: Boolean = true,
+        val integrity: DownloadIntegrity = DownloadIntegrity.UNVERIFIED,
     ) : ModelDownloadState()
     data class Failure(
         /** Catalog id of the model that failed. Nullable only for legacy states. */
@@ -70,8 +70,15 @@ sealed class ModelDownloadState {
 object HuggingFaceModelCatalog {
     val entries: List<HuggingFaceModelEntry> = listOf(
         // SHA-256 values retrieved from the HF API (`lfs.sha256`) and confirmed against the raw LFS
-        // pointer on 2026-09-14. Curated entries without a hash (gated repos or 404 file names as of
-        // that date) fail closed at download time rather than importing unverified.
+        // pointer on 2026-09-14, re-audited against the HF API on 2026-10-08: every pinned digest
+        // below is valid, unique, and matches the provider. A curated entry MUST pin a trusted
+        // digest; entries that could not be pinned were removed rather than offered as downloadable.
+        // Removed on 2026-10-08 because they could not be independently pinned: the gated repos
+        // bartowski/Phi-4-mini-instruct-GGUF, bartowski/Ministral-3B-instruct-GGUF, and
+        // bartowski/stablelm-zephyr-3b-GGUF (HF API returns "Invalid username or password" without
+        // auth); and the nonexistent files Qwen2.5-7B-Instruct-IQ3_XXS.gguf,
+        // qwen2.5-0.5b-instruct-IQ2_XXS.gguf, and qwen2.5-1.5b-instruct-IQ3_XXS.gguf (HTTP 404,
+        // absent from the repos' sibling lists).
         HuggingFaceModelEntry(
             id = "qwen25_05b_q4km",
             name = "Qwen2.5 0.5B Instruct",
@@ -170,17 +177,6 @@ object HuggingFaceModelCatalog {
             notes = "Microsoft Phi-3-mini; strong reasoning for its size, MIT license.",
         ),
         HuggingFaceModelEntry(
-            id = "phi4_mini_38b_q4km",
-            name = "Phi-4-mini 3.8B Instruct",
-            repoId = "bartowski/Phi-4-mini-instruct-GGUF",
-            fileName = "Phi-4-mini-instruct-Q4_K_M.gguf",
-            expectedBytes = 2_300L * 1024L * 1024L,
-            license = "MIT",
-            parameters = "3.8B",
-            quantization = "Q4_K_M",
-            notes = "Microsoft Phi-4-mini; improved reasoning over Phi-3, MIT license.",
-        ),
-        HuggingFaceModelEntry(
             id = "llama32_3b_q4km",
             name = "Llama 3.2 3B Instruct",
             repoId = "bartowski/Llama-3.2-3B-Instruct-GGUF",
@@ -215,17 +211,6 @@ object HuggingFaceModelCatalog {
             parameters = "3B",
             quantization = "Q4_K_M",
             notes = "Alibaba Qwen2.5 3B; excellent coding and reasoning for its size, Apache-2.0.",
-        ),
-        HuggingFaceModelEntry(
-            id = "qwen25_7b_iq3xxs",
-            name = "Qwen2.5 7B Instruct",
-            repoId = "bartowski/Qwen2.5-7B-Instruct-GGUF",
-            fileName = "Qwen2.5-7B-Instruct-IQ3_XXS.gguf",
-            expectedBytes = 3_240L * 1024L * 1024L,
-            license = "Apache-2.0",
-            parameters = "7B",
-            quantization = "IQ3_XXS",
-            notes = "Qwen2.5 7B with aggressive IQ3_XXS quant; fits flagship phones with >8 GiB RAM.",
         ),
         HuggingFaceModelEntry(
             id = "deepseek_r1_distill_qwen_15b_q4km",
@@ -264,17 +249,6 @@ object HuggingFaceModelCatalog {
             notes = "IBM Granite 3.1 3B MoE; mixture-of-experts for efficient inference.",
         ),
         HuggingFaceModelEntry(
-            id = "ministral_3b_q4km",
-            name = "Ministral 3B Instruct",
-            repoId = "bartowski/Ministral-3B-instruct-GGUF",
-            fileName = "Ministral-3B-instruct-Q4_K_M.gguf",
-            expectedBytes = 2_050L * 1024L * 1024L,
-            license = "Mistral Research License",
-            parameters = "3B",
-            quantization = "Q4_K_M",
-            notes = "Mistral Ministral 3B; efficient edge-focused model from Mistral AI.",
-        ),
-        HuggingFaceModelEntry(
             id = "tinyllama_11b_q4km",
             name = "TinyLlama 1.1B Chat",
             repoId = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
@@ -285,39 +259,6 @@ object HuggingFaceModelCatalog {
             parameters = "1.1B",
             quantization = "Q4_K_M",
             notes = "TinyLlama 1.1B; very fast on weak hardware for demos. Not recommended for coding benchmarks.",
-        ),
-        HuggingFaceModelEntry(
-            id = "stablelm_zephyr_3b_q4km",
-            name = "StableLM Zephyr 3B",
-            repoId = "bartowski/stablelm-zephyr-3b-GGUF",
-            fileName = "stablelm-zephyr-3b-Q4_K_M.gguf",
-            expectedBytes = 1_870L * 1024L * 1024L,
-            license = "CC-BY-NC-SA-4.0",
-            parameters = "3B",
-            quantization = "Q4_K_M",
-            notes = "Stability AI StableLM Zephyr 3B; tuned for helpfulness, non-commercial license.",
-        ),
-        HuggingFaceModelEntry(
-            id = "qwen25_05b_iq2xxs",
-            name = "Qwen2.5 0.5B Instruct (compact)",
-            repoId = "bartowski/Qwen2.5-0.5B-Instruct-GGUF",
-            fileName = "qwen2.5-0.5b-instruct-IQ2_XXS.gguf",
-            expectedBytes = 189L * 1024L * 1024L,
-            license = "Apache-2.0",
-            parameters = "0.5B",
-            quantization = "IQ2_XXS",
-            notes = "Ultra-compact Qwen2.5 0.5B; under 200 MiB, fits any device.",
-        ),
-        HuggingFaceModelEntry(
-            id = "qwen25_15b_iq3xxs",
-            name = "Qwen2.5 1.5B Instruct (compact)",
-            repoId = "bartowski/Qwen2.5-1.5B-Instruct-GGUF",
-            fileName = "qwen2.5-1.5b-instruct-IQ3_XXS.gguf",
-            expectedBytes = 550L * 1024L * 1024L,
-            license = "Apache-2.0",
-            parameters = "1.5B",
-            quantization = "IQ3_XXS",
-            notes = "Compact Qwen2.5 1.5B; ~550 MiB with IQ3_XXS, good quality/size tradeoff.",
         ),
         HuggingFaceModelEntry(
             id = "smollm2_17b_q4km",

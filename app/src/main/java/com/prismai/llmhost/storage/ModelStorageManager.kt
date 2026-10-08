@@ -44,6 +44,48 @@ internal object ModelStorageLifecycleGate {
     }
 }
 
+/**
+ * Process-scoped record of model artifacts already hashed during this process.
+ *
+ * Hashing a multi-gigabyte GGUF is expensive, so activation hashes once and then trusts the exact
+ * (size, lastModified) of the bytes it hashed for the rest of the process lifetime. Size and mtime
+ * are only a cache key that detects change; the SHA-256 stays the trust anchor, and any deviation
+ * re-hashes. The record is deliberately in-memory only, so a fresh process re-verifies everything.
+ * Callers that must not trust the cache use [ModelStorageManager.resolveActiveModel] instead of
+ * [ModelStorageManager.resolveActiveModelForActivation].
+ */
+internal object ModelArtifactVerificationCache {
+    private data class Entry(val sha256: String, val sizeBytes: Long, val lastModifiedMs: Long)
+
+    private val entries = mutableMapOf<String, Entry>()
+
+    @Synchronized
+    fun matches(file: File, expectedSha256: String): Boolean {
+        val entry = entries[key(file)] ?: return false
+        return entry.sha256 == expectedSha256.lowercase(Locale.US) &&
+            entry.sizeBytes == file.length() &&
+            entry.lastModifiedMs == file.lastModified()
+    }
+
+    @Synchronized
+    fun remember(file: File, sha256: String) {
+        entries[key(file)] = Entry(sha256.lowercase(Locale.US), file.length(), file.lastModified())
+    }
+
+    @Synchronized
+    fun forgetUnder(directory: File) {
+        val prefix = key(directory)
+        entries.keys.removeAll { it == prefix || it.startsWith("$prefix${File.separator}") }
+    }
+
+    @Synchronized
+    @VisibleForTesting
+    fun clear() = entries.clear()
+
+    private fun key(file: File): String =
+        runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
+}
+
 class ModelStorageManager(
     private val context: Context,
     private val modelsDirectoryOverride: File? = null,
@@ -126,7 +168,7 @@ class ModelStorageManager(
         val models = dir.listFiles()
             ?.filter { it.isDirectory && it.name != IMPORT_STAGING_DIR && File(it, MANIFEST_FILE).exists() }
             ?.mapNotNull { modelRoot ->
-                when (parseManifest(modelRoot, verifyHash = false)) {
+                when (parseManifest(modelRoot, HashPolicy.NONE)) {
                     is ModelResolveResult.Success -> modelRoot.name
                     is ModelResolveResult.Failure -> null
                 }
@@ -143,7 +185,7 @@ class ModelStorageManager(
         return dir.listFiles()
             ?.filter { it.isDirectory && it.name != IMPORT_STAGING_DIR && File(it, MANIFEST_FILE).exists() }
             ?.mapNotNull { modelRoot ->
-                (parseManifest(modelRoot, verifyHash = false) as? ModelResolveResult.Success)?.model
+                (parseManifest(modelRoot, HashPolicy.NONE) as? ModelResolveResult.Success)?.model
             }
             ?.sortedBy { it.id }
             ?: emptyList()
@@ -219,7 +261,7 @@ class ModelStorageManager(
 
         val existingManifest = File(modelsDir, "$modelId/$MANIFEST_FILE")
         if (existingManifest.exists()) {
-            val existing = parseManifest(File(modelsDir, modelId), verifyHash = false)
+            val existing = parseManifest(File(modelsDir, modelId), HashPolicy.NONE)
             if (existing is ModelResolveResult.Failure) {
                 return ImportResult.Failure(existing.error)
             }
@@ -278,7 +320,11 @@ class ModelStorageManager(
             writeManifestAtomically(modelRoot, manifest)
             pruneInactiveVersions(modelRoot, versionId)
 
-            val resolved = resolveActiveModel(modelId)
+            // The staged bytes were just hashed and promotion is a rename that preserves content, so
+            // record the verified artifact instead of hashing the multi-gigabyte file a second time.
+            ModelArtifactVerificationCache.remember(activeFile, sha256)
+
+            val resolved = resolveActiveModelForActivation(modelId)
             if (resolved is ModelResolveResult.Success) {
                 ImportResult.Success(resolved.model)
             } else {
@@ -327,6 +373,7 @@ class ModelStorageManager(
             ModelStorageLifecycleGate.advanceRevision(modelId)
             if (!modelRoot.exists()) return@withLock false
             val deleted = runCatching { modelRoot.deleteRecursively() }.getOrDefault(false)
+            if (deleted) ModelArtifactVerificationCache.forgetUnder(modelRoot)
             runCatching { Log.d(TAG, "deleteModel modelId=$modelId deleted=$deleted") }
             deleted
         }
@@ -337,7 +384,7 @@ class ModelStorageManager(
         confirmedIdentity: ModelIdentity,
     ): Boolean {
         if (confirmedIdentity.modelId != modelId || !modelRoot.exists()) return false
-        val resolved = parseManifest(modelRoot, verifyHash = false)
+        val resolved = parseManifest(modelRoot, HashPolicy.NONE)
         val installed = (resolved as? ModelResolveResult.Success)?.model ?: return false
         return confirmedIdentity.matches(installed)
     }
@@ -356,7 +403,17 @@ class ModelStorageManager(
     }
 
     fun resolveActiveModel(modelId: String, verifyHash: Boolean = true): ModelResolveResult =
-        parseManifest(File(modelsDir, modelId), verifyHash = verifyHash)
+        parseManifest(File(modelsDir, modelId), if (verifyHash) HashPolicy.ALWAYS else HashPolicy.NONE)
+
+    /**
+     * Resolves the active artifact for a native load, verifying its SHA-256 against the recorded
+     * manifest identity. Reuses a digest already computed for these exact bytes earlier in this
+     * process, so switching back to an unchanged model does not re-hash gigabytes. A file whose
+     * size or mtime changed, or whose digest no longer matches, is rejected with [HASH_MISMATCH]
+     * and never handed to the native loader.
+     */
+    fun resolveActiveModelForActivation(modelId: String): ModelResolveResult =
+        parseManifest(File(modelsDir, modelId), HashPolicy.CACHED)
 
     fun activeModelInfo(modelId: String): ActiveModelInfo? =
         (resolveActiveModel(modelId, verifyHash = false) as? ModelResolveResult.Success)?.model
@@ -403,7 +460,18 @@ class ModelStorageManager(
         return freed
     }
 
-    private fun parseManifest(modelRoot: File, verifyHash: Boolean): ModelResolveResult {
+    private enum class HashPolicy {
+        /** Never hash; used by listing and identity-snapshot paths. */
+        NONE,
+
+        /** Always recompute the full-file digest; used where the caller must not trust the cache. */
+        ALWAYS,
+
+        /** Reuse a digest already computed for these exact bytes this process, else hash and cache. */
+        CACHED,
+    }
+
+    private fun parseManifest(modelRoot: File, hashPolicy: HashPolicy): ModelResolveResult {
         val modelId = modelRoot.name
         val manifestFile = File(modelRoot, MANIFEST_FILE)
         if (!manifestFile.exists()) {
@@ -447,16 +515,23 @@ class ModelStorageManager(
                     )
                 )
             val expectedSha = activeObj.getString("sha256")
-            if (verifyHash) {
-                val actualSha = sha256(modelFile)
-                if (!expectedSha.equals(actualSha, ignoreCase = true)) {
-                    return ModelResolveResult.Failure(
-                        ModelStorageError(
-                            ModelStorageError.Code.HASH_MISMATCH,
-                            "Model $modelId failed integrity verification",
-                            "expected=$expectedSha actual=$actualSha",
+            if (hashPolicy != HashPolicy.NONE) {
+                val cachedMatch = hashPolicy == HashPolicy.CACHED &&
+                    ModelArtifactVerificationCache.matches(modelFile, expectedSha)
+                if (!cachedMatch) {
+                    val actualSha = sha256(modelFile)
+                    if (!expectedSha.equals(actualSha, ignoreCase = true)) {
+                        return ModelResolveResult.Failure(
+                            ModelStorageError(
+                                ModelStorageError.Code.HASH_MISMATCH,
+                                "Model $modelId failed integrity verification",
+                                "expected=$expectedSha actual=$actualSha",
+                            )
                         )
-                    )
+                    }
+                    if (hashPolicy == HashPolicy.CACHED) {
+                        ModelArtifactVerificationCache.remember(modelFile, actualSha)
+                    }
                 }
             }
             ModelResolveResult.Success(

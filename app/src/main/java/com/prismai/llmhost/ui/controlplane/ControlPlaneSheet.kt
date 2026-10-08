@@ -656,13 +656,15 @@ private fun HuggingFaceDownloadPanel(
                 }
             }
             is ModelDownloadState.Success -> Text(
-                text = if (state.integrityVerified) {
-                    "Downloaded ${state.entryName}"
-                } else {
-                    "Downloaded ${state.entryName} (unverified: no SHA-256 available)"
+                text = when (state.integrity) {
+                    DownloadIntegrity.VERIFIED_PINNED -> "Downloaded ${state.entryName}"
+                    DownloadIntegrity.VERIFIED_PROVIDER_METADATA ->
+                        "Downloaded ${state.entryName} (matched provider metadata)"
+                    DownloadIntegrity.UNVERIFIED ->
+                        "Downloaded ${state.entryName} (unverified: no SHA-256 available)"
                 },
                 style = MaterialTheme.typography.bodySmall,
-                color = if (state.integrityVerified) PrismGreen else PrismAmber,
+                color = if (state.integrity != DownloadIntegrity.UNVERIFIED) PrismGreen else PrismAmber,
             )
             is ModelDownloadState.Running -> {
                 Text(

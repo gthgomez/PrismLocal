@@ -329,7 +329,7 @@ class InferenceService : Service() {
     // ── Public StateFlow/SharedFlow exposures — delegated to extracted classes ──
     val lastAgentTracePath: StateFlow<String?> get() = uiState.lastAgentTracePath
     val memories: StateFlow<List<MemoryFact>> get() = uiState.memories
-    val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunkSummary>> get() = uiState.vectorChunks
+    val vectorDocuments: StateFlow<List<VectorDocumentSummary>> get() = uiState.vectorDocuments
     val staleVectorChunkCount: StateFlow<Int> get() = uiState.staleVectorChunkCount
     val thermalGovernorState: StateFlow<com.prismai.llmhost.util.ThermalGovernorState> get() = uiState.thermalGovernorState
     val voiceInputResult: StateFlow<String?> get() = uiState.voiceInputResult
@@ -427,7 +427,6 @@ class InferenceService : Service() {
             grokipediaClient = grokipediaClient,
             vectorStore = vectorStore,
             ragManager = ragManager,
-            chunker = DocumentChunker,
         )
         // Phase 7a — Background Agent Execution
         backgroundAgentManager = BackgroundAgentManager(
@@ -1932,6 +1931,8 @@ class InferenceService : Service() {
             failed = result.failedCount,
             total = result.totalChunks,
             committed = result.committed,
+            tooLarge = result.tooLarge,
+            encoderChanged = result.encoderChanged,
         )
         publishUiEvent(message)
         return message
@@ -1986,23 +1987,27 @@ class InferenceService : Service() {
             VectorStore.EMBEDDING_REVISION,
         )
 
-    /** Refreshes the observable retrieval view; the store resolves the current encoder itself. */
+    /**
+     * Refreshes the observable document-browser view. Publishes one bounded summary per stored
+     * document (counts + a short preview) rather than every chunk's text, so a large knowledge base
+     * cannot exhaust the heap. [countObsoleteChunks] counts only rows written by an older embedding
+     * revision, which no model can search; rows belonging to a different but valid encoder are still
+     * shown as stored and are never offered for deletion.
+     */
     private fun refreshVectorChunksList() {
-        // The document browser is a retrieval view: show only chunks that
-        // search() can actually return for the current encoder. getAllChunks() is
-        // reserved for deletion (it must still see stale rows so they can be removed).
         runCatching {
-            uiState._vectorChunks.value = vectorStore.getCurrentChunkSummaries()
-            uiState._staleVectorChunkCount.value = vectorStore.countStaleChunks()
+            uiState._vectorDocuments.value = vectorStore.getDocumentSummaries()
+            uiState._staleVectorChunkCount.value = vectorStore.countObsoleteChunks()
         }
     }
 
     /**
-     * Delete rows left behind by an older embedding identity. Returns the number
-     * of rows removed and refreshes the observable chunk/stale-count state.
+     * Delete rows made obsolete by an older embedding revision. Rows belonging to a merely
+     * unloaded/different encoder are preserved (switching back re-enables them). Returns the number
+     * of rows removed and refreshes the observable state.
      */
     fun deleteStaleVectorChunks(): Int {
-        val deleted = vectorStore.deleteStaleChunks()
+        val deleted = vectorStore.deleteObsoleteChunks()
         refreshVectorChunksList()
         return deleted
     }

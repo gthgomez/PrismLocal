@@ -7,6 +7,7 @@ import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
+import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -25,9 +26,21 @@ class RagTools(
         }
         val result = try {
             ragManager.ingestDocumentWithResult(documentId, title, text)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "Ingestion failed: ${(e.message ?: e::class.java.simpleName).compactForAgent(160)}")
+        }
+        if (result.tooLarge) {
+            return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT,
+                "Document is too large to index in one pass; split it into smaller documents",
+                JSONObject().put("stored", false).put("document_id", documentId))
+        }
+        if (result.encoderChanged) {
+            return toolFailure(call, AgentToolErrorCode.FAILED,
+                "The active model changed while embedding; nothing was indexed. Retry with a stable model.",
+                JSONObject().put("stored", false).put("document_id", documentId))
         }
         if (result.totalChunks == 0) {
             return toolFailure(call, AgentToolErrorCode.FAILED, "No chunks produced from document",
@@ -52,6 +65,8 @@ class RagTools(
         if (query.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Query is required")
         val results = try {
             ragManager.query(query, topK = topK)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "Search failed: ${(e.message ?: e::class.java.simpleName).compactForAgent(160)}")
@@ -69,20 +84,23 @@ class RagTools(
     }
 
     suspend fun listDocuments(call: AgentToolCall): AgentToolResult {
-        val allChunks = try {
-            vectorStore.getCurrentChunkSummaries()
+        val documents = try {
+            vectorStore.getDocumentSummaries()
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "Failed to list documents: ${(e.message ?: e::class.java.simpleName).compactForAgent(160)}")
         }
-        val docMap = mutableMapOf<String, Int>()
-        allChunks.forEach { chunk -> docMap[chunk.documentId] = (docMap[chunk.documentId] ?: 0) + 1 }
         val docsArray = JSONArray()
-        docMap.forEach { (docId, count) ->
-            docsArray.put(JSONObject().put("document_id", docId).put("chunk_count", count))
+        documents.forEach { doc ->
+            docsArray.put(JSONObject()
+                .put("document_id", doc.documentId)
+                .put("chunk_count", doc.storedChunkCount)
+                .put("searchable_chunk_count", doc.searchableChunkCount))
         }
-        return toolSuccess(call, "${docMap.size} documents in knowledge base",
-            JSONObject().put("count", docMap.size).put("documents", docsArray))
+        return toolSuccess(call, "${documents.size} documents in knowledge base",
+            JSONObject().put("count", documents.size).put("documents", docsArray))
     }
 
     suspend fun deleteDocument(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
@@ -91,6 +109,8 @@ class RagTools(
         if (documentId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "document_id is required")
         val removed = try {
             ragManager.deleteDocument(documentId)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             return toolFailure(call, AgentToolErrorCode.FAILED,
                 "Deletion failed: ${(e.message ?: e::class.java.simpleName).compactForAgent(160)}")

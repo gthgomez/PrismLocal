@@ -9,7 +9,16 @@ package com.prismai.llmhost.ui.rag
  * must say the counts and whether the previous index survived.
  */
 object DocumentIngestMessaging {
-    fun describe(embedded: Int, failed: Int, total: Int, committed: Boolean): String = when {
+    fun describe(
+        embedded: Int,
+        failed: Int,
+        total: Int,
+        committed: Boolean,
+        tooLarge: Boolean = false,
+        encoderChanged: Boolean = false,
+    ): String = when {
+        tooLarge -> "Document is too large to index in one pass; split it into smaller documents"
+        encoderChanged -> "The active model changed while embedding; nothing was indexed — retry with a stable model"
         total == 0 -> "Nothing to index"
         !committed -> "Could not index this document: $failed of $total chunks could not be embedded; the previous index was preserved"
         embedded == 0 -> "Could not index this document: $failed of $total chunks could not be embedded"

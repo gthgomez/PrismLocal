@@ -78,10 +78,19 @@ class VectorStoreRevisionMigrationTest {
             listOf("current-1"),
             results.map { it.first.id },
         )
+
+        // The revision-1 row is obsolete under every encoder and may be reclaimed.
+        assertEquals("only the revision-1 row is obsolete", 1, store.countObsoleteChunks())
+        assertEquals(1, store.deleteObsoleteChunks())
+        assertEquals(0, store.countObsoleteChunks())
+        assertTrue(
+            "cleanup must not remove the current-revision row",
+            store.getAllChunks().any { it.id == "current-1" },
+        )
     }
 
     @Test
-    fun encoderIdentity_filteringExcludesRowsFromAnotherEncoder() {
+    fun encoderSwitch_makesRowsUnsearchableButNeverObsoleteOrDeletable() {
         val store = VectorStore(context)
         var encoderId = "sha-a"
         store.setEmbeddingIdentityProvider { EmbeddingIdentity(encoderId, VectorStore.EMBEDDING_REVISION) }
@@ -102,18 +111,31 @@ class VectorStoreRevisionMigrationTest {
         )
         assertEquals(listOf("a-1"), store.getCurrentChunks().map { it.id })
 
-        // Switching model/encoder must not silently reuse the old vectors.
+        // Switching model/encoder must not silently score the old vectors.
         encoderId = "sha-b"
         assertTrue(
             "rows from another encoder must not be scored",
             store.search(floatArrayOf(1f, 0f, 0f), topK = 10, minScore = -1f).isEmpty(),
         )
         assertTrue("rows from another encoder must not be reported current", store.getCurrentChunks().isEmpty())
-        assertEquals("the incompatible row must be surfaced as stale", 1, store.countStaleChunks())
 
-        // Deleting stale rows reclaims it.
-        assertEquals(1, store.deleteStaleChunks())
-        assertEquals(0, store.countStaleChunks())
+        // Critically, another encoder's rows are NOT obsolete: deleting them would destroy the only
+        // stored copy of the document text and force a re-index just because a different model is
+        // loaded for a moment.
+        assertEquals("another encoder's rows must not be obsolete", 0, store.countObsoleteChunks())
+        assertEquals(0, store.deleteObsoleteChunks())
+        assertEquals("the row must still be stored", 1, store.countStoredChunks())
+        assertEquals(0, store.countSearchableChunks())
+        assertTrue(store.getAllChunks().any { it.id == "a-1" })
+
+        // Switching back re-enables retrieval without a re-index.
+        encoderId = "sha-a"
+        assertEquals(
+            "model A -> B -> A must preserve A's index",
+            listOf("a-1"),
+            store.search(floatArrayOf(1f, 0f, 0f), topK = 10, minScore = -1f).map { it.first.id },
+        )
+        assertEquals(1, store.countSearchableChunks())
     }
 
     @Test
@@ -137,7 +159,7 @@ class VectorStoreRevisionMigrationTest {
     }
 
     @Test
-    fun unknownEncoderFallsBackToRevisionInsteadOfReportingEverythingStale() {
+    fun rowsFromAnotherOrUnloadedEncoderAreNeverOfferedForDestructiveCleanup() {
         val store = VectorStore(context)
         // No provider set: identity is UNKNOWN, as when no model is loaded yet.
         store.insert(
@@ -150,17 +172,18 @@ class VectorStoreRevisionMigrationTest {
             )
         )
 
-        assertEquals(
-            "rows must not be hidden (or offered for destructive cleanup) merely because no model is loaded",
-            listOf("pre-model"),
-            store.getCurrentChunks().map { it.id },
-        )
-        assertEquals(0, store.countStaleChunks())
+        // The row is stored, and is never obsolete merely because no model is loaded.
+        assertEquals(1, store.countStoredChunks())
+        assertEquals(0, store.countObsoleteChunks())
+        assertEquals("nothing may be offered for destructive cleanup", 0, store.deleteObsoleteChunks())
 
-        // Once a real encoder is known, the same row is judged against it.
+        // Once a different real encoder is known, the row is not searchable, but it is still stored
+        // and still NOT obsolete: switching back to its encoder must recover it.
         store.setEmbeddingIdentityProvider { EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION) }
         assertTrue(store.getCurrentChunks().isEmpty())
-        assertEquals(1, store.countStaleChunks())
+        assertEquals("a different encoder's row is not obsolete", 0, store.countObsoleteChunks())
+        assertEquals(1, store.countStoredChunks())
+        assertTrue(store.getAllChunks().any { it.id == "pre-model" })
     }
 
     /**

@@ -1,7 +1,7 @@
 package com.prismai.llmhost.ui.rag
 
 import com.prismai.llmhost.storage.VectorChunk
-import com.prismai.llmhost.storage.VectorChunkSummary
+import com.prismai.llmhost.storage.VectorDocumentSummary
 import com.prismai.llmhost.ui.components.DashboardCard
 import com.prismai.llmhost.ui.components.InfoBadge
 import com.prismai.llmhost.ui.components.SectionHeader
@@ -32,7 +32,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,7 +49,7 @@ import java.util.Locale
 
 @Composable
 fun DocumentBrowser(
-    chunks: List<VectorChunkSummary>,
+    documents: List<VectorDocumentSummary>,
     staleChunkCount: Int,
     ingestStatus: String?,
     onIngestDocument: (id: String, title: String, text: String) -> Unit,
@@ -72,17 +71,13 @@ fun DocumentBrowser(
 
     var deleteTargetDocId by remember { mutableStateOf<String?>(null) }
 
-    // Group stored chunks by documentId
-    val docSummaryMap by remember(chunks) {
-        derivedStateOf {
-            chunks.groupBy { it.documentId }
-        }
-    }
+    val totalStoredChunks = documents.sumOf { it.storedChunkCount }
+    val searchableChunks = documents.sumOf { it.searchableChunkCount }
 
     DashboardCard(modifier = modifier) {
         SectionHeader(
             title = "Knowledge Base (RAG)",
-            subtitle = "${docSummaryMap.size} documents • ${chunks.size} vector chunks",
+            subtitle = "${documents.size} documents • $searchableChunks/$totalStoredChunks chunks searchable",
             action = {
                 Button(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
@@ -233,7 +228,7 @@ fun DocumentBrowser(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
-        if (docSummaryMap.isEmpty()) {
+        if (documents.isEmpty()) {
             Text(
                 text = "No documents ingested into knowledge base yet.",
                 style = MaterialTheme.typography.bodySmall,
@@ -245,13 +240,13 @@ fun DocumentBrowser(
                 modifier = Modifier.heightIn(max = 240.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                items(docSummaryMap.keys.toList(), key = { it }) { docId ->
-                    val docChunks = docSummaryMap[docId] ?: emptyList()
+                items(documents, key = { it.documentId }) { doc ->
                     DocumentSummaryRow(
-                        docId = docId,
-                        chunkCount = docChunks.size,
-                        previewText = docChunks.firstOrNull()?.text ?: "",
-                        onDelete = { deleteTargetDocId = docId },
+                        docId = doc.documentId,
+                        storedChunkCount = doc.storedChunkCount,
+                        searchableChunkCount = doc.searchableChunkCount,
+                        previewText = doc.previewText,
+                        onDelete = { deleteTargetDocId = doc.documentId },
                     )
                 }
             }
@@ -414,7 +409,8 @@ private fun VectorSearchResultRow(
 @Composable
 private fun DocumentSummaryRow(
     docId: String,
-    chunkCount: Int,
+    storedChunkCount: Int,
+    searchableChunkCount: Int,
     previewText: String,
     onDelete: () -> Unit,
 ) {
@@ -440,9 +436,17 @@ private fun DocumentSummaryRow(
                     overflow = TextOverflow.Ellipsis,
                 )
                 InfoBadge(
-                    text = "$chunkCount chunks",
+                    text = "$storedChunkCount chunks",
                     color = PrismCyan,
                 )
+                if (searchableChunkCount < storedChunkCount) {
+                    // Stored, but the currently loaded model is not the encoder that produced these
+                    // chunks. Not stale: switch back to that model to search them again.
+                    InfoBadge(
+                        text = "$searchableChunkCount searchable now",
+                        color = PrismSlate,
+                    )
+                }
             }
             if (previewText.isNotBlank()) {
                 Text(

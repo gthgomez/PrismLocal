@@ -229,7 +229,7 @@ fun ChatScreen(
                         val memories by (service?.memories ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
-                        val vectorChunks by (service?.vectorChunks ?: emptyFlow()).collectAsStateWithLifecycle(
+                        val vectorDocuments by (service?.vectorDocuments ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
                         val staleVectorChunkCount by (service?.staleVectorChunkCount ?: emptyFlow())
@@ -833,7 +833,7 @@ fun ChatScreen(
                                 dragHandle = { SheetDragHandle() },
                             ) {
                                 DocumentBrowser(
-                                    chunks = vectorChunks,
+                                    documents = vectorDocuments,
                                     staleChunkCount = staleVectorChunkCount,
                                     ingestStatus = ingestStatus,
                                     onDeleteStaleDocuments = { service?.deleteStaleVectorChunks() },

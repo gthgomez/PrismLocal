@@ -77,16 +77,30 @@ data class VectorChunk(
 }
 
 /**
- * Metadata-only projection of a stored chunk for list/retrieval views. It never carries the
- * embedding, so browsing documents does not materialize the whole vector table.
+ * Bounded, per-document projection for the document browser: counts plus one short preview. It
+ * never loads the whole vector table, so browsing a large knowledge base retains O(documents),
+ * not O(chunks), and never decodes an embedding BLOB.
+ *
+ * The two counts separate what is *stored* from what is *searchable*:
+ *  - [storedChunkCount] counts rows written at the current embedding revision, regardless of which
+ *    encoder produced them. These rows survive on disk across model switches.
+ *  - [searchableChunkCount] counts the subset [VectorStore.search] can return for the *currently
+ *    loaded* encoder. It is 0 when no encoder is loaded or when the stored rows belong to another
+ *    model.
+ *
+ * A document with fewer searchable chunks than stored ones is not stale and must not be offered for
+ * deletion: switching back to its encoder makes it searchable again.
  */
-data class VectorChunkSummary(
-    val id: String,
+data class VectorDocumentSummary(
     val documentId: String,
-    val chunkIndex: Int,
-    val text: String,
+    val storedChunkCount: Int,
+    val searchableChunkCount: Int,
+    val previewText: String,
     val createdAt: Long,
-)
+) {
+    /** True when the currently loaded encoder can score every stored chunk of this document. */
+    val fullySearchable: Boolean get() = storedChunkCount > 0 && searchableChunkCount == storedChunkCount
+}
 
 /**
  * Compatibility identity for stored embeddings.
@@ -129,12 +143,27 @@ interface VectorIndex {
     fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk>
 
     /**
-     * Atomically replace a document's rows with [chunks]: delete the existing
-     * rows and insert the new batch in a single transaction, so a concurrent
-     * [search] never observes the document missing and a failed insert cannot
-     * leave the previous index destroyed.
+     * The encoder identity that would stamp a row written right now. Callers snapshot this once
+     * before encoding a multi-chunk operation and pass the same snapshot to [replaceDocument], so
+     * every row is stamped with the encoder that actually produced its vector even if the loaded
+     * model changes while the operation is in flight.
      */
-    fun replaceDocument(documentId: String, chunks: List<VectorChunk>): List<VectorChunk>
+    fun currentEmbeddingIdentity(): EmbeddingIdentity
+
+    /**
+     * Atomically replace a document's rows with [chunks], stamping every row with [identity]:
+     * delete the existing rows and insert the new batch in a single transaction, so a concurrent
+     * [search] never observes the document missing and a failed insert cannot leave the previous
+     * index destroyed.
+     *
+     * [identity] must be the identity that produced the chunk vectors; the store does not re-read
+     * the live encoder here.
+     */
+    fun replaceDocument(
+        documentId: String,
+        chunks: List<VectorChunk>,
+        identity: EmbeddingIdentity,
+    ): List<VectorChunk>
     fun search(queryEmbedding: FloatArray, topK: Int = 5, minScore: Float = 0.0f): List<Pair<VectorChunk, Float>>
     fun deleteByDocument(documentId: String): Int
     fun documentCount(): Int
@@ -151,15 +180,16 @@ interface VectorIndex {
 /**
  * The subset of [VectorStore] that [KnowledgePackManager] depends on.
  *
- * [getAllChunks] is the maintenance read: it returns every row, including rows
- * written at an older [VectorStore.EMBEDDING_REVISION], so deletion can still
- * remove them. [getCurrentChunks] is the retrieval read: it never returns a row
- * that [search] would refuse to score.
+ * Both operations are bounded and avoid materializing embeddings or the full
+ * chunk table: [getDocumentSummaries] returns one row per stored document, and
+ * [deleteByDocumentPrefix] removes a pack's rows in a single targeted statement.
  */
 interface KnowledgePackChunkStore {
-    fun getAllChunks(): List<VectorChunk>
-    fun getCurrentChunks(): List<VectorChunk>
-    fun deleteByDocument(documentId: String): Int
+    /** One bounded summary per stored document at the current embedding revision. */
+    fun getDocumentSummaries(): List<VectorDocumentSummary>
+
+    /** Delete every row whose document id starts with [prefix]; returns rows removed. */
+    fun deleteByDocumentPrefix(prefix: String): Int
 }
 
 /**
@@ -189,32 +219,33 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     private fun currentIdentity(): EmbeddingIdentity = identityProvider()
 
+    override fun currentEmbeddingIdentity(): EmbeddingIdentity = currentIdentity()
+
     /**
-     * Selection for the retrieval view. When no encoder is loaded the current identity is
-     * [EmbeddingIdentity.UNKNOWN], so a row's encoder cannot be judged: fall back to the revision
-     * contract rather than reporting every stored document as stale (which would offer a destructive
-     * cleanup of still-valid vectors). Once a model is loaded the encoder identity is enforced.
+     * Selection for the retrieval view: rows [search] can score for the currently loaded encoder.
+     * Requires both the current revision and the current encoder token, so it never returns a row
+     * [search] would refuse; with no encoder loaded the token is [EmbeddingIdentity.UNKNOWN] and no
+     * real row matches.
      */
     private fun currentChunkSelection(): Pair<String, Array<String>> {
         val identity = currentIdentity()
         val revisionArg = EMBEDDING_REVISION.toString()
-        return if (identity.encoderId == EmbeddingIdentity.UNKNOWN_ENCODER) {
-            "$COL_EMBEDDING_REVISION = ?" to arrayOf(revisionArg)
-        } else {
-            "$COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ?" to arrayOf(revisionArg, identity.token)
-        }
+        return "$COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ?" to
+            arrayOf(revisionArg, identity.token)
     }
 
-    /** Selection for rows that [search] can no longer reach; see [currentChunkSelection]. */
-    private fun staleChunkSelection(): Pair<String, Array<String>> {
-        val identity = currentIdentity()
-        val revisionArg = EMBEDDING_REVISION.toString()
-        return if (identity.encoderId == EmbeddingIdentity.UNKNOWN_ENCODER) {
-            "$COL_EMBEDDING_REVISION != ?" to arrayOf(revisionArg)
-        } else {
-            "$COL_EMBEDDING_REVISION != ? OR $COL_ENCODER_IDENTITY != ?" to arrayOf(revisionArg, identity.token)
-        }
-    }
+    /**
+     * Selection for rows that are obsolete under EVERY encoder: an older embedding revision
+     * (algorithm/schema), unreachable by [search] no matter which model is loaded. These are the
+     * only rows the reclamation cleanup may delete.
+     *
+     * Rows that merely belong to a *different* encoder are deliberately NOT included. They are
+     * still valid; the currently loaded model simply cannot score them. Deleting them would destroy
+     * the only stored copy of a document's text and force a re-index just because the user switched
+     * models temporarily. Switching back to their encoder makes them searchable again.
+     */
+    private fun obsoleteChunkSelection(): Pair<String, Array<String>> =
+        "$COL_EMBEDDING_REVISION != ?" to arrayOf(EMBEDDING_REVISION.toString())
 
     /**
      * Insert a single chunk. Returns the chunk with its assigned id.
@@ -222,23 +253,26 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
     fun insert(chunk: VectorChunk): VectorChunk {
         lock.withLock {
             dbHelper.writableDatabase.insertWithOnConflict(
-                TABLE, null, toValues(chunk), SQLiteDatabase.CONFLICT_REPLACE
+                TABLE, null, toValues(chunk, currentIdentity()), SQLiteDatabase.CONFLICT_REPLACE
             )
             return chunk
         }
     }
 
     /**
-     * Insert multiple chunks in a single transaction.
+     * Insert multiple chunks in a single transaction, stamped with the live encoder identity at the
+     * time of the call. Multi-chunk ingest goes through [replaceDocument] with a caller-supplied
+     * identity snapshot instead, so this single-shot helper is only for tests/simple writes.
      */
     override fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk> {
         lock.withLock {
+            val identity = currentIdentity()
             val db = dbHelper.writableDatabase
             db.beginTransaction()
             try {
                 for (chunk in chunks) {
                     db.insertWithOnConflict(
-                        TABLE, null, toValues(chunk), SQLiteDatabase.CONFLICT_REPLACE
+                        TABLE, null, toValues(chunk, identity), SQLiteDatabase.CONFLICT_REPLACE
                     )
                 }
                 db.setTransactionSuccessful()
@@ -257,7 +291,11 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
      * failure before the transaction commits rolls back instead of destroying
      * the previously indexed rows.
      */
-    override fun replaceDocument(documentId: String, chunks: List<VectorChunk>): List<VectorChunk> {
+    override fun replaceDocument(
+        documentId: String,
+        chunks: List<VectorChunk>,
+        identity: EmbeddingIdentity,
+    ): List<VectorChunk> {
         lock.withLock {
             val db = dbHelper.writableDatabase
             db.beginTransaction()
@@ -265,7 +303,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                 db.delete(TABLE, "$COL_DOCUMENT_ID = ?", arrayOf(documentId))
                 for (chunk in chunks) {
                     db.insertWithOnConflict(
-                        TABLE, null, toValues(chunk), SQLiteDatabase.CONFLICT_REPLACE
+                        TABLE, null, toValues(chunk, identity), SQLiteDatabase.CONFLICT_REPLACE
                     )
                 }
                 db.setTransactionSuccessful()
@@ -273,6 +311,21 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                 db.endTransaction()
             }
             return chunks
+        }
+    }
+
+    /**
+     * Delete every row whose document id starts with [prefix] in a single statement. Used to remove
+     * a knowledge pack without materializing its rows; the prefix is matched by `substr` so `%`/`_`
+     * characters in a document id are treated literally.
+     */
+    override fun deleteByDocumentPrefix(prefix: String): Int {
+        lock.withLock {
+            return dbHelper.writableDatabase.delete(
+                TABLE,
+                "substr($COL_DOCUMENT_ID, 1, ?) = ?",
+                arrayOf(prefix.length.toString(), prefix),
+            )
         }
     }
 
@@ -402,7 +455,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
      *
      * Materializes the whole table, so prefer targeted queries.
      */
-    override fun getAllChunks(): List<VectorChunk> {
+    fun getAllChunks(): List<VectorChunk> {
         lock.withLock {
             val cursor = dbHelper.readableDatabase.query(
                 TABLE, null, null, null, null, null, "$COL_CREATED ASC"
@@ -416,7 +469,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
      * unreachable by [search] and must not be counted as indexed knowledge.
      * Unlike [getAllChunks], this is safe to use for retrieval or status decisions.
      */
-    override fun getCurrentChunks(): List<VectorChunk> {
+    fun getCurrentChunks(): List<VectorChunk> {
         lock.withLock {
             val (selection, args) = currentChunkSelection()
             val cursor = dbHelper.readableDatabase.query(
@@ -427,27 +480,43 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
     }
 
     /**
-     * Retrieval-view projection of the current chunks: metadata and text only, with the embedding
-     * BLOB never decoded. Use this for listing/browsing so the whole vector table is not retained
-     * in application memory.
+     * One bounded summary per stored document: the current-revision chunk count, how many of those
+     * the currently loaded encoder can score, and a short preview. A single grouped query with a
+     * correlated preview subquery keeps memory O(documents) rather than O(chunks) and never decodes
+     * an embedding BLOB, so browsing a large knowledge base cannot exhaust the heap.
      */
-    fun getCurrentChunkSummaries(): List<VectorChunkSummary> {
+    override fun getDocumentSummaries(): List<VectorDocumentSummary> {
         lock.withLock {
-            val (selection, args) = currentChunkSelection()
-            val columns = arrayOf(COL_ID, COL_DOCUMENT_ID, COL_CHUNK_INDEX, COL_TEXT, COL_CREATED)
-            val cursor = dbHelper.readableDatabase.query(
-                TABLE, columns, selection, args, null, null, "$COL_CREATED ASC"
+            val identity = currentIdentity()
+            val revisionArg = EMBEDDING_REVISION.toString()
+            val sql = """
+                SELECT o.$COL_DOCUMENT_ID AS document_id,
+                       COUNT(*) AS stored_count,
+                       SUM(CASE WHEN o.$COL_ENCODER_IDENTITY = ? THEN 1 ELSE 0 END) AS searchable_count,
+                       MIN(o.$COL_CREATED) AS first_created,
+                       (SELECT i.$COL_TEXT FROM $TABLE i
+                          WHERE i.$COL_DOCUMENT_ID = o.$COL_DOCUMENT_ID
+                            AND i.$COL_EMBEDDING_REVISION = ?
+                          ORDER BY i.$COL_CHUNK_INDEX ASC, i.$COL_CREATED ASC
+                          LIMIT 1) AS preview
+                FROM $TABLE o
+                WHERE o.$COL_EMBEDDING_REVISION = ?
+                GROUP BY o.$COL_DOCUMENT_ID
+                ORDER BY first_created ASC
+            """.trimIndent()
+            val cursor = dbHelper.readableDatabase.rawQuery(
+                sql, arrayOf(identity.token, revisionArg, revisionArg),
             )
             try {
-                val summaries = mutableListOf<VectorChunkSummary>()
+                val summaries = mutableListOf<VectorDocumentSummary>()
                 while (cursor.moveToNext()) {
                     summaries.add(
-                        VectorChunkSummary(
-                            id = cursor.getString(0),
-                            documentId = cursor.getString(1),
-                            chunkIndex = cursor.getInt(2),
-                            text = cursor.getString(3),
-                            createdAt = cursor.getLong(4),
+                        VectorDocumentSummary(
+                            documentId = cursor.getString(0),
+                            storedChunkCount = cursor.getInt(1),
+                            searchableChunkCount = cursor.getInt(2),
+                            previewText = (cursor.getString(4) ?: "").take(PREVIEW_MAX_CHARS),
+                            createdAt = cursor.getLong(3),
                         )
                     )
                 }
@@ -473,12 +542,40 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
     }
 
     /**
-     * Number of rows written by an older [EMBEDDING_REVISION]. Such rows are
-     * unreachable by [search] and can be reclaimed with [deleteStaleChunks].
+     * Number of rows written by an older [EMBEDDING_REVISION]: obsolete under every encoder and
+     * reclaimable with [deleteObsoleteChunks]. Rows belonging to a different but still valid encoder
+     * are NOT counted here.
      */
-    fun countStaleChunks(): Int {
+    fun countObsoleteChunks(): Int {
+        val (selection, args) = obsoleteChunkSelection()
+        return countRows(selection, args)
+    }
+
+    /**
+     * Delete rows written at an older [EMBEDDING_REVISION], which no encoder can reach. Rows that
+     * merely belong to a different (still valid) encoder are never touched, so this can never
+     * destroy a document's only stored text because a different model is loaded. Returns rows
+     * deleted.
+     */
+    fun deleteObsoleteChunks(): Int {
         lock.withLock {
-            val (selection, args) = staleChunkSelection()
+            val (selection, args) = obsoleteChunkSelection()
+            return dbHelper.writableDatabase.delete(TABLE, selection, args)
+        }
+    }
+
+    /** Rows at [EMBEDDING_REVISION], regardless of encoder: everything currently stored on disk. */
+    fun countStoredChunks(): Int =
+        countRows("$COL_EMBEDDING_REVISION = ?", arrayOf(EMBEDDING_REVISION.toString()))
+
+    /** Rows [search] can score for the currently loaded encoder. */
+    fun countSearchableChunks(): Int {
+        val (selection, args) = currentChunkSelection()
+        return countRows(selection, args)
+    }
+
+    private fun countRows(selection: String, args: Array<String>): Int {
+        lock.withLock {
             val cursor = dbHelper.readableDatabase.rawQuery(
                 "SELECT COUNT(*) FROM $TABLE WHERE $selection",
                 args,
@@ -489,17 +586,6 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
             } finally {
                 cursor.close()
             }
-        }
-    }
-
-    /**
-     * Delete rows written by an older [EMBEDDING_REVISION] or a different encoder
-     * identity, which [search] can no longer return. Returns the number of rows deleted.
-     */
-    fun deleteStaleChunks(): Int {
-        lock.withLock {
-            val (selection, args) = staleChunkSelection()
-            return dbHelper.writableDatabase.delete(TABLE, selection, args)
         }
     }
 
@@ -531,6 +617,9 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
         /** Width of the stored embedding, validated against the query width at score time. */
         const val COL_EMBEDDING_DIM = "embedding_dim"
         const val COL_CREATED = "created_at"
+
+        /** Max characters of a document's first chunk retained as a browser preview. */
+        const val PREVIEW_MAX_CHARS = 160
 
         /** True when a row written at [rowRevision] is comparable with this build. */
         fun isCurrentRevision(rowRevision: Int): Boolean = rowRevision == EMBEDDING_REVISION
@@ -636,14 +725,14 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     // ---- Value mapping ----
 
-    private fun toValues(chunk: VectorChunk): ContentValues = ContentValues(9).apply {
+    private fun toValues(chunk: VectorChunk, identity: EmbeddingIdentity): ContentValues = ContentValues(9).apply {
         put(COL_ID, chunk.id)
         put(COL_DOCUMENT_ID, chunk.documentId)
         put(COL_CHUNK_INDEX, chunk.chunkIndex)
         put(COL_TEXT, chunk.text)
         put(COL_EMBEDDING, floatArrayToBytes(chunk.embedding))
         put(COL_EMBEDDING_REVISION, EMBEDDING_REVISION)
-        put(COL_ENCODER_IDENTITY, currentIdentity().token)
+        put(COL_ENCODER_IDENTITY, identity.token)
         put(COL_EMBEDDING_DIM, chunk.embedding.size)
         put(COL_CREATED, chunk.createdAt)
     }

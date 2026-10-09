@@ -135,13 +135,15 @@ class ServiceUiState {
 
     // ── RAG / Vector Store ─────────────────────────────────────────────
 
-    // Metadata-only summaries: the document browser must not retain the whole embedding table.
-    internal val _vectorChunks = MutableStateFlow<List<com.prismai.llmhost.storage.VectorChunkSummary>>(emptyList())
-    val vectorChunks: StateFlow<List<com.prismai.llmhost.storage.VectorChunkSummary>> = _vectorChunks.asStateFlow()
+    // One bounded summary per stored document. The document browser must not retain every chunk's
+    // text, so it lists documents (counts + a short preview) rather than the whole chunk table.
+    internal val _vectorDocuments = MutableStateFlow<List<com.prismai.llmhost.storage.VectorDocumentSummary>>(emptyList())
+    val vectorDocuments: StateFlow<List<com.prismai.llmhost.storage.VectorDocumentSummary>> = _vectorDocuments.asStateFlow()
 
-    // Rows written by an older embedding revision. They are unreachable by
-    // search() but remain on disk until the user runs cleanup; exposing the
-    // count lets the UI offer that cleanup.
+    // Rows written by an older embedding revision — obsolete under every encoder. They are
+    // unreachable by search() but remain on disk until the user runs cleanup; exposing the count
+    // lets the UI offer that cleanup. Rows belonging to a different but valid encoder are NOT
+    // counted here and are never offered for deletion.
     internal val _staleVectorChunkCount = MutableStateFlow(0)
     val staleVectorChunkCount: StateFlow<Int> = _staleVectorChunkCount.asStateFlow()
 

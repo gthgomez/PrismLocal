@@ -54,7 +54,7 @@ data class GrokipediaSearchResult(
  *   2. Meta tag extraction (description, keywords)
  *   3. Raw text fallback if all strategies fail
  */
-class GrokipediaClient(
+open class GrokipediaClient(
     private val connectTimeoutMs: Int = 10_000,
     private val readTimeoutMs: Int = 30_000,
 ) {
@@ -102,7 +102,7 @@ class GrokipediaClient(
      * @param slug article slug (e.g., "artificial-intelligence")
      * @return parsed [GrokipediaArticle] or null if the page cannot be fetched/parsed
      */
-    suspend fun fetchArticle(slug: String): GrokipediaArticle? = withContext(Dispatchers.IO) {
+    open suspend fun fetchArticle(slug: String): GrokipediaArticle? = withContext(Dispatchers.IO) {
         if (slug.isBlank()) return@withContext null
         runCatching {
             val safeSlug = slug.trim().lowercase()

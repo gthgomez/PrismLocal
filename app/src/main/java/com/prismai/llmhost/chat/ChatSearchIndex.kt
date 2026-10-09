@@ -56,6 +56,13 @@ class ChatSearchIndex {
         index[chatId] = haystack.lowercase(Locale.US)
     }
 
+    /**
+     * Evict a chat from the search index.
+     */
+    fun remove(chatId: String) {
+        index.remove(chatId)
+    }
+
     // ── Accessors ────────────────────────────────────────────────────────
 
     /** Returns the raw lowercased haystack for a chat, or null if not indexed. */

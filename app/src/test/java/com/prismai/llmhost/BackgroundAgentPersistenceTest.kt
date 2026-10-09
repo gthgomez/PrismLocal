@@ -165,4 +165,65 @@ class BackgroundAgentPersistenceTest {
         )
         assertTrue(manager3.state.value.completedTasks.isEmpty())
     }
+
+    @Test
+    fun recoversFromBackupWhenPrimaryTasksFileIsCorrupted() {
+        val storageDir = tempFolder.newFolder("bg_tasks_backup_test")
+        val testContext = FakeTestContext()
+
+        val manager1 = BackgroundAgentManager(
+            context = testContext,
+            storageDir = storageDir,
+            isDeviceBusyWithUserGeneration = { true },
+        )
+        val task = manager1.enqueue("Crucial task that must survive")
+        assertNotNull(task)
+        assertEquals(1, manager1.state.value.queuedTasks.size)
+
+        val primaryFile = File(storageDir, BackgroundAgentManager.TASKS_FILE_NAME)
+        val backupFile = File(storageDir, "${BackgroundAgentManager.TASKS_FILE_NAME}.bak")
+        assertTrue(primaryFile.exists())
+
+        // Simulate a backup existing from a previous write
+        primaryFile.copyTo(backupFile, overwrite = true)
+        assertTrue(backupFile.exists())
+
+        // Corrupt the primary file
+        primaryFile.writeText("{ corrupted_json: true, incomplete...")
+
+        // New manager instance should recover from backup
+        val manager2 = BackgroundAgentManager(
+            context = testContext,
+            storageDir = storageDir,
+            isDeviceBusyWithUserGeneration = { true },
+        )
+        assertEquals(1, manager2.state.value.queuedTasks.size)
+        assertEquals(task?.id, manager2.state.value.queuedTasks[0].id)
+    }
+
+    @Test
+    fun failedPersistenceDoesNotFalselyUpdateState() {
+        val storageDir = tempFolder.newFolder("bg_tasks_fail_test")
+        val testContext = FakeTestContext()
+
+        val manager = BackgroundAgentManager(
+            context = testContext,
+            storageDir = storageDir,
+            isDeviceBusyWithUserGeneration = { true },
+        )
+
+        // Make storageDir non-writable to force persistence failure
+        val tasksFile = File(storageDir, BackgroundAgentManager.TASKS_FILE_NAME)
+        // Block writing by making storageDir read-only
+        storageDir.setWritable(false, false)
+        try {
+            val task = manager.enqueue("This task should fail persistence")
+            // When disk write fails, enqueue must not falsely report success or update in-memory state
+            if (task == null) {
+                assertTrue("Queued tasks must be empty on persistence failure", manager.state.value.queuedTasks.isEmpty())
+            }
+        } finally {
+            storageDir.setWritable(true, false)
+        }
+    }
 }

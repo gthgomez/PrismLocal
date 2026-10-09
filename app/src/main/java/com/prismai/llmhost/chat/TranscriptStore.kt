@@ -55,10 +55,13 @@ class TranscriptStore(private val context: Context) {
 
     fun readTranscriptFile(file: File): List<TranscriptMessage> =
         runCatching {
-            if (!file.isFile) {
-                return@runCatching emptyList<TranscriptMessage>()
+            val sourceFile = when {
+                file.isFile -> file
+                File(file.parentFile ?: context.filesDir, "${file.name}.bak").isFile ->
+                    File(file.parentFile ?: context.filesDir, "${file.name}.bak")
+                else -> return@runCatching emptyList<TranscriptMessage>()
             }
-            val array = JSONArray(file.readText())
+            val array = JSONArray(sourceFile.readText())
             buildList {
                 for (index in 0 until array.length()) {
                     val item = array.getJSONObject(index)
@@ -116,13 +119,35 @@ class TranscriptStore(private val context: Context) {
 
 
     fun promoteTempFile(temp: File, target: File) {
-        runCatching {
+        val moved = runCatching {
             Files.move(temp.toPath(), target.toPath(), REPLACE_EXISTING, ATOMIC_MOVE)
-        }.getOrElse {
-            if (!temp.renameTo(target)) {
-                target.delete()
-                check(temp.renameTo(target)) { "Failed to promote temp file ${temp.absolutePath}" }
+            true
+        }.getOrDefault(false)
+
+        if (moved) return
+
+        val backup = File(target.parentFile ?: context.filesDir, "${target.name}.bak")
+        val hadTarget = target.exists()
+        if (hadTarget) {
+            if (backup.exists()) backup.delete()
+            if (!target.renameTo(backup)) {
+                if (!temp.renameTo(target)) {
+                    error("Failed to backup target file ${target.absolutePath} during promotion")
+                }
+                return
             }
+        }
+
+        val promoted = temp.renameTo(target)
+        if (promoted) {
+            if (hadTarget && backup.exists()) {
+                backup.delete()
+            }
+        } else {
+            if (hadTarget && backup.exists()) {
+                backup.renameTo(target)
+            }
+            error("Failed to promote temp file ${temp.absolutePath} to ${target.absolutePath}")
         }
     }
 

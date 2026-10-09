@@ -2168,8 +2168,12 @@ std::vector<float> Engine::encode(const std::string& text) {
     // forcing non-causal attention through a causal decoder graph.
     //
     // The KV cache is irrelevant here and reusing it would leak prompt-cache
-    // state between unrelated documents, so clear it first (embedding.cpp:41).
-    llama_memory_clear(llama_get_memory(runtime->ctx), true);
+    // state between unrelated documents, so reset the runtime context first
+    // (embedding.cpp:41). A bare memory_clear would leave current_position,
+    // active_tokens, system_prefix_length and the conversation validity pointing
+    // at the pre-encode sequence, so the next chat turn's prefix-cache path could
+    // reuse the overwritten positions.
+    resetRuntimeContext(*runtime, false);
     llama_set_embeddings(runtime->ctx, true);
 
     // Pooled models write sequence vectors to embd_seq, not embd.data, so the
@@ -2223,7 +2227,7 @@ std::vector<float> Engine::encode(const std::string& text) {
     // pooling_type == NONE is the only branch implemented: for pooled models
     // upstream reads llama_get_embeddings_seq, and mean-pooling an already-pooled
     // vector would be wrong, so those return empty and PR 2 surfaces the reason.
-    const int32_t n_embd = llama_model_n_embd(runtime->model);
+    const int32_t n_embd = llama_model_n_embd_out(runtime->model);
     std::vector<float> result(static_cast<size_t>(n_embd), 0.0f);
     int32_t pooled = 0;
     for (int32_t t = 0; t < actual; t++) {

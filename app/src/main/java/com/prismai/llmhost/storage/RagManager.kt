@@ -118,7 +118,13 @@ class RagManager(
             }
 
             if (vectorChunks.isNotEmpty()) {
-                vectorStore.insertBatch(vectorChunks)
+                // Replace rather than mix: a re-ingest must not leave the
+                // document's previous rows (e.g. an older chunking or embedding
+                // revision) alongside the new batch. The delete+insert is one
+                // transaction inside the store, so a concurrent search never
+                // sees the document missing and a failed insert cannot lose the
+                // previous index.
+                vectorStore.replaceDocument(documentId, vectorChunks)
             }
 
             val stored = vectorChunks.size

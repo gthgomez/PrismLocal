@@ -45,11 +45,12 @@ them.
   SQLite behavior is only verified on a device/emulator.
 - **Real-model smoke fixtures are not in the tracked tree.** The tiny GGUF the
   smoke test requires is not committed, so `RealInferenceSmokeTest` cannot pass
-  in CI even after its terminal assertion was corrected. The strict
-  `MAX_TOKENS` assertion still assumes the first sampled token is not an EOG
-  token; a model that emits EOG immediately would legitimately report `EOF`, so
-  the always-true invariants (a terminal chunk, with a known reason) are the
-  durable part of that fix.
+  in CI even after its terminal assertion was corrected. The strict `MAX_TOKENS`
+  assertion is sound: the test asserts `tokenCount >= 1` before the terminal
+  assertion, so the `maxTokens = 1` budget is consumed and the engine reports
+  `MAX_TOKENS`. A budget-limited run therefore cannot emit `EOF`, and
+  `MAX_TOKENS` is guaranteed; the always-true invariants (a terminal chunk with
+  a known reason) remain the durable part of that fix.
 
 ## Not proven anywhere in CI
 
@@ -73,6 +74,17 @@ them.
 - The real-model smoke fixtures remain unsupplied. Adding them requires
   committing a model binary or fetching it in CI, which has licensing and
   reproducibility implications that are out of scope for a reliability sprint.
+
+## Review-fix follow-up (this branch)
+
+This branch is a review-fix follow-up on top of the merged wave-1 integration.
+Its changes — off-main chat pre-flight, saveable per-chat drafts, RAG stale
+chunk removal, voice recognizer lifecycle handling, and AI-report failure
+logging — are **pending CI and device verification**, not proven by this
+document. They are covered by JVM unit tests where the logic is testable and by
+compilation elsewhere, but no CI run or qualified-device pass has confirmed
+them yet. Treat the claims above as the baseline this branch builds on, not as
+evidence for these changes.
 
 ## Release gate
 

@@ -1,5 +1,6 @@
 package com.prismai.llmhost.model
 
+import android.util.Log
 import kotlinx.coroutines.CancellationException
 
 /**
@@ -12,11 +13,25 @@ import kotlinx.coroutines.CancellationException
  */
 class SequentialImportQueue(private val importOne: suspend (String) -> Unit) {
 
+    private companion object {
+        const val TAG = "SequentialImportQueue"
+    }
+
     private val pending = mutableListOf<String>()
 
     @Synchronized
     fun enqueueAll(uris: List<String>) {
         pending += uris
+    }
+
+    /** True when nothing is queued. Used by the drain loop under its lock. */
+    @Synchronized
+    fun isEmpty(): Boolean = pending.isEmpty()
+
+    /** Discard everything queued. Used by cancelImport() so cancelled files cannot import later. */
+    @Synchronized
+    fun clear() {
+        pending.clear()
     }
 
     /**
@@ -33,7 +48,9 @@ class SequentialImportQueue(private val importOne: suspend (String) -> Unit) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
-                // Continue past ordinary import failures.
+                // Continue past ordinary import failures, but record them:
+                // silently swallowing a programming error hides broken imports.
+                Log.w(TAG, "import failed for $next", e)
             }
         }
     }

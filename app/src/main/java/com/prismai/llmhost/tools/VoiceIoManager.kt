@@ -75,6 +75,14 @@ class VoiceIoManager(private val context: Context) {
             return true
         }
 
+        // Replace, never orphan: an existing recognizer must be destroyed before
+        // a new one takes its place, otherwise it leaks and a late callback from
+        // it could destroy the new instance.
+        speechRecognizer?.let { existing ->
+            runCatching { existing.destroy() }
+            if (speechRecognizer === existing) speechRecognizer = null
+        }
+
         val recognizer: SpeechRecognizer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
                 ?: SpeechRecognizer.createSpeechRecognizer(context)
@@ -84,7 +92,7 @@ class VoiceIoManager(private val context: Context) {
         }
 
         speechRecognizer = recognizer
-        recognizerLifecycle.onRecognizerCreated()
+        recognizerLifecycle.onRecognizerCreated(recognizer)
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
                 Log.d(TAG, "onReadyForSpeech")
@@ -95,6 +103,9 @@ class VoiceIoManager(private val context: Context) {
             }
 
             override fun onRmsChanged(rmsdB: Float) {
+                // A superseded recognizer may still deliver callbacks after a
+                // restart; drop them so its RMS cannot drive the new session.
+                if (speechRecognizer !== recognizer) return
                 mainHandler.post { onRmsDbChanged?.invoke(rmsdB) }
             }
 
@@ -103,13 +114,15 @@ class VoiceIoManager(private val context: Context) {
             }
 
             override fun onEndOfSpeech() {
+                if (speechRecognizer !== recognizer) return
                 Log.d(TAG, "onEndOfSpeech")
                 isListening = false
             }
 
             override fun onError(error: Int) {
+                if (speechRecognizer !== recognizer) return
                 isListening = false
-                releaseRecognizer()
+                releaseRecognizer(recognizer)
                 val errorMessage = when (error) {
                     SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
                     SpeechRecognizer.ERROR_CLIENT -> "Client-side error"
@@ -130,8 +143,9 @@ class VoiceIoManager(private val context: Context) {
             }
 
             override fun onResults(results: Bundle?) {
+                if (speechRecognizer !== recognizer) return
                 isListening = false
-                releaseRecognizer()
+                releaseRecognizer(recognizer)
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val text = matches?.firstOrNull()
                 if (text != null) {
@@ -142,6 +156,9 @@ class VoiceIoManager(private val context: Context) {
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
+                // A superseded recognizer may still deliver partial text after a
+                // restart; drop it so stale words cannot overwrite the new UI.
+                if (speechRecognizer !== recognizer) return
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val text = matches?.firstOrNull()
                 if (text != null) {
@@ -176,16 +193,23 @@ class VoiceIoManager(private val context: Context) {
         if (!isListening) return
         isListening = false
         speechRecognizer?.stopListening()
-        releaseRecognizer()
+        releaseRecognizer(speechRecognizer)
         Log.d(TAG, "stopListening")
     }
 
-    /** Release the recognizer. Safe to call repeatedly and when none is held. */
-    internal fun releaseRecognizer() {
-        if (!recognizerLifecycle.isCreated) return
-        runCatching { speechRecognizer?.destroy() }
-        speechRecognizer = null
-        recognizerLifecycle.shutdown()
+    /**
+     * Release a specific recognizer. Safe to call repeatedly and when none is
+     * held. Only clears the shared field when it still points at [recognizer],
+     * so a late callback from a superseded instance cannot release the current
+     * one.
+     */
+    internal fun releaseRecognizer(recognizer: SpeechRecognizer?) {
+        if (recognizer == null) return
+        runCatching { recognizer.destroy() }
+        if (speechRecognizer === recognizer) {
+            speechRecognizer = null
+            recognizerLifecycle.shutdown()
+        }
     }
 
     /** Speak text aloud. Returns false if TTS unavailable. */
@@ -254,7 +278,7 @@ class VoiceIoManager(private val context: Context) {
     /** Shutdown and release resources */
     fun shutdown() {
         stopListening()
-        releaseRecognizer()
+        releaseRecognizer(speechRecognizer)
         stopSpeaking()
         tts?.shutdown()
         tts = null

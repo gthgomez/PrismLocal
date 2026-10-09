@@ -50,11 +50,13 @@ import java.util.Locale
 @Composable
 fun DocumentBrowser(
     chunks: List<VectorChunk>,
+    staleChunkCount: Int,
     ingestStatus: String?,
     onIngestDocument: (id: String, title: String, text: String) -> Unit,
     onDeleteDocument: (documentId: String) -> Unit,
     onQueryVectorStore: suspend (query: String) -> List<Pair<VectorChunk, Float>>,
     onRefresh: () -> Unit,
+    onDeleteStaleDocuments: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val coroutineScope = rememberCoroutineScope()
@@ -98,6 +100,47 @@ fun DocumentBrowser(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(vertical = 2.dp),
             )
+        }
+
+        // ── Stale Revision Banner ──
+        // Chunks indexed by an older embedding revision are filtered out of
+        // search, so they are invisible in the list above. Without this the user
+        // had no way to reclaim their storage.
+        if (staleChunkCount > 0) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp),
+                color = PrismAmber.copy(alpha = 0.12f),
+                border = androidx.compose.foundation.BorderStroke(
+                    1.dp,
+                    PrismAmber.copy(alpha = 0.4f),
+                ),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        text = "$staleChunkCount stale vector chunk(s) were indexed by an older " +
+                            "app version and can no longer be searched",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = onDeleteStaleDocuments,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) {
+                        Text(
+                            text = "Remove",
+                            color = PrismAmber,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                }
+            }
         }
 
         // ── Semantic Search Tester ──

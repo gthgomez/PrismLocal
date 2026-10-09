@@ -7,6 +7,7 @@ import com.prismai.llmhost.tools.*
 import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
+import android.util.Log
 import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
@@ -51,6 +52,8 @@ import com.prismai.llmhost.ui.components.InfinityLoadingIndicator
 import com.prismai.llmhost.ui.theme.*
 import com.prismai.llmhost.ui.formatTokensPerSecond
 
+private const val TAG = "MessageItem"
+
 @Composable
 internal fun MessageBubble(
     label: String,
@@ -86,7 +89,7 @@ internal fun MessageBubble(
                         reason = reason,
                         excerpt = text.take(500),
                     )
-                }
+                }.onFailure { Log.w(TAG, "AI-content report failed to persist", it) }
             }
         )
     }

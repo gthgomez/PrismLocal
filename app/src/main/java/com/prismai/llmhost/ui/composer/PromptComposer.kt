@@ -73,6 +73,7 @@ internal fun PromptComposer(
     enabled: Boolean,
     hasModel: Boolean,
     isGenerating: Boolean,
+    isSending: Boolean = false,
     performance: GenerationPerformance?,
     attachments: List<PromptAttachment>,
     isShortHeight: Boolean,
@@ -137,12 +138,14 @@ internal fun PromptComposer(
                     val hasAttachments = attachments.isNotEmpty()
                     ComposerIconButton(
                         action = if (!hasPrompt && canContinue) ComposerAction.More else ComposerAction.Send,
-                        enabled = enabled && (hasPrompt || hasAttachments || canContinue),
+                        enabled = enabled && !isSending && (hasPrompt || hasAttachments || canContinue),
                         onClick = {
-                            if (hasPrompt || hasAttachments) {
-                                onSend()
-                            } else {
-                                onContinue()
+                            if (!isSending) {
+                                if (hasPrompt || hasAttachments) {
+                                    onSend()
+                                } else {
+                                    onContinue()
+                                }
                             }
                         },
                     )

@@ -152,4 +152,81 @@ class DraftStoreTest {
 
         assertEquals("no chat yet", restored.snapshotFor(null).first)
     }
+
+    @Test
+    fun largeAttachmentTextAcrossManyChatsIsStrictlyBoundedInSavedState() {
+        DraftPayloadStore.resetForTesting()
+        val store = DraftStore("chat_0")
+        val longText = "A".repeat(16_000)
+
+        // 10 chats with 6 attachments each = 60 attachments with ~960 KB total text
+        for (chatIdx in 0 until 10) {
+            val chatId = "chat_$chatIdx"
+            val attachments = (1..6).map { attIdx ->
+                PromptAttachment(
+                    uriString = "content://media/$chatId/att_$attIdx",
+                    name = "doc_$attIdx.txt",
+                    mimeType = "text/plain",
+                    sizeBytes = 16_000L,
+                    extractionStatus = AttachmentExtractionStatus.EXTRACTED,
+                    promptText = "$longText-$chatId-$attIdx",
+                )
+            }
+            store.restore(chatId, "draft for $chatId", attachments)
+        }
+
+        val encodedState = store.encodeState()
+        // Without payload offloading, this JSON was > 1 MB, crashing Android binder transaction limits.
+        // With DraftPayloadStore offloading, the bundle JSON payload is strictly bounded (< 30 KB).
+        assertTrue(
+            "Serialized bundle state must be strictly bounded (< 40,000 chars), was ${encodedState.length}",
+            encodedState.length < 40_000,
+        )
+
+        // Decode restores all drafts with their full 16,000-char prompt text
+        val restored = DraftStore.decodeState(encodedState)
+        for (chatIdx in 0 until 10) {
+            val chatId = "chat_$chatIdx"
+            val (text, atts) = restored.snapshotFor(chatId)
+            assertEquals("draft for $chatId", text)
+            assertEquals(6, atts.size)
+            assertEquals("$longText-$chatId-1", atts[0].promptText)
+            assertEquals("$longText-$chatId-6", atts[5].promptText)
+        }
+    }
+
+    @Test
+    fun addAttachmentsToInactiveChatDoesNotModifyActiveChat() {
+        val store = DraftStore("chat_a")
+        store.attachments = listOf(attachment("a.txt"))
+
+        val incomingAttachment = attachment("b.txt")
+        store.addAttachments("chat_b", listOf(incomingAttachment))
+
+        // Active chat a remains unchanged
+        assertEquals(1, store.attachments.size)
+        assertEquals("content://x/a.txt", store.attachments.single().uriString)
+
+        // Target chat b draft received the attachment
+        val (textB, attsB) = store.snapshotFor("chat_b")
+        assertEquals(1, attsB.size)
+        assertEquals("content://x/b.txt", attsB.single().uriString)
+    }
+
+    @Test
+    fun clearIfMatchesOnlyClearsWhenPromptMatchesOriginatingDraft() {
+        val store = DraftStore("chat_a")
+        store.text = "sent prompt"
+        val atts = listOf(attachment("a.txt"))
+        store.attachments = atts
+
+        // Mismatched prompt (e.g. user typed new text while send was in flight) does not clear
+        store.clearIfMatches("chat_a", "different prompt", atts)
+        assertEquals("sent prompt", store.text)
+
+        // Matching prompt clears active draft
+        store.clearIfMatches("chat_a", "sent prompt", atts)
+        assertEquals("", store.text)
+        assertTrue(store.attachments.isEmpty())
+    }
 }

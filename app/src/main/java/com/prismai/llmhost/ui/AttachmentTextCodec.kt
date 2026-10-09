@@ -14,25 +14,39 @@ import org.json.JSONObject
  * and a corrupt entry must be dropped, never crash composition.
  */
 object AttachmentTextCodec {
+    const val MAX_BUNDLE_TEXT_CHARS = 256
 
-    fun encode(attachment: PromptAttachment): String = JSONObject().apply {
-        put("uriString", attachment.uriString)
-        put("name", attachment.name)
-        put("mimeType", attachment.mimeType ?: JSONObject.NULL)
-        put("sizeBytes", attachment.sizeBytes ?: JSONObject.NULL)
-        put("extractionStatus", attachment.extractionStatus.name)
-        put("promptText", attachment.promptText)
-    }.toString()
+    fun encode(attachment: PromptAttachment): String {
+        if (attachment.promptText.isNotEmpty()) {
+            DraftPayloadStore.put(attachment.uriString, attachment.promptText)
+        }
+        val isOffloaded = attachment.promptText.length > MAX_BUNDLE_TEXT_CHARS
+        return JSONObject().apply {
+            put("uriString", attachment.uriString)
+            put("name", attachment.name)
+            put("mimeType", attachment.mimeType ?: JSONObject.NULL)
+            put("sizeBytes", attachment.sizeBytes ?: JSONObject.NULL)
+            put("extractionStatus", attachment.extractionStatus.name)
+            put("hasDurablePayload", isOffloaded)
+            put("promptText", if (isOffloaded) attachment.promptText.take(MAX_BUNDLE_TEXT_CHARS) else attachment.promptText)
+        }.toString()
+    }
 
     fun decode(encoded: String): PromptAttachment? = runCatching {
         val json = JSONObject(encoded)
+        val uriString = json.getString("uriString")
+        val durableText = if (json.optBoolean("hasDurablePayload", false)) {
+            DraftPayloadStore.get(uriString) ?: json.optString("promptText", "")
+        } else {
+            DraftPayloadStore.get(uriString) ?: json.optString("promptText", "")
+        }
         PromptAttachment(
-            uriString = json.getString("uriString"),
+            uriString = uriString,
             name = json.getString("name"),
             mimeType = if (json.isNull("mimeType")) null else json.getString("mimeType"),
             sizeBytes = if (json.isNull("sizeBytes")) null else json.getLong("sizeBytes"),
             extractionStatus = AttachmentExtractionStatus.valueOf(json.getString("extractionStatus")),
-            promptText = json.getString("promptText"),
+            promptText = durableText,
         )
     }.getOrNull()
 }

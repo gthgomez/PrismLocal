@@ -150,6 +150,7 @@ class InferenceService : Service() {
     // defensive double-destroy). destroySafely() is itself idempotent, but this
     // avoids enqueuing redundant cancellation work.
     private val teardownStarted = AtomicBoolean(false)
+    private val inFlightSendTokens = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val modelEpoch = java.util.concurrent.atomic.AtomicLong(1L)
 
     // Single owner of the native memory-pressure level. Writes are funneled
@@ -1127,6 +1128,8 @@ class InferenceService : Service() {
         prompt: String,
         benchmarkPreset: BenchmarkPreset? = null,
         preserveBenchmarkQueue: Boolean = false,
+        sourceChatId: String? = null,
+        sendToken: String? = null,
         onAccepted: (() -> Unit)? = null,
         onRefused: ((String) -> Unit)? = null,
     ) {
@@ -1135,6 +1138,8 @@ class InferenceService : Service() {
                 prompt = prompt,
                 benchmarkPreset = benchmarkPreset,
                 preserveBenchmarkQueue = preserveBenchmarkQueue,
+                    sourceChatId = sourceChatId,
+                    sendToken = sendToken,
                 onAccepted = onAccepted,
                 onRefused = onRefused,
             )
@@ -1154,9 +1159,14 @@ class InferenceService : Service() {
         initiatedByBackground: Boolean = false,
         sourceChatId: String? = null,
         backgroundTaskId: String? = null,
+        sendToken: String? = null,
         onAccepted: (() -> Unit)? = null,
         onRefused: ((String) -> Unit)? = null,
     ): String {
+        if (sendToken != null && !inFlightSendTokens.add(sendToken)) {
+            return refuseSend(onRefused, "Duplicate send in flight")
+        }
+        try {
         if (confirmedChatTransitionChain.get() != null) {
             if (initiatedByBackground) throw BackgroundTaskDeferredException()
             return refuseSend(onRefused, "Chat transition in progress")
@@ -1188,6 +1198,12 @@ class InferenceService : Service() {
             }
             val startGateReserved = true
             try {
+                val acceptance = generationOrchestrator.evaluateSendAcceptance(prompt, benchmarkPreset)
+                if (!acceptance.accepted) {
+                    val reason = acceptance.reason ?: "Generation was refused"
+                    publishUiEvent(reason)
+                    return refuseSend(onRefused, reason)
+                }
                 if (initiatedByBackground) {
                     val prepared = serviceGenerationOwnership.prepareBackgroundChat(
                         taskId = backgroundTaskId,
@@ -1306,6 +1322,9 @@ class InferenceService : Service() {
                     }
                 }
             }
+        }
+        } finally {
+            sendToken?.let { inFlightSendTokens.remove(it) }
         }
     }
 

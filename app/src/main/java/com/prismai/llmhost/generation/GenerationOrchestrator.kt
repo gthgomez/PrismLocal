@@ -182,6 +182,28 @@ class GenerationOrchestrator(
 
     fun takeLaunchResult(): GenerationLaunch = launchResult.getAndSet(GenerationLaunch.REFUSED)
 
+    fun evaluateSendAcceptance(
+        prompt: String,
+        benchmarkPreset: BenchmarkPreset? = null,
+    ): SendAcceptance.Result {
+        val baseSettings = uiState.generationSettings.value.clamped()
+        if (benchmarkPreset == null && baseSettings.agentEnabled && uiState.currentModel.value != null) {
+            val directToolCall = agentToolRouter.directToolCall(prompt)
+            if (directToolCall != null) {
+                return SendAcceptance.Result(true, null)
+            }
+        }
+        val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
+        val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
+        return SendAcceptance.forChat(
+            currentModel = uiState.currentModel.value,
+            settings = settings,
+            prompt = prompt,
+            memoryContext = memoryContext,
+            enforceBudget = benchmarkPreset == null,
+        )
+    }
+
     suspend fun generate(
         prompt: String,
         benchmarkPreset: BenchmarkPreset? = null,
@@ -195,11 +217,9 @@ class GenerationOrchestrator(
             if (directToolCall != null) {
                 chatManager.appendTranscriptMessage(TranscriptRole.USER, prompt)
                 val chainId = agentTrace.beginChain(prompt)
+                launchResult.set(GenerationLaunch.HANDLED)
                 agentToolRouter.activeAgentToolHistory.clear()
                 agentToolRouter.handleToolCall(directToolCall, prompt, depth = 0, chainId = chainId)
-                if (agentTrace.isCurrentChain(chainId)) {
-                    launchResult.set(GenerationLaunch.HANDLED)
-                }
                 return
             }
         }
@@ -212,13 +232,7 @@ class GenerationOrchestrator(
         val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
         val agentEnabled = settings.agentEnabled
         val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
-        val acceptance = SendAcceptance.forChat(
-            currentModel = uiState.currentModel.value,
-            settings = settings,
-            prompt = prompt,
-            memoryContext = memoryContext,
-            enforceBudget = benchmarkPreset == null,
-        )
+        val acceptance = evaluateSendAcceptance(prompt, benchmarkPreset)
         if (!acceptance.accepted) {
             eventBus.publish(acceptance.reason ?: "Request refused")
             return

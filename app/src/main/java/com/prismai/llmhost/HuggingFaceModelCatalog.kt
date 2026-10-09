@@ -1,4 +1,5 @@
 package com.prismai.llmhost
+import android.content.Context
 import com.prismai.llmhost.*
 import com.prismai.llmhost.bridge.*
 import com.prismai.llmhost.service.*
@@ -57,7 +58,12 @@ sealed class ModelDownloadState {
         val entryName: String,
         val integrityVerified: Boolean = true,
     ) : ModelDownloadState()
-    data class Failure(val entryName: String, val message: String) : ModelDownloadState()
+    data class Failure(
+        /** Catalog id of the model that failed. Nullable only for legacy states. */
+        val entryId: String?,
+        val entryName: String,
+        val message: String,
+    ) : ModelDownloadState()
     data object Cancelled : ModelDownloadState()
 }
 
@@ -380,15 +386,33 @@ object HuggingFaceModelCatalog {
         ),
     )
 
-    private val customEntries = mutableMapOf<String, HuggingFaceModelEntry>()
+    /**
+     * Durable custom-entry storage. Defaults to a non-durable in-memory backend so pure-JVM
+     * callers never touch the Android framework before [initialize] wires SharedPreferences.
+     * Production calls [initialize] from the service and the download worker.
+     */
+    @Volatile
+    private var customStore: CustomEntryStore = CustomEntryStore(CustomEntryStore.inMemoryBackend())
 
-    fun find(id: String): HuggingFaceModelEntry? = entries.firstOrNull { it.id == id } ?: customEntries[id]
+    /**
+     * Wires durable SharedPreferences storage and is safe to call repeatedly. Must run before
+     * [find]/[createCustomEntry] are used on a thread whose process may not have run
+     * [com.prismai.llmhost.service.InferenceService.onCreate] (e.g. a WorkManager restart).
+     */
+    fun initialize(context: Context) {
+        customStore = CustomEntryStore.forContext(context.applicationContext)
+    }
 
-    fun createCustomEntry(repoId: String, fileName: String): HuggingFaceModelEntry {
+    fun find(id: String): HuggingFaceModelEntry? =
+        entries.firstOrNull { it.id == id } ?: customStore.find(id)
+
+    /** Pure builder; does not persist. Call [createCustomEntry] to persist. */
+    fun buildCustomEntry(repoId: String, fileName: String): HuggingFaceModelEntry {
         val cleanRepo = repoId.trim().trim('/')
         val cleanFile = fileName.trim().removePrefix("/")
-        val id = "custom_" + (cleanRepo + "_" + cleanFile).replace(Regex("[^A-Za-z0-9._-]+"), "_").take(40)
-        val entry = HuggingFaceModelEntry(
+        val id = "custom_" + (cleanRepo + "_" + cleanFile)
+            .replace(Regex("[^A-Za-z0-9._-]+"), "_").take(40)
+        return HuggingFaceModelEntry(
             id = id,
             name = cleanFile.removeSuffix(".gguf"),
             repoId = cleanRepo,
@@ -400,7 +424,11 @@ object HuggingFaceModelCatalog {
             notes = "User-submitted custom Hugging Face GGUF repository",
             curated = false,
         )
-        customEntries[id] = entry
+    }
+
+    fun createCustomEntry(repoId: String, fileName: String): HuggingFaceModelEntry {
+        val entry = buildCustomEntry(repoId, fileName)
+        customStore.put(entry)
         return entry
     }
 }

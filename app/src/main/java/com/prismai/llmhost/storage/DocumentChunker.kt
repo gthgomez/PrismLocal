@@ -25,6 +25,13 @@ object DocumentChunker {
     )
 
     /**
+     * Maximum characters encoded for a retrieval query. Ingestion chunks to
+     * 512 characters, so a query far larger than that spends decode work on
+     * text that cannot match a single chunk well.
+     */
+    const val QUERY_MAX_CHARS = 2048
+
+    /**
      * Split [text] into overlapping chunks.
      *
      * @param chunkSize target character count per chunk (default 512)

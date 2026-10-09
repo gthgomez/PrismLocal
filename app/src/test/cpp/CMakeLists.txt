@@ -153,6 +153,14 @@ if(PRISM_ENABLE_ENGINE_MOCK_TEST)
     )
     target_compile_definitions(engine_mock_test PRIVATE LLMHOST_DEBUG_HOOKS=1)
     target_compile_options(engine_mock_test PRIVATE -Wall -Wextra)
+    # engine_mock_test compiles the real Engine.cpp and is the only target that
+    # exercises production engine code. Without this, PRISM_ENABLE_SANITIZERS
+    # silently covers only the header-only helpers and the Engine target gets no
+    # instrumentation at all.
+    if(PRISM_SANITIZER_FLAGS)
+        target_compile_options(engine_mock_test PRIVATE ${PRISM_SANITIZER_FLAGS})
+        target_link_options(engine_mock_test PRIVATE ${PRISM_SANITIZER_FLAGS})
+    endif()
     target_link_libraries(engine_mock_test PRIVATE llama ggml Threads::Threads)
     add_test(NAME engine_mock_test COMMAND engine_mock_test)
 endif()

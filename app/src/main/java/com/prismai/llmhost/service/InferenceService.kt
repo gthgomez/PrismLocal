@@ -38,6 +38,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -47,7 +48,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
@@ -66,6 +66,7 @@ import kotlin.coroutines.CoroutineContext
 import org.json.JSONObject
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.ui.UiEventBus
+import com.prismai.llmhost.ui.rag.DocumentIngestMessaging
 import com.prismai.llmhost.engine.EngineConfigStore
 import com.prismai.llmhost.chat.ChatManager
 import com.prismai.llmhost.chat.ChatSearchIndex
@@ -85,6 +86,7 @@ import com.prismai.llmhost.generation.ServiceGenerationOwnership
 import com.prismai.llmhost.generation.GenerationMetrics
 import com.prismai.llmhost.generation.GenerationOrchestrator
 import com.prismai.llmhost.generation.PromptBuilder
+import com.prismai.llmhost.generation.SendAcceptance
 import com.prismai.llmhost.agent.AgentTrace
 import com.prismai.llmhost.agent.AgentToolConfirmation
 import com.prismai.llmhost.agent.AgentToolRouter
@@ -148,16 +150,49 @@ class InferenceService : Service() {
     // avoids enqueuing redundant cancellation work.
     private val teardownStarted = AtomicBoolean(false)
 
+    // Single owner of the native memory-pressure level. Writes are funneled
+    // through an unbounded channel consumed by exactly one coroutine, so the
+    // levels reach native in the same order the reconciler decided them. A
+    // per-write serviceScope.launch would let a CRITICAL(3) push and a NORMAL(0)
+    // poll race on Dispatchers.Default and leave native pinned at 3. The channel
+    // is unbounded (not conflated) so a transient escalation is never dropped:
+    // native must still observe CRITICAL to cancel generation.
+    private val memoryPressureWrites = Channel<Int>(Channel.UNLIMITED)
+
+    private val memoryPressureReconciler = MemoryPressureReconciler(
+        apply = { level -> memoryPressureWrites.trySend(level) },
+        onCriticalTransition = {
+            // Fires once per transition into CRITICAL from either the push or
+            // the poll path. The guard stays as the single dedup state.
+            if (!criticalMemoryAlertActive) {
+                criticalMemoryAlertActive = true
+                saveTranscriptSafely()
+                publishUiEvent("Memory critical; transcript saved")
+            }
+        },
+    )
+
     private lateinit var engine: NativeLlmBridge
     private lateinit var memoryGovernor: MemoryGovernor
     private lateinit var modelStorageManager: ModelStorageManager
     private var generationJob: Job? = null
     private var importJob: Job? = null
+    // The multi-file drain coroutine. Tracked separately from [importJob] (the
+    // current file's job) so cancelImport() stops the whole batch instead of
+    // letting the queue immediately start the next file.
+    private var batchImportJob: Job? = null
     private var downloadObserverJob: Job? = null
+    @Volatile
     private var criticalMemoryAlertActive = false
     @Volatile
     private var generationForegroundActive = false
     private val operationMutex = Mutex()
+    // Serializes the read+write of the observable installed-model list. The
+    // refresh is fire-and-forget from refreshDeviceAndModelReadiness(), so two
+    // overlapping refreshes could otherwise let an older on-disk snapshot be
+    // written after a newer one. The Mutex must guard the listModels() read as
+    // well as the set(): synchronizing only the setter cannot order the reads.
+    private val installedModelsRefresh = Mutex()
     private val generationStartGate = GenerationStartGate()
     private val serviceGenerationOwnership = ServiceGenerationOwnership()
     private val backgroundGenerationOwnership = serviceGenerationOwnership.engine
@@ -289,6 +324,7 @@ class InferenceService : Service() {
     val voiceState: StateFlow<VoiceState> get() = uiState.voiceState
     val currentModel: StateFlow<String?> get() = uiState.currentModel
     val activeModelInfo: StateFlow<ModelStorageManager.ActiveModelInfo?> get() = uiState.activeModelInfo
+    val installedModels: StateFlow<List<String>> get() = uiState.installedModels
     val isGenerating: StateFlow<Boolean> get() = uiState.isGenerating
     val runtimeStatus: StateFlow<RuntimeStatus> get() = uiState.runtimeStatus
     val importState: StateFlow<ImportState> get() = uiState.importState
@@ -312,6 +348,8 @@ class InferenceService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Wire durable custom-download storage before anything resolves catalog entries.
+        HuggingFaceModelCatalog.initialize(this)
         configStore = EngineConfigStore(getSharedPreferences(PREFS_NAME, MODE_PRIVATE))
         chatManager = ChatManager(this, transcriptStore, chatSearchIndex, uiState, eventBus, serviceScope)
         createNotificationChannel()
@@ -624,24 +662,33 @@ class InferenceService : Service() {
                     switchModel(savedModel)
                 }
         }
-        // Register push-based trim callback (instant notification)
-        memoryGovernor.register { state ->
-            serviceScope.launch { engine.setMemoryPressure(state.level) }
+        // Serialized consumer: applies memory levels to native in the exact
+        // order the reconciler decided them. Started before the reconciler can
+        // receive any observation.
+        serviceScope.launch {
+            for (level in memoryPressureWrites) {
+                // A failed native write must not kill the single consumer and
+                // stall every later level; log and continue, as the previous
+                // independent launches effectively did.
+                runCatching { engine.setMemoryPressure(level) }
+                    .onFailure { Log.w(TAG, "Failed to apply memory pressure $level", it) }
+            }
         }
-        // Keep polling flow as fallback (gradual pressure detection)
+        // Push-based trim callback (instant notification). Routed through the
+        // reconciler so it cannot race the polling flow into native.
+        memoryGovernor.register { state ->
+            memoryPressureReconciler.onPush(state)
+            // The reconciler fires the transition callback once per entry into
+            // CRITICAL, so no per-observation save/alert logic lives here.
+            criticalMemoryAlertActive = memoryPressureReconciler.isCritical()
+        }
+        // Polling is the fallback for gradual pressure. distinctUntilChanged()
+        // is removed: the reconciler owns dedup, and it must be able to write an
+        // explicit recovery after a push escalation.
         memoryGovernor.monitorMemory()
-            .distinctUntilChanged()
             .onEach { state ->
-                engine.setMemoryPressure(state.level)
-                if (state == MemoryState.CRITICAL) {
-                    saveTranscriptSafely()
-                    if (!criticalMemoryAlertActive) {
-                        publishUiEvent("Memory critical; transcript saved")
-                    }
-                    criticalMemoryAlertActive = true
-                } else {
-                    criticalMemoryAlertActive = false
-                }
+                memoryPressureReconciler.onPoll(state)
+                criticalMemoryAlertActive = memoryPressureReconciler.isCritical()
             }
             .launchIn(serviceScope)
     }
@@ -657,14 +704,62 @@ class InferenceService : Service() {
         _deviceCapabilityProfile.value = profile
         _modelReadiness.value = modelStorageManager.listInstalledModelInfos()
             .map { info -> modelReadinessAssessor.buildReadiness(info, profile) }
+        // Every mutation path (import, download, delete, link) funnels through
+        // this refresh, so republish the observable installed list here too.
+        serviceScope.launch { refreshInstalledModels() }
     }
 
-    fun importModel(uri: Uri) {
+    /**
+     * Republish the observable installed-model list from disk.
+     *
+     * [ModelManager.listModels] does synchronous filesystem I/O and a manifest
+     * parse per model, so it is moved off the caller's thread. The read and the
+     * write are serialized by [installedModelsRefresh]: without it, overlapping
+     * refreshes could let a refresh that read an older snapshot win the write
+     * after a newer one, leaving the picker stale. Writing through
+     * [ServiceUiState.installedModelsStore] dedups an unchanged list.
+     */
+    private suspend fun refreshInstalledModels() {
+        installedModelsRefresh.withLock {
+            val models = withContext(Dispatchers.IO) { modelManager.listModels() }
+            uiState.installedModelsStore.set(models)
+        }
+    }
+
+    fun importModel(uri: Uri): Job? {
         if (importJob?.isActive == true) {
             publishUiEvent("A model import is already running")
-            return
+            return null
         }
-        importJob = modelImportManager.importModel(uri)
+        return modelImportManager.importModel(uri).also { importJob = it }
+    }
+
+    /**
+     * Import several GGUFs in order, one at a time, continuing past failures.
+     *
+     * The multi-select picker's "Importing N" message was previously a lie: the
+     * old per-URI loop called [importModel] once and ModelImportManager's
+     * single-flight guard rejected every call after the first. Drain the queue
+     * sequentially and await each returned job so the guard sees the previous
+     * import finish before the next one starts.
+     */
+    fun importModels(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val byString = uris.associateBy { it.toString() }
+        // Track the drain coroutine so cancelImport() can stop the whole batch.
+        // Without this, cancelling only the current file's [importJob] lets the
+        // queue start the next file immediately.
+        batchImportJob = serviceScope.launch {
+            val queue = SequentialImportQueue { uriString ->
+                byString[uriString]?.let { uri -> importModel(uri)?.join() }
+            }
+            queue.enqueueAll(uris.map { it.toString() })
+            queue.drain()
+            // Republish once the whole queue finishes: per-file imports already
+            // refresh through onRefreshReadiness, but this guarantees the list is
+            // settled even if the last item failed or was skipped.
+            refreshInstalledModels()
+        }
     }
 
     fun downloadHuggingFaceModel(entryId: String) {
@@ -683,17 +778,11 @@ class InferenceService : Service() {
         modelDownloadManager.downloadCustomHuggingFaceModel(repoId, fileName)
     }
 
-    fun linkExternalModel(uri: Uri) {
-        val result = modelStorageManager.linkExternalModelUri(uri)
-        if (result is ModelStorageManager.ImportResult.Success) {
-            refreshDeviceAndModelReadiness()
-            publishUiEvent("Linked external GGUF ${result.model.id}")
-        } else if (result is ModelStorageManager.ImportResult.Failure) {
-            publishUiEvent("Failed to link GGUF: ${result.error.userMessage}")
-        }
-    }
-
     fun cancelImport() {
+        // Cancel the whole batch first so the queue cannot start the next file,
+        // then the file currently in flight.
+        batchImportJob?.cancel()
+        batchImportJob = null
         importJob?.cancel()
         importJob = null
         WorkManager.getInstance(this).cancelUniqueWork(HuggingFaceDownloadWork.UNIQUE_WORK_NAME)
@@ -1004,6 +1093,27 @@ class InferenceService : Service() {
 
     fun benchmarkCsv(): String = benchmarkStore.csv()
     fun benchmarkJson(): String = benchmarkStore.json()
+
+    /** Non-suspending pre-flight so the UI can decide whether to clear its draft. */
+    fun acceptsGeneration(prompt: String): Boolean =
+        generationAcceptance(prompt).accepted
+
+    fun generationRefusalReason(prompt: String): String? =
+        generationAcceptance(prompt).reason
+
+    private fun generationAcceptance(prompt: String): SendAcceptance.Result {
+        // Same inputs as the orchestrator's normal-chat acceptance: clamped
+        // settings, real retrieved memory, and the agent instruction block when
+        // agents are enabled. buildMemoryContext is non-suspending.
+        val settings = _generationSettings.value.clamped()
+        return SendAcceptance.forChat(
+            currentModel = uiState.currentModel.value,
+            settings = settings,
+            prompt = prompt,
+            memoryContext = promptBuilder.buildMemoryContext(prompt),
+            enforceBudget = true,
+        )
+    }
 
     fun generateSafely(
         prompt: String,
@@ -1797,11 +1907,23 @@ class InferenceService : Service() {
         refreshMemoriesList()
     }
 
-    /** Public API for the document browser UI. Ingests a text document into local SQLite VectorStore. */
-    suspend fun ingestDocument(id: String, title: String, text: String): Int {
-        val count = ragManager.ingestDocument(id, title, text)
+    /**
+     * Public API for the document browser UI. Ingests a text document into local SQLite VectorStore.
+     *
+     * Returns the user-facing status message (see [DocumentIngestMessaging.describe]) so the
+     * browser can show it in its status line, and publishes the same message on the UI event bus
+     * so the chat snackbar reports it too.
+     */
+    suspend fun ingestDocument(id: String, title: String, text: String): String {
+        val result = ragManager.ingestDocumentWithResult(id, title, text)
         refreshVectorChunksList()
-        return count
+        val message = DocumentIngestMessaging.describe(
+            inserted = result.storedCount,
+            failed = result.failedCount,
+            total = result.totalChunks,
+        )
+        publishUiEvent(message)
+        return message
     }
 
     /** Public API for the document browser UI. Deletes all chunks for a document id. */
@@ -1843,7 +1965,10 @@ class InferenceService : Service() {
     }
 
     private fun refreshVectorChunksList() {
-        runCatching { uiState._vectorChunks.value = vectorStore.getAllChunks() }
+        // The document browser is a retrieval view: show only chunks that
+        // search() can actually return. getAllChunks() is reserved for deletion
+        // (it must still see stale rows so they can be removed).
+        runCatching { uiState._vectorChunks.value = vectorStore.getCurrentChunks() }
     }
 
     private fun startAgentFollowUpGeneration(
@@ -2109,6 +2234,8 @@ class InferenceService : Service() {
 
     override fun onDestroy() {
         saveTranscriptSafely()
+        batchImportJob?.cancel()
+        batchImportJob = null
         importJob?.cancel()
         importJob = null
 

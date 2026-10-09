@@ -21,7 +21,9 @@ import com.prismai.llmhost.ui.rag.*
 import com.prismai.llmhost.ui.voice.*
 import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -92,9 +94,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -130,8 +132,6 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
 
-private const val MAX_PROMPT_ATTACHMENTS = 6
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -148,6 +148,7 @@ fun ChatScreen(
         var chatsVisible by remember { mutableStateOf(false) }
         var memoriesVisible by remember { mutableStateOf(false) }
         var ragBrowserVisible by remember { mutableStateOf(false) }
+        var ingestStatus by remember { mutableStateOf<String?>(null) }
         val controlSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val chatSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val memoriesSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -168,7 +169,12 @@ fun ChatScreen(
             Surface(modifier = Modifier.fillMaxSize(), color = prismCanvasColor()) {
                 PrismBackdrop(modifier = Modifier.fillMaxSize())
                 BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                    val minChatHeight = maxHeight * 0.70f
+                    val isShortHeight = LayoutPolicy.isShortHeight(maxHeight)
+                    val headerCompact = LayoutPolicy.headerCompact(maxHeight)
+                    // The old maxHeight * 0.70f floor fought the IME: with the
+                    // keyboard open the list could not shrink below 70% of a
+                    // window that had already shrunk.
+                    val minChatHeight = 0.dp
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
@@ -176,8 +182,6 @@ fun ChatScreen(
                             .padding(horizontal = 16.dp, vertical = 12.dp),
                     ) {
                         val context = LocalContext.current
-                        var refreshKey by remember { mutableIntStateOf(0) }
-                        var models by remember(service) { mutableStateOf(service?.listModels() ?: emptyList()) }
                         var hfCatalog by remember(service) { mutableStateOf(service?.huggingFaceCatalog() ?: emptyList()) }
                         val currentModel by (service?.currentModel ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
                         val activeModelInfo by (service?.activeModelInfo ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
@@ -210,6 +214,12 @@ fun ChatScreen(
                         val modelReadiness by (service?.modelReadiness ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
+                        // One observable installed-model state, owned by the
+                        // service, replaces the old remember snapshot that only
+                        // refreshed on ImportState.Success.
+                        val models by (service?.installedModels ?: emptyFlow()).collectAsStateWithLifecycle(
+                            initialValue = emptyList()
+                        )
                         val pendingAgentToolAction by (service?.pendingAgentToolAction ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = null
                         )
@@ -225,11 +235,49 @@ fun ChatScreen(
                         val voiceState by (service?.voiceState ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = com.prismai.llmhost.tools.VoiceState()
                         )
-                        var prompt by remember { mutableStateOf("") }
-                        var attachments by remember { mutableStateOf<List<PromptAttachment>>(emptyList()) }
+                        // The active chat's draft is the live state here and is saveable,
+                        // so rotation and activity recreation restore it even though the
+                        // service is not yet bound on the first frame. DraftStore holds
+                        // the drafts of chats that are not active, keyed by chat id.
+                        var prompt by rememberSaveable { mutableStateOf("") }
+                        var savedAttachments by rememberSaveable { mutableStateOf(emptyList<String>()) }
+                        var savedChatId by rememberSaveable { mutableStateOf<String?>(null) }
+                        val attachments: List<PromptAttachment> =
+                            remember(savedAttachments) {
+                                savedAttachments.mapNotNull(AttachmentTextCodec::decode)
+                            }
+
+                        // Rebuild the store around the restored active draft before any
+                        // effect can move away from it. On the first frame after
+                        // recreation `service`/`currentChatId` are still unknown, so the
+                        // saved chat id is what attributes the restored draft.
+                        val draftStore = remember {
+                            DraftStore(savedChatId).apply {
+                                restore(savedChatId, prompt, attachments)
+                            }
+                        }
+
+                        // Follow chat switches. Wait for the bound service; by then the
+                        // store already owns the restored draft under its saved chat id,
+                        // so the service reporting that same id is a no-op. The live
+                        // draft is read here, never captured from a previous composition,
+                        // so a switch cannot clobber the incoming chat with stale values.
+                        LaunchedEffect(currentChatId, service) {
+                            if (service == null) return@LaunchedEffect
+                            val loaded = draftStore.applyLiveDraft(
+                                currentChatId = currentChatId,
+                                liveText = prompt,
+                                liveAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode),
+                            ) ?: return@LaunchedEffect
+                            prompt = loaded.first
+                            savedAttachments = loaded.second.map(AttachmentTextCodec::encode)
+                            savedChatId = draftStore.chatId
+                        }
+
                         var importStatus by remember { mutableStateOf("") }
                         var pendingBenchmarkCsv by remember { mutableStateOf<String?>(null) }
                         var pendingBenchmarkJson by remember { mutableStateOf<String?>(null) }
+                        val scrollFollowPolicy = remember { ScrollFollowPolicy() }
                         val listState = rememberLazyListState()
                         val bottomAnchorIndex = if (transcript.isEmpty()) 0 else transcript.size
                         val isAtBottomAnchor by remember(transcript.size) {
@@ -238,9 +286,8 @@ fun ChatScreen(
                                     listState.layoutInfo.visibleItemsInfo.any { item -> item.index == bottomAnchorIndex }
                             }
                         }
-                        // stickToBottom: pin while streaming. Detach only on user-driven scroll away
-                        // from bottom; content growth alone must not clear the flag (would fight follow).
-                        var stickToBottom by remember { mutableStateOf(true) }
+                        // scrollFollowPolicy: pin while streaming. Detach only on user-driven
+                        // scroll away from bottom; content growth alone must not clear follow.
                         var suppressStickDetach by remember { mutableStateOf(false) }
                         LaunchedEffect(listState, transcript.size) {
                             snapshotFlow {
@@ -252,8 +299,8 @@ fun ChatScreen(
                                 listState.isScrollInProgress to atBottom
                             }.collect { (scrolling, atBottom) ->
                                 when {
-                                    atBottom -> stickToBottom = true
-                                    scrolling && !suppressStickDetach -> stickToBottom = false
+                                    atBottom -> scrollFollowPolicy.onUserScrolledToBottom()
+                                    scrolling && !suppressStickDetach -> scrollFollowPolicy.onUserScrolledAway()
                                 }
                             }
                         }
@@ -273,53 +320,65 @@ fun ChatScreen(
                             }
                             service?.importModel(uri)
                         }
-                        val linkLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-                            onImportPickerFinished()
-                            if (uri != null) {
-                                service?.linkExternalModel(uri)
-                            }
-                        }
                         val attachmentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
                             onImportPickerFinished()
-                            if (uris.isEmpty()) {
-                                return@rememberLauncherForActivityResult
-                            }
-                            val importedModels = mutableListOf<String>()
-                            val attached = mutableListOf<PromptAttachment>()
-                            val ggufUris = mutableListOf<Uri>()
-                            uris.forEach { uri ->
-                                runCatching {
-                                    context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                }
-                                val name = AttachmentTextExtractor.displayName(context, uri)
-                                if (name.endsWith(".gguf", ignoreCase = true)) {
-                                    ggufUris += uri
-                                    importedModels += name
-                                } else {
-                                    attached += AttachmentTextExtractor.fromUri(context, uri)
-                                }
-                            }
-                            if (ggufUris.isNotEmpty()) {
-                                scope.launch {
-                                    val targetUri = ggufUris.firstOrNull()
-                                    if (targetUri != null) {
-                                        service?.importModel(targetUri)
+                            if (uris.isEmpty()) return@rememberLauncherForActivityResult
+
+                            // Apply the limit before reading anything: the old path read
+                            // every provider stream on the UI thread and then discarded
+                            // all but the last six. takeUpTo dedups by id and caps, so
+                            // the helper on the production path is what the unit test
+                            // actually guards.
+                            val cappedIds = AttachmentSelection.takeUpTo(
+                                uris.map { it.toString() },
+                                AttachmentSelection.MAX_PROMPT_ATTACHMENTS,
+                            )
+                            val capped = cappedIds.mapNotNull { id -> uris.firstOrNull { it.toString() == id } }
+                            val dropped = uris.size - capped.size
+
+                            scope.launch {
+                                val attached = mutableListOf<PromptAttachment>()
+                                val ggufUris = mutableListOf<Uri>()
+
+                                for (uri in capped) {
+                                    ensureActive()
+                                    runCatching {
+                                        context.contentResolver.takePersistableUriPermission(
+                                            uri,
+                                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                                        )
+                                    }
+                                    val name = AttachmentTextExtractor.displayName(context, uri)
+                                    if (name.endsWith(".gguf", ignoreCase = true)) {
+                                        ggufUris += uri
+                                    } else {
+                                        AttachmentTextExtractor.fromUriAsync(context, uri)
+                                            ?.let { attached += it }
                                     }
                                 }
-                            }
-                            if (attached.isNotEmpty()) {
-                                attachments = (attachments + attached)
-                                    .distinctBy { it.uriString }
-                                    .takeLast(MAX_PROMPT_ATTACHMENTS)
-                            }
-                            snackbarMessage = when {
-                                importedModels.isNotEmpty() && attached.isNotEmpty() ->
-                                    "Importing ${importedModels.size} model(s), attached ${attached.size} file(s)"
-                                importedModels.isNotEmpty() ->
-                                    "Importing ${importedModels.size} model(s)"
-                                attached.isNotEmpty() ->
-                                    "Attached ${attached.size} file(s)"
-                                else -> null
+
+                                if (attached.isNotEmpty()) {
+                                    savedAttachments = (attachments + attached)
+                                        .distinctBy { it.uriString }
+                                        .takeLast(AttachmentSelection.MAX_PROMPT_ATTACHMENTS)
+                                        .map(AttachmentTextCodec::encode)
+                                }
+                                // Task 4 imports every selected GGUF, one at a time,
+                                // rather than dropping all but the first.
+                                if (ggufUris.isNotEmpty()) {
+                                    service?.importModels(ggufUris)
+                                }
+                                snackbarMessage = when {
+                                    dropped > 0 ->
+                                        "Added $dropped fewer attachment(s) (limit ${AttachmentSelection.MAX_PROMPT_ATTACHMENTS})"
+                                    ggufUris.isNotEmpty() && attached.isNotEmpty() ->
+                                        "Importing ${ggufUris.size} model(s), attached ${attached.size} file(s)"
+                                    ggufUris.isNotEmpty() ->
+                                        "Importing ${ggufUris.size} model(s)"
+                                    attached.isNotEmpty() ->
+                                        "Attached ${attached.size} file(s)"
+                                    else -> null
+                                }
                             }
                         }
                         val benchmarkExportLauncher = rememberLauncherForActivityResult(
@@ -359,9 +418,8 @@ fun ChatScreen(
                             }
                         }
 
-                        LaunchedEffect(service, refreshKey, importState) {
+                        LaunchedEffect(service, importState) {
                             service?.refreshDeviceAndModelReadiness()
-                            models = service?.listModels() ?: emptyList()
                             hfCatalog = service?.huggingFaceCatalog() ?: emptyList()
                         }
 
@@ -382,7 +440,6 @@ fun ChatScreen(
                                     }
                                 }
                                 is ImportState.Success -> {
-                                    refreshKey++
                                     importStatus = "Imported ${state.modelId}"
                                     snackbarMessage = "Imported ${state.modelId}"
                                 }
@@ -412,9 +469,8 @@ fun ChatScreen(
                             isGenerating,
                             generatedTokenCount,
                             activeAssistantTextLength,
-                            stickToBottom,
                         ) {
-                            if (transcript.isNotEmpty() && stickToBottom) {
+                            if (transcript.isNotEmpty() && scrollFollowPolicy.shouldAutoScroll()) {
                                 suppressStickDetach = true
                                 try {
                                     listState.scrollToItem(bottomAnchorIndex)
@@ -431,6 +487,7 @@ fun ChatScreen(
                             importStatus = importStatus,
                             importState = importState,
                             collapsed = headerCollapsed,
+                            isShortHeight = isShortHeight,
                             thermalGovernorState = thermalGovernorState,
                             generationPerformance = generationPerformance,
                             onOpenChats = { chatsVisible = true },
@@ -439,7 +496,11 @@ fun ChatScreen(
                             onOpenRag = { ragBrowserVisible = true },
                         )
 
-                        Spacer(modifier = Modifier.height(22.dp))
+                        Spacer(
+                            modifier = Modifier.height(
+                                if (headerCompact) 8.dp else 22.dp
+                            )
+                        )
 
                         val activeAssistantMessageId by remember(transcript.size, isGenerating) {
                             derivedStateOf {
@@ -495,6 +556,7 @@ fun ChatScreen(
                                                     isUser = isUser,
                                                     showLoading = isActiveAssistant,
                                                     performance = generationPerformance.takeIf { isActiveAssistant },
+                                                    messageId = message.id.toString(),
                                                 )
                                             }
                                         }
@@ -532,7 +594,7 @@ fun ChatScreen(
                                     role = Role.Button
                                 },
                                 onClick = {
-                                    stickToBottom = true
+                                    scrollFollowPolicy.onUserScrolledToBottom()
                                     scope.launch {
                                         suppressStickDetach = true
                                         try {
@@ -562,6 +624,28 @@ fun ChatScreen(
                             }
                         }
 
+                        // Inside the IME-padded region: the old placement aligned to the
+                        // outer Box, so refusals were invisible behind the keyboard.
+                        (snackbarMessage ?: uiMessage)?.let { message ->
+                            Snackbar(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                                containerColor = PrismSlate,
+                                contentColor = PrismOnDark,
+                                action = {
+                                    TextButton(onClick = {
+                                        if (snackbarMessage != null) {
+                                            snackbarMessage = null
+                                        }
+                                        onClearUiMessage(message)
+                                    }) {
+                                        Text("Dismiss", color = PrismBlue)
+                                    }
+                                },
+                            ) {
+                                Text(message)
+                            }
+                        }
+
                         PromptComposer(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -573,6 +657,7 @@ fun ChatScreen(
                             isGenerating = isGenerating,
                             performance = generationPerformance,
                             attachments = attachments,
+                            isShortHeight = isShortHeight,
                             canContinue = generationPerformance?.terminalReason == "MAX_TOKENS" &&
                                 transcript.lastOrNull()?.role == TranscriptRole.ASSISTANT,
                             onPromptChange = { prompt = it },
@@ -581,16 +666,27 @@ fun ChatScreen(
                                 attachmentLauncher.launch(arrayOf("*/*"))
                             },
                             onRemoveAttachment = { attachment ->
-                                attachments = attachments.filterNot { it.uriString == attachment.uriString }
+                                savedAttachments = attachments
+                                    .filterNot { it.uriString == attachment.uriString }
+                                    .map(AttachmentTextCodec::encode)
                             },
                             onCancel = { service?.cancelGeneration() },
                             onContinue = { service?.continueGenerationSafely() },
                             onSend = {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 if (text.isNotEmpty()) {
-                                    prompt = ""
-                                    attachments = emptyList()
-                                    service?.generateSafely(text)
+                                    // Ask the service before destroying anything. A refusal
+                                    // must leave the composed text and attachments intact.
+                                    if (service?.acceptsGeneration(text) == true) {
+                                        prompt = ""
+                                        savedAttachments = emptyList()
+                                        draftStore.clear()
+                                        service?.generateSafely(text)
+                                    } else {
+                                        snackbarMessage =
+                                            service?.generationRefusalReason(text)
+                                                ?: "Message refused; draft kept"
+                                    }
                                 }
                             },
                             onVoiceClick = { service?.startVoiceInput() },
@@ -634,10 +730,6 @@ fun ChatScreen(
                                     onImportModel = {
                                         onImportPickerStarted()
                                         importLauncher.launch(arrayOf("*/*"))
-                                    },
-                                    onLinkModel = {
-                                        onImportPickerStarted()
-                                        linkLauncher.launch(arrayOf("*/*"))
                                     },
                                     onCancelImport = { service?.cancelImport() },
                                     onDownloadModel = { entryId -> service?.downloadHuggingFaceModel(entryId) },
@@ -728,8 +820,14 @@ fun ChatScreen(
                             ) {
                                 DocumentBrowser(
                                     chunks = vectorChunks,
+                                    ingestStatus = ingestStatus,
                                     onIngestDocument = { id, title, text ->
-                                        scope.launch(Dispatchers.IO) { service?.ingestDocument(id, title, text) }
+                                        ingestStatus = null
+                                        scope.launch {
+                                            ingestStatus = withContext(Dispatchers.IO) {
+                                                service?.ingestDocument(id, title, text)
+                                            } ?: "Indexing unavailable"
+                                        }
                                     },
                                     onDeleteDocument = { id -> service?.deleteDocument(id) },
                                     onQueryVectorStore = { query ->
@@ -747,15 +845,6 @@ fun ChatScreen(
                             )
                         }
                     }
-                }
-            }
-            (snackbarMessage ?: uiMessage)?.let { message ->
-                Snackbar(
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
-                    containerColor = PrismSlate,
-                    contentColor = PrismOnDark,
-                ) {
-                    Text(message)
                 }
             }
         }

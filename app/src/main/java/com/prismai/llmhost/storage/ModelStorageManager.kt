@@ -243,7 +243,10 @@ class ModelStorageManager(
             copyStream(input, stagedModel, reportedSize, onProgress)
             val bytes = stagedModel.length()
             validateSize(bytes)?.let { return ImportResult.Failure(it).also { cleanup(stagingDir) } }
-            if (!hasUsableSpaceFor(bytes)) {
+            // The model bytes are already on disk at this point and promotion is a
+            // rename, so only the reserve must remain. Requiring the full size again
+            // made a fitting model fail after the entire copy completed.
+            if (!hasReserveSpace()) {
                 return ImportResult.Failure(insufficientSpaceError(bytes)).also { cleanup(stagingDir) }
             }
             val validation = validateGguf(stagedModel)
@@ -357,50 +360,6 @@ class ModelStorageManager(
 
     fun activeModelInfo(modelId: String): ActiveModelInfo? =
         (resolveActiveModel(modelId, verifyHash = false) as? ModelResolveResult.Success)?.model
-
-    fun linkExternalModelUri(uri: Uri): ImportResult = ModelStorageLifecycleGate.withLock {
-        linkExternalModelUriLocked(uri)
-    }
-
-    private fun linkExternalModelUriLocked(uri: Uri): ImportResult {
-        val displayName = displayNameFor(uri)
-        val modelId = modelIdFrom(displayName)
-        val versionId = newVersionId()
-        val now = Instant.now().toString()
-        runCatching {
-            context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        val size = sizeFor(uri).coerceAtLeast(0L)
-        val validation = ModelValidation(
-            format = "GGUF",
-            ggufVersion = 3,
-            status = "saf_linked",
-            validatedAt = now,
-        )
-        val modelRoot = File(modelsDir, modelId)
-        val targetVersionDir = File(modelRoot, "versions/$versionId").also { it.mkdirs() }
-        val dummyFile = File(targetVersionDir, MODEL_FILE).also {
-            if (!it.exists()) runCatching { it.writeText(uri.toString()) }
-        }
-        val manifest = mergedManifest(
-            modelRoot = modelRoot,
-            modelId = modelId,
-            versionId = versionId,
-            versionFile = "versions/$versionId/$MODEL_FILE",
-            displayName = displayName,
-            sha256 = "linked_saf_uri",
-            bytes = size,
-            importedAt = now,
-            validation = validation,
-        )
-        writeManifestAtomically(modelRoot, manifest)
-        val resolved = resolveActiveModel(modelId, verifyHash = false)
-        return if (resolved is ModelResolveResult.Success) {
-            ImportResult.Success(resolved.model)
-        } else {
-            ImportResult.Failure(ModelStorageError(ModelStorageError.Code.OPEN_FAILED, "Failed to link SAF model"))
-        }
-    }
 
     data class StorageBreakdown(
         val installedModelsBytes: Long,
@@ -875,12 +834,16 @@ class ModelStorageManager(
         return digest.digest().toHex()
     }
 
-    private fun hasUsableSpaceFor(bytes: Long): Boolean {
+    private fun freeSpaceBytes(): Long {
         val dir = modelsDir.also { it.mkdirs() }
-        val stat = StatFs(dir.absolutePath)
-        val usable = stat.availableBytes
-        return usable > bytes + MIN_FREE_SPACE_AFTER_IMPORT
+        return StatFs(dir.absolutePath).availableBytes
     }
+
+    private fun hasUsableSpaceFor(bytes: Long): Boolean =
+        hasUsableSpaceFor(freeSpaceBytes(), bytes)
+
+    private fun hasReserveSpace(): Boolean =
+        hasReserveAfterCopy(freeSpaceBytes())
 
     private fun insufficientSpaceError(bytes: Long): ModelStorageError =
         ModelStorageError(
@@ -966,6 +929,23 @@ class ModelStorageManager(
             val cleaned = withoutExtension.replace(Regex("[^A-Za-z0-9._-]+"), "-").trim('-', '.', '_')
             return cleaned.ifBlank { "imported-model" }
         }
+
+        /**
+         * True when [freeBytes] covers a model of [modelBytes] plus the post-import
+         * reserve. Used before the copy, where the model's bytes are still to be
+         * written.
+         */
+        fun hasUsableSpaceFor(freeBytes: Long, modelBytes: Long): Boolean =
+            freeBytes > modelBytes + MIN_FREE_SPACE_AFTER_IMPORT
+
+        /**
+         * True when [freeBytes] still covers the post-import reserve. Used after the
+         * staged copy has landed: those bytes are already on disk, and
+         * promoteDirectory is a rename that consumes no additional space, so
+         * requiring the model size again rejected models that genuinely fit.
+         */
+        fun hasReserveAfterCopy(freeBytes: Long): Boolean =
+            freeBytes > MIN_FREE_SPACE_AFTER_IMPORT
 
         const val TAG = "ModelStorageManager"
         const val MANIFEST_FILE = "manifest.json"

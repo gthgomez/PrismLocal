@@ -13,6 +13,9 @@ import android.content.Context
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import java.util.Base64
 import java.util.Locale
 
@@ -34,6 +37,21 @@ data class PromptAttachment(
     val promptText: String,
 ) {
     val isImage: Boolean = mimeType?.startsWith("image/") == true
+}
+
+/**
+ * Shared attachment-selection limit and ordering.
+ *
+ * Previously MAX_PROMPT_ATTACHMENTS lived in ChatScreen and was applied after
+ * every selected file had already been read from its content provider, so a
+ * 20-file selection performed 20 blocking reads and discarded most of them.
+ */
+object AttachmentSelection {
+    const val MAX_PROMPT_ATTACHMENTS = 6
+
+    /** Deduplicate by name, preserving order, then cap at [limit]. */
+    fun takeUpTo(selected: List<String>, limit: Int): List<String> =
+        selected.distinct().take(if (limit > 0) limit else 0)
 }
 
 object AttachmentTextExtractor {
@@ -76,6 +94,20 @@ object AttachmentTextExtractor {
             promptText = extracted.text,
         )
     }
+
+    /**
+     * Extract an attachment off the main thread.
+     *
+     * fromUri performs blocking provider reads (openInputStream,
+     * BitmapFactory.decodeStream) of up to 512 KiB per file. Calling it from
+     * the picker callback ran that on the UI thread. Returns null if the
+     * coroutine is cancelled before extraction completes.
+     */
+    suspend fun fromUriAsync(context: Context, uri: Uri): PromptAttachment? =
+        withContext(Dispatchers.IO) {
+            ensureActive()
+            runCatching { fromUri(context, uri) }.getOrNull()
+        }
 
     fun fromBytes(name: String, mimeType: String?, bytes: ByteArray): ExtractedAttachment {
         return when {

@@ -50,6 +50,7 @@ import java.util.Locale
 @Composable
 fun DocumentBrowser(
     chunks: List<VectorChunk>,
+    ingestStatus: String?,
     onIngestDocument: (id: String, title: String, text: String) -> Unit,
     onDeleteDocument: (documentId: String) -> Unit,
     onQueryVectorStore: suspend (query: String) -> List<Pair<VectorChunk, Float>>,
@@ -88,6 +89,16 @@ fun DocumentBrowser(
                 }
             },
         )
+
+        // ── Ingest Status Line ──
+        ingestStatus?.let { status ->
+            Text(
+                text = status,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 2.dp),
+            )
+        }
 
         // ── Semantic Search Tester ──
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -253,15 +264,14 @@ fun DocumentBrowser(
                 TextButton(
                     enabled = ingestDocId.isNotBlank() && ingestText.isNotBlank(),
                     onClick = {
-                        onIngestDocument(
-                            ingestDocId.trim(),
-                            ingestTitle.ifBlank { ingestDocId }.trim(),
-                            ingestText.trim(),
-                        )
+                        val docId = ingestDocId.trim()
+                        val title = ingestTitle.ifBlank { ingestDocId }.trim()
+                        val body = ingestText.trim()
                         ingestDocId = ""
                         ingestTitle = ""
                         ingestText = ""
                         showIngestDialog = false
+                        onIngestDocument(docId, title, body)
                     },
                 ) {
                     Text("Ingest & Embed")

@@ -204,8 +204,23 @@ class GenerationOrchestrator(
             }
         }
 
-        if (uiState.currentModel.value == null) {
-            eventBus.publish("Select a model before sending a prompt")
+        // Acceptance is the single pre-flight rule, evaluated before any setup
+        // side effect so a refused send cannot warn, switch chats, reset the
+        // engine, or begin an agent chain. Budget is enforced for normal chat
+        // only: benchmark presets were never budget-checked and must not be
+        // newly refused here.
+        val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
+        val agentEnabled = settings.agentEnabled
+        val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
+        val acceptance = SendAcceptance.forChat(
+            currentModel = uiState.currentModel.value,
+            settings = settings,
+            prompt = prompt,
+            memoryContext = memoryContext,
+            enforceBudget = benchmarkPreset == null,
+        )
+        if (!acceptance.accepted) {
+            eventBus.publish(acceptance.reason ?: "Request refused")
             return
         }
 
@@ -230,12 +245,10 @@ class GenerationOrchestrator(
         }
 
         // Preset overrides apply only to this generation call — never write them into persisted UI settings.
-        val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
         if (baseSettings != uiState.generationSettings.value) {
             uiState._generationSettings.value = baseSettings
         }
 
-        val agentEnabled = settings.agentEnabled
         val agentChainId = if (agentEnabled) {
             agentTrace.beginChain(prompt)
         } else {
@@ -243,22 +256,6 @@ class GenerationOrchestrator(
         }
         if (agentEnabled) {
             agentToolRouter.activeAgentToolHistory.clear()
-        }
-
-        val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
-        if (benchmarkPreset == null && !GenerationBudget.userTurnFits(
-                contextLength = settings.contextLength,
-                maxTokens = settings.maxTokens,
-                userPrompt = prompt,
-                memoryContext = memoryContext,
-                instructionText = if (agentEnabled) AgentToolProtocol.instructionBlock() else "",
-            )
-        ) {
-            if (agentChainId != null) {
-                agentTrace.abortTrace(agentChainId, "Prompt exceeds context window")
-            }
-            eventBus.publish("This message is too long for the context window")
-            return
         }
         // Structured, role-preserving messages for normal chat. The legacy string
         // path stays for agent turns and benchmark presets, which build their own

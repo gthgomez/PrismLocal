@@ -302,3 +302,8 @@ Prism Local has an **excellent C++ inference engine** — page-aligned lock-free
 ---
 
 *Audit conducted 2026-07-30 (updated 2026-07-31) via read-only source analysis. All 32 findings verified against exact file:line citations in the `main` branch (commit `3de358c`). Four Explore subagents covered UI/UX, Native/JNI, Data/RAG/Agent, and Security/Store in parallel. Lead synthesis agent independently verified all subagent findings against primary source reads.*
+
+> 2026-10-06: `storage/LightweightEmbeddingEngine.kt` referenced above was
+> deleted as dead code. No code, test, or benchmark referenced it; the only
+> callers are in this document. Document ingestion uses `RagManager` with
+> `NativeLlmBridge.encode`.

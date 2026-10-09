@@ -22,7 +22,7 @@ import java.util.UUID
  * [DocumentChunker] (pure stateless).
  */
 class RagManager(
-    private val vectorStore: VectorStore,
+    private val vectorStore: VectorIndex,
     private val chunker: DocumentChunker,
     /** Suspending function that returns float embedding for a text string. */
     private val encode: suspend (String) -> FloatArray,
@@ -136,8 +136,11 @@ class RagManager(
         withContext(Dispatchers.IO) {
             if (userPrompt.isBlank()) return@withContext emptyList()
 
+            // Bound the encoded text: Engine::encode runs a real decode pass over
+            // every token, so an unbounded user prompt is unbounded work.
+            val queryText = userPrompt.take(DocumentChunker.QUERY_MAX_CHARS)
             val queryEmbedding = runCatching {
-                encode(userPrompt)
+                encode(queryText)
             }.getOrNull()
 
             if (queryEmbedding == null || queryEmbedding.isEmpty()) {

@@ -97,7 +97,6 @@ internal fun ControlPlaneSheet(
     onSwitchModel: (String) -> Unit,
     onDeleteModel: ((ModelIdentity) -> Unit)? = null,
     onImportModel: () -> Unit,
-    onLinkModel: (() -> Unit)? = null,
     onCancelImport: () -> Unit,
     onDownloadModel: (String) -> Unit,
     onDownloadCustomHfModel: ((String, String) -> Unit)? = null,
@@ -262,15 +261,6 @@ internal fun ControlPlaneSheet(
                                     onClick = onImportModel,
                                 ) {
                                     Text("Import GGUF", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                }
-                                if (onLinkModel != null) {
-                                    OutlinedButton(
-                                        modifier = Modifier.weight(1f),
-                                        enabled = controlsEnabled && serviceAvailable,
-                                        onClick = onLinkModel,
-                                    ) {
-                                        Text("Link (No Copy)", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    }
                                 }
                             }
                         }
@@ -653,10 +643,12 @@ private fun HuggingFaceDownloadPanel(
                         style = MaterialTheme.typography.bodySmall,
                         color = PrismRed,
                     )
-                    selectedEntry?.let { entry ->
+                    // Retry the model that failed, not the dropdown selection,
+                    // which defaults to the first catalog entry.
+                    state.entryId?.let { failedId ->
                         TextButton(
                             contentPadding = PaddingValues(0.dp),
-                            onClick = { onDownload(entry.id) },
+                            onClick = { onDownload(failedId) },
                         ) {
                             Text("Retry Download", color = PrismBlue, style = MaterialTheme.typography.labelSmall)
                         }

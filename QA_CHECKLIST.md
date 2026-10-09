@@ -1,5 +1,8 @@
 # LLM Host Android (Prism Local) — QA Checklist
 
+> Current verification status — what CI does and does not prove — is tracked in
+> [VERIFICATION_STATUS.md](./docs/qualification/VERIFICATION_STATUS.md).
+
 ---
 
 ## 1. JNI Bridge

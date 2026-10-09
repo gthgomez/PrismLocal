@@ -12,6 +12,30 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
+ * Observable installed-model list.
+ *
+ * The UI previously held a `remember` snapshot refreshed by a `refreshKey` that
+ * only incremented on ImportState.Success. Deleting a model, or completing a
+ * download through a path that published no ImportState, left the deleted model
+ * visible in the picker. This holds the list and suppresses redundant
+ * emissions so an unchanged refresh does not re-render the dropdown.
+ */
+class InstalledModelsStore {
+    private val _value = MutableStateFlow<List<String>>(emptyList())
+    val value: StateFlow<List<String>> = _value.asStateFlow()
+
+    /** Exposed for tests: how many times the value actually changed. */
+    var emissionCount: Int = 0
+        private set
+
+    fun set(models: List<String>) {
+        if (_value.value == models) return
+        _value.value = models
+        emissionCount++
+    }
+}
+
+/**
  * Central holder for all UI-observable state in the inference service.
  *
  * Each flow follows the internal-mutable pattern: the public [StateFlow] is
@@ -27,6 +51,12 @@ class ServiceUiState {
 
     internal val _activeModelInfo = MutableStateFlow<ModelStorageManager.ActiveModelInfo?>(null)
     val activeModelInfo: StateFlow<ModelStorageManager.ActiveModelInfo?> = _activeModelInfo.asStateFlow()
+
+    // Single production owner of the observable installed-model list. The
+    // service writes through [installedModelsStore]; the UI collects
+    // [installedModels]. See [InstalledModelsStore].
+    internal val installedModelsStore = InstalledModelsStore()
+    val installedModels: StateFlow<List<String>> = installedModelsStore.value
 
     // ── Generation ─────────────────────────────────────────────────────
 

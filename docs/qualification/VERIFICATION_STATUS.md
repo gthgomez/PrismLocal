@@ -86,6 +86,38 @@ compilation elsewhere, but no CI run or qualified-device pass has confirmed
 them yet. Treat the claims above as the baseline this branch builds on, not as
 evidence for these changes.
 
+## Reliability-closure merge train (2026-10-09)
+
+The review-fix follow-up above, the native-encode/PIR fixes, and the model/RAG
+correctness work have since merged to `main`. This section records the state
+without rewriting the historical rows above.
+
+| Change | Merged as | Evidence |
+| --- | --- | --- |
+| #25 native/model + chat/composer + verification sprint | merge `e3a8e1b` | CI: Unit Tests + Native Host Tests + Native Builds pass |
+| #26 review fixes (encode state, off-main I/O, atomic import/re-ingest, downloads, voice) | merge `d2a6c6b` | CI 3/3 pass on head `935f52e`; main run success |
+| #27 trusted download pins + activation verification (with a head/tail content fingerprint on the verification cache) | merge `b582880` | CI 3/3 pass on head `e43ad3d` |
+| #28 RAG encoder-identity + failure-atomic re-ingest + bounded UI memory (non-destructive cleanup) | merge `cb93073` | CI 3/3 pass on head `9487314` |
+| #29 clear the composer only after the send is actually admitted | merge `cf6e8b4` | CI 3/3 pass on head `6fd22a2` |
+
+New JVM coverage added by this train (all green in `:app:testDevDebugUnitTest`
+and `:app:testPlayDebugUnitTest`): encoder snapshot + mid-ingest switch abort,
+commit-aware ingest counts, cancellation propagation, oversized-document reject,
+partial knowledge pack not indexed, single-pass pack delete, same-size/same-mtime
+artifact substitution detection, and send-acceptance mapping.
+
+### Device-only, still not executed
+
+- `VectorStoreRevisionMigrationTest` now also asserts the **A → B → A survival**
+  contract (rows from another valid encoder are not obsolete and are never
+  deleted) and obsolete-only reclamation. It is compiled but not run in CI.
+- Chat composer refusal-keeps-draft and fast-double-submit behavior (#29) needs a
+  Compose device test; only the acceptance mapping is unit-tested.
+- **No automated test executes `llama_decode` in embeddings mode.** The host mock
+  returns at `Engine::encode`'s no-model early return, so real embedding output
+  (pooling NONE, `llama_model_n_embd_out` width, and the KV reset's effect on the
+  next chat turn) remains device-only. See issue #21.
+
 ## Release gate
 
 The authoritative gate is the user journey in

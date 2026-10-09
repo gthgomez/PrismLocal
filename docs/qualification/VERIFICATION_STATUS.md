@@ -106,21 +106,50 @@ commit-aware ingest counts, cancellation propagation, oversized-document reject,
 partial knowledge pack not indexed, single-pass pack delete, same-size/same-mtime
 artifact substitution detection, and send-acceptance mapping.
 
-### Device-only, still not executed
+## Bug findings & agent remediation merge train (2026-10-09)
 
-- `VectorStoreRevisionMigrationTest` now also asserts the **A → B → A survival**
-  contract (rows from another valid encoder are not obsolete and are never
-  deleted) and obsolete-only reclamation. It is compiled but not run in CI.
-- Chat composer refusal-keeps-draft and fast-double-submit behavior (#29) needs a
-  Compose device test; only the acceptance mapping is unit-tested.
-- **No automated test executes `llama_decode` in embeddings mode.** The host mock
-  returns at `Engine::encode`'s no-model early return, so real embedding output
-  (pooling NONE, `llama_model_n_embd_out` width, and the KV reset's effect on the
-  next chat turn) remains device-only. See issue #21.
+Following the initial reliability train, the 18 audit findings and qualification gaps
+(PL-F01–PL-F18, PL-Q01–PL-Q03) were remediated in four sequential PRs:
 
-## Release gate
+| Sequence | Merged as | Findings Remediated | Evidence & Tests Added |
+| --- | --- | --- | --- |
+| **Sequence A: RAG & Vector Store** | PR #34 (`c37775f`) | PL-F08, PL-F10, PL-F11, PL-F12, PL-F18 | DocumentChunker exact-boundary unit test; KnowledgePackTools partial-download failure test; VectorStoreRevisionMigrationTest v2→v3 obsolete row cleanup; VectorStore multi-pack wipe test; EmbeddingIdentity epoch mid-flight abort tests. |
+| **Sequence B: Chat Admission & Draft Ownership** | PR #35 (`e0a1442`) | PL-F01, PL-F02, PL-F03, PL-F04, PL-F07 | Service admission-before-cancellation tests; direct-tool synchronous failure outcome test; draft revision ownership and in-flight token idempotency tests; ChatScreen attachment picker bound to originating chat; DraftPayloadStore app-private durable storage bounding rememberSaveable bundles. |
+| **Sequence C: Task Durability & Search Consistency** | PR #36 (`fe914aa`) | PL-F05, PL-F06, PL-Q02, PL-Q03 | Atomic task persistence with `.bak` rollback; BackgroundAgentPersistenceTest durability barrier; ChatSearchAndDeletionConsistencyTest verifying search index eviction, delete error propagation, and ordered revisions. |
+| **Sequence D: Imports, Downloads & Provenance** | PR #37 (`6745922`) | PL-F09, PL-F13, PL-F14, PL-F15, PL-F16, PL-F17 | SequentialImportQueue non-dropping retry loop on busy; fatal `Throwable` rethrow; URI map release; ResumableDownloadEngineTest verifying Content-Range 206 validation, 200 reset, ETag mutation reset, disk reserve & MAX_MODEL_BYTES; catalog SHA-256 ID derivation with legacy lookup; cache threat model boundary test; ModelProvenancePersistenceTest manifest round-trip. |
 
-The authoritative gate is the user journey in
-`docs/superpowers/specs/2026-10-06-reliability-sprint-design.md`, run on a
-qualified APK on physical hardware. CI is a necessary precondition, not a
-substitute.
+## Qualification ledger & release qualification matrix
+
+| ID | Title / Subsystem | Tag | Remediation / Verification Status |
+| --- | --- | --- | --- |
+| **PL-F01** | Rejected message can cancel an existing generation | C | **RESOLVED** in PR #35. Evaluates admission and preflight before cancelling running generations. |
+| **PL-F02** | Synchronously failed direct tool reported as unaccepted | C | **RESOLVED** in PR #35. Direct tool path sets `HANDLED` launch result, preserving failure trace without lying to composer. |
+| **PL-F03** | In-flight send draft ownership / idempotency guard | R | **RESOLVED** in PR #35. Binds send callbacks to originating chat ID and draft revision token; disables composer during in-flight send. |
+| **PL-F04** | Attachment picker can attach content to wrong chat | R | **RESOLVED** in PR #35. Attachment picker coroutine bound to originating chat ID; ignores reads if chat was switched. |
+| **PL-F05** | Background agent task persistence file loss / rollback | C | **RESOLVED** in PR #36. Atomic file replace with `.bak` rollback, synchronous write barrier before StateFlow emission. |
+| **PL-F06** | Chat deletion/clear inconsistent with search / durable index | C/R | **RESOLVED** in PR #36. Evicts search index entries on clear/delete, propagates deletion errors, versions chat index snapshots. |
+| **PL-F07** | rememberSaveable stores unbounded attachment text | C/R | **RESOLVED** in PR #35. Large extracted attachment text offloaded to app-private `DraftPayloadStore`; bundle size strictly bounded. |
+| **PL-F08** | v2→v3 vector store migration unsearchable rows | C | **RESOLVED** in PR #34. Obsolete migrated rows with blank encoder or zero dim offered for cleanup via `cleanObsoleteChunks`. |
+| **PL-F09** | Batch import silently drops files on busy | C/R | **RESOLVED** in PR #37. Typed `ImportDispatchOutcome.RetryableBusy` with non-dropping retry loop in `SequentialImportQueue`. |
+| **PL-F10** | Partially downloaded pack reported as completed | C | **RESOLVED** in PR #34. `PackDownloadResult` reports failures; `KnowledgePackTools` fails cleanly when pack chunks fail. |
+| **PL-F11** | DocumentChunker duplicates terminal chunk on boundary | C | **RESOLVED** in PR #34. Suppressed duplicate tail chunk when `start >= text.length`. |
+| **PL-F12** | Embedding model switch during RAG creates mixed-model index | R | **RESOLVED** in PR #34. Added monotonic `epoch` to `EmbeddingIdentity`; aborts mid-flight ingest and rejects stale searches. |
+| **PL-F13** | Resumable download lacks Content-Range validation & ETag guards | C/R | **RESOLVED** in PR #37. `ResumableDownloadEngine` validates HTTP 206 range start/total, resets on 200, checks ETag in `.part.meta`, enforces disk headroom. |
+| **PL-F14** | Truncated custom entry ID collision vulnerability | C | **RESOLVED** in PR #37. Uses SHA-256 over `repoId:fileName` for `customEntryId`; maintains `legacyCustomEntryId` resolution. |
+| **PL-F15** | Verification cache threat model boundary | C | **RESOLVED** in PR #37. Documented threat model as fast change detector for app-private storage; verified boundary on >256 KiB files. |
+| **PL-F16** | Legacy imported models falsely upgraded to verified pinned | C | **RESOLVED** in PR #37. Introduced `DownloadIntegrity.UNKNOWN_LEGACY`; preserved provenance across manifest round-trips. |
+| **PL-F17** | Swallowed fatal Throwable & import URI map leak | C | **RESOLVED** in PR #37. Caught `Exception` instead of `Throwable` to rethrow `OutOfMemoryError`; evicted URIs on completion/failure. |
+| **PL-F18** | clearAllKnowledgePacks does not clear on-demand grokipedia | C | **RESOLVED** in PR #34. Deletes all knowledge packs across both curated and on-demand grokipedia domains. |
+| **PL-Q01** | Release qualification matrix and device-smoke gate | QUAL | **DEVICE_BLOCKED**. CI unit tests and native host CTests pass (10/10); instrumentation tests compile; real GGUF decode and embeddings require physical device execution. **Issue #21 remains OPEN**. |
+| **PL-Q02** | BackgroundAgentPersistenceTest flakiness / race | G | **RESOLVED** in PR #36. Added durability barrier and atomic rollback recovery tests. |
+| **PL-Q03** | ChatSearchAndDeletionConsistencyTest coverage | G | **RESOLVED** in PR #36. Added comprehensive unit tests for search eviction, delete failure propagation, and temp file rollback. |
+
+## Release gate: DEVICE_BLOCKED
+
+The release qualification status is **DEVICE_BLOCKED**:
+1. **Native GGUF embedding is untested in host CI**: CTest executes `engine_mock_test` with a mock engine that early-returns before `llama_decode` in embeddings mode.
+2. **Instrumentation tests are compiled but not run**: `assembleDevDebugAndroidTest` builds `RealInferenceSmokeTest` and `VectorStoreRevisionMigrationTest`, but cloud CI lacks Android emulators/hardware.
+3. **Issue #21 remains OPEN** as the tracking gate until physical device execution verifies real model inference, token generation, and embedding cosine similarity.
+
+CI passing is a necessary prerequisite, but release qualification requires on-device smoke verification per `docs/evidence/QUAL_RUNBOOK.md`.
+

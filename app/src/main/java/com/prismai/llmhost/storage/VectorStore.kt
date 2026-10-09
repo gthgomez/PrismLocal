@@ -97,9 +97,11 @@ data class VectorDocumentSummary(
     val searchableChunkCount: Int,
     val previewText: String,
     val createdAt: Long,
+    val legacyChunkCount: Int = 0,
 ) {
     /** True when the currently loaded encoder can score every stored chunk of this document. */
-    val fullySearchable: Boolean get() = storedChunkCount > 0 && searchableChunkCount == storedChunkCount
+    val fullySearchable: Boolean get() = storedChunkCount > 0 && searchableChunkCount == storedChunkCount && legacyChunkCount == 0
+    val hasLegacyChunks: Boolean get() = legacyChunkCount > 0
 }
 
 /**
@@ -120,6 +122,8 @@ data class EmbeddingIdentity(
     val encoderId: String,
     /** Revision of the embedding computation (pooling/normalization included). */
     val algorithmRevision: Int,
+    /** Monotonic model/config epoch incremented on every model change/reload. */
+    val epoch: Long = 0L,
 ) {
     val token: String get() = "rev=$algorithmRevision;enc=$encoderId"
 
@@ -127,10 +131,10 @@ data class EmbeddingIdentity(
         const val UNKNOWN_ENCODER = "unknown"
 
         /** Identity for when no encoder/model is loaded: matches nothing that was ever stamped. */
-        val UNKNOWN = EmbeddingIdentity(UNKNOWN_ENCODER, 0)
+        val UNKNOWN = EmbeddingIdentity(UNKNOWN_ENCODER, 0, 0L)
 
-        fun of(encoderId: String?, algorithmRevision: Int): EmbeddingIdentity =
-            EmbeddingIdentity(encoderId?.takeIf { it.isNotBlank() } ?: UNKNOWN_ENCODER, algorithmRevision)
+        fun of(encoderId: String?, algorithmRevision: Int, epoch: Long = 0L): EmbeddingIdentity =
+            EmbeddingIdentity(encoderId?.takeIf { it.isNotBlank() } ?: UNKNOWN_ENCODER, algorithmRevision, epoch)
     }
 }
 
@@ -165,6 +169,12 @@ interface VectorIndex {
         identity: EmbeddingIdentity,
     ): List<VectorChunk>
     fun search(queryEmbedding: FloatArray, topK: Int = 5, minScore: Float = 0.0f): List<Pair<VectorChunk, Float>>
+    fun search(
+        queryEmbedding: FloatArray,
+        topK: Int = 5,
+        minScore: Float = 0.0f,
+        expectedIdentity: EmbeddingIdentity? = null,
+    ): List<Pair<VectorChunk, Float>> = search(queryEmbedding, topK, minScore)
     fun deleteByDocument(documentId: String): Int
     fun documentCount(): Int
     fun chunkCount(): Int
@@ -236,16 +246,18 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     /**
      * Selection for rows that are obsolete under EVERY encoder: an older embedding revision
-     * (algorithm/schema), unreachable by [search] no matter which model is loaded. These are the
+     * (algorithm/schema), or unrecoverable legacy rows without valid encoder identity/dimension,
+     * unreachable by [search] no matter which model is loaded. These are the
      * only rows the reclamation cleanup may delete.
      *
-     * Rows that merely belong to a *different* encoder are deliberately NOT included. They are
+     * Rows that merely belong to a *different* valid encoder are deliberately NOT included. They are
      * still valid; the currently loaded model simply cannot score them. Deleting them would destroy
      * the only stored copy of a document's text and force a re-index just because the user switched
      * models temporarily. Switching back to their encoder makes them searchable again.
      */
     private fun obsoleteChunkSelection(): Pair<String, Array<String>> =
-        "$COL_EMBEDDING_REVISION != ?" to arrayOf(EMBEDDING_REVISION.toString())
+        "($COL_EMBEDDING_REVISION != ? OR $COL_ENCODER_IDENTITY = '' OR $COL_ENCODER_IDENTITY IS NULL OR $COL_EMBEDDING_DIM <= 0)" to
+            arrayOf(EMBEDDING_REVISION.toString())
 
     /**
      * Insert a single chunk. Returns the chunk with its assigned id.
@@ -349,14 +361,26 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
      * [topK] chunks are retained, so the full table (text + embedding BLOBs) is
      * never materialized on the heap.
      */
-    override fun search(queryEmbedding: FloatArray, topK: Int, minScore: Float): List<Pair<VectorChunk, Float>> {
+    override fun search(queryEmbedding: FloatArray, topK: Int, minScore: Float): List<Pair<VectorChunk, Float>> =
+        search(queryEmbedding, topK, minScore, null)
+
+    override fun search(
+        queryEmbedding: FloatArray,
+        topK: Int,
+        minScore: Float,
+        expectedIdentity: EmbeddingIdentity?,
+    ): List<Pair<VectorChunk, Float>> {
         if (topK <= 0 || queryEmbedding.isEmpty()) return emptyList()
         lock.withLock {
             val current = currentIdentity()
+            if (expectedIdentity != null && expectedIdentity != current) {
+                return emptyList()
+            }
+            val activeToken = expectedIdentity?.token ?: current.token
             val cursor = dbHelper.readableDatabase.query(
                 TABLE, null,
                 "$COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ? AND $COL_EMBEDDING_DIM = ?",
-                arrayOf(EMBEDDING_REVISION.toString(), current.token, queryEmbedding.size.toString()),
+                arrayOf(EMBEDDING_REVISION.toString(), activeToken, queryEmbedding.size.toString()),
                 null, null, "$COL_CREATED ASC"
             )
             try {
@@ -492,20 +516,20 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
             val sql = """
                 SELECT o.$COL_DOCUMENT_ID AS document_id,
                        COUNT(*) AS stored_count,
-                       SUM(CASE WHEN o.$COL_ENCODER_IDENTITY = ? THEN 1 ELSE 0 END) AS searchable_count,
+                       SUM(CASE WHEN o.$COL_EMBEDDING_REVISION = ? AND o.$COL_ENCODER_IDENTITY = ? AND o.$COL_EMBEDDING_DIM > 0 THEN 1 ELSE 0 END) AS searchable_count,
                        MIN(o.$COL_CREATED) AS first_created,
                        (SELECT i.$COL_TEXT FROM $TABLE i
                           WHERE i.$COL_DOCUMENT_ID = o.$COL_DOCUMENT_ID
                             AND i.$COL_EMBEDDING_REVISION = ?
                           ORDER BY i.$COL_CHUNK_INDEX ASC, i.$COL_CREATED ASC
-                          LIMIT 1) AS preview
+                          LIMIT 1) AS preview,
+                       SUM(CASE WHEN o.$COL_EMBEDDING_REVISION != ? OR o.$COL_ENCODER_IDENTITY = '' OR o.$COL_ENCODER_IDENTITY IS NULL OR o.$COL_EMBEDDING_DIM <= 0 THEN 1 ELSE 0 END) AS legacy_count
                 FROM $TABLE o
-                WHERE o.$COL_EMBEDDING_REVISION = ?
                 GROUP BY o.$COL_DOCUMENT_ID
                 ORDER BY first_created ASC
             """.trimIndent()
             val cursor = dbHelper.readableDatabase.rawQuery(
-                sql, arrayOf(identity.token, revisionArg, revisionArg),
+                sql, arrayOf(revisionArg, identity.token, revisionArg, revisionArg),
             )
             try {
                 val summaries = mutableListOf<VectorDocumentSummary>()
@@ -517,6 +541,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                             searchableChunkCount = cursor.getInt(2),
                             previewText = (cursor.getString(4) ?: "").take(PREVIEW_MAX_CHARS),
                             createdAt = cursor.getLong(3),
+                            legacyChunkCount = cursor.getInt(5),
                         )
                     )
                 }
@@ -561,6 +586,24 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
         lock.withLock {
             val (selection, args) = obsoleteChunkSelection()
             return dbHelper.writableDatabase.delete(TABLE, selection, args)
+        }
+    }
+
+    /**
+     * Count rows that have current [EMBEDDING_REVISION] but empty/invalid encoder identity or zero dimension.
+     */
+    fun countLegacyUnknownChunks(): Int {
+        val selection = "$COL_EMBEDDING_REVISION = ? AND ($COL_ENCODER_IDENTITY = '' OR $COL_ENCODER_IDENTITY IS NULL OR $COL_EMBEDDING_DIM <= 0)"
+        return countRows(selection, arrayOf(EMBEDDING_REVISION.toString()))
+    }
+
+    /**
+     * Reclaim unrecoverable legacy rows that have current revision but empty/invalid encoder identity or zero dimension.
+     */
+    fun deleteLegacyUnknownChunks(): Int {
+        lock.withLock {
+            val selection = "$COL_EMBEDDING_REVISION = ? AND ($COL_ENCODER_IDENTITY = '' OR $COL_ENCODER_IDENTITY IS NULL OR $COL_EMBEDDING_DIM <= 0)"
+            return dbHelper.writableDatabase.delete(TABLE, selection, arrayOf(EMBEDDING_REVISION.toString()))
         }
     }
 
@@ -626,7 +669,11 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
         /** True when a row stamped with [rowIdentity] is comparable with [current]. */
         fun isCompatibleIdentity(rowIdentity: String?, current: EmbeddingIdentity): Boolean =
-            rowIdentity == current.token
+            rowIdentity != null && rowIdentity == current.token
+
+        /** True when a row with [rowRevision], [encoderIdentity], and [dimension] is unrecoverable legacy. */
+        fun isUnrecoverableLegacy(rowRevision: Int, encoderIdentity: String?, dimension: Int): Boolean =
+            rowRevision != EMBEDDING_REVISION || encoderIdentity.isNullOrBlank() || dimension <= 0
 
         val CREATE_TABLE_SQL: String = """
             CREATE TABLE IF NOT EXISTS $TABLE (

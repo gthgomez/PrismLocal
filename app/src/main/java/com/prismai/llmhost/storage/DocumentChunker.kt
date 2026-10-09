@@ -54,6 +54,9 @@ object DocumentChunker {
                 result.add(Chunk(text = chunkText, index = index))
                 index++
             }
+            if (end >= text.length) {
+                break
+            }
             // Advance start, accounting for overlap
             val nextStart = if (safeOverlap > 0 && end - safeOverlap > start) {
                 end - safeOverlap

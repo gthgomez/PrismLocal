@@ -214,7 +214,7 @@ class RagManager(
                 return@withContext emptyList()
             }
 
-            vectorStore.search(queryEmbedding, topK = topK, minScore = DEFAULT_MIN_RAG_SCORE)
+            vectorStore.search(queryEmbedding, topK = topK, minScore = DEFAULT_MIN_RAG_SCORE, expectedIdentity = identity)
         }
 
     /**

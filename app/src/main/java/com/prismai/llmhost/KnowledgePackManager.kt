@@ -38,8 +38,20 @@ data class KnowledgePack(
     val description: String,          // Brief description
     val topicSlugs: List<String>,     // Grokipedia article slugs in this pack
     val totalChunks: Int = 0,        // Number of chunks stored after indexing
+    val searchableChunks: Int = 0,   // Number of chunks searchable under currently loaded encoder
     val downloadStatus: KnowledgePackStatus = KnowledgePackStatus.NOT_DOWNLOADED,
 )
+
+data class PackDownloadResult(
+    val packId: String,
+    val committedSlugs: Int,
+    val totalSlugs: Int,
+    val status: KnowledgePackStatus,
+    val storedChunks: Int,
+    val searchableChunks: Int,
+) {
+    val isComplete: Boolean get() = status == KnowledgePackStatus.INDEXED
+}
 
 /**
  * Manages downloadable knowledge packs sourced from Grokipedia.
@@ -138,12 +150,14 @@ class KnowledgePackManager(
     // In-memory state: pack id -> current status (persisted across downloads within a session).
     private val packStatuses = mutableMapOf<String, KnowledgePackStatus>()
     private val packChunkCounts = mutableMapOf<String, Int>()
+    private val packSearchableChunkCounts = mutableMapOf<String, Int>()
 
     init {
         // Initialize all packs as NOT_DOWNLOADED
         CURATED_PACKS.forEach { pack ->
             packStatuses[pack.id] = KnowledgePackStatus.NOT_DOWNLOADED
             packChunkCounts[pack.id] = 0
+            packSearchableChunkCounts[pack.id] = 0
         }
     }
 
@@ -155,9 +169,12 @@ class KnowledgePackManager(
     fun listAvailablePacks(): List<KnowledgePack> {
         return CURATED_PACKS.map { pack ->
             val fetched = checkPackAlreadyIndexed(pack)
+            val stored = packChunkCounts[pack.id] ?: 0
+            val searchable = packSearchableChunkCounts[pack.id] ?: 0
             pack.copy(
                 downloadStatus = fetched ?: packStatuses[pack.id] ?: KnowledgePackStatus.NOT_DOWNLOADED,
-                totalChunks = packChunkCounts[pack.id] ?: 0,
+                totalChunks = stored,
+                searchableChunks = searchable,
             )
         }
     }
@@ -172,19 +189,35 @@ class KnowledgePackManager(
      * @param onProgress callback with progress fraction (0.0 to 1.0)
      * @return total number of chunks indexed, or -1 on failure
      */
-    suspend fun downloadPack(packId: String, onProgress: (Float) -> Unit = {}): Int = withContext(Dispatchers.IO) {
+    suspend fun downloadPack(packId: String, onProgress: (Float) -> Unit = {}): PackDownloadResult = withContext(Dispatchers.IO) {
         val pack = packMap[packId]
         if (pack == null) {
             Log.w(TAG, "downloadPack unknown packId=$packId")
             packStatuses[packId] = KnowledgePackStatus.FAILED
-            return@withContext -1
+            return@withContext PackDownloadResult(
+                packId = packId,
+                committedSlugs = 0,
+                totalSlugs = 0,
+                status = KnowledgePackStatus.FAILED,
+                storedChunks = 0,
+                searchableChunks = 0,
+            )
         }
 
         // Check if already indexed
         val existing = checkPackAlreadyIndexed(pack)
         if (existing == KnowledgePackStatus.INDEXED) {
-            Log.i(TAG, "downloadPack packId=$packId already indexed with ${packChunkCounts[packId]} chunks")
-            return@withContext packChunkCounts[packId] ?: 0
+            val stored = packChunkCounts[packId] ?: 0
+            val searchable = packSearchableChunkCounts[packId] ?: 0
+            Log.i(TAG, "downloadPack packId=$packId already indexed with $stored chunks ($searchable searchable)")
+            return@withContext PackDownloadResult(
+                packId = packId,
+                committedSlugs = pack.topicSlugs.size,
+                totalSlugs = pack.topicSlugs.size,
+                status = KnowledgePackStatus.INDEXED,
+                storedChunks = stored,
+                searchableChunks = searchable,
+            )
         }
 
         Log.i(TAG, "downloadPack starting packId=$packId slugs=${pack.topicSlugs}")
@@ -247,23 +280,42 @@ class KnowledgePackManager(
             onProgress(progress.coerceIn(0.0f, 1.0f))
         }
 
+        val prefix = "$GROKIPEDIA_DOC_ID_PREFIX:$packId:"
+        val packDocs = vectorStore.getDocumentSummaries().filter { it.documentId.startsWith(prefix) }
+        val storedChunks = packDocs.sumOf { it.storedChunkCount }
+        val searchableChunks = packDocs.sumOf { it.searchableChunkCount }
+
         // Update status. INDEXED only when every slug committed; a partially stored pack is reported
         // as FAILED rather than pretending the whole pack is searchable.
-        if (committedSlugs == slugs.size && totalIndexed > 0) {
-            packStatuses[packId] = KnowledgePackStatus.INDEXED
-            packChunkCounts[packId] = totalIndexed
-            Log.i(TAG, "downloadPack complete packId=$packId indexed=$totalIndexed failed=$failedSlugs")
+        val finalStatus = if (committedSlugs == slugs.size && storedChunks > 0) {
+            KnowledgePackStatus.INDEXED
         } else {
-            packStatuses[packId] = KnowledgePackStatus.FAILED
+            KnowledgePackStatus.FAILED
+        }
+
+        packStatuses[packId] = finalStatus
+        packChunkCounts[packId] = storedChunks
+        packSearchableChunkCounts[packId] = searchableChunks
+
+        if (finalStatus == KnowledgePackStatus.INDEXED) {
+            Log.i(TAG, "downloadPack complete packId=$packId stored=$storedChunks searchable=$searchableChunks failed=$failedSlugs")
+        } else {
             Log.w(
                 TAG,
                 "downloadPack failed packId=$packId committed=$committedSlugs/${slugs.size} " +
-                    "indexed=$totalIndexed failed=$failedSlugs",
+                    "stored=$storedChunks searchable=$searchableChunks failed=$failedSlugs",
             )
         }
 
         onProgress(1.0f)
-        return@withContext totalIndexed
+        return@withContext PackDownloadResult(
+            packId = packId,
+            committedSlugs = committedSlugs,
+            totalSlugs = slugs.size,
+            status = finalStatus,
+            storedChunks = storedChunks,
+            searchableChunks = searchableChunks,
+        )
     }
 
     /**
@@ -365,23 +417,27 @@ class KnowledgePackManager(
         // Reset in-memory status
         packStatuses[packId] = KnowledgePackStatus.NOT_DOWNLOADED
         packChunkCounts[packId] = 0
+        packSearchableChunkCounts[packId] = 0
 
         Log.i(TAG, "deletePack packId=$packId removed=$removed")
         return removed
     }
 
     /**
-     * Clean up all Grokipedia chunks from the vector store.
+     * Clean up all Grokipedia chunks from the vector store, including curated packs
+     * and on-demand imported articles.
      *
      * @return number of chunks removed
      */
     fun clearAllKnowledgePacks(): Int {
-        var totalRemoved = 0
+        val removed = vectorStore.deleteByDocumentPrefix("$GROKIPEDIA_DOC_ID_PREFIX:")
         for (pack in CURATED_PACKS) {
-            totalRemoved += deletePack(pack.id)
+            packStatuses[pack.id] = KnowledgePackStatus.NOT_DOWNLOADED
+            packChunkCounts[pack.id] = 0
+            packSearchableChunkCounts[pack.id] = 0
         }
-        Log.i(TAG, "clearAllKnowledgePacks removed=$totalRemoved")
-        return totalRemoved
+        Log.i(TAG, "clearAllKnowledgePacks removed=$removed")
+        return removed
     }
 
     // ---- Internal helpers ----
@@ -410,8 +466,11 @@ class KnowledgePackManager(
         val allSlugsPresent = pack.topicSlugs.all { slug -> slug in foundSlugs }
 
         if (allSlugsPresent) {
+            val stored = packDocuments.sumOf { it.storedChunkCount }
+            val searchable = packDocuments.sumOf { it.searchableChunkCount }
             packStatuses[pack.id] = KnowledgePackStatus.INDEXED
-            packChunkCounts[pack.id] = packDocuments.sumOf { it.storedChunkCount }
+            packChunkCounts[pack.id] = stored
+            packSearchableChunkCounts[pack.id] = searchable
             return KnowledgePackStatus.INDEXED
         }
 

@@ -210,6 +210,27 @@ class RagReIngestTest {
         assertTrue("mixed-encoder rows must never be written", store.events.isEmpty())
     }
 
+    @Test
+    fun ingestAbortsWhenModelSwitchesAndReturnsToSameEncoderMidIngest() = runBlocking {
+        val initialIdentity = EmbeddingIdentity("enc-A", VectorStore.EMBEDDING_REVISION, epoch = 1L)
+        val store = RecordingVectorIndex(initialIdentity)
+        var calls = 0
+        val rag = RagManager(store, DocumentChunker) { _ ->
+            calls++
+            if (calls == 2) {
+                // Encoder switches to B (epoch 2), then back to A (epoch 3)
+                store.setIdentity(EmbeddingIdentity("enc-A", VectorStore.EMBEDDING_REVISION, epoch = 3L))
+            }
+            FloatArray(4) { 0.1f }
+        }
+
+        val result = rag.ingestDocumentWithResult("doc-1", "title", longBody())
+
+        assertTrue("an A -> B -> A model transition must trigger encoderChanged abort", result.encoderChanged)
+        assertFalse(result.committed)
+        assertTrue("no rows may be written across epoch change", store.events.isEmpty())
+    }
+
     // ── D: cancellation is not swallowed ───────────────────────────────
 
     @Test

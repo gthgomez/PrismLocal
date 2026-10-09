@@ -42,7 +42,42 @@ class VectorStoreSchemaTest {
     }
 
     @Test
-    fun dbVersion_isBumpedForTheRevisionMigration() {
-        assertEquals(2, VectorStore.DB_VERSION)
+    fun createTableSql_declaresEncoderIdentityAndDimensionColumns() {
+        assertTrue(VectorStore.CREATE_TABLE_SQL.contains(VectorStore.COL_ENCODER_IDENTITY))
+        assertTrue(VectorStore.CREATE_TABLE_SQL.contains(VectorStore.COL_EMBEDDING_DIM))
+    }
+
+    @Test
+    fun dbVersion_isBumpedForTheEncoderIdentityMigration() {
+        assertEquals(3, VectorStore.DB_VERSION)
+    }
+
+    @Test
+    fun identityToken_distinguishesEncoderArtifactAndRevision() {
+        val a = EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION)
+        val sameA = EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION)
+        val otherModel = EmbeddingIdentity("sha-b", VectorStore.EMBEDDING_REVISION)
+        val otherRevision = EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION - 1)
+
+        assertEquals(a.token, sameA.token)
+        assertFalse(a.token == otherModel.token)
+        assertFalse(a.token == otherRevision.token)
+    }
+
+    @Test
+    fun isCompatibleIdentity_rejectsRowsFromOtherEncodersAndUnknownStamps() {
+        val current = EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION)
+
+        assertTrue(VectorStore.isCompatibleIdentity(current.token, current))
+        assertFalse(VectorStore.isCompatibleIdentity(EmbeddingIdentity("sha-b", VectorStore.EMBEDDING_REVISION).token, current))
+        assertFalse(VectorStore.isCompatibleIdentity("", current))
+        assertFalse(VectorStore.isCompatibleIdentity(null, current))
+    }
+
+    @Test
+    fun unknownIdentity_of_buildsFromBlankEncoderId() {
+        assertEquals(EmbeddingIdentity.UNKNOWN_ENCODER, EmbeddingIdentity.of(null, 2).encoderId)
+        assertEquals(EmbeddingIdentity.UNKNOWN_ENCODER, EmbeddingIdentity.of("   ", 2).encoderId)
+        assertEquals("sha-a", EmbeddingIdentity.of("sha-a", 2).encoderId)
     }
 }

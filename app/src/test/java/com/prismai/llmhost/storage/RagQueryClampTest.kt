@@ -15,9 +15,13 @@ class RagQueryClampTest {
     private class FakeVectorStore : VectorIndex {
         override fun insertBatch(chunks: List<VectorChunk>): List<VectorChunk> = chunks
 
+        override fun currentEmbeddingIdentity(): EmbeddingIdentity =
+            EmbeddingIdentity("enc-1", VectorStore.EMBEDDING_REVISION)
+
         override fun replaceDocument(
             documentId: String,
             chunks: List<VectorChunk>,
+            identity: EmbeddingIdentity,
         ): List<VectorChunk> = chunks
 
         override fun search(
@@ -30,6 +34,7 @@ class RagQueryClampTest {
         override fun documentCount(): Int = 0
         override fun chunkCount(): Int = 0
         override fun clear() = Unit
+        override fun setEmbeddingIdentityProvider(provider: () -> EmbeddingIdentity) = Unit
     }
 
     @Test

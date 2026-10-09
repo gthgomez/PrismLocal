@@ -78,6 +78,112 @@ class VectorStoreRevisionMigrationTest {
             listOf("current-1"),
             results.map { it.first.id },
         )
+
+        // The revision-1 row is obsolete under every encoder and may be reclaimed.
+        assertEquals("only the revision-1 row is obsolete", 1, store.countObsoleteChunks())
+        assertEquals(1, store.deleteObsoleteChunks())
+        assertEquals(0, store.countObsoleteChunks())
+        assertTrue(
+            "cleanup must not remove the current-revision row",
+            store.getAllChunks().any { it.id == "current-1" },
+        )
+    }
+
+    @Test
+    fun encoderSwitch_makesRowsUnsearchableButNeverObsoleteOrDeletable() {
+        val store = VectorStore(context)
+        var encoderId = "sha-a"
+        store.setEmbeddingIdentityProvider { EmbeddingIdentity(encoderId, VectorStore.EMBEDDING_REVISION) }
+        store.insert(
+            VectorChunk(
+                id = "a-1",
+                documentId = "doc-a",
+                chunkIndex = 0,
+                text = "chunk from encoder a",
+                embedding = floatArrayOf(1f, 0f, 0f),
+            )
+        )
+
+        // Same encoder: the row is searchable and current.
+        assertEquals(
+            listOf("a-1"),
+            store.search(floatArrayOf(1f, 0f, 0f), topK = 10, minScore = -1f).map { it.first.id },
+        )
+        assertEquals(listOf("a-1"), store.getCurrentChunks().map { it.id })
+
+        // Switching model/encoder must not silently score the old vectors.
+        encoderId = "sha-b"
+        assertTrue(
+            "rows from another encoder must not be scored",
+            store.search(floatArrayOf(1f, 0f, 0f), topK = 10, minScore = -1f).isEmpty(),
+        )
+        assertTrue("rows from another encoder must not be reported current", store.getCurrentChunks().isEmpty())
+
+        // Critically, another encoder's rows are NOT obsolete: deleting them would destroy the only
+        // stored copy of the document text and force a re-index just because a different model is
+        // loaded for a moment.
+        assertEquals("another encoder's rows must not be obsolete", 0, store.countObsoleteChunks())
+        assertEquals(0, store.deleteObsoleteChunks())
+        assertEquals("the row must still be stored", 1, store.countStoredChunks())
+        assertEquals(0, store.countSearchableChunks())
+        assertTrue(store.getAllChunks().any { it.id == "a-1" })
+
+        // Switching back re-enables retrieval without a re-index.
+        encoderId = "sha-a"
+        assertEquals(
+            "model A -> B -> A must preserve A's index",
+            listOf("a-1"),
+            store.search(floatArrayOf(1f, 0f, 0f), topK = 10, minScore = -1f).map { it.first.id },
+        )
+        assertEquals(1, store.countSearchableChunks())
+    }
+
+    @Test
+    fun search_doesNotMatchRowsOfADifferentDimension() {
+        val store = VectorStore(context)
+        store.setEmbeddingIdentityProvider { EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION) }
+        store.insert(
+            VectorChunk(
+                id = "dim-3",
+                documentId = "doc-a",
+                chunkIndex = 0,
+                text = "3-wide",
+                embedding = floatArrayOf(1f, 0f, 0f),
+            )
+        )
+
+        assertTrue(
+            "a query of another width must not match stored rows",
+            store.search(floatArrayOf(1f, 0f), topK = 10, minScore = -1f).isEmpty(),
+        )
+    }
+
+    @Test
+    fun rowsFromAnotherOrUnloadedEncoderAreNeverOfferedForDestructiveCleanup() {
+        val store = VectorStore(context)
+        // No provider set: identity is UNKNOWN, as when no model is loaded yet.
+        store.insert(
+            VectorChunk(
+                id = "pre-model",
+                documentId = "doc-a",
+                chunkIndex = 0,
+                text = "indexed while a model was loaded earlier",
+                embedding = floatArrayOf(1f, 0f, 0f),
+            )
+        )
+
+        // The row is stored, and is never obsolete merely because no model is loaded.
+        assertEquals(1, store.countStoredChunks())
+        assertEquals(0, store.countObsoleteChunks())
+        assertEquals("nothing may be offered for destructive cleanup", 0, store.deleteObsoleteChunks())
+
+        // Once a different real encoder is known, the row is not searchable, but it is still stored
+        // and still NOT obsolete: switching back to its encoder must recover it.
+        store.setEmbeddingIdentityProvider { EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION) }
+        assertTrue(store.getCurrentChunks().isEmpty())
+        assertEquals("a different encoder's row is not obsolete", 0, store.countObsoleteChunks())
+        assertEquals(1, store.countStoredChunks())
+        assertTrue(store.getAllChunks().any { it.id == "pre-model" })
     }
 
     /**

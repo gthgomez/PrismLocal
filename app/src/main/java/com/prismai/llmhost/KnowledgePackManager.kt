@@ -8,6 +8,7 @@ import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -57,7 +58,6 @@ class KnowledgePackManager(
     private val grokipediaClient: GrokipediaClient,
     private val vectorStore: KnowledgePackChunkStore,
     private val ragManager: RagManager,
-    private val chunker: DocumentChunker = DocumentChunker,
 ) {
     companion object {
         private const val TAG = "KnowledgePackManager"
@@ -194,59 +194,72 @@ class KnowledgePackManager(
         val slugs = pack.topicSlugs
         var totalIndexed = 0
         var failedSlugs = 0
+        var committedSlugs = 0
 
         for ((index, slug) in slugs.withIndex()) {
-            val result = runCatching {
+            val committed = try {
                 val article = grokipediaClient.fetchArticle(slug)
                 if (article == null) {
                     Log.w(TAG, "downloadPack slug=$slug returned null")
-                    failedSlugs++
-                    return@runCatching null
+                    false
+                } else {
+                    // Use the article content or fall back to the summary if content is empty
+                    val content = if (article.content.isNotBlank()) article.content else article.summary
+                    if (content.isBlank()) {
+                        Log.w(TAG, "downloadPack slug=$slug has empty content")
+                        false
+                    } else {
+                        // Compute document ID: grokipedia:{packId}:{slug}
+                        val docId = "$GROKIPEDIA_DOC_ID_PREFIX:$packId:${article.slug}"
+                        val ingest = ragManager.ingestDocumentWithResult(
+                            documentId = docId,
+                            title = article.title,
+                            text = content,
+                        )
+                        // Only a committed ingest wrote rows. A partial embed, an encoder switch, or
+                        // an oversized article wrote nothing; do not count it as indexed.
+                        if (ingest.committed) {
+                            totalIndexed += ingest.embeddedCount
+                            Log.d(TAG, "downloadPack slug=$slug chunks=${ingest.embeddedCount}")
+                            true
+                        } else {
+                            Log.w(
+                                TAG,
+                                "downloadPack slug=$slug not committed chunks=${ingest.totalChunks} " +
+                                    "failed=${ingest.failedCount} encoderChanged=${ingest.encoderChanged} " +
+                                    "tooLarge=${ingest.tooLarge}",
+                            )
+                            false
+                        }
+                    }
                 }
-
-                // Use the article content or fall back to the summary if content is empty
-                val content = if (article.content.isNotBlank()) article.content else article.summary
-                if (content.isBlank()) {
-                    Log.w(TAG, "downloadPack slug=$slug has empty content")
-                    failedSlugs++
-                    return@runCatching null
-                }
-
-                // Chunk the article
-                val chunks = chunker.chunk(content)
-
-                // Compute document ID: grokipedia:{packId}:{slug}
-                val docId = "$GROKIPEDIA_DOC_ID_PREFIX:$packId:${article.slug}"
-
-                // Ingest each chunk via RagManager
-                val chunkCount = ragManager.ingestDocument(
-                    documentId = docId,
-                    title = article.title,
-                    text = content,
-                )
-
-                totalIndexed += chunkCount
-                Log.d(TAG, "downloadPack slug=$slug chunks=$chunkCount")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "downloadPack slug=$slug failed", e)
+                false
             }
 
-            if (result.isFailure) {
-                Log.w(TAG, "downloadPack slug=$slug failed", result.exceptionOrNull())
-                failedSlugs++
-            }
+            if (committed) committedSlugs++ else failedSlugs++
 
             // Report progress
             val progress = (index + 1).toFloat() / slugs.size.toFloat()
             onProgress(progress.coerceIn(0.0f, 1.0f))
         }
 
-        // Update status
-        if (totalIndexed > 0) {
+        // Update status. INDEXED only when every slug committed; a partially stored pack is reported
+        // as FAILED rather than pretending the whole pack is searchable.
+        if (committedSlugs == slugs.size && totalIndexed > 0) {
             packStatuses[packId] = KnowledgePackStatus.INDEXED
             packChunkCounts[packId] = totalIndexed
             Log.i(TAG, "downloadPack complete packId=$packId indexed=$totalIndexed failed=$failedSlugs")
         } else {
             packStatuses[packId] = KnowledgePackStatus.FAILED
-            Log.w(TAG, "downloadPack failed packId=$packId no chunks indexed")
+            Log.w(
+                TAG,
+                "downloadPack failed packId=$packId committed=$committedSlugs/${slugs.size} " +
+                    "indexed=$totalIndexed failed=$failedSlugs",
+            )
         }
 
         onProgress(1.0f)
@@ -286,24 +299,35 @@ class KnowledgePackManager(
      */
     suspend fun fetchAndIndex(slug: String): Int = withContext(Dispatchers.IO) {
         if (slug.isBlank()) return@withContext -1
-        val result = runCatching {
+        try {
             val article = grokipediaClient.fetchArticle(slug)
-            if (article == null) return@runCatching -1
+            if (article == null) return@withContext -1
 
             val content = if (article.content.isNotBlank()) article.content else article.summary
-            if (content.isBlank()) return@runCatching -1
+            if (content.isBlank()) return@withContext -1
 
             val docId = "$GROKIPEDIA_DOC_ID_PREFIX:on-demand:${article.slug}"
-            val chunkCount = ragManager.ingestDocument(
+            val ingest = ragManager.ingestDocumentWithResult(
                 documentId = docId,
                 title = article.title,
                 text = content,
             )
-            Log.i(TAG, "fetchAndIndex slug=$slug chunks=$chunkCount")
-            chunkCount
+            if (!ingest.committed) {
+                Log.w(
+                    TAG,
+                    "fetchAndIndex slug=$slug not committed failed=${ingest.failedCount} " +
+                        "encoderChanged=${ingest.encoderChanged} tooLarge=${ingest.tooLarge}",
+                )
+                return@withContext -1
+            }
+            Log.i(TAG, "fetchAndIndex slug=$slug chunks=${ingest.embeddedCount}")
+            ingest.embeddedCount
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchAndIndex slug=$slug failed", e)
+            -1
         }
-
-        result.getOrDefault(-1)
     }
 
     /**
@@ -333,15 +357,10 @@ class KnowledgePackManager(
     fun deletePack(packId: String): Int {
         if (packId.isBlank()) return -1
         val prefix = "$GROKIPEDIA_DOC_ID_PREFIX:$packId:"
-        var removed = 0
 
-        val allChunks = vectorStore.getAllChunks()
-        val toDelete = allChunks.filter { it.documentId.startsWith(prefix) }
-
-        for (chunk in toDelete) {
-            val deleted = vectorStore.deleteByDocument(chunk.documentId)
-            removed += deleted
-        }
+        // One targeted DELETE instead of loading every row (and decoding every embedding) just to
+        // discover the pack's document ids.
+        val removed = vectorStore.deleteByDocumentPrefix(prefix)
 
         // Reset in-memory status
         packStatuses[packId] = KnowledgePackStatus.NOT_DOWNLOADED
@@ -377,21 +396,22 @@ class KnowledgePackManager(
      */
     private fun checkPackAlreadyIndexed(pack: KnowledgePack): KnowledgePackStatus? {
         val prefix = "$GROKIPEDIA_DOC_ID_PREFIX:${pack.id}:"
-        val allChunks = vectorStore.getCurrentChunks()
-        val packChunks = allChunks.filter { it.documentId.startsWith(prefix) }
+        // Stored, encoder-independent view: a pack is indexed when its rows are on disk, regardless
+        // of which model is currently loaded. Bounded to one row per document.
+        val packDocuments = vectorStore.getDocumentSummaries().filter { it.documentId.startsWith(prefix) }
 
-        if (packChunks.isEmpty()) return null
+        if (packDocuments.isEmpty()) return null
 
-        // Check that every slug in the pack has at least one chunk
-        val foundSlugs = packChunks.map { chunk ->
-            chunk.documentId.removePrefix(prefix).substringBefore(":")
+        // Check that every slug in the pack has at least one stored chunk
+        val foundSlugs = packDocuments.map { summary ->
+            summary.documentId.removePrefix(prefix).substringBefore(":")
         }.toSet()
 
-        val allSlugsPresent = pack.topicSlugs.all { slug -> foundSlugs.any { it == slug } }
+        val allSlugsPresent = pack.topicSlugs.all { slug -> slug in foundSlugs }
 
         if (allSlugsPresent) {
             packStatuses[pack.id] = KnowledgePackStatus.INDEXED
-            packChunkCounts[pack.id] = packChunks.size
+            packChunkCounts[pack.id] = packDocuments.sumOf { it.storedChunkCount }
             return KnowledgePackStatus.INDEXED
         }
 

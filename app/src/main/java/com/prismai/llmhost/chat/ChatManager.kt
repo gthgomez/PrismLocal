@@ -24,6 +24,8 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Chat CRUD operations.
@@ -44,6 +46,7 @@ class ChatManager(
 ) {
     private val ioMutex = Mutex()
     private val transcriptWriteGate = TranscriptWriteGate()
+    private val chatIndexRevision = AtomicLong(0L)
 
     // ── Public fields — accessed from InferenceService via delegation props ──
     @Volatile
@@ -142,14 +145,23 @@ class ChatManager(
             return false
         }
 
-        val remaining = uiState._chatSessions.value.filterNot { it.id == chatId }
-        runCatching {
+        val deleteSucceeded = runCatching {
             transcriptWriteGate.invalidateAndRun(chatId, retireOwner = true) {
-                transcriptStore.transcriptFile(chatId).delete()
+                val file = transcriptStore.transcriptFile(chatId)
+                if (file.exists()) file.delete() else true
             }
+        }.getOrElse { error ->
+            Log.w(TAG, "failed to delete chat transcript", error)
+            false
         }
-            .onFailure { error -> Log.w(TAG, "failed to delete chat transcript", error) }
 
+        if (!deleteSucceeded) {
+            return false
+        }
+
+        searchIndex.remove(chatId)
+
+        val remaining = uiState._chatSessions.value.filterNot { it.id == chatId }
         if (remaining.isEmpty()) {
             synchronized(lock) {
                 uiState._chatSessions.value = emptyList()
@@ -191,6 +203,7 @@ class ChatManager(
             eventBus.publish("Cancel generation before clearing chat")
             return
         }
+        val currentId = uiState._currentChatId.value
         synchronized(lock) {
             uiState._transcript.value = emptyList()
             nextTranscriptId = 1L
@@ -199,14 +212,17 @@ class ChatManager(
         }
         uiState.streamState.clear()
         touchCurrentChat(emptyList(), updateTitle = false)
-        runCatching {
-            uiState._currentChatId.value?.let { chatId ->
-                transcriptWriteGate.invalidateAndRun(chatId) {
-                    transcriptStore.transcriptFile(chatId).delete()
+        if (currentId != null) {
+            val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == currentId }?.title
+            searchIndex.update(currentId, emptyList(), sessionTitle)
+            runCatching {
+                transcriptWriteGate.invalidateAndRun(currentId) {
+                    val file = transcriptStore.transcriptFile(currentId)
+                    if (file.exists()) file.delete() else true
                 }
+            }.onFailure { error ->
+                Log.w(TAG, "failed to delete transcript", error)
             }
-        }.onFailure { error ->
-            Log.w(TAG, "failed to delete transcript", error)
         }
         persistChatIndex()
     }
@@ -284,9 +300,13 @@ class ChatManager(
         }.getOrDefault(emptyList())
 
     fun persistChatIndex() {
+        val revision = chatIndexRevision.incrementAndGet()
         val sessionsSnapshot = uiState._chatSessions.value
         scope.launch(Dispatchers.IO) {
             ioMutex.withLock {
+                if (revision < chatIndexRevision.get()) {
+                    return@withLock
+                }
                 runCatching {
                     val array = JSONArray()
                     sessionsSnapshot.forEach { session ->
@@ -301,7 +321,7 @@ class ChatManager(
                         )
                     }
                     val target = transcriptStore.chatIndexFile()
-                    val temp = File(context.filesDir, "chat_index.json.tmp")
+                    val temp = File(context.filesDir, "chat_index.${UUID.randomUUID()}.tmp")
                     temp.writeText(array.toString())
                     transcriptStore.promoteTempFile(temp, target)
                 }.onFailure { error ->
@@ -313,8 +333,9 @@ class ChatManager(
 
     fun newSession(title: String, messageCount: Int): ChatSession {
         val now = System.currentTimeMillis()
+        val uptime = runCatching { SystemClock.uptimeMillis() }.getOrDefault(System.nanoTime())
         return ChatSession(
-            id = "chat_${now}_${SystemClock.uptimeMillis()}",
+            id = "chat_${now}_$uptime",
             title = title,
             createdAt = now,
             updatedAt = now,

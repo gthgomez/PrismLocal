@@ -21,6 +21,11 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import org.json.JSONArray
 import org.json.JSONObject
@@ -103,6 +108,8 @@ class BackgroundAgentManager(
     val state: StateFlow<BackgroundAgentState> = _state.asStateFlow()
     private val bgScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val taskIdCounter = AtomicLong(0L)
+    val persistenceRevision = AtomicLong(0L)
+    fun getPersistenceRevision(): Long = persistenceRevision.get()
     private var activeTaskJob: Job? = null
     private var deviceBusyRetryJob: Job? = null
     @Volatile private var cancelInFlight = false
@@ -169,9 +176,29 @@ class BackgroundAgentManager(
     private fun loadPersistedTasksLocked() {
         val dir = storageDir ?: return
         val file = File(dir, TASKS_FILE_NAME)
-        if (!file.exists()) return
+        val backup = File(dir, "$TASKS_FILE_NAME.bak")
+        val fileToRead = when {
+            file.exists() && file.length() > 0L -> file
+            backup.exists() && backup.length() > 0L -> backup
+            else -> return
+        }
+        val content = runCatching {
+            fileToRead.readText()
+        }.recoverCatching {
+            if (fileToRead != backup && backup.exists() && backup.length() > 0L) {
+                backup.readText()
+            } else throw it
+        }.getOrNull() ?: return
+
         runCatching {
-            val root = JSONObject(file.readText())
+            val root = runCatching {
+                JSONObject(content)
+            }.recoverCatching {
+                if (fileToRead != backup && backup.exists() && backup.length() > 0L) {
+                    JSONObject(backup.readText())
+                } else throw it
+            }.getOrThrow()
+
             val queued = mutableListOf<BackgroundTask>()
             val completed = mutableListOf<BackgroundTask>()
             var highestId = 0L
@@ -216,49 +243,86 @@ class BackgroundAgentManager(
             }
 
             taskIdCounter.set(highestId)
-            _state.value = _state.value.copy(
+            val restoredState = _state.value.copy(
                 queuedTasks = queued.take(MAX_QUEUED_TASKS),
                 completedTasks = completed.takeLast(MAX_COMPLETED_TASKS_SAVED),
             )
+            _state.value = restoredState
             // Rewrite legacy completed records without their formerly persisted prompts.
-            persistTasksLocked()
+            persistTasksLocked(restoredState)
             logD(TAG, "Restored ${queued.size} queued tasks, ${completed.size} completed tasks from disk")
         }.onFailure { e ->
             logW(TAG, "Failed to load persisted background tasks: ${e.message}")
         }
     }
 
-    private fun persistTasksLocked() {
-        val dir = storageDir ?: return
-        runCatching {
-            val current = _state.value
+    private fun persistTasksLocked(targetState: BackgroundAgentState = _state.value): Boolean {
+        val dir = storageDir ?: return true
+        return runCatching {
             val root = JSONObject().apply {
                 put("version", 1)
                 val queuedArr = JSONArray()
-                current.queuedTasks.forEach { queuedArr.put(taskToJson(it, includePrompt = true)) }
+                targetState.queuedTasks.forEach { queuedArr.put(taskToJson(it, includePrompt = true)) }
                 put("queuedTasks", queuedArr)
 
-                if (current.activeTask != null) {
-                    put("activeTask", taskToJson(current.activeTask, includePrompt = true))
+                if (targetState.activeTask != null) {
+                    put("activeTask", taskToJson(targetState.activeTask, includePrompt = true))
                 } else {
                     put("activeTask", JSONObject.NULL)
                 }
 
                 val completedArr = JSONArray()
-                current.completedTasks.takeLast(MAX_COMPLETED_TASKS_SAVED)
+                targetState.completedTasks.takeLast(MAX_COMPLETED_TASKS_SAVED)
                     .forEach { completedArr.put(taskToJson(it, includePrompt = false)) }
                 put("completedTasks", completedArr)
             }
 
             if (!dir.exists()) dir.mkdirs()
-            val temp = File(dir, "$TASKS_FILE_NAME.tmp")
+            val temp = File(dir, "$TASKS_FILE_NAME.${UUID.randomUUID()}.tmp")
             val target = File(dir, TASKS_FILE_NAME)
-            temp.writeText(root.toString())
-            if (target.exists()) target.delete()
-            temp.renameTo(target)
+            val backup = File(dir, "$TASKS_FILE_NAME.bak")
+
+            FileOutputStream(temp).use { fos ->
+                fos.write(root.toString().toByteArray(Charsets.UTF_8))
+                fos.flush()
+                fos.fd.sync()
+            }
+
+            val moved = runCatching {
+                Files.move(temp.toPath(), target.toPath(), REPLACE_EXISTING, ATOMIC_MOVE)
+                true
+            }.getOrDefault(false)
+
+            if (!moved) {
+                val hadTarget = target.exists()
+                if (hadTarget) {
+                    if (backup.exists()) backup.delete()
+                    if (!target.renameTo(backup)) {
+                        if (!temp.renameTo(target)) {
+                            temp.delete()
+                            error("Failed to backup target file during tasks persistence")
+                        }
+                        persistenceRevision.incrementAndGet()
+                        return@runCatching true
+                    }
+                }
+                if (temp.renameTo(target)) {
+                    if (hadTarget && backup.exists()) {
+                        backup.delete()
+                    }
+                } else {
+                    if (hadTarget && backup.exists()) {
+                        backup.renameTo(target)
+                    }
+                    temp.delete()
+                    error("Failed to promote temp file to $TASKS_FILE_NAME")
+                }
+            }
+            persistenceRevision.incrementAndGet()
+            true
         }.onFailure { e ->
             logW(TAG, "Failed to persist background tasks: ${e.message}")
-        }
+        }.getOrDefault(false)
     }
 
     /**
@@ -274,8 +338,12 @@ class BackgroundAgentManager(
             }
             val id = "bg_task_${taskIdCounter.incrementAndGet()}"
             val task = BackgroundTask(id = id, prompt = prompt, sourceChatId = sourceChatId)
-            _state.value = current.copy(queuedTasks = current.queuedTasks + task)
-            persistTasksLocked()
+            val nextState = current.copy(queuedTasks = current.queuedTasks + task)
+            if (!persistTasksLocked(nextState)) {
+                logW(TAG, "Failed to persist task $id to disk, aborting enqueue")
+                return null
+            }
+            _state.value = nextState
             task
         }
 
@@ -294,11 +362,12 @@ class BackgroundAgentManager(
             val current = _state.value
             if (current.activeTask?.sourceChatId == chatId) return@synchronized false
             if (!deleteChat()) return@synchronized false
-            _state.value = current.copy(
+            val nextState = current.copy(
                 queuedTasks = current.queuedTasks.filterNot { it.sourceChatId == chatId },
                 completedTasks = current.completedTasks.filterNot { it.sourceChatId == chatId },
             )
-            persistTasksLocked()
+            persistTasksLocked(nextState)
+            _state.value = nextState
             true
         }
 
@@ -326,11 +395,12 @@ class BackgroundAgentManager(
      */
     private fun promoteHeadLocked(current: BackgroundAgentState): BackgroundTask {
         val head = current.queuedTasks.first().copy(status = BackgroundTaskStatus.RUNNING)
-        _state.value = current.copy(
+        val nextState = current.copy(
             activeTask = head,
             queuedTasks = current.queuedTasks.drop(1),
         )
-        persistTasksLocked()
+        persistTasksLocked(nextState)
+        _state.value = nextState
         return head
     }
 
@@ -394,13 +464,14 @@ class BackgroundAgentManager(
                 synchronized(stateLock) {
                     val current = _state.value
                     if (current.activeTask?.id == task.id) {
-                        _state.value = current.copy(
+                        val nextState = current.copy(
                             activeTask = null,
                             queuedTasks = listOf(
                                 task.copy(status = BackgroundTaskStatus.QUEUED),
                             ) + current.queuedTasks,
                         )
-                        persistTasksLocked()
+                        persistTasksLocked(nextState)
+                        _state.value = nextState
                     }
                 }
             } catch (e: Exception) {
@@ -492,7 +563,7 @@ class BackgroundAgentManager(
         synchronized(stateLock) {
             val latest = _state.value
             val dropped = latest.activeTask
-            _state.value = latest.copy(
+            val nextState = latest.copy(
                 isBackgroundMode = false,
                 activeTask = null,
                 completedTasks = if (dropped != null) {
@@ -501,7 +572,8 @@ class BackgroundAgentManager(
                     latest.completedTasks
                 },
             )
-            persistTasksLocked()
+            persistTasksLocked(nextState)
+            _state.value = nextState
         }
         releaseWakeLockSafely()
         cancelProgressNotification()
@@ -519,13 +591,14 @@ class BackgroundAgentManager(
                 active?.id == taskId -> activeSnapshot = active
                 current.queuedTasks.any { it.id == taskId } -> {
                     val task = current.queuedTasks.first { it.id == taskId }
-                    _state.value = current.copy(
+                    val nextState = current.copy(
                         queuedTasks = current.queuedTasks.filterNot { it.id == taskId },
                         completedTasks = current.completedTasks + task.copy(
                             status = BackgroundTaskStatus.CANCELLED
                         ),
                     )
-                    persistTasksLocked()
+                    persistTasksLocked(nextState)
+                    _state.value = nextState
                     queuedCancelled = true
                 }
             }
@@ -546,14 +619,15 @@ class BackgroundAgentManager(
                 runCatching { cancelNativeGeneration?.invoke() }
                 synchronized(stateLock) {
                     val latest = _state.value
-                    _state.value = latest.copy(
+                    val nextState = latest.copy(
                         activeTask = null,
                         queuedTasks = latest.queuedTasks.filterNot { it.id == taskId },
                         completedTasks = latest.completedTasks + active.copy(
                             status = BackgroundTaskStatus.CANCELLED
                         ),
                     )
-                    persistTasksLocked()
+                    persistTasksLocked(nextState)
+                    _state.value = nextState
                 }
                 releaseWakeLockSafely()
             } finally {
@@ -573,11 +647,12 @@ class BackgroundAgentManager(
                 status = BackgroundTaskStatus.COMPLETED,
                 resultSummary = summary,
             )
-            _state.value = current.copy(
+            val nextState = current.copy(
                 activeTask = null,
                 completedTasks = current.completedTasks + done,
             )
-            persistTasksLocked()
+            persistTasksLocked(nextState)
+            _state.value = nextState
             done
         }
         notifyTaskComplete(completed)
@@ -593,11 +668,12 @@ class BackgroundAgentManager(
                 status = BackgroundTaskStatus.FAILED,
                 resultSummary = error,
             )
-            _state.value = current.copy(
+            val nextState = current.copy(
                 activeTask = null,
                 completedTasks = current.completedTasks + done,
             )
-            persistTasksLocked()
+            persistTasksLocked(nextState)
+            _state.value = nextState
             done
         }
         notifyTaskComplete(failed)
@@ -662,8 +738,9 @@ class BackgroundAgentManager(
     /** Clear history of completed/failed/cancelled tasks. */
     fun clearCompletedTasks() {
         synchronized(stateLock) {
-            _state.value = _state.value.copy(completedTasks = emptyList())
-            persistTasksLocked()
+            val nextState = _state.value.copy(completedTasks = emptyList())
+            persistTasksLocked(nextState)
+            _state.value = nextState
         }
     }
 

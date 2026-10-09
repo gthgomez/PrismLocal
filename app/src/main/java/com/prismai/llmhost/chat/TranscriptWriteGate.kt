@@ -22,11 +22,11 @@ class TranscriptWriteGate {
         }
 
     /** Invalidate queued snapshots, wait for any active publication, then clear/delete storage. */
-    fun invalidateAndRun(
+    fun <T> invalidateAndRun(
         chatId: String,
         retireOwner: Boolean = false,
-        mutation: () -> Unit,
-    ) = synchronized(lock) {
+        mutation: () -> T,
+    ): T = synchronized(lock) {
         revisions[chatId] = (revisions[chatId] ?: 0L) + 1L
         if (retireOwner) retiredOwners += chatId
         mutation()

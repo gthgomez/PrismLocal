@@ -51,7 +51,9 @@ class KnowledgePackTools(
             packsArray.put(JSONObject()
                 .put("id", pack.id).put("name", pack.name).put("description", pack.description)
                 .put("downloaded", pack.downloadStatus == KnowledgePackStatus.INDEXED)
-                .put("chunks", pack.totalChunks).put("article_count", pack.topicSlugs.size).put("status", pack.downloadStatus.name))
+                .put("chunks", pack.totalChunks)
+                .put("searchable_chunks", pack.searchableChunks)
+                .put("article_count", pack.topicSlugs.size).put("status", pack.downloadStatus.name))
         }
         val totalDownloaded = packs.count { it.downloadStatus == KnowledgePackStatus.INDEXED }
         return toolSuccess(call, "$totalDownloaded/${packs.size} knowledge packs downloaded",
@@ -64,9 +66,29 @@ class KnowledgePackTools(
         if (packId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Knowledge pack ID is required")
         val pack = KnowledgePackManager.CURATED_PACKS.firstOrNull { it.id == packId }
             ?: return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "Unknown knowledge pack: $packId")
-        val chunks = knowledgePackManager.downloadPack(packId)
-        if (chunks <= 0) return toolFailure(call, AgentToolErrorCode.FAILED, "Failed to download pack '$packId'")
-        return toolSuccess(call, "Downloaded '$packId' ($chunks chunks)",
-            JSONObject().put("downloaded", true).put("pack_id", packId).put("pack_name", pack.name).put("chunks", chunks).put("articles", pack.topicSlugs.size).put("source", "grokipedia"))
+        val result = knowledgePackManager.downloadPack(packId)
+        if (!result.isComplete) {
+            val details = JSONObject()
+                .put("downloaded", false)
+                .put("pack_id", packId)
+                .put("pack_name", pack.name)
+                .put("committed_slugs", result.committedSlugs)
+                .put("total_slugs", result.totalSlugs)
+                .put("status", result.status.name)
+                .put("chunks", result.storedChunks)
+                .put("searchable_chunks", result.searchableChunks)
+            return if (result.committedSlugs > 0) {
+                toolFailure(
+                    call,
+                    AgentToolErrorCode.FAILED,
+                    "Partially downloaded '$packId': ${result.committedSlugs}/${result.totalSlugs} articles (${result.storedChunks} chunks stored, ${result.searchableChunks} searchable)",
+                    details,
+                )
+            } else {
+                toolFailure(call, AgentToolErrorCode.FAILED, "Failed to download pack '$packId'", details)
+            }
+        }
+        return toolSuccess(call, "Downloaded '$packId' (${result.storedChunks} chunks, ${result.searchableChunks} searchable)",
+            JSONObject().put("downloaded", true).put("pack_id", packId).put("pack_name", pack.name).put("chunks", result.storedChunks).put("searchable_chunks", result.searchableChunks).put("articles", pack.topicSlugs.size).put("source", "grokipedia"))
     }
 }

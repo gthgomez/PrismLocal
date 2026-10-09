@@ -150,6 +150,7 @@ class InferenceService : Service() {
     // defensive double-destroy). destroySafely() is itself idempotent, but this
     // avoids enqueuing redundant cancellation work.
     private val teardownStarted = AtomicBoolean(false)
+    private val modelEpoch = java.util.concurrent.atomic.AtomicLong(1L)
 
     // Single owner of the native memory-pressure level. Writes are funneled
     // through an unbounded channel consumed by exactly one coroutine, so the
@@ -821,7 +822,11 @@ class InferenceService : Service() {
                     finalizeActiveTrace = !preserveConfirmedChain,
                     preserveActiveTrace = preserveConfirmedChain,
                 )
-                modelManager.switchModel(modelId)
+                modelManager.switchModel(modelId).also { loaded ->
+                    if (loaded) {
+                        modelEpoch.incrementAndGet()
+                    }
+                }
             } finally {
                 if (preserveConfirmedChain) {
                     agentTrace.releaseChainPreservation(confirmedAuthorization.chainId)
@@ -857,7 +862,11 @@ class InferenceService : Service() {
                     finalizeActiveTrace = !preserveConfirmedChain,
                     preserveActiveTrace = preserveConfirmedChain,
                 )
-                modelManager.deleteModel(modelId, identity)
+                modelManager.deleteModel(modelId, identity).also { deleted ->
+                    if (deleted) {
+                        modelEpoch.incrementAndGet()
+                    }
+                }
             } finally {
                 if (preserveConfirmedChain) {
                     agentTrace.releaseChainPreservation(confirmedAuthorization.chainId)
@@ -1998,6 +2007,7 @@ class InferenceService : Service() {
         EmbeddingIdentity.of(
             uiState._activeModelInfo.value?.sha256,
             VectorStore.EMBEDDING_REVISION,
+            modelEpoch.get(),
         )
 
     /**

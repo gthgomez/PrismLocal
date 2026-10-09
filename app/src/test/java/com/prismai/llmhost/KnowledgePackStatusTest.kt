@@ -167,9 +167,11 @@ class KnowledgePackStatusTest {
         )
         val mgr = KnowledgePackManager(grokipedia, store, rag)
 
-        val indexed = mgr.downloadPack(pack.id)
+        val result = mgr.downloadPack(pack.id)
 
-        assertEquals("a partially embedded pack must report zero indexed chunks", 0, indexed)
+        assertEquals("a partially embedded pack must report zero indexed chunks", 0, result.storedChunks)
+        assertEquals(KnowledgePackStatus.FAILED, result.status)
+        assertTrue("result isComplete must be false on failure", !result.isComplete)
         assertEquals(KnowledgePackStatus.FAILED, mgr.packStatus(pack.id))
         assertTrue(
             "no pack rows may be written when every article's ingest failed",
@@ -200,5 +202,39 @@ class KnowledgePackStatusTest {
 
         assertEquals(pack.topicSlugs.size, removed)
         assertTrue("all pack rows must be gone", store.rows.isEmpty())
+    }
+
+    @Test
+    fun clearAllKnowledgePacksRemovesBothCuratedAndOnDemandDocuments() {
+        val store = InMemoryVectorStore()
+        store.rows += VectorChunk(
+            id = "curated-1",
+            documentId = "grokipedia:${pack.id}:some-slug",
+            chunkIndex = 0,
+            text = "curated pack text",
+            embedding = FloatArray(4) { 0.1f },
+        )
+        store.rows += VectorChunk(
+            id = "ondemand-1",
+            documentId = "grokipedia:on-demand:python-intro",
+            chunkIndex = 0,
+            text = "on demand article text",
+            embedding = FloatArray(4) { 0.1f },
+        )
+        store.rows += VectorChunk(
+            id = "user-1",
+            documentId = "user-doc-notes",
+            chunkIndex = 0,
+            text = "user personal note",
+            embedding = FloatArray(4) { 0.2f },
+        )
+
+        val mgr = manager(store)
+        val removed = mgr.clearAllKnowledgePacks()
+
+        assertEquals(2, removed)
+        assertEquals(1, store.rows.size)
+        assertEquals("user-doc-notes", store.rows.first().documentId)
+        assertEquals(KnowledgePackStatus.NOT_DOWNLOADED, mgr.packStatus(pack.id))
     }
 }

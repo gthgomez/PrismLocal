@@ -80,4 +80,18 @@ class VectorStoreSchemaTest {
         assertEquals(EmbeddingIdentity.UNKNOWN_ENCODER, EmbeddingIdentity.of("   ", 2).encoderId)
         assertEquals("sha-a", EmbeddingIdentity.of("sha-a", 2).encoderId)
     }
+
+    @Test
+    fun isUnrecoverableLegacy_identifiesLegacyMigratedAndObsoleteRows() {
+        // Obsolete revision
+        assertTrue(VectorStore.isUnrecoverableLegacy(1, "rev=2;enc=sha-a", 384))
+        // Migrated from v2 to v3 with blank encoder identity and dimension 0
+        assertTrue(VectorStore.isUnrecoverableLegacy(2, "", 0))
+        assertTrue(VectorStore.isUnrecoverableLegacy(2, null, 384))
+        assertTrue(VectorStore.isUnrecoverableLegacy(2, "rev=2;enc=sha-a", 0))
+        assertTrue(VectorStore.isUnrecoverableLegacy(2, "   ", 384))
+
+        // Fully valid chunk from another model or current model
+        assertFalse(VectorStore.isUnrecoverableLegacy(2, "rev=2;enc=sha-a", 384))
+    }
 }

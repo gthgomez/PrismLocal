@@ -245,6 +245,7 @@ fun DocumentBrowser(
                         docId = doc.documentId,
                         storedChunkCount = doc.storedChunkCount,
                         searchableChunkCount = doc.searchableChunkCount,
+                        legacyChunkCount = doc.legacyChunkCount,
                         previewText = doc.previewText,
                         onDelete = { deleteTargetDocId = doc.documentId },
                     )
@@ -411,6 +412,7 @@ private fun DocumentSummaryRow(
     docId: String,
     storedChunkCount: Int,
     searchableChunkCount: Int,
+    legacyChunkCount: Int = 0,
     previewText: String,
     onDelete: () -> Unit,
 ) {
@@ -445,6 +447,12 @@ private fun DocumentSummaryRow(
                     InfoBadge(
                         text = "$searchableChunkCount searchable now",
                         color = PrismSlate,
+                    )
+                }
+                if (legacyChunkCount > 0) {
+                    InfoBadge(
+                        text = "$legacyChunkCount legacy chunks",
+                        color = PrismAmber,
                     )
                 }
             }

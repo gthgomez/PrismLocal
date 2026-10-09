@@ -186,6 +186,38 @@ class VectorStoreRevisionMigrationTest {
         assertTrue(store.getAllChunks().any { it.id == "pre-model" })
     }
 
+    @Test
+    fun upgradeFromVersion2ToVersion3_marksMigratedRowsAsObsoleteAndCleansThem() {
+        seedVersion2Database()
+
+        // Opening through VectorStore runs onUpgrade(2 -> 3), adding
+        // encoder_identity with DEFAULT '' and embedding_dim with DEFAULT 0.
+        val store = VectorStore(context)
+        store.setEmbeddingIdentityProvider { EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION) }
+        store.insert(
+            VectorChunk(
+                id = "v3-current",
+                documentId = "current-doc",
+                chunkIndex = 0,
+                text = "fresh chunk on v3",
+                embedding = floatArrayOf(1f, 0f, 0f),
+            )
+        )
+
+        // The v2 row cannot be searched under any encoder because its encoder_identity is empty and dim is 0
+        val searchResults = store.search(floatArrayOf(1f, 0f, 0f), topK = 10, minScore = -1f)
+        assertEquals(listOf("v3-current"), searchResults.map { it.first.id })
+
+        // The v2 migrated row must be reported as obsolete/legacy and offered for cleanup
+        assertEquals("the migrated v2 row must be identified as obsolete", 1, store.countObsoleteChunks())
+        assertEquals("countLegacyUnknownChunks must also count it", 1, store.countLegacyUnknownChunks())
+
+        // deleteObsoleteChunks must reclaim it without affecting the v3 row
+        assertEquals(1, store.deleteObsoleteChunks())
+        assertEquals(0, store.countObsoleteChunks())
+        assertTrue("v3 row must remain", store.getAllChunks().any { it.id == "v3-current" })
+    }
+
     /**
      * Recreate the pre-revision schema at user_version 1, exactly as an upgraded
      * install would have it, and insert one row.
@@ -217,6 +249,44 @@ class VectorStoreRevisionMigrationTest {
             }
             db.insert(VectorStore.TABLE, null, values)
             db.version = 1
+        } finally {
+            db.close()
+        }
+    }
+
+    /**
+     * Recreate the version 2 schema (embedding_revision present, but no encoder_identity or embedding_dim)
+     * and insert a row with embedding_revision = 2.
+     */
+    private fun seedVersion2Database() {
+        val dbFile = context.getDatabasePath(VectorStore.DB_NAME)
+        dbFile.parentFile?.mkdirs()
+        val db = SQLiteDatabase.openOrCreateDatabase(dbFile, null)
+        try {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS ${VectorStore.TABLE} (
+                    ${VectorStore.COL_ID} TEXT PRIMARY KEY,
+                    ${VectorStore.COL_DOCUMENT_ID} TEXT NOT NULL,
+                    ${VectorStore.COL_CHUNK_INDEX} INTEGER NOT NULL,
+                    ${VectorStore.COL_TEXT} TEXT NOT NULL,
+                    ${VectorStore.COL_EMBEDDING} BLOB NOT NULL,
+                    ${VectorStore.COL_CREATED} INTEGER NOT NULL,
+                    ${VectorStore.COL_EMBEDDING_REVISION} INTEGER NOT NULL DEFAULT 2
+                )
+                """.trimIndent()
+            )
+            val values = ContentValues().apply {
+                put(VectorStore.COL_ID, "v2-legacy-1")
+                put(VectorStore.COL_DOCUMENT_ID, "v2-legacy-doc")
+                put(VectorStore.COL_CHUNK_INDEX, 0)
+                put(VectorStore.COL_TEXT, "migrated v2 chunk without encoder")
+                put(VectorStore.COL_EMBEDDING, VectorStore.floatArrayToBytes(floatArrayOf(1f, 0f, 0f)))
+                put(VectorStore.COL_CREATED, 2L)
+                put(VectorStore.COL_EMBEDDING_REVISION, 2)
+            }
+            db.insert(VectorStore.TABLE, null, values)
+            db.version = 2
         } finally {
             db.close()
         }

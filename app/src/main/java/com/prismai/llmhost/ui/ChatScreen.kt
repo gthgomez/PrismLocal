@@ -919,13 +919,15 @@ private fun ModelOnboardingCard(
                     )
                 }
                 is ModelDownloadState.Success -> Text(
-                    text = if (downloadState.integrityVerified) {
-                        "Downloaded ${downloadState.entryName}"
-                    } else {
-                        "Downloaded ${downloadState.entryName} (unverified: no SHA-256 available)"
+                    text = when (downloadState.integrity) {
+                        DownloadIntegrity.VERIFIED_PINNED -> "Downloaded ${downloadState.entryName}"
+                        DownloadIntegrity.VERIFIED_PROVIDER_METADATA ->
+                            "Downloaded ${downloadState.entryName} (matched provider metadata)"
+                        DownloadIntegrity.UNVERIFIED ->
+                            "Downloaded ${downloadState.entryName} (unverified: no SHA-256 available)"
                     },
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (downloadState.integrityVerified) PrismGreen else PrismAmber,
+                    color = if (downloadState.integrity != DownloadIntegrity.UNVERIFIED) PrismGreen else PrismAmber,
                 )
                 is ModelDownloadState.Failure -> Text(
                     text = downloadState.message,

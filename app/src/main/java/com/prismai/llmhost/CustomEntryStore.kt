@@ -94,7 +94,7 @@ class CustomEntryStore(private val backend: Backend) {
             // Integrity pin: re-validate on the way in, treating a malformed value
             // as absent so it fails closed instead of being trusted verbatim.
             val expectedSha256 = o.optString("expectedSha256", "").ifBlank { null }
-                .takeIf { decideDownloadIntegrity(it, curated = false) == DownloadIntegrityDecision.VERIFY_SHA256 }
+                .takeIf { decideDownloadIntegrity(it, providerHash = null, curated = false) == DownloadIntegrityDecision.VERIFY_TRUSTED_PIN }
             HuggingFaceModelEntry(
                 id = id,
                 name = o.optString("name"),

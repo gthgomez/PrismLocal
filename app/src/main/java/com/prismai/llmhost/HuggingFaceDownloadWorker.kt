@@ -52,9 +52,13 @@ object HuggingFaceDownloadWork {
     const val KEY_MODEL_SHA256 = "model_sha256"
     const val MODEL_OWNER_TAG_PREFIX = "model_storage_owner:"
 
-    /** Download integrity outcome: [INTEGRITY_VERIFIED] or [INTEGRITY_UNVERIFIED]. */
+    /**
+     * Download integrity outcome: [INTEGRITY_VERIFIED_PINNED],
+     * [INTEGRITY_VERIFIED_PROVIDER_METADATA], or [INTEGRITY_UNVERIFIED].
+     */
     const val KEY_INTEGRITY = "integrity"
-    const val INTEGRITY_VERIFIED = "verified"
+    const val INTEGRITY_VERIFIED_PINNED = "verified_pinned"
+    const val INTEGRITY_VERIFIED_PROVIDER_METADATA = "verified_provider_metadata"
     const val INTEGRITY_UNVERIFIED = "unverified"
 
     fun request(entryId: String): OneTimeWorkRequest {
@@ -111,14 +115,31 @@ class HuggingFaceDownloadWorker(
             )
             val remoteMetadata = fetchRemoteMetadata(entry)
             val expectedSize = remoteMetadata.sizeBytes ?: entry.expectedBytes.takeIf { it > 0L }
-            val expectedSha = remoteMetadata.sha256 ?: entry.expectedSha256
-            val integrityDecision = decideDownloadIntegrity(expectedSha, entry.curated)
-            if (integrityDecision == DownloadIntegrityDecision.FAIL_CLOSED) {
-                throw IllegalStateException(
-                    "No trusted SHA-256 available for ${entry.name}; refusing to import an unverified model."
+            // The trusted pin is the curated entry's own digest (or a user pin). Provider metadata
+            // is never allowed to override it, and a conflict is a hard failure rather than a
+            // silent downgrade to the remote value.
+            val trustedPin = entry.expectedSha256
+            val integrityDecision = decideDownloadIntegrity(trustedPin, remoteMetadata.sha256, entry.curated)
+            when (integrityDecision) {
+                DownloadIntegrityDecision.FAIL_CLOSED -> throw IllegalStateException(
+                    "No trusted SHA-256 is pinned for ${entry.name}; refusing to import an unverified curated model."
                 )
+                DownloadIntegrityDecision.TRUST_CONFLICT -> throw IllegalStateException(
+                    "Hugging Face metadata for ${entry.name} conflicts with its pinned SHA-256; refusing to import."
+                )
+                else -> Unit
             }
-            val shaToVerify = if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) expectedSha else null
+            val integrity = checkNotNull(integrityDecision.outcome())
+            val shaToVerify = when (integrityDecision) {
+                DownloadIntegrityDecision.VERIFY_TRUSTED_PIN -> trustedPin
+                DownloadIntegrityDecision.VERIFY_PROVIDER_METADATA -> remoteMetadata.sha256
+                else -> null
+            }
+            val installLabel = when (integrity) {
+                DownloadIntegrity.VERIFIED_PINNED -> "Installing verified GGUF"
+                DownloadIntegrity.VERIFIED_PROVIDER_METADATA -> "Installing GGUF (provider metadata verified)"
+                DownloadIntegrity.UNVERIFIED -> "Installing GGUF (unverified)"
+            }
 
             downloadResumable(entry, partialFile, expectedSize)
 
@@ -129,7 +150,7 @@ class HuggingFaceDownloadWorker(
                 stage = ModelDownloadState.Running.Stage.IMPORTING,
                 bytesDone = 0L,
                 totalBytes = partialFile.length(),
-                message = if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) "Installing verified GGUF" else "Installing GGUF (unverified)",
+                message = installLabel,
             )
             val importResult = partialFile.inputStream().use { input ->
                 storage.importModelFromStream(
@@ -146,7 +167,7 @@ class HuggingFaceDownloadWorker(
                                 stage = ModelDownloadState.Running.Stage.IMPORTING,
                                 bytesDone = progress.bytesCopied,
                                 totalBytes = progress.totalBytes,
-                                message = if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) "Installing verified GGUF" else "Installing GGUF (unverified)",
+                                message = installLabel,
                             )
                         }
                     },
@@ -172,10 +193,13 @@ class HuggingFaceDownloadWorker(
                             HuggingFaceDownloadWork.KEY_MODEL_ID to importResult.model.id,
                             HuggingFaceDownloadWork.KEY_MODEL_BYTES to importResult.model.bytes,
                             HuggingFaceDownloadWork.KEY_MODEL_SHA256 to importResult.model.sha256,
-                            HuggingFaceDownloadWork.KEY_INTEGRITY to if (integrityDecision == DownloadIntegrityDecision.VERIFY_SHA256) {
-                                HuggingFaceDownloadWork.INTEGRITY_VERIFIED
-                            } else {
-                                HuggingFaceDownloadWork.INTEGRITY_UNVERIFIED
+                            HuggingFaceDownloadWork.KEY_INTEGRITY to when (integrity) {
+                                DownloadIntegrity.VERIFIED_PINNED ->
+                                    HuggingFaceDownloadWork.INTEGRITY_VERIFIED_PINNED
+                                DownloadIntegrity.VERIFIED_PROVIDER_METADATA ->
+                                    HuggingFaceDownloadWork.INTEGRITY_VERIFIED_PROVIDER_METADATA
+                                DownloadIntegrity.UNVERIFIED ->
+                                    HuggingFaceDownloadWork.INTEGRITY_UNVERIFIED
                             },
                         )
                     )

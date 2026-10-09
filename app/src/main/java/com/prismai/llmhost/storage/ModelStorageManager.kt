@@ -21,6 +21,8 @@ import kotlinx.coroutines.CancellationException
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.Locale
@@ -42,6 +44,111 @@ internal object ModelStorageLifecycleGate {
         revisions[modelId] = next
         next
     }
+}
+
+/**
+ * Process-scoped record of model artifacts already hashed during this process.
+ *
+ * Hashing a multi-gigabyte GGUF is expensive, so activation hashes the whole file once and then
+ * reuses that digest while the artifact is unchanged. "Unchanged" is checked against a
+ * [fingerprint] — the file length plus a hash of its first and last [FINGERPRINT_BYTES] — together
+ * with size and mtime. The fingerprint detects a same-size, same-mtime *substitution of a
+ * different artifact* (its head/tail bytes differ) at negligible I/O cost, so "matches" is not
+ * merely a (size, mtime) spoof check.
+ *
+ * The cache is not a trust boundary. The SHA-256 it caches is only as trustworthy as the directory
+ * the artifact lives in: the model directory is app-private and written only by app code, so an
+ * attacker who could replace the model bytes could equally rewrite the manifest's recorded digest.
+ * The cache does not make that attack possible or impossible — it avoids re-hashing bytes this
+ * process has already hashed and that still fingerprint the same. The record is in-memory only, so
+ * a fresh process re-verifies everything. Callers that must not trust the cache use
+ * [ModelStorageManager.resolveActiveModel] instead of
+ * [ModelStorageManager.resolveActiveModelForActivation].
+ */
+internal object ModelArtifactVerificationCache {
+    /** Bytes read from each end of the artifact for the change fingerprint. */
+    private const val FINGERPRINT_BYTES = 64 * 1024
+
+    private data class Entry(
+        val sha256: String,
+        val sizeBytes: Long,
+        val lastModifiedMs: Long,
+        val fingerprint: String,
+    )
+
+    private val entries = mutableMapOf<String, Entry>()
+
+    @Synchronized
+    fun matches(file: File, expectedSha256: String): Boolean {
+        val entry = entries[key(file)] ?: return false
+        if (entry.sha256 != expectedSha256.lowercase(Locale.US)) return false
+        if (entry.sizeBytes != file.length()) return false
+        if (entry.lastModifiedMs != file.lastModified()) return false
+        // A failed/empty fingerprint must never count as a match (re-hash instead).
+        if (entry.fingerprint.isEmpty()) return false
+        return entry.fingerprint == fingerprint(file)
+    }
+
+    @Synchronized
+    fun remember(file: File, sha256: String) {
+        entries[key(file)] = Entry(
+            sha256 = sha256.lowercase(Locale.US),
+            sizeBytes = file.length(),
+            lastModifiedMs = file.lastModified(),
+            fingerprint = fingerprint(file),
+        )
+    }
+
+    /**
+     * Change fingerprint that is stable for identical bytes and different for a different artifact:
+     * SHA-256 over the length and the first and last [FINGERPRINT_BYTES]. Returns "" if the file
+     * cannot be read, which can only cause a cache miss (a re-hash), never a false match.
+     */
+    private fun fingerprint(file: File): String = try {
+        val length = file.length()
+        val headLen = minOf(FINGERPRINT_BYTES.toLong(), length).toInt()
+        val tailStart = maxOf(0L, length - FINGERPRINT_BYTES)
+        val tailLen = (length - tailStart).toInt()
+        val md = MessageDigest.getInstance("SHA-256")
+        md.update(ByteBuffer.allocate(8).putLong(length).array())
+        file.inputStream().use { input ->
+            val head = ByteArray(headLen)
+            var read = 0
+            while (read < headLen) {
+                val n = input.read(head, read, headLen - read)
+                if (n < 0) break
+                read += n
+            }
+            md.update(head, 0, read)
+        }
+        RandomAccessFile(file, "r").use { raf ->
+            raf.seek(tailStart)
+            val tail = ByteArray(tailLen)
+            var read = 0
+            while (read < tailLen) {
+                val n = raf.read(tail, read, tailLen - read)
+                if (n < 0) break
+                read += n
+            }
+            md.update(tail, 0, read)
+        }
+        md.digest().joinToString("") { "%02x".format(it) }
+    } catch (e: Exception) {
+        ""
+    }
+
+    @Synchronized
+    fun forgetUnder(directory: File) {
+        val prefix = key(directory)
+        entries.keys.removeAll { it == prefix || it.startsWith("$prefix${File.separator}") }
+    }
+
+    @Synchronized
+    @VisibleForTesting
+    fun clear() = entries.clear()
+
+    private fun key(file: File): String =
+        runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
 }
 
 class ModelStorageManager(
@@ -126,7 +233,7 @@ class ModelStorageManager(
         val models = dir.listFiles()
             ?.filter { it.isDirectory && it.name != IMPORT_STAGING_DIR && File(it, MANIFEST_FILE).exists() }
             ?.mapNotNull { modelRoot ->
-                when (parseManifest(modelRoot, verifyHash = false)) {
+                when (parseManifest(modelRoot, HashPolicy.NONE)) {
                     is ModelResolveResult.Success -> modelRoot.name
                     is ModelResolveResult.Failure -> null
                 }
@@ -143,7 +250,7 @@ class ModelStorageManager(
         return dir.listFiles()
             ?.filter { it.isDirectory && it.name != IMPORT_STAGING_DIR && File(it, MANIFEST_FILE).exists() }
             ?.mapNotNull { modelRoot ->
-                (parseManifest(modelRoot, verifyHash = false) as? ModelResolveResult.Success)?.model
+                (parseManifest(modelRoot, HashPolicy.NONE) as? ModelResolveResult.Success)?.model
             }
             ?.sortedBy { it.id }
             ?: emptyList()
@@ -219,7 +326,7 @@ class ModelStorageManager(
 
         val existingManifest = File(modelsDir, "$modelId/$MANIFEST_FILE")
         if (existingManifest.exists()) {
-            val existing = parseManifest(File(modelsDir, modelId), verifyHash = false)
+            val existing = parseManifest(File(modelsDir, modelId), HashPolicy.NONE)
             if (existing is ModelResolveResult.Failure) {
                 return ImportResult.Failure(existing.error)
             }
@@ -278,7 +385,11 @@ class ModelStorageManager(
             writeManifestAtomically(modelRoot, manifest)
             pruneInactiveVersions(modelRoot, versionId)
 
-            val resolved = resolveActiveModel(modelId)
+            // The staged bytes were just hashed and promotion is a rename that preserves content, so
+            // record the verified artifact instead of hashing the multi-gigabyte file a second time.
+            ModelArtifactVerificationCache.remember(activeFile, sha256)
+
+            val resolved = resolveActiveModelForActivation(modelId)
             if (resolved is ModelResolveResult.Success) {
                 ImportResult.Success(resolved.model)
             } else {
@@ -327,6 +438,7 @@ class ModelStorageManager(
             ModelStorageLifecycleGate.advanceRevision(modelId)
             if (!modelRoot.exists()) return@withLock false
             val deleted = runCatching { modelRoot.deleteRecursively() }.getOrDefault(false)
+            if (deleted) ModelArtifactVerificationCache.forgetUnder(modelRoot)
             runCatching { Log.d(TAG, "deleteModel modelId=$modelId deleted=$deleted") }
             deleted
         }
@@ -337,7 +449,7 @@ class ModelStorageManager(
         confirmedIdentity: ModelIdentity,
     ): Boolean {
         if (confirmedIdentity.modelId != modelId || !modelRoot.exists()) return false
-        val resolved = parseManifest(modelRoot, verifyHash = false)
+        val resolved = parseManifest(modelRoot, HashPolicy.NONE)
         val installed = (resolved as? ModelResolveResult.Success)?.model ?: return false
         return confirmedIdentity.matches(installed)
     }
@@ -356,7 +468,18 @@ class ModelStorageManager(
     }
 
     fun resolveActiveModel(modelId: String, verifyHash: Boolean = true): ModelResolveResult =
-        parseManifest(File(modelsDir, modelId), verifyHash = verifyHash)
+        parseManifest(File(modelsDir, modelId), if (verifyHash) HashPolicy.ALWAYS else HashPolicy.NONE)
+
+    /**
+     * Resolves the active artifact for a native load, verifying its SHA-256 against the recorded
+     * manifest identity. A digest hashed earlier in this process is reused only when the artifact
+     * still fingerprints the same (length, head/tail bytes, size, mtime); see
+     * [ModelArtifactVerificationCache]. An artifact whose size, mtime or content fingerprint
+     * changed, or whose digest no longer matches, is rejected with [HASH_MISMATCH] and never
+     * handed to the native loader.
+     */
+    fun resolveActiveModelForActivation(modelId: String): ModelResolveResult =
+        parseManifest(File(modelsDir, modelId), HashPolicy.CACHED)
 
     fun activeModelInfo(modelId: String): ActiveModelInfo? =
         (resolveActiveModel(modelId, verifyHash = false) as? ModelResolveResult.Success)?.model
@@ -403,7 +526,21 @@ class ModelStorageManager(
         return freed
     }
 
-    private fun parseManifest(modelRoot: File, verifyHash: Boolean): ModelResolveResult {
+    private enum class HashPolicy {
+        /** Never hash; used by listing and identity-snapshot paths. */
+        NONE,
+
+        /** Always recompute the full-file digest; used where the caller must not trust the cache. */
+        ALWAYS,
+
+        /**
+         * Reuse a digest already computed for this artifact earlier in the process when it still
+         * fingerprints the same (length + head/tail hash + size + mtime), else hash and cache.
+         */
+        CACHED,
+    }
+
+    private fun parseManifest(modelRoot: File, hashPolicy: HashPolicy): ModelResolveResult {
         val modelId = modelRoot.name
         val manifestFile = File(modelRoot, MANIFEST_FILE)
         if (!manifestFile.exists()) {
@@ -447,16 +584,23 @@ class ModelStorageManager(
                     )
                 )
             val expectedSha = activeObj.getString("sha256")
-            if (verifyHash) {
-                val actualSha = sha256(modelFile)
-                if (!expectedSha.equals(actualSha, ignoreCase = true)) {
-                    return ModelResolveResult.Failure(
-                        ModelStorageError(
-                            ModelStorageError.Code.HASH_MISMATCH,
-                            "Model $modelId failed integrity verification",
-                            "expected=$expectedSha actual=$actualSha",
+            if (hashPolicy != HashPolicy.NONE) {
+                val cachedMatch = hashPolicy == HashPolicy.CACHED &&
+                    ModelArtifactVerificationCache.matches(modelFile, expectedSha)
+                if (!cachedMatch) {
+                    val actualSha = sha256(modelFile)
+                    if (!expectedSha.equals(actualSha, ignoreCase = true)) {
+                        return ModelResolveResult.Failure(
+                            ModelStorageError(
+                                ModelStorageError.Code.HASH_MISMATCH,
+                                "Model $modelId failed integrity verification",
+                                "expected=$expectedSha actual=$actualSha",
+                            )
                         )
-                    )
+                    }
+                    if (hashPolicy == HashPolicy.CACHED) {
+                        ModelArtifactVerificationCache.remember(modelFile, actualSha)
+                    }
                 }
             }
             ModelResolveResult.Success(

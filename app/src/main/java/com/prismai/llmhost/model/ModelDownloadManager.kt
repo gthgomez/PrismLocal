@@ -155,10 +155,14 @@ class ModelDownloadManager(
                 val modelBytes = data.getLong(HuggingFaceDownloadWork.KEY_MODEL_BYTES, 0L)
                 val modelSha256 = data.getString(HuggingFaceDownloadWork.KEY_MODEL_SHA256).orEmpty()
                 // Absent/unknown integrity means unverified: never present an unchecked import as verified.
-                val integrityVerified =
-                    data.getString(HuggingFaceDownloadWork.KEY_INTEGRITY) == HuggingFaceDownloadWork.INTEGRITY_VERIFIED
+                val integrity = when (data.getString(HuggingFaceDownloadWork.KEY_INTEGRITY)) {
+                    HuggingFaceDownloadWork.INTEGRITY_VERIFIED_PINNED -> DownloadIntegrity.VERIFIED_PINNED
+                    HuggingFaceDownloadWork.INTEGRITY_VERIFIED_PROVIDER_METADATA ->
+                        DownloadIntegrity.VERIFIED_PROVIDER_METADATA
+                    else -> DownloadIntegrity.UNVERIFIED
+                }
                 val previous = uiState._modelDownloadState.value
-                uiState._modelDownloadState.value = ModelDownloadState.Success(modelId, entryName, integrityVerified)
+                uiState._modelDownloadState.value = ModelDownloadState.Success(modelId, entryName, integrity)
                 uiState._importState.value = ImportState.Success(
                     modelId = modelId,
                     bytes = modelBytes,
@@ -166,7 +170,11 @@ class ModelDownloadManager(
                 )
                 uiState._runtimeStatus.value = RuntimeStatus.IDLE
                 onRefreshReadiness()
-                val verifiedSuffix = if (integrityVerified) "" else " (unverified: no SHA-256 available)"
+                val verifiedSuffix = when (integrity) {
+                    DownloadIntegrity.VERIFIED_PINNED -> ""
+                    DownloadIntegrity.VERIFIED_PROVIDER_METADATA -> " (matched provider metadata)"
+                    DownloadIntegrity.UNVERIFIED -> " (unverified: no SHA-256 available)"
+                }
                 if (uiState._currentModel.value == null) {
                     serviceScope.launch {
                         if (onAutoLoadModel(modelId)) {

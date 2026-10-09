@@ -110,7 +110,7 @@ class ImportBatchDrainer(
             refresh()
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Throwable) {
+        } catch (e: Exception) {
             Log.w(TAG, "refresh after import drain failed; continuing", e)
         }
     }

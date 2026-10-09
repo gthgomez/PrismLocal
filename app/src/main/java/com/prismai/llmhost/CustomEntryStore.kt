@@ -25,7 +25,10 @@ class CustomEntryStore(private val backend: Backend) {
     }
 
     fun find(id: String): HuggingFaceModelEntry? = synchronized(this) {
-        findAll().firstOrNull { it.id == id }
+        findAll().firstOrNull { entry ->
+            entry.id == id ||
+                HuggingFaceModelCatalog.legacyCustomEntryId(entry.repoId, entry.fileName) == id
+        }
     }
 
     fun findAll(): List<HuggingFaceModelEntry> = synchronized(this) {

@@ -113,4 +113,33 @@ class ModelArtifactVerificationCacheTest {
         assertFalse(ModelArtifactVerificationCache.matches(inTree, sha))
         assertTrue("artifacts outside the deleted subtree must be retained", ModelArtifactVerificationCache.matches(outside, sha))
     }
+
+    // --- PL-F15: Verification cache does not detect middle-of-file substitutions (threat model boundary) ---
+
+    @Test
+    fun middleOfFileMutationWithSameSizeAndMtimeMatchesCacheDeclaringThreatModel() {
+        val size = 256 * 1024 + 1024
+        val file = temp.newFile("large-model.gguf")
+        val original = ByteArray(size) { (it % 127).toByte() }
+        file.writeBytes(original)
+        val mtime = 1_000_000_000_000L
+        file.setLastModified(mtime)
+
+        ModelArtifactVerificationCache.remember(file, sha)
+        assertTrue(ModelArtifactVerificationCache.matches(file, sha))
+
+        // Mutate a byte in the middle (at 128 KiB, strictly outside the 64 KiB head and 64 KiB tail)
+        val mutated = original.copyOf()
+        val middleIndex = 128 * 1024
+        mutated[middleIndex] = (mutated[middleIndex] + 1).toByte()
+        file.writeBytes(mutated)
+        file.setLastModified(mtime)
+
+        // As documented in the threat model, head/tail change detection does not detect
+        // middle-of-file mutations in app-private storage.
+        assertTrue(
+            "middle-of-file mutation outside head/tail fingerprint window matches cache (change detector threat model)",
+            ModelArtifactVerificationCache.matches(file, sha),
+        )
+    }
 }

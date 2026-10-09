@@ -174,6 +174,7 @@ class ModelDownloadManager(
                     DownloadIntegrity.VERIFIED_PINNED -> ""
                     DownloadIntegrity.VERIFIED_PROVIDER_METADATA -> " (matched provider metadata)"
                     DownloadIntegrity.UNVERIFIED -> " (unverified: no SHA-256 available)"
+                    DownloadIntegrity.UNKNOWN_LEGACY -> " (legacy import)"
                 }
                 if (uiState._currentModel.value == null) {
                     serviceScope.launch {

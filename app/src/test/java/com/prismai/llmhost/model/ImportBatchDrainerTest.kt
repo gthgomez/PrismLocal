@@ -24,7 +24,7 @@ class ImportBatchDrainerTest {
     @Test
     fun urisEnqueuedDuringRefreshAreDrainedNotDropped() = runBlocking {
         val processed = mutableListOf<String>()
-        val queue = SequentialImportQueue { processed += it }
+        val queue = SequentialImportQueue.simple { processed += it }
         val refreshGate = CompletableDeferred<Unit>()
         var refreshCalls = 0
         val drainer = ImportBatchDrainer(queue) {
@@ -55,7 +55,7 @@ class ImportBatchDrainerTest {
     @Test
     fun uriEnqueuedDuringAFailingRefreshIsStillDrained() = runBlocking {
         val processed = mutableListOf<String>()
-        val queue = SequentialImportQueue { processed += it }
+        val queue = SequentialImportQueue.simple { processed += it }
         val refreshGate = CompletableDeferred<Unit>()
         var refreshCalls = 0
         val drainer = ImportBatchDrainer(queue) {
@@ -95,7 +95,7 @@ class ImportBatchDrainerTest {
     fun cancelClearsPendingWorkSoCancelledFilesCannotImportLater() = runBlocking {
         val processed = mutableListOf<String>()
         val firstImportGate = CompletableDeferred<Unit>()
-        val queue = SequentialImportQueue { uri ->
+        val queue = SequentialImportQueue.simple { uri ->
             processed += uri
             if (processed.size == 1) firstImportGate.await()
         }
@@ -121,7 +121,7 @@ class ImportBatchDrainerTest {
     @Test
     fun refreshFailureDoesNotWedgeTheDrainer() = runBlocking {
         val processed = mutableListOf<String>()
-        val queue = SequentialImportQueue { processed += it }
+        val queue = SequentialImportQueue.simple { processed += it }
         var failNextRefresh = true
         val drainer = ImportBatchDrainer(queue) {
             if (failNextRefresh) {
@@ -148,7 +148,7 @@ class ImportBatchDrainerTest {
     @Test
     fun enqueueAfterCancelStartsAFreshDrain() = runBlocking {
         val processed = mutableListOf<String>()
-        val queue = SequentialImportQueue { processed += it }
+        val queue = SequentialImportQueue.simple { processed += it }
         val drainer = ImportBatchDrainer(queue, refresh = {})
 
         drainer.enqueue(listOf("a"))
@@ -159,5 +159,17 @@ class ImportBatchDrainerTest {
         drainer.drainAll(token!!)
 
         assertEquals(listOf("b"), processed)
+    }
+
+    // --- PL-F17: fatal Error (OutOfMemoryError) in refresh must propagate and never be swallowed ---
+
+    @Test(expected = OutOfMemoryError::class)
+    fun refreshPropagatesOutOfMemoryErrorWithoutSwallowingIt() = runBlocking {
+        val queue = SequentialImportQueue.simple { }
+        val drainer = ImportBatchDrainer(queue) {
+            throw OutOfMemoryError("simulated fatal OOM in refresh")
+        }
+        val token = checkNotNull(drainer.enqueue(listOf("a")))
+        drainer.drainAll(token)
     }
 }

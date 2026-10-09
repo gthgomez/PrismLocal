@@ -563,8 +563,14 @@ private fun ModelPickerRow(
             style = MaterialTheme.typography.bodyMedium,
         )
         readiness?.let { info ->
+            val integrityLabel = when (info.info.integrity) {
+                DownloadIntegrity.VERIFIED_PINNED -> "pinned"
+                DownloadIntegrity.VERIFIED_PROVIDER_METADATA -> "provider metadata"
+                DownloadIntegrity.UNVERIFIED -> "unverified"
+                DownloadIntegrity.UNKNOWN_LEGACY -> "legacy"
+            }
             Text(
-                text = "${info.performance.label} • ${info.fit.quantization ?: "quant unknown"} • expected ${predictionRange(info.prediction)}",
+                text = "${info.performance.label} • ${info.fit.quantization ?: "quant unknown"} • $integrityLabel • expected ${predictionRange(info.prediction)}",
                 style = MaterialTheme.typography.labelSmall,
                 color = performanceColor(info.performance.tier),
                 maxLines = 1,
@@ -662,6 +668,8 @@ private fun HuggingFaceDownloadPanel(
                         "Downloaded ${state.entryName} (matched provider metadata)"
                     DownloadIntegrity.UNVERIFIED ->
                         "Downloaded ${state.entryName} (unverified: no SHA-256 available)"
+                    DownloadIntegrity.UNKNOWN_LEGACY ->
+                        "Imported ${state.entryName} (legacy)"
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = if (state.integrity != DownloadIntegrity.UNVERIFIED) PrismGreen else PrismAmber,

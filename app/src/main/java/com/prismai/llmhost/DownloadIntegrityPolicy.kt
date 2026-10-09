@@ -39,6 +39,7 @@ enum class DownloadIntegrity {
     VERIFIED_PINNED,
     VERIFIED_PROVIDER_METADATA,
     UNVERIFIED,
+    UNKNOWN_LEGACY,
 }
 
 /** Maps a successful integrity decision to the outcome to report; null for refusing decisions. */

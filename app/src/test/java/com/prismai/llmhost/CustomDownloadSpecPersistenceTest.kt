@@ -150,6 +150,44 @@ class CustomDownloadSpecPersistenceTest {
         assertNotNull(restored)
         assertFalse("a restored custom entry must never become curated", restored!!.curated)
     }
+
+    // --- PL-F14: Truncated custom-download IDs collide ---
+
+    @Test
+    fun customEntriesWithSameFortyCharPrefixDoNotCollideAndRoundTrip() {
+        val longRepo = "TheBloke/Long-Repository-Name-Exceeding-Normal-Limits-GGUF"
+        val file1 = "model-variant-q4_k_m.gguf"
+        val file2 = "model-variant-q5_k_m.gguf"
+
+        val entry1 = HuggingFaceModelCatalog.buildCustomEntry(longRepo, file1)
+        val entry2 = HuggingFaceModelCatalog.buildCustomEntry(longRepo, file2)
+
+        // The first 40 chars of the old scheme would have collided:
+        val legacy1 = HuggingFaceModelCatalog.legacyCustomEntryId(longRepo, file1)
+        val legacy2 = HuggingFaceModelCatalog.legacyCustomEntryId(longRepo, file2)
+        assertEquals("legacy IDs collided due to 40 char truncation", legacy1, legacy2)
+
+        // But new collision-resistant IDs MUST differ:
+        org.junit.Assert.assertNotEquals("new collision-resistant IDs must not collide", entry1.id, entry2.id)
+
+        val store = FakeCustomEntryStore()
+        store.put(entry1)
+        store.put(entry2)
+
+        // Both survive in store without replacing each other:
+        val restored = FakeCustomEntryStore(rehydratedFrom = store)
+        val found1 = restored.find(entry1.id)
+        val found2 = restored.find(entry2.id)
+
+        assertNotNull(found1)
+        assertNotNull(found2)
+        assertEquals(file1, found1!!.fileName)
+        assertEquals(file2, found2!!.fileName)
+
+        // Also test legacy fallback resolution: an enqueued request holding the legacy truncated ID resolves
+        val foundLegacy = restored.find(legacy1)
+        assertNotNull("queued legacy ID must resolve without orphaning", foundLegacy)
+    }
 }
 
 /**

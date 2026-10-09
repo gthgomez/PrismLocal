@@ -351,8 +351,7 @@ object HuggingFaceModelCatalog {
     fun buildCustomEntry(repoId: String, fileName: String): HuggingFaceModelEntry {
         val cleanRepo = repoId.trim().trim('/')
         val cleanFile = fileName.trim().removePrefix("/")
-        val id = "custom_" + (cleanRepo + "_" + cleanFile)
-            .replace(Regex("[^A-Za-z0-9._-]+"), "_").take(40)
+        val id = customEntryId(cleanRepo, cleanFile)
         return HuggingFaceModelEntry(
             id = id,
             name = cleanFile.removeSuffix(".gguf"),
@@ -365,6 +364,29 @@ object HuggingFaceModelCatalog {
             notes = "User-submitted custom Hugging Face GGUF repository",
             curated = false,
         )
+    }
+
+    /**
+     * Collision-resistant ID derived from SHA-256 over canonical repo and file.
+     * Prevents collisions between distinct models sharing the same 40-character prefix.
+     */
+    fun customEntryId(cleanRepo: String, cleanFile: String): String {
+        val prefix = (cleanRepo + "_" + cleanFile)
+            .replace(Regex("[^A-Za-z0-9._-]+"), "_")
+            .take(32)
+        val canonical = "$cleanRepo:$cleanFile"
+        val hash = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(canonical.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return "custom_${prefix}_$hash"
+    }
+
+    /**
+     * Legacy truncated ID generator for resolving existing queued WorkManager requests.
+     */
+    fun legacyCustomEntryId(cleanRepo: String, cleanFile: String): String {
+        return "custom_" + (cleanRepo + "_" + cleanFile)
+            .replace(Regex("[^A-Za-z0-9._-]+"), "_").take(40)
     }
 
     fun createCustomEntry(repoId: String, fileName: String): HuggingFaceModelEntry {

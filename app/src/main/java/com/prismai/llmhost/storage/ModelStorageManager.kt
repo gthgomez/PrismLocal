@@ -56,14 +56,19 @@ internal object ModelStorageLifecycleGate {
  * different artifact* (its head/tail bytes differ) at negligible I/O cost, so "matches" is not
  * merely a (size, mtime) spoof check.
  *
- * The cache is not a trust boundary. The SHA-256 it caches is only as trustworthy as the directory
- * the artifact lives in: the model directory is app-private and written only by app code, so an
- * attacker who could replace the model bytes could equally rewrite the manifest's recorded digest.
- * The cache does not make that attack possible or impossible — it avoids re-hashing bytes this
- * process has already hashed and that still fingerprint the same. The record is in-memory only, so
- * a fresh process re-verifies everything. Callers that must not trust the cache use
- * [ModelStorageManager.resolveActiveModel] instead of
- * [ModelStorageManager.resolveActiveModelForActivation].
+ * Threat model & boundary (PL-F15):
+ * The verification cache is an opportunistic change detector for app-private storage, NOT an
+ * adversarial tamper-proof guarantee. It detects accidental corruption, truncation, and replacement
+ * of the artifact with a different file. It does NOT detect deliberate middle-of-file mutations
+ * (>64 KiB from ends) where an entity with write access to the app's private sandbox modifies bytes
+ * while preserving exact file length and mtime. Under Android's security architecture, any process
+ * with arbitrary write access to the app-private filesDir has already completely compromised the
+ * application's sandbox (and could equally rewrite manifest.json itself).
+ *
+ * Full SHA-256 streaming verification is performed upon initial import/download before writing the
+ * manifest. Subsequent activations rely on this cache for performance (avoiding multi-gigabyte re-reads).
+ * Callers that must not trust the cache use [ModelStorageManager.resolveActiveModel] with
+ * [HashPolicy.FULL] instead of [ModelStorageManager.resolveActiveModelForActivation].
  */
 internal object ModelArtifactVerificationCache {
     /** Bytes read from each end of the artifact for the change fingerprint. */
@@ -169,6 +174,7 @@ class ModelStorageManager(
         val bytes: Long,
         val importedAt: String,
         val validation: ModelValidation,
+        val integrity: DownloadIntegrity = DownloadIntegrity.UNKNOWN_LEGACY,
     )
 
     data class ModelValidation(
@@ -296,6 +302,7 @@ class ModelStorageManager(
         input: InputStream,
         expectedLifecycleRevision: Long? = null,
         onProgress: (ImportProgress) -> Unit = {},
+        integrity: DownloadIntegrity = DownloadIntegrity.UNKNOWN_LEGACY,
     ): ImportResult = ModelStorageLifecycleGate.withLock {
         val modelId = modelIdFromDisplayName(displayName)
         val expected = expectedLifecycleRevision ?: ModelStorageLifecycleGate.revision(modelId)
@@ -308,7 +315,7 @@ class ModelStorageManager(
                 ),
             )
         } else {
-            importModelFromStreamLocked(displayName, reportedSize, input, onProgress)
+            importModelFromStreamLocked(displayName, reportedSize, input, onProgress, integrity)
         }
     }
 
@@ -317,6 +324,7 @@ class ModelStorageManager(
         reportedSize: Long,
         input: InputStream,
         onProgress: (ImportProgress) -> Unit,
+        integrity: DownloadIntegrity = DownloadIntegrity.UNKNOWN_LEGACY,
     ): ImportResult {
         val modelId = modelIdFrom(displayName)
         val versionId = newVersionId()
@@ -381,6 +389,7 @@ class ModelStorageManager(
                 bytes = activeFile.length(),
                 importedAt = now,
                 validation = validation,
+                integrity = integrity,
             )
             writeManifestAtomically(modelRoot, manifest)
             pruneInactiveVersions(modelRoot, versionId)
@@ -603,6 +612,13 @@ class ModelStorageManager(
                     }
                 }
             }
+            val integrity = when (activeObj.optString("integrity", "")) {
+                DownloadIntegrity.VERIFIED_PINNED.name -> DownloadIntegrity.VERIFIED_PINNED
+                DownloadIntegrity.VERIFIED_PROVIDER_METADATA.name -> DownloadIntegrity.VERIFIED_PROVIDER_METADATA
+                DownloadIntegrity.UNVERIFIED.name -> DownloadIntegrity.UNVERIFIED
+                DownloadIntegrity.UNKNOWN_LEGACY.name -> DownloadIntegrity.UNKNOWN_LEGACY
+                else -> DownloadIntegrity.UNKNOWN_LEGACY
+            }
             ModelResolveResult.Success(
                 ActiveModelInfo(
                     id = modelId,
@@ -613,6 +629,7 @@ class ModelStorageManager(
                     bytes = activeObj.optLong("bytes", modelFile.length()),
                     importedAt = activeObj.optString("imported_at", ""),
                     validation = validation,
+                    integrity = integrity,
                 )
             )
         } catch (e: JSONException) {
@@ -646,6 +663,7 @@ class ModelStorageManager(
         bytes: Long,
         importedAt: String,
         validation: ModelValidation,
+        integrity: DownloadIntegrity = DownloadIntegrity.UNKNOWN_LEGACY,
     ): JSONObject {
         val existing = File(modelRoot, MANIFEST_FILE)
         val versions = if (existing.exists()) {
@@ -661,6 +679,7 @@ class ModelStorageManager(
                 .put("sha256", sha256)
                 .put("bytes", bytes)
                 .put("imported_at", importedAt)
+                .put("integrity", integrity.name)
                 .put(
                     "validation",
                     JSONObject()

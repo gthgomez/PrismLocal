@@ -1052,3 +1052,12 @@ class GenerationOrchestrator(
     }
 
 }
+
+/**
+ * True when [launch] means the message was actually accepted by the engine: a started generation
+ * or a tool action handled in place. Only then may the caller clear the composed message; a
+ * [GenerationOrchestrator.GenerationLaunch.REFUSED] launch must leave the draft intact.
+ */
+internal fun GenerationOrchestrator.GenerationLaunch.acceptsMessage(): Boolean =
+    this == GenerationOrchestrator.GenerationLaunch.STARTED ||
+        this == GenerationOrchestrator.GenerationLaunch.HANDLED

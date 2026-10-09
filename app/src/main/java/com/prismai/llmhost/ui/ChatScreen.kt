@@ -683,23 +683,26 @@ fun ChatScreen(
                             onContinue = { service?.continueGenerationSafely() },
                             onSend = {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
+                                val svc = service
                                 if (text.isNotEmpty()) {
-                                    // Ask the service before destroying anything, off the
-                                    // main thread because acceptance reads SQLite memory.
-                                    // A refusal must leave the composed text and
-                                    // attachments intact.
-                                    scope.launch {
-                                        val result = service?.preflightSend(text)
-                                        if (result == null) {
-                                            snackbarMessage = "Service unavailable"
-                                        } else if (result.accepted) {
-                                            prompt = ""
-                                            savedAttachments = emptyList()
-                                            draftStore.clear()
-                                            service?.generateSafely(text)
-                                        } else {
-                                            snackbarMessage = result.reason ?: "Message refused; draft kept"
-                                        }
+                                    if (svc == null) {
+                                        snackbarMessage = "Service unavailable"
+                                    } else {
+                                        // Clear the composer only after the service confirms the
+                                        // message was actually admitted. A refusal (chat
+                                        // transition, background owner, capacity) keeps the draft,
+                                        // so text and attachments are never lost.
+                                        svc.generateSafely(
+                                            prompt = text,
+                                            onAccepted = {
+                                                scope.launch {
+                                                    prompt = ""
+                                                    savedAttachments = emptyList()
+                                                    draftStore.clear()
+                                                }
+                                            },
+                                            onRefused = { reason -> snackbarMessage = reason },
+                                        )
                                     }
                                 }
                             },

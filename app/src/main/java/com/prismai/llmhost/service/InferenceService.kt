@@ -87,7 +87,7 @@ import com.prismai.llmhost.generation.ServiceGenerationOwnership
 import com.prismai.llmhost.generation.GenerationMetrics
 import com.prismai.llmhost.generation.GenerationOrchestrator
 import com.prismai.llmhost.generation.PromptBuilder
-import com.prismai.llmhost.generation.SendAcceptance
+import com.prismai.llmhost.generation.acceptsMessage
 import com.prismai.llmhost.agent.AgentTrace
 import com.prismai.llmhost.agent.AgentToolConfirmation
 import com.prismai.llmhost.agent.AgentToolRouter
@@ -1103,35 +1103,39 @@ class InferenceService : Service() {
     fun benchmarkJson(): String = benchmarkStore.json()
 
     /**
-     * Off-main pre-flight: [generationAcceptance] reads active memories from
-     * SQLite, so running it on the UI thread would block a frame. The UI calls
-     * this from a coroutine before it decides whether to clear its draft.
+     * Starts a chat generation for [prompt] and reports the *authoritative* admission outcome.
+     *
+     * [onAccepted] runs only once the service has actually accepted the message: the orchestrator
+     * reports a started generation or a handled tool action. [onRefused] runs with the reason when
+     * the message was not admitted (a chat transition, a background owner, or a refused launch).
+     * The composer must clear its draft in [onAccepted] and never before — admission is decided
+     * under the operation mutex and can fail after any earlier, cheaper check.
+     *
+     * This replaces the UI-side `preflightSend`: that duplicated the orchestrator's acceptance work
+     * (including the memory-context build) and could still disagree with the real admission.
      */
-    suspend fun preflightSend(prompt: String): SendAcceptance.Result =
-        withContext(Dispatchers.Default) { generationAcceptance(prompt) }
-
-    private fun generationAcceptance(prompt: String): SendAcceptance.Result {
-        // Same inputs as the orchestrator's normal-chat acceptance: clamped
-        // settings, real retrieved memory, and the agent instruction block when
-        // agents are enabled. buildMemoryContext is non-suspending.
-        val settings = _generationSettings.value.clamped()
-        return SendAcceptance.forChat(
-            currentModel = uiState.currentModel.value,
-            settings = settings,
-            prompt = prompt,
-            memoryContext = promptBuilder.buildMemoryContext(prompt),
-            enforceBudget = true,
-        )
-    }
-
     fun generateSafely(
         prompt: String,
         benchmarkPreset: BenchmarkPreset? = null,
         preserveBenchmarkQueue: Boolean = false,
+        onAccepted: (() -> Unit)? = null,
+        onRefused: ((String) -> Unit)? = null,
     ) {
         serviceScope.launch {
-            generateSafelyAndAwait(prompt, benchmarkPreset, preserveBenchmarkQueue)
+            generateSafelyAndAwait(
+                prompt = prompt,
+                benchmarkPreset = benchmarkPreset,
+                preserveBenchmarkQueue = preserveBenchmarkQueue,
+                onAccepted = onAccepted,
+                onRefused = onRefused,
+            )
         }
+    }
+
+    /** Reports a refusal to the caller (if any) and returns the reason as the call result. */
+    private fun refuseSend(onRefused: ((String) -> Unit)?, reason: String): String {
+        onRefused?.invoke(reason)
+        return reason
     }
 
     suspend fun generateSafelyAndAwait(
@@ -1141,10 +1145,12 @@ class InferenceService : Service() {
         initiatedByBackground: Boolean = false,
         sourceChatId: String? = null,
         backgroundTaskId: String? = null,
+        onAccepted: (() -> Unit)? = null,
+        onRefused: ((String) -> Unit)? = null,
     ): String {
         if (confirmedChatTransitionChain.get() != null) {
             if (initiatedByBackground) throw BackgroundTaskDeferredException()
-            return "Chat transition in progress"
+            return refuseSend(onRefused, "Chat transition in progress")
         }
         var restoreChatId: String? = null
         var resultSessionId: Long? = null
@@ -1154,7 +1160,7 @@ class InferenceService : Service() {
         operationMutex.withLock {
             if (!initiatedByBackground && backgroundGenerationOwnership.hasOwner()) {
                 publishUiEvent("A background task currently owns the generation engine")
-                return "Background task owns the engine"
+                return refuseSend(onRefused, "Background task owns the engine")
             }
             if (initiatedByBackground &&
                 serviceGenerationOwnership.mustDeferBackgroundTask(
@@ -1169,7 +1175,7 @@ class InferenceService : Service() {
             }
             if (!generationStartGate.beginStart()) {
                 if (initiatedByBackground) throw BackgroundTaskDeferredException()
-                return "Generation deferred while a chat transition completes"
+                return refuseSend(onRefused, "Generation deferred while a chat transition completes")
             }
             val startGateReserved = true
             try {
@@ -1196,6 +1202,13 @@ class InferenceService : Service() {
                 val previousAgentChainId = agentTrace.activeChainId
                 generationOrchestrator.generate(prompt, benchmarkPreset)
                 launchResult = generationOrchestrator.takeLaunchResult()
+                // Authoritative admission result: only now may the caller treat the send as
+                // accepted (and clear the composer), or report the refusal.
+                if (launchResult.acceptsMessage()) {
+                    onAccepted?.invoke()
+                } else {
+                    onRefused?.invoke("Generation was refused")
+                }
                 if (generationSession != previousSessionId) resultSessionId = generationSession
                 val startedAgentChainId = agentTrace.activeChainId
                 if (startedAgentChainId != previousAgentChainId) {

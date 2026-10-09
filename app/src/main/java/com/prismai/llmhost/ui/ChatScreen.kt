@@ -244,6 +244,8 @@ fun ChatScreen(
                         var prompt by rememberSaveable { mutableStateOf("") }
                         var savedAttachments by rememberSaveable { mutableStateOf(emptyList<String>()) }
                         var savedChatId by rememberSaveable { mutableStateOf<String?>(null) }
+                        var isSending by remember { mutableStateOf(false) }
+                        LaunchedEffect(Unit) { DraftPayloadStore.init(context.filesDir) }
                         val attachments: List<PromptAttachment> =
                             remember(savedAttachments) {
                                 savedAttachments.mapNotNull(AttachmentTextCodec::decode)
@@ -328,6 +330,7 @@ fun ChatScreen(
                         val attachmentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
                             onImportPickerFinished()
                             if (uris.isEmpty()) return@rememberLauncherForActivityResult
+                            val pickerChatId = currentChatId
 
                             // Apply the limit before reading anything: the old path read
                             // every provider stream on the UI thread and then discarded
@@ -363,10 +366,15 @@ fun ChatScreen(
                                 }
 
                                 if (attached.isNotEmpty()) {
-                                    savedAttachments = (attachments + attached)
-                                        .distinctBy { it.uriString }
-                                        .takeLast(AttachmentSelection.MAX_PROMPT_ATTACHMENTS)
-                                        .map(AttachmentTextCodec::encode)
+                                    if (currentChatId == pickerChatId) {
+                                        val currentLive = savedAttachments.mapNotNull(AttachmentTextCodec::decode)
+                                        savedAttachments = (currentLive + attached)
+                                            .distinctBy { it.uriString }
+                                            .takeLast(AttachmentSelection.MAX_PROMPT_ATTACHMENTS)
+                                            .map(AttachmentTextCodec::encode)
+                                    } else {
+                                        draftStore.addAttachments(pickerChatId, attached)
+                                    }
                                 }
                                 // Task 4 imports every selected GGUF, one at a time,
                                 // rather than dropping all but the first.
@@ -675,35 +683,53 @@ fun ChatScreen(
                                 attachmentLauncher.launch(arrayOf("*/*"))
                             },
                             onRemoveAttachment = { attachment ->
+
+                                DraftPayloadStore.remove(attachment.uriString)
                                 savedAttachments = attachments
                                     .filterNot { it.uriString == attachment.uriString }
                                     .map(AttachmentTextCodec::encode)
                             },
                             onCancel = { service?.cancelGeneration() },
                             onContinue = { service?.continueGenerationSafely() },
+                            isSending = isSending,
                             onSend = {
+                                if (!isSending) {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 val svc = service
                                 if (text.isNotEmpty()) {
                                     if (svc == null) {
                                         snackbarMessage = "Service unavailable"
                                     } else {
-                                        // Clear the composer only after the service confirms the
-                                        // message was actually admitted. A refusal (chat
-                                        // transition, background owner, capacity) keeps the draft,
-                                        // so text and attachments are never lost.
+                                        val originatingChatId = currentChatId
+                                        val originatingPrompt = prompt
+                                        val originatingAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode)
+                                        val sendToken = java.util.UUID.randomUUID().toString()
+                                        isSending = true
                                         svc.generateSafely(
                                             prompt = text,
+                                            sourceChatId = originatingChatId,
+                                            sendToken = sendToken,
                                             onAccepted = {
                                                 scope.launch {
-                                                    prompt = ""
-                                                    savedAttachments = emptyList()
-                                                    draftStore.clear()
+                                                    isSending = false
+                                                    if (currentChatId == originatingChatId) {
+                                                        if (prompt == originatingPrompt) {
+                                                            prompt = ""
+                                                        }
+                                                        if (savedAttachments.mapNotNull(AttachmentTextCodec::decode) == originatingAttachments) {
+                                                            savedAttachments = emptyList()
+                                                        }
+                                                    }
+                                                    draftStore.clearIfMatches(originatingChatId, originatingPrompt, originatingAttachments)
                                                 }
                                             },
-                                            onRefused = { reason -> snackbarMessage = reason },
+                                            onRefused = { reason ->
+                                                isSending = false
+                                                snackbarMessage = reason
+                                            },
                                         )
                                     }
+                                }
                                 }
                             },
                             onVoiceClick = { service?.startVoiceInput() },

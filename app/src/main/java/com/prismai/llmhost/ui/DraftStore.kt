@@ -64,9 +64,45 @@ class DraftStore(initialChatId: String?) {
 
     /** Erase the active chat's draft. Other chats are untouched. */
     fun clear() {
+        attachments.forEach { DraftPayloadStore.remove(it.uriString) }
         text = ""
         attachments = emptyList()
-        drafts.remove(key(chatId))
+        val removed = drafts.remove(key(chatId))
+        removed?.attachments?.forEach { DraftPayloadStore.remove(it.uriString) }
+    }
+
+    /** Add attachments to a specific chat's draft (e.g. from picker completion). */
+    fun addAttachments(targetChatId: String?, newAttachments: List<PromptAttachment>) {
+        if (targetChatId == chatId) {
+            attachments = (attachments + newAttachments)
+                .distinctBy { it.uriString }
+                .takeLast(com.prismai.llmhost.AttachmentSelection.MAX_PROMPT_ATTACHMENTS)
+        } else {
+            val stored = drafts[key(targetChatId)]
+            val merged = ((stored?.attachments ?: emptyList()) + newAttachments)
+                .distinctBy { it.uriString }
+                .takeLast(com.prismai.llmhost.AttachmentSelection.MAX_PROMPT_ATTACHMENTS)
+            drafts[key(targetChatId)] = Draft(stored?.text ?: "", merged)
+        }
+    }
+
+    /** Clears draft if the targetChatId and contents match the expected accepted draft. */
+    fun clearIfMatches(
+        targetChatId: String?,
+        expectedPrompt: String,
+        expectedAttachments: List<PromptAttachment>,
+    ) {
+        if (targetChatId == chatId) {
+            if (text == expectedPrompt && attachments == expectedAttachments) {
+                clear()
+            }
+        } else {
+            val stored = drafts[key(targetChatId)]
+            if (stored != null && stored.text == expectedPrompt && stored.attachments == expectedAttachments) {
+                stored.attachments.forEach { DraftPayloadStore.remove(it.uriString) }
+                drafts.remove(key(targetChatId))
+            }
+        }
     }
 
     /** Value copy of a chat's draft, for saveable-state persistence. */

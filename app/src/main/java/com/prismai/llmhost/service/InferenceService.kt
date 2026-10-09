@@ -190,7 +190,30 @@ class InferenceService : Service() {
     // ModelImportManager's single-flight guard and silently skips files.
     private val importUriByString = ConcurrentHashMap<String, Uri>()
     private val importQueue = SequentialImportQueue { uriString ->
-        importUriByString[uriString]?.let { uri -> importModel(uri)?.join() }
+        val uri = importUriByString[uriString]
+            ?: return@SequentialImportQueue ImportDispatchOutcome.PermanentError("No URI for $uriString")
+
+        if (importJob?.isActive == true ||
+            uiState._importState.value is ImportState.Running ||
+            uiState._modelDownloadState.value is ModelDownloadState.Running) {
+            return@SequentialImportQueue ImportDispatchOutcome.RetryableBusy
+        }
+
+        try {
+            val job = importModel(uri)
+            if (job == null) {
+                ImportDispatchOutcome.RetryableBusy
+            } else {
+                job.join()
+                importUriByString.remove(uriString)
+                ImportDispatchOutcome.Success
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            importUriByString.remove(uriString)
+            ImportDispatchOutcome.PermanentError("Import exception for $uriString", e)
+        }
     }
     // Owns the atomic enqueue/ensure-drain and the drain loop's terminal check.
     // See ImportBatchDrainer for why the old batchImportJob?.isActive gate
@@ -798,6 +821,9 @@ class InferenceService : Service() {
         WorkManager.getInstance(this).cancelUniqueWork(HuggingFaceDownloadWork.UNIQUE_WORK_NAME)
         modelImportManager.cancelImport()
     }
+
+    @androidx.annotation.VisibleForTesting
+    fun getImportUriMapSize(): Int = importUriByString.size
 
     fun clearImportState() {
         modelImportManager.clearImportState()

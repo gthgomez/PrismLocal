@@ -17,7 +17,7 @@ class SequentialImportQueueTest {
     @Test
     fun queueImportsEveryUriInOrder() = runBlocking {
         val done = mutableListOf<String>()
-        val queue = SequentialImportQueue { uri -> done += uri }
+        val queue = SequentialImportQueue.simple { uri -> done += uri }
         queue.enqueueAll(listOf("a", "b", "c"))
         queue.drain()
         assertEquals(listOf("a", "b", "c"), done)
@@ -26,7 +26,7 @@ class SequentialImportQueueTest {
     @Test
     fun queueContinuesAfterAFailure() = runBlocking {
         val done = mutableListOf<String>()
-        val queue = SequentialImportQueue { uri ->
+        val queue = SequentialImportQueue.simple { uri ->
             if (uri == "b") error("boom")
             done += uri
         }
@@ -42,7 +42,7 @@ class SequentialImportQueueTest {
         // The import suspends, so this actually exercises sequencing: if drain()
         // started the next import without awaiting the previous one, all three
         // would be in flight together and maxConcurrent would be 3.
-        val queue = SequentialImportQueue {
+        val queue = SequentialImportQueue.simple {
             inFlight++
             maxConcurrent = maxOf(maxConcurrent, inFlight)
             delay(20)
@@ -57,7 +57,7 @@ class SequentialImportQueueTest {
     fun drainPropagatesCancellationInsteadOfSwallowingIt() = runBlocking {
         val processed = mutableListOf<String>()
         val gate = CompletableDeferred<Unit>()
-        val queue = SequentialImportQueue { uri ->
+        val queue = SequentialImportQueue.simple { uri ->
             processed += uri
             gate.await() // suspend until cancelled; never completes
         }
@@ -96,7 +96,7 @@ class SequentialImportQueueTest {
         // the joined child is a separate job.
         val processed = mutableListOf<String>()
         val childJobs = mutableListOf<kotlinx.coroutines.Job>()
-        val queue = SequentialImportQueue { uri ->
+        val queue = SequentialImportQueue.simple { uri ->
             processed += uri
             val child = launch { awaitCancellation() }
             childJobs += child
@@ -119,7 +119,7 @@ class SequentialImportQueueTest {
     @Test
     fun emptyQueueIsANoOp() = runBlocking {
         val done = mutableListOf<String>()
-        val queue = SequentialImportQueue { done += it }
+        val queue = SequentialImportQueue.simple { done += it }
         queue.enqueueAll(emptyList())
         queue.drain()
         assertEquals(emptyList<String>(), done)
@@ -127,7 +127,7 @@ class SequentialImportQueueTest {
 
     @Test
     fun isEmptyReflectsPendingWork() {
-        val queue = SequentialImportQueue { }
+        val queue = SequentialImportQueue.simple { }
         assertTrue("a fresh queue is empty", queue.isEmpty())
         queue.enqueueAll(listOf("a", "b"))
         assertTrue("enqueued URIs make the queue non-empty", !queue.isEmpty())
@@ -136,7 +136,7 @@ class SequentialImportQueueTest {
     @Test
     fun clearDropsEverythingPending() = runBlocking {
         val done = mutableListOf<String>()
-        val queue = SequentialImportQueue { done += it }
+        val queue = SequentialImportQueue.simple { done += it }
         queue.enqueueAll(listOf("a", "b", "c"))
 
         queue.clear()
@@ -144,5 +144,39 @@ class SequentialImportQueueTest {
         assertTrue("clear() must empty the queue", queue.isEmpty())
         queue.drain()
         assertEquals("cleared URIs must never import", emptyList<String>(), done)
+    }
+
+    // --- PL-F17: fatal Error (OutOfMemoryError) must propagate and never be swallowed ---
+
+    @Test(expected = OutOfMemoryError::class)
+    fun drainPropagatesOutOfMemoryErrorImmediately() = runBlocking {
+        val queue = SequentialImportQueue.simple { uri ->
+            if (uri == "b") throw OutOfMemoryError("simulated OOM in import")
+        }
+        queue.enqueueAll(listOf("a", "b", "c"))
+        queue.drain()
+    }
+
+    // --- PL-F09: retryable busy preserves the queued item without dropping or consuming it ---
+
+    @Test
+    fun retryableBusyRetriesItemWithoutConsumingOrDroppingIt() = runBlocking {
+        val attempts = mutableListOf<String>()
+        var busyCount = 2
+        val queue = SequentialImportQueue { uri ->
+            attempts += uri
+            if (uri == "a" && busyCount > 0) {
+                busyCount--
+                ImportDispatchOutcome.RetryableBusy
+            } else {
+                ImportDispatchOutcome.Success
+            }
+        }
+        queue.enqueueAll(listOf("a", "b"))
+        queue.drain(retryDelayMs = 1L)
+
+        // "a" was attempted 3 times (2 retryable busy + 1 success), then "b" succeeded
+        assertEquals(listOf("a", "a", "a", "b"), attempts)
+        assertTrue("queue must be empty once all items succeed", queue.isEmpty())
     }
 }

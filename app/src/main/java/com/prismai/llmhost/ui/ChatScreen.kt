@@ -954,6 +954,8 @@ private fun ModelOnboardingCard(
                             "Downloaded ${downloadState.entryName} (matched provider metadata)"
                         DownloadIntegrity.UNVERIFIED ->
                             "Downloaded ${downloadState.entryName} (unverified: no SHA-256 available)"
+                        DownloadIntegrity.UNKNOWN_LEGACY ->
+                            "Imported ${downloadState.entryName} (legacy)"
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = if (downloadState.integrity != DownloadIntegrity.UNVERIFIED) PrismGreen else PrismAmber,

@@ -138,7 +138,8 @@ class HuggingFaceDownloadWorker(
             val installLabel = when (integrity) {
                 DownloadIntegrity.VERIFIED_PINNED -> "Installing verified GGUF"
                 DownloadIntegrity.VERIFIED_PROVIDER_METADATA -> "Installing GGUF (provider metadata verified)"
-                DownloadIntegrity.UNVERIFIED -> "Installing GGUF (unverified)"
+                DownloadIntegrity.UNVERIFIED,
+                DownloadIntegrity.UNKNOWN_LEGACY -> "Installing GGUF (unverified)"
             }
 
             downloadResumable(entry, partialFile, expectedSize)
@@ -172,11 +173,13 @@ class HuggingFaceDownloadWorker(
                         }
                     },
                     expectedLifecycleRevision = storageRevision,
+                    integrity = integrity,
                 )
             }
             when (importResult) {
                 is ModelStorageManager.ImportResult.Failure -> {
                     partialFile.delete()
+                    File(downloadsDir, "${entry.id}.part.meta").delete()
                     Result.failure(
                         workDataOf(
                             HuggingFaceDownloadWork.KEY_ENTRY_NAME to entry.name,
@@ -186,6 +189,7 @@ class HuggingFaceDownloadWorker(
                 }
                 is ModelStorageManager.ImportResult.Success -> {
                     partialFile.delete()
+                    File(downloadsDir, "${entry.id}.part.meta").delete()
                     Result.success(
                         workDataOf(
                             HuggingFaceDownloadWork.KEY_ENTRY_ID to entry.id,
@@ -198,7 +202,8 @@ class HuggingFaceDownloadWorker(
                                     HuggingFaceDownloadWork.INTEGRITY_VERIFIED_PINNED
                                 DownloadIntegrity.VERIFIED_PROVIDER_METADATA ->
                                     HuggingFaceDownloadWork.INTEGRITY_VERIFIED_PROVIDER_METADATA
-                                DownloadIntegrity.UNVERIFIED ->
+                                DownloadIntegrity.UNVERIFIED,
+                                DownloadIntegrity.UNKNOWN_LEGACY ->
                                     HuggingFaceDownloadWork.INTEGRITY_UNVERIFIED
                             },
                         )
@@ -289,65 +294,33 @@ class HuggingFaceDownloadWorker(
     }
 
     private suspend fun downloadResumable(entry: HuggingFaceModelEntry, target: File, expectedSize: Long?) {
-        var existing = target.length().coerceAtLeast(0L)
-        val connection = (URL(entry.downloadUrl).openConnection() as HttpURLConnection).apply {
-            instanceFollowRedirects = true
-            connectTimeout = 20_000
-            readTimeout = 30_000
-            requestMethod = "GET"
-            setRequestProperty("User-Agent", "PrismLocalAndroid/1.0")
-            if (existing > 0L) {
-                setRequestProperty("Range", "bytes=$existing-")
+        val engine = ResumableDownloadEngine()
+        engine.downloadResumable(
+            downloadUrl = entry.downloadUrl,
+            target = target,
+            expectedSize = expectedSize,
+            onProgress = { copied, total, resumedFrom ->
+                setDownloadProgress(
+                    entry = entry,
+                    stage = ModelDownloadState.Running.Stage.DOWNLOADING,
+                    bytesDone = copied,
+                    totalBytes = total,
+                    message = if (resumedFrom != null && resumedFrom > 0L) {
+                        "Resumed at ${formatWorkerBytes(resumedFrom)}"
+                    } else {
+                        "Downloading"
+                    },
+                )
+                setForeground(
+                    downloadForegroundInfo(
+                        entry,
+                        "${formatWorkerBytes(copied)} / ${total?.let(::formatWorkerBytes) ?: "unknown"}"
+                    )
+                )
             }
-        }
-        try {
-            val code = connection.responseCode
-            if (code == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE) {
-                if (expectedSize != null && existing == expectedSize) return
-                target.delete()
-                if (existing == 0L) throw IllegalStateException("HTTP 416: Invalid range requested for empty file")
-                return downloadResumable(entry, target, expectedSize)
-            }
-            if (code !in 200..299) {
-                throw IllegalStateException("HTTP $code from Hugging Face download")
-            }
-            val append = existing > 0L && code == HttpURLConnection.HTTP_PARTIAL
-            if (!append) {
-                target.delete()
-                existing = 0L
-            }
-            val total = expectedSize ?: parseContentRangeTotal(connection.getHeaderField("Content-Range"))
-                ?: connection.contentLengthLong.takeIf { it > 0L }
-            var copied = existing
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            var lastProgressAt = 0L
-            FileOutputStream(target, append).use { output ->
-                connection.inputStream.use { input ->
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read == -1) break
-                        currentCoroutineContext().ensureActive()
-                        output.write(buffer, 0, read)
-                        copied += read
-                        val now = SystemClock.elapsedRealtime()
-                        if (now - lastProgressAt > 500L || copied == total) {
-                            lastProgressAt = now
-                            setDownloadProgress(
-                                entry = entry,
-                                stage = ModelDownloadState.Running.Stage.DOWNLOADING,
-                                bytesDone = copied,
-                                totalBytes = total,
-                                message = if (existing > 0L && append) "Resumed at ${formatWorkerBytes(existing)}" else "Downloading",
-                            )
-                            setForeground(downloadForegroundInfo(entry, "${formatWorkerBytes(copied)} / ${total?.let(::formatWorkerBytes) ?: "unknown"}"))
-                        }
-                    }
-                }
-            }
-        } finally {
-            connection.disconnect()
-        }
+        )
     }
+
 
     private suspend fun verifyCompletedDownload(
         entry: HuggingFaceModelEntry,
@@ -357,6 +330,8 @@ class HuggingFaceDownloadWorker(
     ) {
         val size = file.length()
         if (expectedSize != null && size != expectedSize) {
+            file.delete()
+            File(file.parentFile ?: appContext.filesDir, "${file.name}.meta").delete()
             throw IllegalStateException("Downloaded size mismatch: got ${formatWorkerBytes(size)}, expected ${formatWorkerBytes(expectedSize)}")
         }
         setDownloadProgress(
@@ -378,6 +353,7 @@ class HuggingFaceDownloadWorker(
         }
         if (!actual.equals(expectedSha256, ignoreCase = true)) {
             file.delete()
+            File(file.parentFile ?: appContext.filesDir, "${file.name}.meta").delete()
             throw IllegalStateException("Downloaded SHA-256 mismatch")
         }
     }
@@ -403,11 +379,6 @@ class HuggingFaceDownloadWorker(
         }
         return digest.digest().toHex()
     }
-
-    private fun parseContentRangeTotal(value: String?): Long? =
-        value?.substringAfter('/', missingDelimiterValue = "")
-            ?.toLongOrNull()
-            ?.takeIf { it > 0L }
 
     private suspend fun setDownloadProgress(
         entry: HuggingFaceModelEntry,
@@ -479,7 +450,7 @@ private fun cleanupStalePartialFiles(downloadsDir: File, maxAgeMs: Long = 24 * 3
     runCatching {
         val now = System.currentTimeMillis()
         downloadsDir.listFiles()?.forEach { file ->
-            if (file.name.endsWith(".part") && (now - file.lastModified() > maxAgeMs)) {
+            if ((file.name.endsWith(".part") || file.name.endsWith(".part.meta")) && (now - file.lastModified() > maxAgeMs)) {
                 file.delete()
             }
         }

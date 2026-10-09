@@ -312,10 +312,11 @@ class ModelStorageManagerTest {
             assertTrue(imported is ModelStorageManager.ImportResult.Success)
             val file = (imported as ModelStorageManager.ImportResult.Success).model.file
 
-            // Same length and a valid GGUF header, but different weights: the manifest hash no
-            // longer describes these bytes.
+            // Same length, same mtime, valid GGUF header, but different weights. Only the content
+            // fingerprint can catch this: neither the size nor the mtime check will.
+            val originalMtime = file.lastModified()
             file.writeBytes(validGgufBytes(seed = 9))
-            check(file.setLastModified(file.lastModified() + 5_000))
+            check(file.setLastModified(originalMtime))
 
             val activated = manager.resolveActiveModelForActivation("tampered-model")
             assertTrue("tampered weights must be rejected, got $activated", activated is ModelStorageManager.ModelResolveResult.Failure)

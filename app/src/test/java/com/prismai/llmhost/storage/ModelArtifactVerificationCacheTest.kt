@@ -8,8 +8,11 @@ import org.junit.rules.TemporaryFolder
 import java.io.File
 
 /**
- * Guards the activation-time verification cache: it must only ever report a match for the exact
- * bytes that were hashed, and any change to size, mtime, digest, or location must invalidate it.
+ * Guards the activation-time verification cache. A match requires the same digest, size, mtime and
+ * content fingerprint, so any change to size, mtime, digest, location, or the head/tail bytes
+ * invalidates it. The fingerprint is what stops a same-size, same-mtime substitution of a different
+ * artifact from reusing a previously computed digest; it is not a substitute for the app-private
+ * writer boundary the whole hash check relies on.
  */
 class ModelArtifactVerificationCacheTest {
 
@@ -59,6 +62,41 @@ class ModelArtifactVerificationCacheTest {
         file.writeBytes(ByteArray(32))
 
         assertFalse(ModelArtifactVerificationCache.matches(file, sha))
+    }
+
+    @Test
+    fun sameSizeSameMtimeSubstitutionIsDetectedByFingerprint() {
+        val file = temp.newFile("model.gguf")
+        val original = ByteArray(4096) { it.toByte() }
+        file.writeBytes(original)
+        val mtime = 1_000_000_000_000L
+        file.setLastModified(mtime)
+        ModelArtifactVerificationCache.remember(file, sha)
+
+        // Same length, same mtime, different content: the fingerprint window differs.
+        val substituted = original.copyOf().also { it[0] = (it[0] + 1).toByte() }
+        file.writeBytes(substituted)
+        file.setLastModified(mtime)
+
+        assertFalse(
+            "a same-size, same-mtime substitution must not reuse the cached digest",
+            ModelArtifactVerificationCache.matches(file, sha),
+        )
+    }
+
+    @Test
+    fun identicalBytesWithSameMetadataStillMatch() {
+        val file = temp.newFile("model.gguf")
+        val bytes = ByteArray(4096) { it.toByte() }
+        file.writeBytes(bytes)
+        file.setLastModified(1_000_000_000_000L)
+        ModelArtifactVerificationCache.remember(file, sha)
+
+        // Rewrite identical content and the same mtime: still the bytes we hashed.
+        file.writeBytes(bytes)
+        file.setLastModified(1_000_000_000_000L)
+
+        assertTrue(ModelArtifactVerificationCache.matches(file, sha))
     }
 
     @Test

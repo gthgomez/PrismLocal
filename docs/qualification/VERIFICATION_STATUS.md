@@ -118,6 +118,16 @@ Following the initial reliability train, the 18 audit findings and qualification
 | **Sequence C: Task Durability & Search Consistency** | PR #36 (`fe914aa`) | PL-F05, PL-F06, PL-Q02, PL-Q03 | Atomic task persistence with `.bak` rollback; BackgroundAgentPersistenceTest durability barrier; ChatSearchAndDeletionConsistencyTest verifying search index eviction, delete error propagation, and ordered revisions. |
 | **Sequence D: Imports, Downloads & Provenance** | PR #37 (`6745922`) | PL-F09, PL-F13, PL-F14, PL-F15, PL-F16, PL-F17 | SequentialImportQueue non-dropping retry loop on busy; fatal `Throwable` rethrow; URI map release; ResumableDownloadEngineTest verifying Content-Range 206 validation, 200 reset, ETag mutation reset, disk reserve & MAX_MODEL_BYTES; catalog SHA-256 ID derivation with legacy lookup; cache threat model boundary test; ModelProvenancePersistenceTest manifest round-trip. |
 
+> **Closure-evidence caveat (2026-10-10).** The merge-train rows above record that
+> source changes and tests landed; they are not, by themselves, proof that the
+> corresponding GitHub issue's acceptance criteria are met. Independent review of the
+> issue comments found that the closure evidence for **#14, #15, #17, and #20** does
+> not demonstrate the original defect (for example, #20 concerns background-task chat
+> ownership, and HTTP download handling does not address it). Treat those issues as
+> requalification candidates, not resolved, until source-specific acceptance evidence
+> exists. The JVM unit-test evidence was also invalidated by the `a6bd73d` CI
+> regression and must be re-confirmed on the fixed head (see `STATUS.md`).
+
 ## Qualification ledger & release qualification matrix
 
 | ID | Title / Subsystem | Tag | Remediation / Verification Status |

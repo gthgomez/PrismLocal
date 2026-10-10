@@ -393,13 +393,20 @@ class BackgroundAgentManager(
      * [stateLock]; the returned task is owned by the caller and must be
      * executed only after the lock is released.
      */
-    private fun promoteHeadLocked(current: BackgroundAgentState): BackgroundTask {
+    private fun promoteHeadLocked(current: BackgroundAgentState): BackgroundTask? {
         val head = current.queuedTasks.first().copy(status = BackgroundTaskStatus.RUNNING)
         val nextState = current.copy(
             activeTask = head,
             queuedTasks = current.queuedTasks.drop(1),
         )
-        persistTasksLocked(nextState)
+        // Persist before publishing the promoted state: a failed disk write must
+        // not leave the task RUNNING/active in memory while the durable record
+        // still shows it QUEUED. On failure, keep the task at the queue head and
+        // report "nothing promoted" so the caller leaves it for a later retry.
+        if (!persistTasksLocked(nextState)) {
+            logW(TAG, "Failed to persist promotion of ${head.id}, holding it queued")
+            return null
+        }
         _state.value = nextState
         return head
     }
@@ -431,7 +438,10 @@ class BackgroundAgentManager(
                 busyHoldNeeded = true
             } else {
                 promoted = promoteHeadLocked(current)
-                if (!current.isBackgroundMode) {
+                // Only enter background mode when a task was actually promoted
+                // and its promotion was durably persisted; otherwise the wake
+                // lock would be held with no task behind it.
+                if (promoted != null && !current.isBackgroundMode) {
                     startNeeded = true
                 }
             }

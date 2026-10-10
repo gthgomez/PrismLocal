@@ -148,7 +148,13 @@ class ChatManager(
         val deleteSucceeded = runCatching {
             transcriptWriteGate.invalidateAndRun(chatId, retireOwner = true) {
                 val file = transcriptStore.transcriptFile(chatId)
-                if (file.exists()) file.delete() else true
+                val deleted = if (file.exists()) file.delete() else true
+                // Evict the search entry under the same gate that serializes
+                // transcript publication. An in-flight persist either runs
+                // before this eviction (and is then evicted) or is rejected as
+                // stale afterwards, so a deleted chat can never be re-indexed.
+                if (deleted) searchIndex.remove(chatId)
+                deleted
             }
         }.getOrElse { error ->
             Log.w(TAG, "failed to delete chat transcript", error)
@@ -158,8 +164,6 @@ class ChatManager(
         if (!deleteSucceeded) {
             return false
         }
-
-        searchIndex.remove(chatId)
 
         val remaining = uiState._chatSessions.value.filterNot { it.id == chatId }
         if (remaining.isEmpty()) {
@@ -213,10 +217,12 @@ class ChatManager(
         uiState.streamState.clear()
         touchCurrentChat(emptyList(), updateTitle = false)
         if (currentId != null) {
-            val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == currentId }?.title
-            searchIndex.update(currentId, emptyList(), sessionTitle)
             runCatching {
                 transcriptWriteGate.invalidateAndRun(currentId) {
+                    // Update the index under the gate so a stale in-flight
+                    // publish cannot re-index the cleared transcript afterwards.
+                    val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == currentId }?.title
+                    searchIndex.update(currentId, emptyList(), sessionTitle)
                     val file = transcriptStore.transcriptFile(currentId)
                     if (file.exists()) file.delete() else true
                 }

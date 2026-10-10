@@ -2,6 +2,7 @@ package com.prismai.llmhost
 
 import android.content.Context
 import android.content.ContextWrapper
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
@@ -12,13 +13,18 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 class FakeTestContext : ContextWrapper(null) {
     override fun getSystemService(name: String): Any? = null
 }
 
 class BackgroundAgentManagerTest {
+
+    @get:Rule
+    val tempFolder = TemporaryFolder()
 
     @Test
     fun deletingSourceChatDiscardsOnlyItsQueuedTasks() = runBlocking {
@@ -427,5 +433,123 @@ class BackgroundAgentManagerTest {
         assertNull(manager.state.value.activeTask)
         manager.cancelTask(manager.state.value.queuedTasks.first().id)
         Unit
+    }
+
+    @Test
+    fun backgroundModeStopsAfterTheQueueDrains() = runBlocking {
+        val manager = BackgroundAgentManager(
+            context = FakeTestContext(),
+            executeTask = { "done" },
+        )
+
+        manager.enqueue("only task")
+
+        var attempts = 0
+        while (manager.state.value.completedTasks.isEmpty() && attempts < 100) {
+            delay(20)
+            attempts++
+        }
+        assertEquals(1, manager.state.value.completedTasks.size)
+
+        attempts = 0
+        while (manager.state.value.isBackgroundMode && attempts < 100) {
+            delay(20)
+            attempts++
+        }
+        assertFalse(
+            "background mode must be cleared once the last task finishes",
+            manager.state.value.isBackgroundMode,
+        )
+        assertNull(manager.state.value.activeTask)
+        manager.shutdown()
+    }
+
+    @Test
+    fun failedCompletionPersistenceIsNotPublishedAndRetriesAfterRecovery() = runBlocking {
+        val storageDir = tempFolder.newFolder("bg_commit_retry")
+        val gate = CompletableDeferred<Unit>()
+        val manager = BackgroundAgentManager(
+            context = FakeTestContext(),
+            executeTask = { gate.await(); "done" },
+            storageDir = storageDir,
+        )
+
+        val task = manager.enqueue("durable completion")!!
+        var attempts = 0
+        while (manager.state.value.activeTask?.id != task.id && attempts < 50) {
+            delay(20)
+            attempts++
+        }
+        assertEquals(task.id, manager.state.value.activeTask?.id)
+
+        // Break durability deterministically: replace the storage directory with
+        // a regular file so the persistence write cannot succeed.
+        storageDir.deleteRecursively()
+        storageDir.writeText("blocked")
+
+        gate.complete(Unit)
+        delay(400)
+
+        // A completion the disk refused must not be reported as durable.
+        assertEquals(task.id, manager.state.value.activeTask?.id)
+        assertTrue(manager.state.value.completedTasks.isEmpty())
+
+        // Recover the write path; the scheduled retry must commit the transition.
+        storageDir.delete()
+        storageDir.mkdirs()
+        attempts = 0
+        while (manager.state.value.completedTasks.none { it.id == task.id } && attempts < 120) {
+            delay(50)
+            attempts++
+        }
+        assertEquals(
+            BackgroundTaskStatus.COMPLETED,
+            manager.state.value.completedTasks.first { it.id == task.id }.status,
+        )
+        assertNull(manager.state.value.activeTask)
+        manager.shutdown()
+    }
+
+    @Test
+    fun failedPromotionIsRetriedInsteadOfStrandingTheQueue() = runBlocking {
+        val storageDir = tempFolder.newFolder("bg_promote_retry")
+        val deviceBusy = AtomicBoolean(true)
+        val executed = AtomicInteger()
+        val manager = BackgroundAgentManager(
+            context = FakeTestContext(),
+            executeTask = { executed.incrementAndGet(); "done" },
+            isDeviceBusyWithUserGeneration = { deviceBusy.get() },
+            storageDir = storageDir,
+        )
+
+        manager.enqueue("queued while busy")
+        assertEquals(1, manager.state.value.queuedTasks.size)
+
+        // Break persistence, then free the device so promotion is attempted.
+        storageDir.deleteRecursively()
+        storageDir.writeText("blocked")
+        deviceBusy.set(false)
+        manager.processNextTask()
+        delay(300)
+
+        // The promotion could not be persisted: nothing ran and the task stays queued.
+        assertEquals(0, executed.get())
+        assertEquals(1, manager.state.value.queuedTasks.size)
+        assertNull(manager.state.value.activeTask)
+
+        // Recover the write path; the retry must promote and run the task.
+        storageDir.delete()
+        storageDir.mkdirs()
+        var attempts = 0
+        while (manager.state.value.completedTasks.isEmpty() && attempts < 120) {
+            delay(50)
+            attempts++
+        }
+        assertEquals(1, executed.get())
+        assertEquals(
+            BackgroundTaskStatus.COMPLETED,
+            manager.state.value.completedTasks.first().status,
+        )
+        manager.shutdown()
     }
 }

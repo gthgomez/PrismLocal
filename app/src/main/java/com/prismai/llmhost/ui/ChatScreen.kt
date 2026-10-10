@@ -245,7 +245,6 @@ fun ChatScreen(
                         var savedAttachments by rememberSaveable { mutableStateOf(emptyList<String>()) }
                         var savedChatId by rememberSaveable { mutableStateOf<String?>(null) }
                         var isSending by remember { mutableStateOf(false) }
-                        LaunchedEffect(Unit) { DraftPayloadStore.init(context.filesDir) }
                         val attachments: List<PromptAttachment> =
                             remember(savedAttachments) {
                                 savedAttachments.mapNotNull(AttachmentTextCodec::decode)
@@ -684,7 +683,7 @@ fun ChatScreen(
                             },
                             onRemoveAttachment = { attachment ->
 
-                                DraftPayloadStore.remove(attachment.uriString)
+                                draftStore.releaseLiveAttachmentPayload(attachment.uriString)
                                 savedAttachments = attachments
                                     .filterNot { it.uriString == attachment.uriString }
                                     .map(AttachmentTextCodec::encode)

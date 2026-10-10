@@ -56,6 +56,8 @@ class ResumableDownloadEngineTest {
         assertNull(ResumableDownloadEngine.parseContentRange(null))
         assertNull(ResumableDownloadEngine.parseContentRange("invalid"))
         assertNull(ResumableDownloadEngine.parseContentRange("bytes foo-bar/baz"))
+        assertNull("end before start is malformed", ResumableDownloadEngine.parseContentRange("bytes 50-20/100"))
+        assertNull("end at the declared total is malformed", ResumableDownloadEngine.parseContentRange("bytes 0-100/100"))
 
         assertEquals(1000L, ResumableDownloadEngine.parseContentRangeTotal("bytes 100-199/1000"))
         assertEquals(500L, ResumableDownloadEngine.parseContentRangeTotal("bytes */500"))
@@ -292,5 +294,76 @@ class ResumableDownloadEngineTest {
         assertEquals(100, combined.size)
         assertArrayEquals(initialPart, combined.copyOfRange(0, 40))
         assertArrayEquals(remainingPart, combined.copyOfRange(40, 100))
+    }
+
+    @Test
+    fun rangeBodyShorterThanDeclared_failsAndDeletesPartialFile() = runBlocking {
+        server.createContext("/model.gguf") { exchange ->
+            // Declares the range through byte 99 but only sends 30 bytes.
+            exchange.responseHeaders.set("Content-Range", "bytes 40-99/100")
+            exchange.responseHeaders.set("ETag", "\"tag1\"")
+            exchange.sendResponseHeaders(206, 30)
+            exchange.responseBody.write(ByteArray(30) { 'Z'.code.toByte() })
+            exchange.close()
+        }
+
+        val target = File(tempFolder.root, "test.part")
+        target.writeBytes(ByteArray(40) { 'A'.code.toByte() })
+        val meta = File(tempFolder.root, "test.part.meta")
+        meta.writeText(JSONObject().put("etag", "tag1").put("expected_size", 100L).toString())
+
+        val engine = ResumableDownloadEngine()
+        try {
+            engine.downloadResumable(
+                downloadUrl = "http://127.0.0.1:$serverPort/model.gguf",
+                target = target,
+                expectedSize = 100L,
+            )
+            fail("Expected an incomplete-download failure")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message!!.contains("Incomplete download"))
+        }
+
+        assertFalse("a short range body must not leave a partial file", target.exists())
+        assertFalse(meta.exists())
+    }
+
+    @Test
+    fun resumeWithoutCorroboratingValidators_restartsFromZeroInsteadOfAppending() = runBlocking {
+        val fullData = ByteArray(100) { '5'.code.toByte() }
+        var requestCount = 0
+
+        server.createContext("/model.gguf") { exchange ->
+            requestCount++
+            val rangeHeader = exchange.requestHeaders.getFirst("Range")
+            if (rangeHeader != null) {
+                // Valid 206 range, but no ETag/Last-Modified to tie it to the
+                // already-downloaded prefix.
+                exchange.responseHeaders.set("Content-Range", "bytes 40-99/100")
+                exchange.sendResponseHeaders(206, 60)
+                exchange.responseBody.write(ByteArray(60) { '9'.code.toByte() })
+            } else {
+                exchange.responseHeaders.set("ETag", "\"tag1\"")
+                exchange.sendResponseHeaders(200, 100)
+                exchange.responseBody.write(fullData)
+            }
+            exchange.close()
+        }
+
+        val target = File(tempFolder.root, "test.part")
+        target.writeBytes(ByteArray(40) { 'A'.code.toByte() })
+        val meta = File(tempFolder.root, "test.part.meta")
+        meta.writeText(JSONObject().put("etag", "tag1").put("expected_size", 100L).toString())
+
+        val engine = ResumableDownloadEngine()
+        engine.downloadResumable(
+            downloadUrl = "http://127.0.0.1:$serverPort/model.gguf",
+            target = target,
+            expectedSize = 100L,
+        )
+
+        assertEquals("an unverifiable resume must restart rather than append", 2, requestCount)
+        assertEquals(100L, target.length())
+        assertArrayEquals(fullData, target.readBytes())
     }
 }

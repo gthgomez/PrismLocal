@@ -10,6 +10,7 @@ import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.ui.UiEventBus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -71,6 +72,16 @@ class ChatSearchAndDeletionConsistencyTest {
         override fun getSharedPreferences(name: String, mode: Int): SharedPreferences = prefs
     }
 
+    /**
+     * Wait for every coroutine the manager launched on [this] scope (transcript
+     * and chat-index persists run on `Dispatchers.IO`). Tests that rewrite a
+     * persisted path must drain these first, or a late write can recreate a file
+     * after the test has replaced it, making the setup race.
+     */
+    private suspend fun CoroutineScope.awaitLaunchedWork() {
+        coroutineContext[Job]?.children?.toList()?.forEach { it.join() }
+    }
+
     @Test
     fun clearedTranscriptIsEvictedFromSearchImmediately(): Unit = runBlocking {
         val baseDir = tempFolder.newFolder("chat_test_clear")
@@ -96,11 +107,13 @@ class ChatSearchAndDeletionConsistencyTest {
             TranscriptRole.USER,
             "Searching for extraterrestrial intelligence with radio telescopes",
         )
-        // Ensure index reflects message
-        searchIndex.update(
+        // Persist through the write gate so the index reflects this transcript and
+        // any stale in-flight snapshot launched by createChatInternal is
+        // superseded by the newer revision rather than clobbering the entry.
+        chatManager.persistTranscript(
             chatId,
             uiState.transcript.value,
-            uiState.chatSessions.value.first { it.id == chatId }.title,
+            chatManager.transcriptWriteRevision(chatId),
         )
 
         // Verify query matches before clearing
@@ -141,14 +154,24 @@ class ChatSearchAndDeletionConsistencyTest {
         chatManager.createChatInternal("Chat Alpha")
         val chatAId = uiState.currentChatId.value!!
         chatManager.appendTranscriptMessage(TranscriptRole.USER, "Supernova explosion observation")
-        val sessionA = uiState.chatSessions.value.first { it.id == chatAId }
-        searchIndex.update(chatAId, uiState.transcript.value, sessionA.title)
+        // Persist through the write gate (see above): the manual index update
+        // that used to live here did not bump the gate revision, so a stale
+        // empty-transcript persist could overwrite the entry with a title-only
+        // haystack and make this chat unsearchable.
+        chatManager.persistTranscript(
+            chatAId,
+            uiState.transcript.value,
+            chatManager.transcriptWriteRevision(chatAId),
+        )
 
         chatManager.createChatInternal("Chat Beta")
         val chatBId = uiState.currentChatId.value!!
         chatManager.appendTranscriptMessage(TranscriptRole.USER, "Quantum entanglement experiment")
-        val sessionB = uiState.chatSessions.value.first { it.id == chatBId }
-        searchIndex.update(chatBId, uiState.transcript.value, sessionB.title)
+        chatManager.persistTranscript(
+            chatBId,
+            uiState.transcript.value,
+            chatManager.transcriptWriteRevision(chatBId),
+        )
 
         // Search finds Chat Alpha
         val resultsA = searchIndex.search("supernova", uiState.chatSessions.value, transcriptStore)
@@ -174,6 +197,43 @@ class ChatSearchAndDeletionConsistencyTest {
     }
 
     @Test
+    fun stalePersistAfterDeleteCannotReIndexTheChat(): Unit = runBlocking {
+        val baseDir = tempFolder.newFolder("chat_test_stale_persist")
+        val context = TestContext(baseDir)
+        val transcriptStore = TranscriptStore(context)
+        val searchIndex = ChatSearchIndex()
+        val uiState = ServiceUiState()
+        val eventBus = UiEventBus()
+        val scope = CoroutineScope(Dispatchers.Unconfined)
+
+        val chatManager = ChatManager(
+            context = context,
+            transcriptStore = transcriptStore,
+            searchIndex = searchIndex,
+            uiState = uiState,
+            eventBus = eventBus,
+            scope = scope,
+        )
+
+        chatManager.createChatInternal("Stale Publish Chat")
+        val chatId = uiState.currentChatId.value!!
+        chatManager.appendTranscriptMessage(TranscriptRole.USER, "Supernova leftover text")
+        val messages = uiState.transcript.value
+        // Capture the revision an in-flight persist would have snapshotted.
+        val staleRevision = chatManager.transcriptWriteRevision(chatId)
+        searchIndex.update(chatId, messages, "Stale Publish Chat")
+
+        assertTrue(chatManager.deleteChat(chatId))
+        assertNull(searchIndex.get(chatId))
+
+        // A publish that already passed the pre-delete gate must be rejected,
+        // never re-indexing the deleted chat.
+        chatManager.persistTranscript(chatId, messages, staleRevision)
+
+        assertNull("a stale persist must not re-index a deleted chat", searchIndex.get(chatId))
+    }
+
+    @Test
     fun failedFilesystemDeletePropagatesFalseAndRetainsChatSession(): Unit = runBlocking {
         val baseDir = tempFolder.newFolder("chat_test_fail_delete")
         val context = TestContext(baseDir)
@@ -194,6 +254,10 @@ class ChatSearchAndDeletionConsistencyTest {
 
         chatManager.createChatInternal("Undeletable Chat")
         val chatId = uiState.currentChatId.value!!
+        // Drain createChatInternal's async transcript/index persists before we
+        // replace the transcript path with a directory; otherwise a late write
+        // recreates the file after mkdirs() and the setup races.
+        scope.awaitLaunchedWork()
 
         // In POSIX and Java, deleting a non-empty directory via File.delete() always returns false.
         // We replace the target file with a non-empty directory so transcriptFile(chatId).delete() returns false.

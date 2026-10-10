@@ -67,7 +67,12 @@ class SequentialImportQueue(
                     is ImportDispatchOutcome.PermanentError -> {
                         synchronized(this) {
                             if (pending.firstOrNull() == next) {
-                                pending.removeFirst()
+                                // removeAt(0), not removeFirst(): the latter binds
+                                // to java.util.List.removeFirst() (JDK 21 /
+                                // Android API 35+ SequencedCollection) and throws
+                                // NoSuchMethodError on the JDK 17 test JVM and on
+                                // devices below API 35.
+                                pending.removeAt(0)
                             }
                         }
                     }
@@ -83,7 +88,9 @@ class SequentialImportQueue(
                 Log.w(TAG, "import failed for $next", e)
                 synchronized(this) {
                     if (pending.firstOrNull() == next) {
-                        pending.removeFirst()
+                        // removeAt(0) avoids the JDK 21 / API 35+ removeFirst()
+                        // binding; see the success branch above.
+                        pending.removeAt(0)
                     }
                 }
             }

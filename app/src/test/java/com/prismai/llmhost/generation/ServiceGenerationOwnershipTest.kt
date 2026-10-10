@@ -108,4 +108,29 @@ class ServiceGenerationOwnershipTest {
         )
         assertEquals("chat-c", ownership.engine.finish("task-a"))
     }
+
+    @Test
+    fun userSendFromASwitchedChatIsRefused() {
+        val ownership = ServiceGenerationOwnership()
+        assertFalse(
+            "a send admitted in its originating chat is accepted",
+            ownership.shouldRefuseUserSend(sourceChatId = "chat-a", selectedChatId = "chat-a"),
+        )
+        assertTrue(
+            "a queued send whose chat changed before admission must be refused",
+            ownership.shouldRefuseUserSend(sourceChatId = "chat-a", selectedChatId = "chat-b"),
+        )
+        assertTrue(
+            "losing the selection before admission must be refused",
+            ownership.shouldRefuseUserSend(sourceChatId = "chat-a", selectedChatId = null),
+        )
+        assertFalse(
+            "a first send from a not-yet-created chat is admitted",
+            ownership.shouldRefuseUserSend(sourceChatId = null, selectedChatId = null),
+        )
+        assertFalse(
+            "a null source chat must not block a first send into a freshly selected chat",
+            ownership.shouldRefuseUserSend(sourceChatId = null, selectedChatId = "chat-b"),
+        )
+    }
 }

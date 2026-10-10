@@ -96,6 +96,7 @@ class BackgroundAgentManager(
         private const val MAX_PERSISTED_RESULT_SUMMARY_CHARS = 120
         private const val LOW_BATTERY_THRESHOLD = 15
         private const val DEVICE_BUSY_RETRY_INTERVAL_MS = 2_000L
+        private const val PERSISTENCE_RETRY_INTERVAL_MS = 2_000L
         const val TASKS_FILE_NAME = "background_tasks.json"
     }
 
@@ -112,6 +113,12 @@ class BackgroundAgentManager(
     fun getPersistenceRevision(): Long = persistenceRevision.get()
     private var activeTaskJob: Job? = null
     private var deviceBusyRetryJob: Job? = null
+    private var persistenceRetryJob: Job? = null
+    private var processingRetryJob: Job? = null
+    // Latest logical state whose durable write has not succeeded yet, plus the
+    // completion notice that must fire once it does. Guarded by [stateLock].
+    private var pendingPersistState: BackgroundAgentState? = null
+    private var pendingCompletionNotice: BackgroundTask? = null
     @Volatile private var cancelInFlight = false
     @Volatile private var shutdownStarted = false
 
@@ -326,12 +333,103 @@ class BackgroundAgentManager(
     }
 
     /**
+     * Latest logical state, including a transition whose durable write has not
+     * succeeded yet. Mutations derive from this so a pending write is never
+     * silently overwritten by a later persist.
+     */
+    private fun currentStateLocked(): BackgroundAgentState = pendingPersistState ?: _state.value
+
+    /**
+     * Publish [nextState] as committed: clear any pending write and, since the
+     * new write now includes it, fire the completion notice that write held.
+     */
+    private fun publishCommittedLocked(nextState: BackgroundAgentState) {
+        val supersededNotice = if (pendingPersistState != null) pendingCompletionNotice else null
+        pendingPersistState = null
+        pendingCompletionNotice = null
+        _state.value = nextState
+        supersededNotice?.let { notifyTaskComplete(it) }
+    }
+
+    /**
+     * Persist [nextState] and publish it only when the write succeeds. A failed
+     * write is held as the pending target and retried, so a transition is never
+     * reported as durable before it is and no caller has to remember to retry.
+     */
+    private fun commitStateLocked(nextState: BackgroundAgentState): Boolean {
+        if (persistTasksLocked(nextState)) {
+            publishCommittedLocked(nextState)
+            return true
+        }
+        pendingPersistState = nextState
+        schedulePersistenceRetryLocked()
+        return false
+    }
+
+    /** Retry a failed durable write until it succeeds, then resume the queue. */
+    private fun schedulePersistenceRetryLocked() {
+        if (persistenceRetryJob?.isActive == true || shutdownStarted) return
+        persistenceRetryJob = bgScope.launch {
+            val self = coroutineContext[Job]
+            while (true) {
+                if (synchronized(stateLock) { pendingPersistState } == null) break
+                delay(PERSISTENCE_RETRY_INTERVAL_MS)
+                var notice: BackgroundTask? = null
+                val committed = synchronized(stateLock) {
+                    val target = pendingPersistState ?: return@synchronized false
+                    if (persistTasksLocked(target)) {
+                        notice = pendingCompletionNotice
+                        pendingPersistState = null
+                        pendingCompletionNotice = null
+                        _state.value = target
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (committed) {
+                    notice?.let { notifyTaskComplete(it) }
+                    break
+                }
+            }
+            synchronized(stateLock) {
+                if (persistenceRetryJob === self) persistenceRetryJob = null
+            }
+            processNextTask()
+        }
+    }
+
+    /**
+     * Retry queue processing after a promotion could not be durably persisted.
+     * The head task stays QUEUED; without this retry it would be stranded until
+     * some other event happened to invoke [processNextTask].
+     */
+    private fun scheduleProcessingRetryLocked() {
+        if (processingRetryJob?.isActive == true || shutdownStarted) return
+        processingRetryJob = bgScope.launch {
+            val self = coroutineContext[Job]
+            var cancelled = false
+            try {
+                delay(PERSISTENCE_RETRY_INTERVAL_MS)
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                cancelled = true
+                throw c
+            } finally {
+                synchronized(stateLock) {
+                    if (processingRetryJob === self) processingRetryJob = null
+                }
+            }
+            if (!cancelled) processNextTask()
+        }
+    }
+
+    /**
      * Queue a task for background execution. Returns task ID.
      * Rejects if the queue is full (max [MAX_QUEUED_TASKS]).
      */
     fun enqueue(prompt: String, sourceChatId: String? = null): BackgroundTask? {
         val queued: BackgroundTask = synchronized(stateLock) {
-            val current = _state.value
+            val current = currentStateLocked()
             if (current.queuedTasks.size >= MAX_QUEUED_TASKS) {
                 logW(TAG, "Task queue full, rejecting prompt (len=${prompt.length})")
                 return null
@@ -343,7 +441,7 @@ class BackgroundAgentManager(
                 logW(TAG, "Failed to persist task $id to disk, aborting enqueue")
                 return null
             }
-            _state.value = nextState
+            publishCommittedLocked(nextState)
             task
         }
 
@@ -359,16 +457,14 @@ class BackgroundAgentManager(
      */
     fun deleteChatAndInvalidateTasks(chatId: String, deleteChat: () -> Boolean): Boolean =
         synchronized(stateLock) {
-            val current = _state.value
+            val current = currentStateLocked()
             if (current.activeTask?.sourceChatId == chatId) return@synchronized false
             if (!deleteChat()) return@synchronized false
             val nextState = current.copy(
                 queuedTasks = current.queuedTasks.filterNot { it.sourceChatId == chatId },
                 completedTasks = current.completedTasks.filterNot { it.sourceChatId == chatId },
             )
-            persistTasksLocked(nextState)
-            _state.value = nextState
-            true
+            commitStateLocked(nextState)
         }
 
     /** Start processing the queue. Acquires wake lock. */
@@ -393,14 +489,27 @@ class BackgroundAgentManager(
      * [stateLock]; the returned task is owned by the caller and must be
      * executed only after the lock is released.
      */
-    private fun promoteHeadLocked(current: BackgroundAgentState): BackgroundTask {
+    private fun promoteHeadLocked(current: BackgroundAgentState): BackgroundTask? {
         val head = current.queuedTasks.first().copy(status = BackgroundTaskStatus.RUNNING)
         val nextState = current.copy(
             activeTask = head,
             queuedTasks = current.queuedTasks.drop(1),
         )
-        persistTasksLocked(nextState)
-        _state.value = nextState
+        // Persist before publishing the promoted state: a failed disk write must
+        // not leave the task RUNNING/active in memory while the durable record
+        // still shows it QUEUED. On failure, keep the task at the queue head and
+        // report "nothing promoted" so the caller leaves it for a later retry.
+        if (!persistTasksLocked(nextState)) {
+            logW(TAG, "Failed to persist promotion of ${head.id}, holding it queued")
+            // Leave the task QUEUED and schedule a retry: otherwise a transient
+            // disk error would strand the queue until some unrelated event
+            // happened to call processNextTask again.
+            scheduleProcessingRetryLocked()
+            return null
+        }
+        // publishCommittedLocked (rather than a bare assignment) also clears any
+        // pending write the promotion now subsumes.
+        publishCommittedLocked(nextState)
         return head
     }
 
@@ -417,13 +526,16 @@ class BackgroundAgentManager(
         var busyHoldNeeded = false
 
         synchronized(stateLock) {
-            val current = _state.value
-            if (current.activeTask != null || cancelInFlight) return
+            val current = currentStateLocked()
+            // These early exits must return from within the synchronized block
+            // only; [synchronized] is inline, so a bare `return` would exit
+            // processNextTask and skip the idle-stop handling below.
+            if (current.activeTask != null || cancelInFlight) return@synchronized
             if (current.queuedTasks.isEmpty()) {
                 if (current.isBackgroundMode) {
                     idleStopNeeded = true
                 }
-                return
+                return@synchronized
             }
             if (isDeviceBusyWithUserGeneration()) {
                 // Hold the head task QUEUED; fall through below so the retry
@@ -431,7 +543,10 @@ class BackgroundAgentManager(
                 busyHoldNeeded = true
             } else {
                 promoted = promoteHeadLocked(current)
-                if (!current.isBackgroundMode) {
+                // Only enter background mode when a task was actually promoted
+                // and its promotion was durably persisted; otherwise the wake
+                // lock would be held with no task behind it.
+                if (promoted != null && !current.isBackgroundMode) {
                     startNeeded = true
                 }
             }
@@ -462,7 +577,7 @@ class BackgroundAgentManager(
             } catch (_: BackgroundTaskDeferredException) {
                 deferred = true
                 synchronized(stateLock) {
-                    val current = _state.value
+                    val current = currentStateLocked()
                     if (current.activeTask?.id == task.id) {
                         val nextState = current.copy(
                             activeTask = null,
@@ -470,8 +585,7 @@ class BackgroundAgentManager(
                                 task.copy(status = BackgroundTaskStatus.QUEUED),
                             ) + current.queuedTasks,
                         )
-                        persistTasksLocked(nextState)
-                        _state.value = nextState
+                        commitStateLocked(nextState)
                     }
                 }
             } catch (e: Exception) {
@@ -553,15 +667,20 @@ class BackgroundAgentManager(
         job?.cancelAndJoin()
         val retryJob = synchronized(stateLock) { deviceBusyRetryJob }
         retryJob?.cancel()
+        val processingJob = synchronized(stateLock) { processingRetryJob }
+        processingJob?.cancel()
         synchronized(stateLock) {
             activeTaskJob = null
             if (deviceBusyRetryJob === retryJob) {
                 deviceBusyRetryJob = null
             }
+            if (processingRetryJob === processingJob) {
+                processingRetryJob = null
+            }
         }
         runCatching { cancelNativeGeneration?.invoke() }
         synchronized(stateLock) {
-            val latest = _state.value
+            val latest = currentStateLocked()
             val dropped = latest.activeTask
             val nextState = latest.copy(
                 isBackgroundMode = false,
@@ -572,8 +691,7 @@ class BackgroundAgentManager(
                     latest.completedTasks
                 },
             )
-            persistTasksLocked(nextState)
-            _state.value = nextState
+            commitStateLocked(nextState)
         }
         releaseWakeLockSafely()
         cancelProgressNotification()
@@ -585,7 +703,7 @@ class BackgroundAgentManager(
         var activeSnapshot: BackgroundTask? = null
         var queuedCancelled = false
         synchronized(stateLock) {
-            val current = _state.value
+            val current = currentStateLocked()
             val active = current.activeTask
             when {
                 active?.id == taskId -> activeSnapshot = active
@@ -597,8 +715,7 @@ class BackgroundAgentManager(
                             status = BackgroundTaskStatus.CANCELLED
                         ),
                     )
-                    persistTasksLocked(nextState)
-                    _state.value = nextState
+                    commitStateLocked(nextState)
                     queuedCancelled = true
                 }
             }
@@ -618,7 +735,7 @@ class BackgroundAgentManager(
                 }
                 runCatching { cancelNativeGeneration?.invoke() }
                 synchronized(stateLock) {
-                    val latest = _state.value
+                    val latest = currentStateLocked()
                     val nextState = latest.copy(
                         activeTask = null,
                         queuedTasks = latest.queuedTasks.filterNot { it.id == taskId },
@@ -626,8 +743,7 @@ class BackgroundAgentManager(
                             status = BackgroundTaskStatus.CANCELLED
                         ),
                     )
-                    persistTasksLocked(nextState)
-                    _state.value = nextState
+                    commitStateLocked(nextState)
                 }
                 releaseWakeLockSafely()
             } finally {
@@ -640,8 +756,9 @@ class BackgroundAgentManager(
 
     /** Mark the active task as complete with summary */
     fun completeCurrentTask(summary: String) {
-        val completed: BackgroundTask = synchronized(stateLock) {
-            val current = _state.value
+        var completed: BackgroundTask? = null
+        synchronized(stateLock) {
+            val current = currentStateLocked()
             val active = current.activeTask ?: return
             val done = active.copy(
                 status = BackgroundTaskStatus.COMPLETED,
@@ -651,18 +768,25 @@ class BackgroundAgentManager(
                 activeTask = null,
                 completedTasks = current.completedTasks + done,
             )
-            persistTasksLocked(nextState)
-            _state.value = nextState
-            done
+            if (commitStateLocked(nextState)) {
+                completed = done
+            } else {
+                // Hold the notice until the write lands so a disk failure is not
+                // reported as a durable completion.
+                pendingCompletionNotice = done
+            }
         }
-        notifyTaskComplete(completed)
-        if (BuildConfig.DEBUG) logD(TAG, "Task ${completed.id} completed: ${summary.take(80)}")
+        completed?.let {
+            notifyTaskComplete(it)
+            if (BuildConfig.DEBUG) logD(TAG, "Task ${it.id} completed: ${summary.take(80)}")
+        }
     }
 
     /** Mark the active task as failed */
     fun failCurrentTask(error: String) {
-        val failed: BackgroundTask = synchronized(stateLock) {
-            val current = _state.value
+        var failed: BackgroundTask? = null
+        synchronized(stateLock) {
+            val current = currentStateLocked()
             val active = current.activeTask ?: return
             val done = active.copy(
                 status = BackgroundTaskStatus.FAILED,
@@ -672,12 +796,16 @@ class BackgroundAgentManager(
                 activeTask = null,
                 completedTasks = current.completedTasks + done,
             )
-            persistTasksLocked(nextState)
-            _state.value = nextState
-            done
+            if (commitStateLocked(nextState)) {
+                failed = done
+            } else {
+                pendingCompletionNotice = done
+            }
         }
-        notifyTaskComplete(failed)
-        if (BuildConfig.DEBUG) logD(TAG, "Task ${failed.id} failed: ${error.take(80)}")
+        failed?.let {
+            notifyTaskComplete(it)
+            if (BuildConfig.DEBUG) logD(TAG, "Task ${it.id} failed: ${error.take(80)}")
+        }
     }
 
     /** Check battery/thermal budget. Returns false if resources are too constrained. */
@@ -729,7 +857,7 @@ class BackgroundAgentManager(
     /** Get the next queued task, or null if the queue is empty */
     fun nextTask(): BackgroundTask? {
         synchronized(stateLock) {
-            val current = _state.value
+            val current = currentStateLocked()
             if (current.queuedTasks.isEmpty() || current.activeTask != null) return null
             return promoteHeadLocked(current)
         }
@@ -738,9 +866,8 @@ class BackgroundAgentManager(
     /** Clear history of completed/failed/cancelled tasks. */
     fun clearCompletedTasks() {
         synchronized(stateLock) {
-            val nextState = _state.value.copy(completedTasks = emptyList())
-            persistTasksLocked(nextState)
-            _state.value = nextState
+            val nextState = currentStateLocked().copy(completedTasks = emptyList())
+            commitStateLocked(nextState)
         }
     }
 

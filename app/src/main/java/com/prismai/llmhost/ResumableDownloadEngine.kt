@@ -9,6 +9,9 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
+/** An interrupted transfer that ended early but whose verified prefix may resume. */
+class IncompleteDownloadException(message: String) : IllegalStateException(message)
+
 /**
  * Resumable download engine with byte range validation, ETag artifact change detection,
  * storage reserve enforcement, and maximum size bounds.
@@ -27,7 +30,10 @@ class ResumableDownloadEngine(
 
         fun parseContentRange(value: String?): ContentRangeInfo? {
             if (value == null) return null
-            val match = Regex("""bytes\s+(\d+)-(\d+)/(?:(\d+)|\*)""", RegexOption.IGNORE_CASE).find(value.trim()) ?: return null
+            // matchEntire (not find): a malformed header that merely embeds a
+            // well-formed range must be rejected, not silently trusted.
+            val match = Regex("""bytes\s+(\d+)-(\d+)/(?:(\d+)|\*)""", RegexOption.IGNORE_CASE)
+                .matchEntire(value.trim()) ?: return null
             val start = match.groupValues[1].toLongOrNull() ?: return null
             val end = match.groupValues[2].toLongOrNull() ?: return null
             val total = match.groupValues[3].toLongOrNull()
@@ -44,6 +50,18 @@ class ResumableDownloadEngine(
                 ?: value?.substringAfter('/', missingDelimiterValue = "")
                     ?.toLongOrNull()
                     ?.takeIf { it > 0L }
+    }
+
+    /**
+     * Keep an incomplete transfer's bytes only when [resumable] validators allow
+     * a later attempt to append safely; otherwise drop the partial and its meta
+     * so nothing stale is mistaken for progress.
+     */
+    private fun discardUnlessResumable(resumable: Boolean, target: File, metaFile: File) {
+        if (!resumable) {
+            target.delete()
+            metaFile.delete()
+        }
     }
 
     suspend fun downloadResumable(
@@ -226,19 +244,21 @@ class ResumableDownloadEngine(
             // Completion postconditions. A stream that ends early (a truncated
             // 206 or a short 200) must fail rather than leave a partial file that
             // looks complete. Enforce the exact declared range when the server
-            // sent one, and the announced total when known.
+            // sent one, and the announced total when known. When the partial
+            // carries validators that let a later attempt resume safely, keep it
+            // so an interrupted multi-gigabyte transfer does not restart from
+            // zero; without them there is nothing safe to resume, so discard it.
+            val resumable = !currentEtag.isNullOrBlank() || !currentLastModified.isNullOrBlank()
             val declaredRangeEnd = contentRange?.end
             if (declaredRangeEnd != null && copied != declaredRangeEnd + 1) {
-                target.delete()
-                metaFile.delete()
-                throw IllegalStateException(
+                discardUnlessResumable(resumable, target, metaFile)
+                throw IncompleteDownloadException(
                     "Incomplete download: received $copied bytes but the server declared content through byte $declaredRangeEnd"
                 )
             }
             if (total != null && copied != total) {
-                target.delete()
-                metaFile.delete()
-                throw IllegalStateException("Incomplete download: received $copied bytes of $total")
+                discardUnlessResumable(resumable, target, metaFile)
+                throw IncompleteDownloadException("Incomplete download: received $copied bytes of $total")
             }
         } finally {
             connection.disconnect()

@@ -20,13 +20,17 @@ The reliability-closure train merged on 2026-10-09 (#25–#29), followed by the 
 
 `main` advanced through the remediation train to `a6bd73d` (PR #38). The Android CI run for that head was **red**, not green: the JVM unit-test job failed with `NoSuchMethodError` in `SequentialImportQueueTest` and `ImportBatchDrainerTest` (plus an intermittent `ChatSearchAndDeletionConsistencyTest` failure), so the release-like native builds were skipped. Native host CTests pass (10/10) and Android instrumentation compiles. The root cause and its fix are recorded under **CI remediation** below.
 
-## CI remediation (pending push and a green CI run)
+## CI remediation (green on the PR #39 head)
 
-The last merged head (`a6bd73d`) failed Android CI. The unit-test job reported `NoSuchMethodError` in `SequentialImportQueueTest` and `ImportBatchDrainerTest`, with an intermittent `ChatSearchAndDeletionConsistencyTest` failure.
+PR #39 (`fix/ci-remediation-2026-10-10`) restores green CI. On head `3fc1973` the Android CI workflow passed all three required jobs — **Unit Tests & Golden Conformance**, **Native Host Tests (CTest)**, and **Native Builds (benchmark & release)** — and both the push and PR workflows succeeded. `main` (`a6bd73d`) remains red until this branch lands.
+
+The regression the PR fixed: the last merged head (`a6bd73d`) failed Android CI. The unit-test job reported `NoSuchMethodError` in `SequentialImportQueueTest` and `ImportBatchDrainerTest`, with an intermittent `ChatSearchAndDeletionConsistencyTest` failure.
 
 - **Root cause:** `SequentialImportQueue.drain()` called `pending.removeFirst()`. Compiled on a JDK 21 developer machine, that binds to `java.util.List.removeFirst()` (the JDK 21 `SequencedCollection` method); the CI runner uses JDK 17, where the method does not exist, so the first dispatch threw `NoSuchMethodError`. The locally green run was therefore not reproducible on CI.
 - **Fix:** `removeAt(0)` (unambiguous on every supported JDK), plus a deterministic drain of the test's launched I/O to remove the chat-search timing race.
-- **Verification:** `JAVA_HOME=<jdk17> ./gradlew :app:testDevDebugUnitTest :app:testPlayDebugUnitTest` (JDK 17, matching CI). **Not yet pushed or confirmed by a CI run.** Treat the earlier "all tests pass" claim as the pre-regression baseline until CI confirms the fix.
+- **Verification:** confirmed by the CI run on head `3fc1973` (Unit Tests & Golden Conformance, Native Host Tests, and Native Builds all pass); the same command (`JAVA_HOME=<jdk17> ./gradlew :app:testDevDebugUnitTest :app:testPlayDebugUnitTest`) also passes locally under JDK 17.
+
+On top of the CI recovery, this branch carries the follow-up correctness fixes from the merge-readiness review: the background-task idle-stop control flow, durable commit-and-retry for task transitions (including promotion), resumable-prefix retention for interrupted downloads, and whole-string `Content-Range` validation.
 
 ## Verified Capabilities
 
@@ -43,7 +47,7 @@ The last merged head (`a6bd73d`) failed Android CI. The unit-test job reported `
 
 ## Recent Evidence
 
-- PR #34, #35, and #36 merged with green CI. PR #37 and its follow-up #38 were merged and only afterwards shown to be red (see **CI remediation**); the earlier "full test passing" claim for the final candidate is not supported by CI. Native host tests (10/10 CTest) pass and Android instrumentation compiles (`assembleDevDebugAndroidTest`).
+- PR #34, #35, and #36 merged with green CI. PR #37 and its follow-up #38 were merged and only afterwards shown to be red (see **CI remediation**); the earlier "full test passing" claim for the final candidate is not supported by CI. PR #39 restores green CI on head `3fc1973` (Unit Tests & Golden Conformance, Native Host Tests, Native Builds). Native host tests (10/10 CTest) pass and Android instrumentation compiles (`assembleDevDebugAndroidTest`).
 - `FINDINGS_REPORT_2026-07-31.md` documents JNI memory bounds, model switch hashing fixes, and bounds-checked memory indexing audits.
 - `ROADMAP.md` confirms capability roadmap status and P0 merge train tracking.
 - `docs/qualification/VERIFICATION_STATUS.md` records comprehensive qualification ledger.
@@ -65,12 +69,12 @@ The last merged head (`a6bd73d`) failed Android CI. The unit-test job reported `
 ## Verification
 
 - `.\scripts\verify.ps1` (unit tests + `assembleDevBenchmark` + `assemblePlayRelease`) verified; CI runs the same set in the `native-builds` job.
-- `JAVA_HOME=<jdk17> ./gradlew testDevDebugUnitTest testPlayDebugUnitTest` passes in the working tree after the CI remediation; the last CI run of `main` (`a6bd73d`) was red (see **CI remediation**).
+- `JAVA_HOME=<jdk17> ./gradlew testDevDebugUnitTest testPlayDebugUnitTest` passes in the working tree after the CI remediation and is confirmed by CI on PR #39 head `3fc1973`; the last CI run of `main` (`a6bd73d`) was red until this branch lands (see **CI remediation**).
 - `ctest --test-dir build/prism-native-tests --output-on-failure` 10/10 clean pass.
 
 ## Next Actions
 
-0. Restore green CI: push the JDK-17 `removeFirst()` fix and require the full CI suite (JVM unit tests, native host tests, and release-like native builds) to pass on the exact merge candidate before merging. `main` (`a6bd73d`) is currently red; `main` has no enforced required status checks.
+0. Merge PR #39 to restore green CI, then verify the new `main` SHA runs green and configure required status checks (`main` currently has none enforced).
 1. Requalify disputed issue closures. Independent review found the closure evidence for **#14, #15, #17, and #20** does not demonstrate those issues' acceptance criteria (e.g. #20 is a background-task/chat-ownership defect, not a download concern). Reopen or requalify them before treating them as resolved; #30 remains supported. Issue #21 remains OPEN as the device qualification gate (`PL-Q01`, `DEVICE_BLOCKED`).
 2. Execute physical-device qualification campaign (`QUAL`) on real hardware per `docs/evidence/QUAL_RUNBOOK.md`.
 3. Execute Bonsai-27B Q1_0 device spike per `docs/BONSAI_27B_INTEGRATION_PLAN.md`.

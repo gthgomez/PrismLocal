@@ -78,13 +78,18 @@ them.
 ## Review-fix follow-up (this branch)
 
 This branch is a review-fix follow-up on top of the merged wave-1 integration.
-Its changes — off-main chat pre-flight, saveable per-chat drafts, RAG stale
-chunk removal, voice recognizer lifecycle handling, and AI-report failure
-logging — are **pending CI and device verification**, not proven by this
-document. They are covered by JVM unit tests where the logic is testable and by
-compilation elsewhere, but no CI run or qualified-device pass has confirmed
-them yet. Treat the claims above as the baseline this branch builds on, not as
-evidence for these changes.
+Its CI-recovery change — the JDK-17-safe `removeFirst()` replacement and the
+deterministic chat-search drain — is confirmed by the Android CI run on head
+`3fc1973` (Unit Tests & Golden Conformance, Native Host Tests, and Native
+Builds all pass). The earlier review fixes — off-main chat pre-flight, saveable
+per-chat drafts, RAG stale chunk removal, voice recognizer lifecycle handling,
+and AI-report failure logging — are covered by JVM unit tests where the logic is
+testable and by compilation elsewhere. The follow-up correctness fixes on top of
+CI recovery (background-task idle-stop control flow, durable commit-and-retry for
+task transitions, resumable-prefix retention for interrupted downloads, and
+whole-string `Content-Range` validation) are covered by new JVM unit tests. None
+of this is a substitute for a qualified-device pass; the device and inference
+gaps below are unchanged.
 
 ## Reliability-closure merge train (2026-10-09)
 

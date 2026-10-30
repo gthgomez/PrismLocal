@@ -15,6 +15,40 @@ import org.junit.Test
 class SequentialImportQueueTest {
 
     @Test
+    fun terminalOutcomesConsumeDuplicateEntriesOneAtATime() = runBlocking {
+        val attempted = mutableListOf<String>()
+        val queue = SequentialImportQueue { uri ->
+            attempted += uri
+            if (attempted.size == 2) {
+                ImportDispatchOutcome.PermanentError("invalid fixture")
+            } else {
+                ImportDispatchOutcome.Success
+            }
+        }
+        queue.enqueueAll(listOf("same", "same", "last"))
+
+        queue.drain()
+
+        assertEquals(listOf("same", "same", "last"), attempted)
+        assertTrue("each terminal outcome must consume exactly one queued item", queue.isEmpty())
+    }
+
+    @Test
+    fun ordinaryFailuresConsumeOnlyTheirEntriesAndContinueDraining() = runBlocking {
+        val attempted = mutableListOf<String>()
+        val queue = SequentialImportQueue.simple { uri ->
+            attempted += uri
+            if (uri == "bad") error("invalid fixture")
+        }
+        queue.enqueueAll(listOf("bad", "good", "bad"))
+
+        queue.drain()
+
+        assertEquals(listOf("bad", "good", "bad"), attempted)
+        assertTrue("failed entries must not strand later work or remain queued", queue.isEmpty())
+    }
+
+    @Test
     fun queueImportsEveryUriInOrder() = runBlocking {
         val done = mutableListOf<String>()
         val queue = SequentialImportQueue.simple { uri -> done += uri }

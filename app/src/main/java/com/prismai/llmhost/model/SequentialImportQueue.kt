@@ -67,7 +67,8 @@ class SequentialImportQueue(
                     is ImportDispatchOutcome.PermanentError -> {
                         synchronized(this) {
                             if (pending.firstOrNull() == next) {
-                                pending.removeFirst()
+                                // SDK 35+ resolves removeFirst() to a newer Java List API.
+                                pending.removeAt(0)
                             }
                         }
                     }
@@ -83,7 +84,7 @@ class SequentialImportQueue(
                 Log.w(TAG, "import failed for $next", e)
                 synchronized(this) {
                     if (pending.firstOrNull() == next) {
-                        pending.removeFirst()
+                        pending.removeAt(0)
                     }
                 }
             }

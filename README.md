@@ -10,6 +10,33 @@
 
 Prism Local is an open-source Android application for high-performance, private, on-device GGUF large language model (LLM) inference. It embeds a C++20 `llama.cpp` runtime into an Android foreground service via a thread-safe JNI bridge, providing local inference without requiring a cloud LLM provider, alongside chat, tool dispatch, document retrieval (RAG), and model lifecycle management.
 
+## Showcase — Local AI on an Android device
+
+Import a GGUF model, chat with it locally, and manage conversations and runtime controls. The native inference engine embeds upstream [llama.cpp](https://github.com/ggml-org/llama.cpp); its MIT attribution remains in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+| Explore | What the app provides |
+| --- | --- |
+| Chat | Streaming local responses and saved conversations |
+| Models | GGUF import, validation, and app-owned storage |
+| Runtime | Generation controls and memory/thermal governors |
+
+**Demo status:** runtime screenshots and video are pending. The README showcase pass
+on 2026-10-30 inspected source at [`a6bd73d4473a`](https://github.com/gthgomez/PrismLocal/tree/a6bd73d4473ae83f8635c009a15edd565bebb645);
+this cloud environment has no Android SDK, emulator, or attached Android device.
+No device/model execution was attempted, and no GGUF or paid inference was downloaded.
+See the [capture checklist and evidence limits](docs/showcase/README.md).
+
+### Try it locally
+
+JDK 17, Android SDK platform 36, NDK 28.2.13676358, CMake 3.22.1, initialized native submodules/local patches, and an Android 8.0+ device with enough RAM and storage for the selected GGUF. Follow the existing native setup documentation.
+
+From the repository root (Windows: `gradlew.bat`):
+
+```sh
+git submodule update --init --recursive
+./gradlew --no-daemon :app:testDevDebugUnitTest :app:assembleDevDebug
+```
+
 ---
 
 ## Architecture Overview

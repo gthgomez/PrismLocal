@@ -2,13 +2,20 @@ name: Android CI
 
 on:
   push:
+    # PRs cover feature/fix branches; keep push coverage for integrated main.
     branches:
       - main
-      - feat/*
-      - fix/*
   pull_request:
     branches:
       - main
+  # Allow an explicit check of a branch before opening its PR.
+  workflow_dispatch:
+
+concurrency:
+  # Only revisions of the same PR share a group. Keep main/manual runs unique
+  # so even pending runs cannot replace one another.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

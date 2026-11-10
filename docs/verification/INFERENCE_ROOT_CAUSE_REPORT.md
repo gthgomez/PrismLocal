@@ -243,16 +243,18 @@ Considered and not done:
 | `run-probe.sh` on Q4_K_M and on Q8_0, x86, greedy, second turn | Both printed `greedy fixture matched` |
 | qemu ARM probe, baseline and Kleidi, Q4 and Kleidi Q8 | Greedy ids and second-turn text matched section 5. Runtime about 4 minutes for the three runs |
 | `llama-completion` greedy matrix in section 8 | Matched |
-| `:app:testDevDebugUnitTest`, `assembleDevDebug`, device instrumentation | **Not run.** No Android SDK, NDK, or device. JDK on this host is 21 |
+| `:app:testDevDebugUnitTest` and `:app:testPlayDebugUnitTest` | **Pass** on GitHub Actions run `42838468204` (Ubuntu, JDK 17, NDK installed by the workflow). Local host still has no Android SDK |
+| Native host CTest in that run, including `engine_mock_test` linked against the submodule | **Pass** (2m53s) |
+| `assembleDevDebugAndroidTest`, `assembleDevBenchmark`, `assemblePlayRelease` | **Pass** (14m3s). This compiles the changed `Engine.cpp` with the NDK for the debug androidTest and for RelWithDebInfo benchmark/release. It does not install or run on a device |
 | 20 generations on device, restarts, cancellation, model switch | **Not run** |
 
-`GenerationSettingsClampTest` is in the tree and was not executed, because Gradle unit tests need the Android SDK.
+`GenerationSettingsClampTest` ran inside the passing JVM unit-test job. Connected instrumentation was assembled and not executed.
 
 ## 14. Limitations
 
 - No physical device and no Android emulator. The salad's first device-side logit id is still unknown.
 - Vulkan was not linked in the reference, so the op-offload hypothesis is a code proof plus the existing Adreno patch, not a measured wrong logit.
-- NDK clang, 16 KB pages, and the Snapdragon 8 Elite are not in the qemu configuration that passed.
+- GitHub Actions compiled this branch with the NDK (debug androidTest, benchmark, and Play release). That binary was not installed or executed. 16 KB pages and the Snapdragon 8 Elite are not in the qemu configuration that passed.
 - Cancel, model switch, context shift under memory pressure, and `encode()` then generate were not executed against libllama.
 - Llama 3.2 weights were not loaded. The BOS rule is a unit test of the predicate.
 - One prefix-reuse turn is not a proof of every `shrinkCommittedPrefix` branch.
@@ -278,12 +280,12 @@ Considered and not done:
 
 **FIX:** `runtime/InferencePolicy.hpp` and the load, tokenize, sampler, detokenize, and temperature changes in `Engine.cpp` / `GenerationSettings.kt`. Diagnostic fields `cpu_pinned` and `op_offload` are now logged.
 
-**VERIFICATION:** Host CTest 10/10. `Engine.cpp` compiles clean against the pinned headers. Probe fixture matched twice on x86 (Q4 and Q8) and the ARM qemu runs matched the same ids. Gradle, NDK, and the phone were not run.
+**VERIFICATION:** Host CTest 10/10. `Engine.cpp` compiles clean against the pinned headers. Probe fixture matched twice on x86 (Q4 and Q8) and the ARM qemu runs matched the same ids. GitHub Actions run `42838468204` on `278cb5b` passed all three jobs: JVM unit tests (dev and play), native host CTest including the engine mock, and NDK benchmark/release plus the debug androidTest assemble. Nothing was installed on a phone.
 
 **REGRESSION PROTECTION:** `inference_policy_test` locks the GPU decision and the Llama 3 versus ChatML BOS rule. `run-probe.sh` fails if the greedy ids or the second-turn sentence change, when a model file is supplied. `GenerationSettingsClampTest` locks temperature 0. The fixture records the ids a device log must match.
 
-**LIMITATIONS:** Device effect of the CPU pin is unmeasured. Vulkan with `gpuLayers>0` is unmeasured. NDK codegen is unmeasured. Cancel, shift, and embedding-then-generate are unmeasured.
+**LIMITATIONS:** Device effect of the CPU pin is unmeasured. Vulkan with `gpuLayers>0` is unmeasured. The NDK build compiled in CI and was not executed, so 16 KB pages and the Snapdragon 8 Elite are still untested. Cancel, shift, and embedding-then-generate are unmeasured.
 
-**INTEGRATION:** Branch `cursor/inference-root-cause-e5d3` off `main`. It does not merge PR #42. It replaces PR #42's inference conclusion and keeps that PR's two native repairs (BOS, detokenize), with the BOS rule corrected for a warm cache. PR #42 remains a conflicting draft (`mergeable=CONFLICTING`, head `9f2aa454`, zero GitHub Actions runs). The workflow on `main` already triggers `pull_request` to `main` with no draft filter and no path filter. The head commit's check suites were queued Vercel and Cursor only. `repos/.../actions/permissions` returned 403, so an Actions-disable flag could not be read. No workflow edit is included, because the YAML already requests the run. The submodule gitlink is unchanged and was not dirty.
+**INTEGRATION:** Branch `cursor/inference-root-cause-e5d3` off `main`, PR #43, not merged. Android CI run `42838468204` is green on `278cb5b` (unit tests, native host tests, native benchmark/release). A later docs-only commit records that result and starts a second Actions run. A new pull request to `main` does trigger Actions; PR #42's empty check list did not reproduce here. This branch does not merge PR #42. It replaces that PR's inference conclusion and keeps its two native repairs (BOS, detokenize), with the BOS rule corrected for a warm cache. PR #42 remains a conflicting draft. No workflow edit is included. The submodule gitlink is unchanged and was not dirty.
 
 **NEXT ACTION:** Flash this branch's `devDebug` build on the SM-S938U with `gpuLayers=0`, confirm `cpu_pinned=1` and `op_offload=0`, set temperature 0 and top-k 1, and require the first generated id to be 785 for the capital prompt. If that fails, the divergence is in the NDK binary or in a lifecycle path this host could not run, and the log will finally contain the id to compare.

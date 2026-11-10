@@ -89,7 +89,7 @@ data class GenerationSettings(
         const val MAX_BATCH_SIZE = 2048
         const val BATCH_SIZE_STEP = 128
 
-        const val MIN_TEMPERATURE = 0.05f
+        const val MIN_TEMPERATURE = 0.0f
         const val DEFAULT_TEMPERATURE = 0.70f
         const val MAX_TEMPERATURE = 1.50f
 

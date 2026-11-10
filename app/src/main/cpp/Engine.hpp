@@ -43,9 +43,10 @@ struct GenerationConfig {
     std::string kv_cache_type_k = "q8_0";
     std::string kv_cache_type_v = "q8_0";
     bool enable_flash_attn = true;
-    // PIR-06: explicit backend preference. When false, GPU layer offload is
-    // disabled for this load (CPU-only). Native readback still reports the
-    // actually-applied backend; this is only the request.
+    // GPU matmul offload is requested only when this is true and gpu_layers > 0.
+    // use_vulkan with zero layers stays on the CPU: llama.cpp would otherwise
+    // keep the GPU device and offload host-weight ops while the log still
+    // names the CPU build. See gpuLayerOffloadRequested().
     bool use_vulkan = true;
     std::vector<LoraAdapterSpec> lora_adapters;
 };

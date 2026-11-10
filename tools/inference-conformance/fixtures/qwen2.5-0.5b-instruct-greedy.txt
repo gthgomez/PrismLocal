@@ -1,0 +1,14 @@
+# Reference greedy continuation for Qwen2.5-0.5B-Instruct.
+# Same token ids for Q4_K_M (sha256 74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db)
+# and Q8_0 (sha256 ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e).
+# llama.cpp bbeb89d76c41bc250f16e4a6fefcc9b530d6e3f3
+# ctx 2048, batch 256, flash attention off, F16 KV, threads 1, temp 0, top_k 1, penalties off
+# system: You are Assistant in a local Android chat. Use the recent conversation for context.
+# user: The capital of France is
+prompt_tokens=34
+prompt_ids=151644,8948,198,2610,525,21388,304,264,2205,8514,6236,13,5443,279,3213,10435,369,2266,13,151645,198,151644,872,198,785,6722,315,9625,374,151645,198,151644,77091,198
+top1_id=785
+greedy_ids=785,6722,315,9625,374,12095,13
+greedy_text=The capital of France is Paris.
+second_user=What is two plus two?
+second_text=Two plus two is four.

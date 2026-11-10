@@ -11,6 +11,7 @@
 #include "runtime/NativeErrorCode.hpp"
 #include "runtime/GenerationLifecycleGate.hpp"
 #include "runtime/GenerationDrainAck.hpp"
+#include "runtime/InferencePolicy.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -204,7 +205,8 @@ GenerationConfig sanitizeGenerationConfig(GenerationConfig config, int fallback_
     if (!std::isfinite(config.temperature)) {
         config.temperature = kDefaultTemperature;
     }
-    config.temperature = std::clamp(config.temperature, 0.05f, 1.50f);
+    // 0 is true greedy. A floor of 0.05 made a requested greedy decode sample.
+    config.temperature = std::clamp(config.temperature, 0.0f, 1.50f);
     config.top_k = std::clamp(config.top_k, 1, 100);
     if (!std::isfinite(config.top_p)) {
         config.top_p = kDefaultTopP;
@@ -394,7 +396,8 @@ struct ModelRuntime {
     int context_length = kDefaultContextLength;
     int batch_size = kDefaultBatchSize;
     int gpu_layers = 0;             // verified offloaded layer count (0 if GPU init failed at runtime)
-    std::string actual_backend_name = "CPU"; // set at load time from verified runtime state
+    bool cpu_execution_pinned = false;
+    std::string actual_backend_name = "CPU"; // compile-time label; cpu_execution_pinned is the load decision
     llama_pos current_position = 0;
     int system_prefix_length = 0;
     std::string model_path;
@@ -892,27 +895,31 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     const GenerationConfig config = sanitizeGenerationConfig(requested_config, kDefaultThreadCount);
 
     llama_model_params model_params = llama_model_default_params();
-    // PIR-06: honour the explicit backend preference. A CPU request must not
-    // enable GPU layer offload. n_gpu_layers=0 is the documented way to keep
-    // the model resident on the CPU; the actually-applied backend is still
-    // verified below via llama_supports_gpu_offload() and reported as observed,
-    // never assumed from this request.
-    const bool gpu_requested = config.use_vulkan && config.gpu_layers > 0;
+    // Zero GPU layers used to leave `devices` null and op_offload at its
+    // default. llama.cpp then keeps every GPU it enumerated and may run
+    // host-weight matmuls on that GPU (ggml-backend scheduler cause "1.off")
+    // while this function still reports a CPU/Kleidi label, because that
+    // label only checks n_gpu_layers. Pin the CPU device and disable both
+    // offload flags unless a positive layer count was requested.
+    const bool gpu_requested = gpuLayerOffloadRequested(config.use_vulkan, config.gpu_layers);
     model_params.n_gpu_layers = gpu_requested ? config.gpu_layers : 0;
-    // PIR-06: pin the CPU backend device when Vulkan is not requested. Zero GPU
-    // layers alone does not guarantee every operation stays on the CPU, so the
-    // strict CPU baseline explicitly selects the CPU device(s). The array is
-    // static because llama keeps the pointer for the lifetime of the model.
+    bool cpu_pinned = false;
+    // Static: llama retains the pointer for the lifetime of the model.
     static ggml_backend_dev_t s_cpu_only_devices[] = {nullptr, nullptr};
-    if (!config.use_vulkan) {
+    if (!gpu_requested) {
         ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_device != nullptr) {
             s_cpu_only_devices[0] = cpu_device;
             model_params.devices = s_cpu_only_devices;
+            cpu_pinned = true;
         } else {
-            LOGW("cpu_only_device_unavailable; relying on n_gpu_layers=0");
+            LOGW("cpu_only_device_unavailable; relying on n_gpu_layers=0 and op_offload=0");
         }
     }
+    auto applyOffloadBoundary = [&](llama_context_params& params) {
+        params.offload_kqv = gpu_requested;
+        params.op_offload = gpu_requested;
+    };
     model_params.use_mmap = use_mmap;
     model_params.use_mlock = false;
     model_params.check_tensors = true;
@@ -933,6 +940,7 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     ctx_params.type_v = parseGgmlType(config.kv_cache_type_v);
     ctx_params.flash_attn_type = config.enable_flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     ctx_params.no_perf = false;
+    applyOffloadBoundary(ctx_params);
 
     llama_context* ctx = llama_init_from_model(model, ctx_params);
     if (ctx == nullptr) {
@@ -948,6 +956,7 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
         ctx_params.n_ctx = config.context_length;
         ctx_params.n_batch = config.batch_size;
         ctx_params.n_threads = config.thread_count;
+        applyOffloadBoundary(ctx_params);
         ctx = llama_init_from_model(model, ctx_params);
     }
     if (ctx == nullptr) {
@@ -973,13 +982,16 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     runtime->context_length = ctx_params.n_ctx;
     runtime->batch_size = ctx_params.n_batch;
     runtime->gpu_layers = verified_gpu_layers;
+    runtime->cpu_execution_pinned = cpu_pinned;
     // PIR-05: record the KV layout actually selected (post-fallback) so it can be
     // part of the cache identity.
     runtime->kv_type_k = ggml_type_name(ctx_params.type_k);
     runtime->kv_type_v = ggml_type_name(ctx_params.type_v);
     runtime->flash_attn = (ctx_params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED);
 
-    // Derive backend name from verified runtime state, not compile-time macros alone.
+    // The name is the compile-time build plus whether layer offload was requested.
+    // It is not proof that a Kleidi kernel ran. cpu_execution_pinned is that proof
+    // for the CPU boundary.
 #if defined(LLMHOST_VULKAN_ENABLED)
     runtime->actual_backend_name = gpu_offload_live ? "Vulkan GPU" :
 #if defined(LLMHOST_KLEIDIAI_ENABLED)
@@ -995,7 +1007,7 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     runtime->actual_backend_name = "CPU";
 #endif
 
-    LOGI("model_loaded path=%s mmap=%s n_ctx=%u n_batch=%u threads=%d gpu_layers_requested=%d gpu_layers_verified=%d backend=%s",
+    LOGI("model_loaded path=%s mmap=%s n_ctx=%u n_batch=%u threads=%d gpu_layers_requested=%d gpu_layers_verified=%d backend_label=%s cpu_pinned=%d op_offload=%d use_extra_bufts=%d",
          path.c_str(),
          use_mmap ? "true" : "false",
          ctx_params.n_ctx,
@@ -1003,7 +1015,10 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
          ctx_params.n_threads,
          config.gpu_layers,
          verified_gpu_layers,
-         runtime->actual_backend_name.c_str());
+         runtime->actual_backend_name.c_str(),
+         cpu_pinned ? 1 : 0,
+         ctx_params.op_offload ? 1 : 0,
+         model_params.use_extra_bufts ? 1 : 0);
 
     if (!requested_config.lora_adapters.empty()) {
         runtime->applyLoraAdapters(requested_config.lora_adapters);
@@ -1167,9 +1182,10 @@ struct Engine::Impl {
              session->config.top_p,
              session->config.repeat_penalty,
              static_cast<int>(runtime->current_position));
-        LOGI("generation_breadcrumb stage=generation_start generation_id=%u backend=%s model=%s n_ctx=%d n_batch=%d threads=%d gpu_layers=%d kv_k=%s kv_v=%s flash_attn=%d",
+        LOGI("generation_breadcrumb stage=generation_start generation_id=%u backend_label=%s cpu_pinned=%d model=%s n_ctx=%d n_batch=%d threads=%d gpu_layers=%d kv_k=%s kv_v=%s flash_attn=%d",
              session->generation_id,
              runtime->actual_backend_name.c_str(),
+             runtime->cpu_execution_pinned ? 1 : 0,
              runtime->model_path.c_str(),
              runtime->context_length,
              runtime->batch_size,
@@ -1225,18 +1241,12 @@ struct Engine::Impl {
                  prompt.size(),
                 formatted_prompt.size());
 
-            // PIR-05: tokenize as a continuation only when a *proven* prefix is
-            // present. After an aborted decode current_position may be > 0 while
-            // the cache is invalid; a full replay starts at position 0, so the
-            // prompt must regain its BOS/special tokens.
-            bool add_special = (runtime->current_position == 0) || !runtime->conversation.valid;
-            if (formatted_prompt.rfind("<s>", 0) == 0 ||
-                formatted_prompt.rfind("<|im_start|>", 0) == 0 ||
-                formatted_prompt.rfind("<|start_header_id|>", 0) == 0 ||
-                formatted_prompt.rfind("<|begin_of_text|>", 0) == 0 ||
-                formatted_prompt.rfind("[INST]", 0) == 0) {
-                add_special = false;
-            }
+            // The full rendered prompt is tokenized on every turn. Prefix reuse
+            // happens after that, so a warm KV cache must not suppress BOS:
+            // Llama 3's template starts at <|start_header_id|> and the BOS
+            // token is inserted by the tokenizer. ChatML and Mistral already
+            // carry their boundary marker and stay suppressed.
+            const bool add_special = shouldAddSpecialTokens(formatted_prompt, true);
 
             const int32_t token_count = -llama_tokenize(
                 runtime->vocab,
@@ -1485,7 +1495,11 @@ struct Engine::Impl {
             finishSession(session, StreamState::Error);
             return;
         }
-        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, session->config.repeat_penalty, 0.2f, 0.2f));
+        // Frequency and presence penalties are not generation settings. A
+        // hardcoded 0.2 changed later tokens without a control and is not
+        // applied to the prompt, so it cannot explain a wrong first token.
+        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
+            64, session->config.repeat_penalty, /*penalty_freq=*/0.0f, /*penalty_present=*/0.0f));
         llama_sampler_chain_add(sampler, llama_sampler_init_top_k(session->config.top_k));
         llama_sampler_chain_add(sampler, llama_sampler_init_top_p(session->config.top_p, 1));
         llama_sampler_chain_add(sampler, llama_sampler_init_temp(session->config.temperature));
@@ -2090,34 +2104,29 @@ bool Engine::decodeTokensChecked(int generation_id, const std::vector<int32_t>& 
         llama_tokens.push_back(static_cast<llama_token>(token));
     }
 
-    int32_t needed = llama_detokenize(
-        runtime->vocab,
-        llama_tokens.data(),
-        static_cast<int32_t>(llama_tokens.size()),
-        nullptr,
-        0,
-        false,
-        false);
-    if (needed < 0) {
-        needed = -needed;
+    // llama_detokenize() strips the leading space of the first token whenever
+    // the tokenizer uses add_space_prefix. Each drain used to call it on its
+    // own chunk, so a one-token drain deleted the space before every word.
+    // Per-token pieces with lstrip=0 keep the bytes the model emitted.
+    output.clear();
+    char piece[256];
+    for (const llama_token token : llama_tokens) {
+        int32_t len = llama_token_to_piece(
+            runtime->vocab, token, piece, static_cast<int32_t>(sizeof(piece)), 0, false);
+        if (len < 0) {
+            const int32_t needed_len = -len;
+            std::string large(static_cast<size_t>(needed_len), '\0');
+            len = llama_token_to_piece(
+                runtime->vocab, token, large.data(), needed_len, 0, false);
+            if (len < 0) {
+                output.clear();
+                return false;
+            }
+            output.append(large.data(), static_cast<size_t>(len));
+        } else if (len > 0) {
+            output.append(piece, static_cast<size_t>(len));
+        }
     }
-    if (needed <= 0) {
-        return true;
-    }
-    output.resize(static_cast<size_t>(needed));
-    const int32_t actual = llama_detokenize(
-        runtime->vocab,
-        llama_tokens.data(),
-        static_cast<int32_t>(llama_tokens.size()),
-        output.data(),
-        needed,
-        false,
-        false);
-    if (actual <= 0) {
-        output.clear();
-        return false;
-    }
-    output.resize(static_cast<size_t>(actual));
     return true;
 }
 
@@ -2366,7 +2375,8 @@ std::string Engine::get_backend_name() const {
     if (!impl_->active_runtime) {
         return "CPU";
     }
-    // actual_backend_name is set at load time from verified runtime state (llama_supports_gpu_offload).
+    // actual_backend_name is the compile-time build label. CPU pinning is
+    // ModelRuntime::cpu_execution_pinned, logged as cpu_pinned at load.
     return impl_->active_runtime->actual_backend_name;
 }
 

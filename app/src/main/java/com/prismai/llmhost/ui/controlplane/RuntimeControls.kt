@@ -188,7 +188,7 @@ internal fun RuntimeControls(
                 valueText = String.format(Locale.US, "%.2f", settings.temperature),
                 value = settings.temperature,
                 valueRange = GenerationSettings.MIN_TEMPERATURE..GenerationSettings.MAX_TEMPERATURE,
-                steps = 28,
+                steps = 29,
                 enabled = enabled,
                 onValueChange = { value ->
                     onSettingsChange(settings.copy(temperature = value))

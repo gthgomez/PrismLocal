@@ -78,16 +78,20 @@ them.
 ## Review-fix follow-up (this branch)
 
 This branch is a review-fix follow-up on top of the merged wave-1 integration.
-Its CI-recovery change — the JDK-17-safe `removeFirst()` replacement and the
-deterministic chat-search drain — is confirmed by the Android CI run on head
-`3fc1973` (Unit Tests & Golden Conformance, Native Host Tests, and Native
-Builds all pass). The earlier review fixes — off-main chat pre-flight, saveable
+The CI regression it was originally opened to fix — the JDK-17
+`NoSuchMethodError` from `removeFirst()` and the chat-search timing race — was
+fixed independently in PR #40 (`a4b21d3`), which restored green CI on `main` at
+`97d6e44`. This branch's equivalent hunk was dropped on rebase (taking `main`'s
+already-landed version), so nothing here is required for `main` to be green.
+The earlier review fixes — off-main chat pre-flight, saveable
 per-chat drafts, RAG stale chunk removal, voice recognizer lifecycle handling,
 and AI-report failure logging — are covered by JVM unit tests where the logic is
-testable and by compilation elsewhere. The follow-up correctness fixes on top of
-CI recovery (background-task idle-stop control flow, durable commit-and-retry for
-task transitions, resumable-prefix retention for interrupted downloads, and
-whole-string `Content-Range` validation) are covered by new JVM unit tests. None
+testable and by compilation elsewhere. The follow-up correctness fixes on top
+(background-task idle-stop control flow, durable commit-and-retry for
+task transitions, resumable-prefix retention for interrupted downloads,
+whole-string `Content-Range` validation, send-ownership refusal under the
+admission mutex, and draft-payload last-reference release) are covered by new JVM
+unit tests, re-confirmed by CI on the rebased head. None
 of this is a substitute for a qualified-device pass; the device and inference
 gaps below are unchanged.
 
@@ -131,7 +135,9 @@ Following the initial reliability train, the 18 audit findings and qualification
 > ownership, and HTTP download handling does not address it). Treat those issues as
 > requalification candidates, not resolved, until source-specific acceptance evidence
 > exists. The JVM unit-test evidence was also invalidated by the `a6bd73d` CI
-> regression and must be re-confirmed on the fixed head (see `STATUS.md`).
+> regression; PR #40 (`a4b21d3`) fixed it and `main` has been green since
+> `97d6e44`, so pre-fix test evidence should be treated as unconfirmed (see
+> `STATUS.md`).
 
 ## Qualification ledger & release qualification matrix
 

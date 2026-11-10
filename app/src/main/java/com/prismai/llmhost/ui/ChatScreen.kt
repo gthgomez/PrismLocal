@@ -19,6 +19,7 @@ import com.prismai.llmhost.ui.benchmark.*
 import com.prismai.llmhost.ui.controlplane.*
 import com.prismai.llmhost.ui.rag.*
 import com.prismai.llmhost.ui.voice.*
+import com.prismai.llmhost.ui.onboarding.*
 import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
@@ -439,7 +440,28 @@ fun ChatScreen(
                             hfCatalog = service?.huggingFaceCatalog() ?: emptyList()
                         }
 
-                        LaunchedEffect(importState) {
+                        LaunchedEffect(importState, modelDownloadState) {
+                            val download = modelDownloadState
+                            if (download is ModelDownloadState.Running) {
+                                val total = download.totalBytes
+                                val done = download.bytesDone
+                                importStatus = when (download.stage) {
+                                    ModelDownloadState.Running.Stage.VERIFYING_METADATA,
+                                    ModelDownloadState.Running.Stage.VERIFYING_FILE ->
+                                        "Verifying ${download.entry.name}"
+                                    ModelDownloadState.Running.Stage.IMPORTING -> if (total != null && total > 0) {
+                                        "Importing ${formatBytes(done)} / ${formatBytes(total)}"
+                                    } else {
+                                        "Importing ${download.entry.name}"
+                                    }
+                                    else -> if (total != null && total > 0) {
+                                        "Downloading ${formatBytes(done)} / ${formatBytes(total)}"
+                                    } else {
+                                        "Downloading ${download.entry.name}"
+                                    }
+                                }
+                                return@LaunchedEffect
+                            }
                             when (val state = importState) {
                                 ImportState.Cancelled -> importStatus = "Import cancelled"
                                 is ImportState.Failure -> {
@@ -544,6 +566,8 @@ fun ChatScreen(
                                         installedModelCount = models.size,
                                         recommendedModel = hfCatalog.firstOrNull(),
                                         downloadState = modelDownloadState,
+                                        importState = importState,
+                                        deviceProfile = deviceCapabilityProfile,
                                         enabled = modelActionsEnabled,
                                         onImportModel = {
                                             onImportPickerStarted()
@@ -551,6 +575,9 @@ fun ChatScreen(
                                         },
                                         onDownloadRecommended = { entry ->
                                             service?.downloadHuggingFaceModel(entry.id)
+                                        },
+                                        onRetryDownload = { entryId ->
+                                            service?.downloadHuggingFaceModel(entryId)
                                         },
                                         onOpenControls = { controlsVisible = true },
                                     )
@@ -647,6 +674,7 @@ fun ChatScreen(
                                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                                 containerColor = PrismSlate,
                                 contentColor = PrismOnDark,
+                                actionOnNewLine = true,
                                 action = {
                                     TextButton(onClick = {
                                         if (snackbarMessage != null) {
@@ -660,6 +688,11 @@ fun ChatScreen(
                             ) {
                                 Text(message)
                             }
+                        }
+
+                        if (currentModel == null && service != null && transcript.isNotEmpty()) {
+                            NoModelBanner(onOpenControls = { controlsVisible = true })
+                            Spacer(modifier = Modifier.height(8.dp))
                         }
 
                         PromptComposer(
@@ -905,35 +938,60 @@ private fun ModelOnboardingCard(
     installedModelCount: Int,
     recommendedModel: HuggingFaceModelEntry?,
     downloadState: ModelDownloadState,
+    importState: ImportState,
+    deviceProfile: DeviceCapabilityProfile?,
     enabled: Boolean,
     onImportModel: () -> Unit,
     onDownloadRecommended: (HuggingFaceModelEntry) -> Unit,
+    onRetryDownload: (String) -> Unit,
     onOpenControls: () -> Unit,
 ) {
+    val guidance = FirstRunGuidance.snapshot(
+        currentModel = currentModel,
+        installedModelCount = installedModelCount,
+        downloadState = downloadState,
+        importState = importState,
+    )
     GlassSurface(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text(
-                text = if (currentModel == null) "Choose a local model" else "Start a chat",
+                text = "Private AI, on this device",
                 style = MaterialTheme.typography.titleMedium,
                 color = PrismBlue,
                 fontWeight = FontWeight.SemiBold,
             )
             Text(
-                text = when {
-                    currentModel != null -> compactModelName(currentModel)
-                    installedModelCount > 0 -> "$installedModelCount installed models available"
-                    recommendedModel != null -> "Starter pick: ${recommendedModel.name} (${recommendedModel.parameters}, ${recommendedModel.quantization})"
-                    else -> "Import a GGUF model to begin"
-                },
+                text = "Run compatible GGUF language models directly on your phone. " +
+                    "Local inference does not use a cloud LLM: prompts and replies stay on this device.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                OnboardingStep("1", "Choose", guidance.stage == FirstRunStage.CHOOSE_MODEL)
+                OnboardingStep("2", "Download", guidance.stage == FirstRunStage.DOWNLOADING)
+                OnboardingStep("3", "Chat", guidance.stage == FirstRunStage.READY)
+            }
+
+            Text(
+                text = guidance.title,
+                style = MaterialTheme.typography.titleSmall,
+                color = if (guidance.stage == FirstRunStage.ERROR) PrismRed else PrismText,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = guidance.detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (guidance.stage == FirstRunStage.ERROR) PrismRed
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
             )
 
+            if (currentModel == null) {
             when (downloadState) {
                 is ModelDownloadState.Running -> {
                     Text(
@@ -959,24 +1017,91 @@ private fun ModelOnboardingCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = if (downloadState.integrity != DownloadIntegrity.UNVERIFIED) PrismGreen else PrismAmber,
                 )
-                is ModelDownloadState.Failure -> Text(
+                is ModelDownloadState.Failure -> {
+                    Text(
                     text = downloadState.message,
                     style = MaterialTheme.typography.bodySmall,
                     color = PrismRed,
                 )
+                    downloadState.entryId?.let { entryId ->
+                        TextButton(
+                            contentPadding = PaddingValues(0.dp),
+                            onClick = { onRetryDownload(entryId) },
+                        ) {
+                            Text("Retry download", color = PrismBlue)
+                        }
+                    }
+                }
                 ModelDownloadState.Cancelled -> Text(
-                    text = "Download cancelled",
+                    text = "Download cancelled. You can retry at any time.",
                     style = MaterialTheme.typography.bodySmall,
                     color = PrismAmber,
                 )
                 ModelDownloadState.Idle -> Unit
             }
+            }
 
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (currentModel == null) {
                 recommendedModel?.let { entry ->
+                    val storageOk = FirstRunGuidance.hasStorageFor(
+                        expectedBytes = entry.expectedBytes,
+                        freeBytes = deviceProfile?.storageFreeBytes,
+                    )
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                        color = PrismBlue.copy(alpha = 0.06f),
+                        border = BorderStroke(1.dp, PrismBlue.copy(alpha = 0.16f)),
+                        shadowElevation = 0.dp,
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = "Recommended starter",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = PrismBlue,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                text = entry.name,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                InfoBadge(text = entry.parameters, color = PrismBlue)
+                                InfoBadge(text = entry.quantization, color = PrismViolet)
+                                InfoBadge(text = formatBytes(entry.expectedBytes), color = PrismSlate)
+                            }
+                            Text(
+                                text = entry.notes,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = FirstRunGuidance.ramFitLabel(
+                                    expectedBytes = entry.expectedBytes,
+                                    availableRamBytes = deviceProfile?.availableRamBytes,
+                                ),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                text = FirstRunGuidance.storageLabel(
+                                    expectedBytes = entry.expectedBytes,
+                                    freeBytes = deviceProfile?.storageFreeBytes,
+                                ),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (storageOk) MaterialTheme.colorScheme.onSurfaceVariant else PrismRed,
+                            )
                     Button(
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = enabled,
+                                enabled = enabled && storageOk && downloadState !is ModelDownloadState.Running,
                         onClick = { onDownloadRecommended(entry) },
                     ) {
                         Text(
@@ -985,21 +1110,98 @@ private fun ModelOnboardingCard(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
+                            if (!storageOk) {
+                                Text(
+                                    text = "Not enough free storage. Delete an unused model or free space, then retry.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = PrismRed,
+                                )
+                            }
                 }
-                Button(
+                    }
+                }
+
+                Row(
                     modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    TextButton(
+                        modifier = Modifier.weight(1f),
                     enabled = enabled,
                     onClick = onImportModel,
                 ) {
                     Text("Import GGUF", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 TextButton(
-                    modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.weight(1f),
                     enabled = enabled || installedModelCount > 0,
                     onClick = onOpenControls,
                 ) {
-                    Text("Model & Runtime", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            text = if (installedModelCount > 0) "Choose installed" else "Models & runtime",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun OnboardingStep(step: String, label: String, active: Boolean) {
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = if (active) PrismBlue.copy(alpha = 0.14f)
+        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.50f),
+        contentColor = if (active) PrismBlue else MaterialTheme.colorScheme.onSurfaceVariant,
+        border = BorderStroke(
+            1.dp,
+            if (active) PrismBlue.copy(alpha = 0.30f)
+            else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.40f),
+        ),
+        shadowElevation = 0.dp,
+    ) {
+        Text(
+            text = "$step $label",
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1,
+            softWrap = false,
+        )
+    }
+}
+
+@Composable
+private fun NoModelBanner(onOpenControls: () -> Unit) {
+    GlassSurface(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = "No model loaded",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = PrismAmber,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = "Choose a local model to enable chat. Your draft is kept.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                }
+            TextButton(onClick = onOpenControls) {
+                Text("Choose", color = PrismBlue, maxLines = 1)
             }
         }
     }

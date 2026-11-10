@@ -89,8 +89,8 @@ internal fun PromptComposer(
 ) {
     val placeholder = when {
         !enabled -> "Starting Prism Local..."
-        hasModel -> "Ask about code..."
-        else -> "Ask for model help or import a GGUF"
+        !hasModel -> "Choose a model to start chatting"
+        else -> "Ask anything — it stays on this device"
     }
     val density = LocalDensity.current
     val imeVisible = WindowInsets.ime.getBottom(density) > 0
@@ -138,7 +138,11 @@ internal fun PromptComposer(
                     val hasAttachments = attachments.isNotEmpty()
                     ComposerIconButton(
                         action = if (!hasPrompt && canContinue) ComposerAction.More else ComposerAction.Send,
-                        enabled = enabled && !isSending && (hasPrompt || hasAttachments || canContinue),
+                        // Local chat is unavailable until a model is loaded; the
+                        // service still refuses fail-closed, but the composer
+                        // must not advertise a send that cannot be served.
+                        enabled = enabled && hasModel && !isSending &&
+                            (hasPrompt || hasAttachments || canContinue),
                         onClick = {
                             if (!isSending) {
                                 if (hasPrompt || hasAttachments) {

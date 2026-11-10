@@ -213,7 +213,12 @@ class HuggingFaceDownloadWorker(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            partialFile.delete()
+            // Preserve the partial file: an interrupted transfer keeps its
+            // resumable prefix so a later attempt can continue instead of
+            // restarting a multi-gigabyte download from zero. The engine already
+            // discards a prefix it cannot safely resume, verification deletes a
+            // corrupt or mis-sized file, and the completed file is verified
+            // before import, so a retained partial is never installed as a model.
             Result.failure(
                 workDataOf(
                     HuggingFaceDownloadWork.KEY_ENTRY_ID to entry.id,

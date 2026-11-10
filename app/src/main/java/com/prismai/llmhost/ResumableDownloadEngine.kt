@@ -9,6 +9,9 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
+/** An interrupted transfer that ended early but whose verified prefix may resume. */
+class IncompleteDownloadException(message: String) : IllegalStateException(message)
+
 /**
  * Resumable download engine with byte range validation, ETag artifact change detection,
  * storage reserve enforcement, and maximum size bounds.
@@ -27,10 +30,18 @@ class ResumableDownloadEngine(
 
         fun parseContentRange(value: String?): ContentRangeInfo? {
             if (value == null) return null
-            val match = Regex("""bytes\s+(\d+)-(\d+)/(?:(\d+)|\*)""", RegexOption.IGNORE_CASE).find(value.trim()) ?: return null
+            // matchEntire (not find): a malformed header that merely embeds a
+            // well-formed range must be rejected, not silently trusted.
+            val match = Regex("""bytes\s+(\d+)-(\d+)/(?:(\d+)|\*)""", RegexOption.IGNORE_CASE)
+                .matchEntire(value.trim()) ?: return null
             val start = match.groupValues[1].toLongOrNull() ?: return null
             val end = match.groupValues[2].toLongOrNull() ?: return null
             val total = match.groupValues[3].toLongOrNull()
+            // Reject malformed ranges rather than trusting them: an end before the
+            // start, or an end at/beyond a declared total, cannot describe a real
+            // byte range and would corrupt an append.
+            if (end < start) return null
+            if (total != null && end >= total) return null
             return ContentRangeInfo(start, end, total)
         }
 
@@ -39,6 +50,18 @@ class ResumableDownloadEngine(
                 ?: value?.substringAfter('/', missingDelimiterValue = "")
                     ?.toLongOrNull()
                     ?.takeIf { it > 0L }
+    }
+
+    /**
+     * Keep an incomplete transfer's bytes only when [resumable] validators allow
+     * a later attempt to append safely; otherwise drop the partial and its meta
+     * so nothing stale is mistaken for progress.
+     */
+    private fun discardUnlessResumable(resumable: Boolean, target: File, metaFile: File) {
+        if (!resumable) {
+            target.delete()
+            metaFile.delete()
+        }
     }
 
     suspend fun downloadResumable(
@@ -83,31 +106,52 @@ class ResumableDownloadEngine(
 
             val currentEtag = connection.getHeaderField("ETag")?.trim('"', ' ')
             val currentLastModified = connection.getHeaderField("Last-Modified")
-            if (existing > 0L && metaFile.exists()) {
-                val metaJson = runCatching { JSONObject(metaFile.readText()) }.getOrNull()
-                val savedEtag = metaJson?.optString("etag")?.takeIf { it.isNotBlank() }
-                val savedLastModified = metaJson?.optString("last_modified")?.takeIf { it.isNotBlank() }
-                val savedExpectedSize = metaJson?.optLong("expected_size", -1L)?.takeIf { it > 0L }
-                if ((savedEtag != null && currentEtag != null && savedEtag != currentEtag) ||
-                    (savedLastModified != null && currentLastModified != null && savedLastModified != currentLastModified) ||
-                    (savedExpectedSize != null && expectedSize != null && savedExpectedSize != expectedSize)) {
-                    target.delete()
-                    metaFile.delete()
-                    return downloadResumable(downloadUrl, target, expectedSize, onProgress)
-                }
+            val metaJson = if (existing > 0L && metaFile.exists()) {
+                runCatching { JSONObject(metaFile.readText()) }.getOrNull()
+            } else {
+                null
             }
+            val savedEtag = metaJson?.optString("etag")?.takeIf { it.isNotBlank() }
+            val savedLastModified = metaJson?.optString("last_modified")?.takeIf { it.isNotBlank() }
+            val savedExpectedSize = metaJson?.optLong("expected_size", -1L)?.takeIf { it > 0L }
+            if ((savedEtag != null && currentEtag != null && savedEtag != currentEtag) ||
+                (savedLastModified != null && currentLastModified != null && savedLastModified != currentLastModified) ||
+                (savedExpectedSize != null && expectedSize != null && savedExpectedSize != expectedSize)) {
+                target.delete()
+                metaFile.delete()
+                return downloadResumable(downloadUrl, target, expectedSize, onProgress)
+            }
+            // An append may only proceed when the already-downloaded prefix can be
+            // tied to the same remote artifact. A saved validator that the new
+            // response does not corroborate — a missing ETag/Last-Modified, or no
+            // validator at all — cannot establish continuity, so the partial file
+            // is discarded and re-fetched rather than silently concatenating
+            // bytes from a possibly different artifact.
+            val continuityEstablished = metaJson != null &&
+                (savedEtag != null || savedLastModified != null) &&
+                (savedEtag == null || currentEtag == savedEtag) &&
+                (savedLastModified == null || currentLastModified == savedLastModified) &&
+                (savedExpectedSize == null || expectedSize == null || savedExpectedSize == expectedSize)
 
             var append = false
             var contentRange: ContentRangeInfo? = null
             if (code == HttpURLConnection.HTTP_PARTIAL) {
                 contentRange = parseContentRange(connection.getHeaderField("Content-Range"))
-                if (existing > 0L && contentRange != null && contentRange.start == existing) {
-                    append = true
-                } else if (existing > 0L) {
-                    target.delete()
-                    metaFile.delete()
-                    return downloadResumable(downloadUrl, target, expectedSize, onProgress)
+                    ?: throw IllegalStateException("HTTP 206 without a valid Content-Range header")
+                if (existing > 0L) {
+                    if (contentRange.start == existing && continuityEstablished) {
+                        append = true
+                    } else {
+                        target.delete()
+                        metaFile.delete()
+                        return downloadResumable(downloadUrl, target, expectedSize, onProgress)
+                    }
                 } else {
+                    if (contentRange.start != 0L) {
+                        target.delete()
+                        metaFile.delete()
+                        throw IllegalStateException("HTTP 206 began at byte ${contentRange.start} for a fresh download")
+                    }
                     append = false
                     existing = 0L
                 }
@@ -195,6 +239,26 @@ class ResumableDownloadEngine(
                         }
                     }
                 }
+            }
+
+            // Completion postconditions. A stream that ends early (a truncated
+            // 206 or a short 200) must fail rather than leave a partial file that
+            // looks complete. Enforce the exact declared range when the server
+            // sent one, and the announced total when known. When the partial
+            // carries validators that let a later attempt resume safely, keep it
+            // so an interrupted multi-gigabyte transfer does not restart from
+            // zero; without them there is nothing safe to resume, so discard it.
+            val resumable = !currentEtag.isNullOrBlank() || !currentLastModified.isNullOrBlank()
+            val declaredRangeEnd = contentRange?.end
+            if (declaredRangeEnd != null && copied != declaredRangeEnd + 1) {
+                discardUnlessResumable(resumable, target, metaFile)
+                throw IncompleteDownloadException(
+                    "Incomplete download: received $copied bytes but the server declared content through byte $declaredRangeEnd"
+                )
+            }
+            if (total != null && copied != total) {
+                discardUnlessResumable(resumable, target, metaFile)
+                throw IncompleteDownloadException("Incomplete download: received $copied bytes of $total")
             }
         } finally {
             connection.disconnect()

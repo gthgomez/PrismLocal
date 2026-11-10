@@ -75,6 +75,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Initialize the disk-backed draft payload store before any composition.
+        // The restore path decodes saved attachments during the first
+        // composition; if the store were initialized from a LaunchedEffect
+        // (which runs afterwards), a process-death restore would decode against
+        // the truncated 256-char inline stub instead of the durable payload.
+        DraftPayloadStore.init(filesDir)
         setContent {
             ChatScreen(
                 service = service,

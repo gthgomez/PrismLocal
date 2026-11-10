@@ -78,13 +78,22 @@ them.
 ## Review-fix follow-up (this branch)
 
 This branch is a review-fix follow-up on top of the merged wave-1 integration.
-Its changes — off-main chat pre-flight, saveable per-chat drafts, RAG stale
-chunk removal, voice recognizer lifecycle handling, and AI-report failure
-logging — are **pending CI and device verification**, not proven by this
-document. They are covered by JVM unit tests where the logic is testable and by
-compilation elsewhere, but no CI run or qualified-device pass has confirmed
-them yet. Treat the claims above as the baseline this branch builds on, not as
-evidence for these changes.
+The CI regression it was originally opened to fix — the JDK-17
+`NoSuchMethodError` from `removeFirst()` and the chat-search timing race — was
+fixed independently in PR #40 (`a4b21d3`), which restored green CI on `main` at
+`97d6e44`. This branch's equivalent hunk was dropped on rebase (taking `main`'s
+already-landed version), so nothing here is required for `main` to be green.
+The earlier review fixes — off-main chat pre-flight, saveable
+per-chat drafts, RAG stale chunk removal, voice recognizer lifecycle handling,
+and AI-report failure logging — are covered by JVM unit tests where the logic is
+testable and by compilation elsewhere. The follow-up correctness fixes on top
+(background-task idle-stop control flow, durable commit-and-retry for
+task transitions, resumable-prefix retention for interrupted downloads,
+whole-string `Content-Range` validation, send-ownership refusal under the
+admission mutex, and draft-payload last-reference release) are covered by new JVM
+unit tests, re-confirmed by CI on the rebased head. None
+of this is a substitute for a qualified-device pass; the device and inference
+gaps below are unchanged.
 
 ## Reliability-closure merge train (2026-10-09)
 
@@ -117,6 +126,18 @@ Following the initial reliability train, the 18 audit findings and qualification
 | **Sequence B: Chat Admission & Draft Ownership** | PR #35 (`e0a1442`) | PL-F01, PL-F02, PL-F03, PL-F04, PL-F07 | Service admission-before-cancellation tests; direct-tool synchronous failure outcome test; draft revision ownership and in-flight token idempotency tests; ChatScreen attachment picker bound to originating chat; DraftPayloadStore app-private durable storage bounding rememberSaveable bundles. |
 | **Sequence C: Task Durability & Search Consistency** | PR #36 (`fe914aa`) | PL-F05, PL-F06, PL-Q02, PL-Q03 | Atomic task persistence with `.bak` rollback; BackgroundAgentPersistenceTest durability barrier; ChatSearchAndDeletionConsistencyTest verifying search index eviction, delete error propagation, and ordered revisions. |
 | **Sequence D: Imports, Downloads & Provenance** | PR #37 (`6745922`) | PL-F09, PL-F13, PL-F14, PL-F15, PL-F16, PL-F17 | SequentialImportQueue non-dropping retry loop on busy; fatal `Throwable` rethrow; URI map release; ResumableDownloadEngineTest verifying Content-Range 206 validation, 200 reset, ETag mutation reset, disk reserve & MAX_MODEL_BYTES; catalog SHA-256 ID derivation with legacy lookup; cache threat model boundary test; ModelProvenancePersistenceTest manifest round-trip. |
+
+> **Closure-evidence caveat (2026-10-10).** The merge-train rows above record that
+> source changes and tests landed; they are not, by themselves, proof that the
+> corresponding GitHub issue's acceptance criteria are met. Independent review of the
+> issue comments found that the closure evidence for **#14, #15, #17, and #20** does
+> not demonstrate the original defect (for example, #20 concerns background-task chat
+> ownership, and HTTP download handling does not address it). Treat those issues as
+> requalification candidates, not resolved, until source-specific acceptance evidence
+> exists. The JVM unit-test evidence was also invalidated by the `a6bd73d` CI
+> regression; PR #40 (`a4b21d3`) fixed it and `main` has been green since
+> `97d6e44`, so pre-fix test evidence should be treated as unconfirmed (see
+> `STATUS.md`).
 
 ## Qualification ledger & release qualification matrix
 

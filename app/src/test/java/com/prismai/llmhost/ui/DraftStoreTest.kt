@@ -196,6 +196,48 @@ class DraftStoreTest {
     }
 
     @Test
+    fun clearingOneChatDoesNotTruncateAnotherChatsSharedAttachment() {
+        DraftPayloadStore.resetForTesting()
+        try {
+            val full = "A".repeat(1_000)
+            val shared = PromptAttachment(
+                uriString = "content://media/shared.pdf",
+                name = "shared.pdf",
+                mimeType = "application/pdf",
+                sizeBytes = 1_000L,
+                extractionStatus = AttachmentExtractionStatus.EXTRACTED,
+                promptText = full,
+            )
+            val store = DraftStore("chat_a")
+            store.restore("chat_a", "draft a", listOf(shared))
+            store.restore("chat_b", "draft b", listOf(shared))
+
+            // Persist both drafts' payloads the way the Compose Saver does.
+            store.encodeState()
+
+            // Clearing chat_a must not delete the payload chat_b still needs.
+            store.clear()
+
+            val restored = DraftStore.decodeState(store.encodeState())
+            assertEquals(
+                "chat_b must still restore the full offloaded payload",
+                full,
+                restored.snapshotFor("chat_b").second.single().promptText,
+            )
+
+            // Only once the last referencing draft is cleared is it released.
+            restored.moveTo("chat_b")
+            restored.clear()
+            assertNull(
+                "payload is released once no draft references it",
+                DraftPayloadStore.get("content://media/shared.pdf"),
+            )
+        } finally {
+            DraftPayloadStore.resetForTesting()
+        }
+    }
+
+    @Test
     fun addAttachmentsToInactiveChatDoesNotModifyActiveChat() {
         val store = DraftStore("chat_a")
         store.attachments = listOf(attachment("a.txt"))

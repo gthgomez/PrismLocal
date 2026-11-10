@@ -64,11 +64,26 @@ class DraftStore(initialChatId: String?) {
 
     /** Erase the active chat's draft. Other chats are untouched. */
     fun clear() {
-        attachments.forEach { DraftPayloadStore.remove(it.uriString) }
+        val excludedKey = key(chatId)
+        val removed = drafts.remove(excludedKey)
+        val released = attachments + (removed?.attachments ?: emptyList())
         text = ""
         attachments = emptyList()
-        val removed = drafts.remove(key(chatId))
-        removed?.attachments?.forEach { DraftPayloadStore.remove(it.uriString) }
+        releasePayloads(released, excludedKey)
+    }
+
+    /**
+     * Release the durable payload for an attachment the user removed from the
+     * live draft, unless another saved draft still references the same URI.
+     *
+     * Payloads are keyed by URI and two drafts can hold the same attachment; a
+     * payload may only be deleted once no draft needs it, or clearing one chat
+     * would truncate the other's restored attachment to its 256-char stub.
+     */
+    fun releaseLiveAttachmentPayload(uri: String) {
+        if (!isPayloadReferencedElsewhere(uri, key(chatId))) {
+            DraftPayloadStore.remove(uri)
+        }
     }
 
     /** Add attachments to a specific chat's draft (e.g. from picker completion). */
@@ -97,10 +112,11 @@ class DraftStore(initialChatId: String?) {
                 clear()
             }
         } else {
-            val stored = drafts[key(targetChatId)]
+            val storedKey = key(targetChatId)
+            val stored = drafts[storedKey]
             if (stored != null && stored.text == expectedPrompt && stored.attachments == expectedAttachments) {
-                stored.attachments.forEach { DraftPayloadStore.remove(it.uriString) }
-                drafts.remove(key(targetChatId))
+                drafts.remove(storedKey)
+                releasePayloads(stored.attachments, storedKey)
             }
         }
     }
@@ -127,6 +143,27 @@ class DraftStore(initialChatId: String?) {
     }
 
     private fun key(id: String?): String = id ?: NEW_CHAT_KEY
+
+    /**
+     * True when some draft other than [excludedKey] still references [uri].
+     * Payloads are shared by URI across drafts, so deletion must be a
+     * last-reference operation.
+     */
+    private fun isPayloadReferencedElsewhere(uri: String, excludedKey: String): Boolean {
+        if (key(chatId) != excludedKey && attachments.any { it.uriString == uri }) return true
+        return drafts.any { (draftKey, draft) ->
+            draftKey != excludedKey && draft.attachments.any { it.uriString == uri }
+        }
+    }
+
+    /** Delete the given drafts' payload files, but only those no other draft references. */
+    private fun releasePayloads(candidates: List<PromptAttachment>, excludedKey: String) {
+        candidates.forEach { attachment ->
+            if (!isPayloadReferencedElsewhere(attachment.uriString, excludedKey)) {
+                DraftPayloadStore.remove(attachment.uriString)
+            }
+        }
+    }
 
     /**
      * Serialize the whole store — every keyed draft, active and inactive — so a

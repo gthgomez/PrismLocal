@@ -26,6 +26,19 @@ internal class ServiceGenerationOwnership(
         agentToolJobActive = agentToolJobActive,
     )
 
+    /**
+     * True when a user-initiated send must be refused because the chat it was
+     * captured from is no longer the selected chat. The composer passes the chat
+     * that was selected at send time as [sourceChatId]; if the user switches
+     * chats before admission runs, the generation would otherwise execute in the
+     * wrong chat.
+     *
+     * A send from a not-yet-created chat ([sourceChatId] null) is always allowed:
+     * that chat is created during admission and has no identity to compare.
+     */
+    fun shouldRefuseUserSend(sourceChatId: String?, selectedChatId: String?): Boolean =
+        sourceChatId != null && selectedChatId != sourceChatId
+
     fun prepareBackgroundChat(
         taskId: String?,
         sourceChatId: String?,

@@ -1218,6 +1218,17 @@ class InferenceService : Service() {
             ) {
                 throw BackgroundTaskDeferredException()
             }
+            if (!initiatedByBackground &&
+                serviceGenerationOwnership.shouldRefuseUserSend(sourceChatId, _currentChatId.value)
+            ) {
+                // The composer captured this send while its source chat was
+                // selected, but the selection changed before the operation mutex
+                // was granted. Refuse under the admission lock, before any
+                // cancellation or transcript mutation, so a send can never
+                // execute in a chat it did not originate from.
+                publishUiEvent("Chat changed before the send was admitted")
+                return refuseSend(onRefused, "Chat changed before the send was admitted")
+            }
             if (!generationStartGate.beginStart()) {
                 if (initiatedByBackground) throw BackgroundTaskDeferredException()
                 return refuseSend(onRefused, "Generation deferred while a chat transition completes")

@@ -56,6 +56,20 @@ class ResumableDownloadEngineTest {
         assertNull(ResumableDownloadEngine.parseContentRange(null))
         assertNull(ResumableDownloadEngine.parseContentRange("invalid"))
         assertNull(ResumableDownloadEngine.parseContentRange("bytes foo-bar/baz"))
+        assertNull("end before start is malformed", ResumableDownloadEngine.parseContentRange("bytes 50-20/100"))
+        assertNull("end at the declared total is malformed", ResumableDownloadEngine.parseContentRange("bytes 0-100/100"))
+        assertNull(
+            "a well-formed range embedded in a malformed header must be rejected",
+            ResumableDownloadEngine.parseContentRange("garbage bytes 0-50/100"),
+        )
+        assertNull(
+            "trailing garbage after a valid range must be rejected",
+            ResumableDownloadEngine.parseContentRange("bytes 0-50/100 trailing"),
+        )
+        assertNull(
+            "extra segments after a valid range must be rejected",
+            ResumableDownloadEngine.parseContentRange("bytes 0-50/100;foo"),
+        )
 
         assertEquals(1000L, ResumableDownloadEngine.parseContentRangeTotal("bytes 100-199/1000"))
         assertEquals(500L, ResumableDownloadEngine.parseContentRangeTotal("bytes */500"))
@@ -292,5 +306,147 @@ class ResumableDownloadEngineTest {
         assertEquals(100, combined.size)
         assertArrayEquals(initialPart, combined.copyOfRange(0, 40))
         assertArrayEquals(remainingPart, combined.copyOfRange(40, 100))
+    }
+
+    @Test
+    fun rangeBodyShorterThanDeclared_failsAndRetainsResumablePartialFile() = runBlocking {
+        server.createContext("/model.gguf") { exchange ->
+            // Declares the range through byte 99 but only sends 30 bytes.
+            exchange.responseHeaders.set("Content-Range", "bytes 40-99/100")
+            exchange.responseHeaders.set("ETag", "\"tag1\"")
+            exchange.sendResponseHeaders(206, 30)
+            exchange.responseBody.write(ByteArray(30) { 'Z'.code.toByte() })
+            exchange.close()
+        }
+
+        val target = File(tempFolder.root, "test.part")
+        target.writeBytes(ByteArray(40) { 'A'.code.toByte() })
+        val meta = File(tempFolder.root, "test.part.meta")
+        meta.writeText(JSONObject().put("etag", "tag1").put("expected_size", 100L).toString())
+
+        val engine = ResumableDownloadEngine()
+        try {
+            engine.downloadResumable(
+                downloadUrl = "http://127.0.0.1:$serverPort/model.gguf",
+                target = target,
+                expectedSize = 100L,
+            )
+            fail("Expected an incomplete-download failure")
+        } catch (e: IncompleteDownloadException) {
+            assertTrue(e.message!!.contains("Incomplete download"))
+        }
+
+        assertEquals(
+            "a truncated transfer with validators must keep its resumable prefix",
+            70L,
+            target.length(),
+        )
+        assertTrue("the validators must be kept so the retry can resume", meta.exists())
+    }
+
+    @Test
+    fun truncatedDownloadWithValidators_retainsPrefixAndResumesOnNextAttempt() = runBlocking {
+        val fullData = ByteArray(100) { (it % 10 + '0'.code).toByte() }
+        var requestCount = 0
+
+        server.createContext("/model.gguf") { exchange ->
+            requestCount++
+            val range = exchange.requestHeaders.getFirst("Range")
+            exchange.responseHeaders.set("ETag", "\"tag1\"")
+            if (range == null) {
+                // First attempt: a fresh, valid 206 that is cut short after 40 bytes.
+                exchange.responseHeaders.set("Content-Range", "bytes 0-99/100")
+                exchange.sendResponseHeaders(206, 40)
+                exchange.responseBody.write(fullData, 0, 40)
+            } else {
+                // Retry: serve the remainder so the transfer completes.
+                exchange.responseHeaders.set("Content-Range", "bytes 40-99/100")
+                exchange.sendResponseHeaders(206, 60)
+                exchange.responseBody.write(fullData, 40, 60)
+            }
+            exchange.close()
+        }
+
+        val target = File(tempFolder.root, "test.part")
+        val meta = File(tempFolder.root, "test.part.meta")
+        val engine = ResumableDownloadEngine()
+
+        try {
+            engine.downloadResumable("http://127.0.0.1:$serverPort/model.gguf", target, 100L)
+            fail("Expected the first attempt to fail as incomplete")
+        } catch (e: IncompleteDownloadException) {
+            // expected
+        }
+        assertEquals("the verified prefix is retained", 40L, target.length())
+        assertTrue("validators are retained for the resume", meta.exists())
+
+        engine.downloadResumable("http://127.0.0.1:$serverPort/model.gguf", target, 100L)
+        assertEquals("the retry must resume rather than restart", 2, requestCount)
+        assertEquals(100L, target.length())
+        assertArrayEquals(fullData, target.readBytes())
+    }
+
+    @Test
+    fun truncatedDownloadWithoutValidators_discardsPartialFile() = runBlocking {
+        server.createContext("/model.gguf") { exchange ->
+            // A short 206 with no ETag/Last-Modified: nothing ties the bytes to
+            // the artifact, so the prefix cannot be safely resumed.
+            exchange.responseHeaders.set("Content-Range", "bytes 0-99/100")
+            exchange.sendResponseHeaders(206, 40)
+            exchange.responseBody.write(ByteArray(40) { 'T'.code.toByte() })
+            exchange.close()
+        }
+
+        val target = File(tempFolder.root, "test.part")
+        val meta = File(tempFolder.root, "test.part.meta")
+        val engine = ResumableDownloadEngine()
+        try {
+            engine.downloadResumable("http://127.0.0.1:$serverPort/model.gguf", target, 100L)
+            fail("Expected an incomplete-download failure")
+        } catch (e: IncompleteDownloadException) {
+            assertTrue(e.message!!.contains("Incomplete download"))
+        }
+
+        assertFalse("without validators the partial must be discarded", target.exists())
+        assertFalse("without validators the meta must be discarded", meta.exists())
+    }
+
+    @Test
+    fun resumeWithoutCorroboratingValidators_restartsFromZeroInsteadOfAppending() = runBlocking {
+        val fullData = ByteArray(100) { '5'.code.toByte() }
+        var requestCount = 0
+
+        server.createContext("/model.gguf") { exchange ->
+            requestCount++
+            val rangeHeader = exchange.requestHeaders.getFirst("Range")
+            if (rangeHeader != null) {
+                // Valid 206 range, but no ETag/Last-Modified to tie it to the
+                // already-downloaded prefix.
+                exchange.responseHeaders.set("Content-Range", "bytes 40-99/100")
+                exchange.sendResponseHeaders(206, 60)
+                exchange.responseBody.write(ByteArray(60) { '9'.code.toByte() })
+            } else {
+                exchange.responseHeaders.set("ETag", "\"tag1\"")
+                exchange.sendResponseHeaders(200, 100)
+                exchange.responseBody.write(fullData)
+            }
+            exchange.close()
+        }
+
+        val target = File(tempFolder.root, "test.part")
+        target.writeBytes(ByteArray(40) { 'A'.code.toByte() })
+        val meta = File(tempFolder.root, "test.part.meta")
+        meta.writeText(JSONObject().put("etag", "tag1").put("expected_size", 100L).toString())
+
+        val engine = ResumableDownloadEngine()
+        engine.downloadResumable(
+            downloadUrl = "http://127.0.0.1:$serverPort/model.gguf",
+            target = target,
+            expectedSize = 100L,
+        )
+
+        assertEquals("an unverifiable resume must restart rather than append", 2, requestCount)
+        assertEquals(100L, target.length())
+        assertArrayEquals(fullData, target.readBytes())
     }
 }

@@ -82,7 +82,9 @@ internal fun ChatTopBar(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    PrismLogoTile(size = 38.dp)
+                    // The brand tile is dropped in the collapsed bar: on a 360-400dp
+                    // phone the four actions leave too little width and the title
+                    // clipped to "Pr...".
                     TopBarTitle(
                         modifier = Modifier.weight(1f),
                         runtimeStatus = runtimeStatus,
@@ -287,7 +289,7 @@ private fun TopBarAction(
 ) {
     Surface(
         modifier = if (compact) {
-            modifier.height(56.dp)
+            modifier.height(60.dp)
         } else {
             modifier.size(width = 82.dp, height = 68.dp)
         }.semantics { contentDescription = label },
@@ -299,55 +301,38 @@ private fun TopBarAction(
         shadowElevation = 0.dp,
         onClick = onClick,
     ) {
-        val contentModifier = Modifier.padding(
-            vertical = if (compact) 7.dp else 8.dp,
-            horizontal = 8.dp,
-        )
-        if (compact) {
-            Row(
-                modifier = contentModifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                TopBarActionIcon(label = label)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = label,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    softWrap = false,
-                )
-            }
-        } else {
-            Column(
-                modifier = contentModifier,
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center,
-            ) {
-                TopBarActionIcon(label = label)
-                Text(
-                    text = label,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    softWrap = false,
-                )
-            }
+        // Stacked icon + label at every width: the old horizontal compact row
+        // clipped "Memory" and "Settings" on ~360-390dp phones.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp, horizontal = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            TopBarActionIcon(label = label, iconSize = if (compact) 20.dp else 25.dp)
+            Text(
+                text = label,
+                style = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
 
 @Composable
-private fun TopBarActionIcon(label: String) {
+private fun TopBarActionIcon(label: String, iconSize: Dp = 25.dp) {
     val iconColor = when (label) {
         "Chats" -> PrismBlue
+        "Docs" -> PrismCyan
         "Memory" -> PrismViolet
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
-    Canvas(modifier = Modifier.size(25.dp)) {
+    Canvas(modifier = Modifier.size(iconSize)) {
         val stroke = Stroke(width = 2.5f, cap = StrokeCap.Round)
         when (label) {
             "Chats" -> {
@@ -379,6 +364,24 @@ private fun TopBarActionIcon(label: String) {
                     strokeWidth = 2.5f,
                     cap = StrokeCap.Round,
                 )
+            }
+            "Docs" -> {
+                drawRoundRect(
+                    color = iconColor,
+                    topLeft = Offset(size.width * 0.22f, size.height * 0.14f),
+                    size = Size(size.width * 0.56f, size.height * 0.72f),
+                    cornerRadius = CornerRadius(5f, 5f),
+                    style = stroke,
+                )
+                listOf(0.34f, 0.50f, 0.66f).forEach { yRatio ->
+                    drawLine(
+                        color = iconColor,
+                        start = Offset(size.width * 0.34f, size.height * yRatio),
+                        end = Offset(size.width * 0.66f, size.height * yRatio),
+                        strokeWidth = 2.2f,
+                        cap = StrokeCap.Round,
+                    )
+                }
             }
             "Memory" -> {
                 drawRoundRect(
@@ -464,7 +467,7 @@ private fun topBarSubtitle(
     } else if (!modelName.isNullOrBlank()) {
         "${polishedModelName(modelName)} • Offline"
     } else {
-        "Offline AI workspace"
+        "No model loaded · Choose one to chat"
     }
 }
 

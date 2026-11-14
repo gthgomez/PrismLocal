@@ -244,9 +244,13 @@ class ModelManager(
         // Block only when the model physically cannot fit. A tight-but-fitting model
         // (RISKY) still loads — slow is not blocked — and a model already proven on
         // this device overrides even the physical projection.
-        val exceedsAvailableRam = fit.requiredRamBytes > fit.availableRamAfterUnloadBytes
-        val allowed = !overHardCap && (!exceedsAvailableRam || fit.provenUsable)
-        if (allowed) {
+        val blocked = ModelLoadLimits.isLoadBlocked(
+            modelBytes = model.bytes,
+            requiredRamBytes = fit.requiredRamBytes,
+            availableRamAfterUnloadBytes = fit.availableRamAfterUnloadBytes,
+            provenUsable = fit.provenUsable,
+        )
+        if (!blocked) {
             if (fit.rating == ModelFitRating.RISKY) {
                 Log.i(
                     TAG,

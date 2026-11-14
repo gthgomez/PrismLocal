@@ -162,8 +162,7 @@ class ModelReadinessAssessor(
             val safeFraction = if (isLargeModelClass) 0.60 else 0.75
             val safeBudget = (availableAfterUnloadBytes * safeFraction).toLong()
             return when {
-                modelBytes > ModelLoadLimits.HARD_CAP_BYTES -> ModelFitRating.TOO_LARGE
-                requiredRamBytes > availableAfterUnloadBytes -> ModelFitRating.TOO_LARGE
+                ModelLoadLimits.isLoadBlocked(modelBytes, requiredRamBytes, availableAfterUnloadBytes, false) -> ModelFitRating.TOO_LARGE
                 requiredRamBytes <= safeBudget && !lowMemory -> ModelFitRating.SAFE
                 else -> ModelFitRating.RISKY
             }

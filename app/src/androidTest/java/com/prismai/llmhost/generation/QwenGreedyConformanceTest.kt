@@ -1,6 +1,9 @@
 package com.prismai.llmhost.generation
 
 import android.util.Log
+import android.os.ParcelFileDescriptor
+import android.os.Process
+import android.os.SystemClock
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.prismai.llmhost.GenerationSettings
@@ -26,6 +29,44 @@ import org.junit.runner.RunWith
  */
 @RunWith(AndroidJUnit4::class)
 class QwenGreedyConformanceTest {
+    @Test
+    fun cancellationInsideRealPrefillIsReportedByTheWorkerAndCanRecover() = runBlocking {
+        val model = requiredModel()
+        val engine = NativeLlmBridge.create(debugHooksEnabled = false)
+        try {
+            val settings = fixtureSettings()
+            assertTrue(engine.loadModel(model.absolutePath, settings))
+            val generationId = 100_000 + (SystemClock.elapsedRealtime() % 1_000_000).toInt()
+            val prompt = "Please summarize this repeated cancellation test context. ".repeat(80)
+            assertTrue(engine.debugStartGenerationForTesting(prompt, generationId))
+            withTimeout(30_000) {
+                while (!nativeLogs().contains("stage=prefill_begin generation_id=$generationId ")) delay(100)
+            }
+            delay(200)
+            assertTrue(
+                "fixture completed prefill before it could be cancelled",
+                !nativeLogs().contains("stage=prefill_complete generation_id=$generationId "),
+            )
+            engine.debugCancelGenerationForTesting(generationId)
+            val logs = nativeLogs()
+            assertTrue("worker did not classify interrupted prefill as cancellation", logs.contains("stage=prefill_complete generation_id=$generationId rc=-999"))
+            assertTrue("worker did not publish CANCELLED", logs.contains("stage=terminal terminal=CANCELLED terminal_code=2 generation_id=$generationId"))
+            val followUp = withTimeout(180_000) {
+                engine.generate("Once upon a", settings.copy(maxTokens = 1)).toList()
+            }
+            assertTrue("generation did not recover after cancellation", followUp.sumOf { it.tokenCount } > 0)
+            assertTrue("generation after cancellation failed", followUp.none { it.isTerminal && it.terminalReason == "ERROR" })
+        } finally {
+            engine.destroySafely()
+        }
+    }
+
+    private fun nativeLogs(): String {
+        val command = "logcat -d --pid=${Process.myPid()} -s LlmHostNative:I"
+        val descriptor = InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command)
+        return ParcelFileDescriptor.AutoCloseInputStream(descriptor).bufferedReader().use { it.readText() }
+    }
+
     @Test
     fun pinnedQwenMatchesGreedyReference() = runBlocking {
         val model = requiredModel()

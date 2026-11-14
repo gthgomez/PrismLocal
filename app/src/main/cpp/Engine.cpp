@@ -587,8 +587,27 @@ const char* streamTerminalName(StreamTerminal terminal) {
     }
 }
 
-int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_vocab* vocab) {
+const char* systemClosingTag(const std::string& text) {
+    const std::string chatml_system_prefix = "<|im_start|>system";
+    const bool has_chatml_system_role =
+        text.rfind(chatml_system_prefix, 0) == 0 &&
+        text.size() > chatml_system_prefix.size() &&
+        (text[chatml_system_prefix.size()] == '\n' ||
+         text[chatml_system_prefix.size()] == '\r' ||
+         text[chatml_system_prefix.size()] == ' ' ||
+         text[chatml_system_prefix.size()] == '\t');
+    if (has_chatml_system_role) return "<|im_end|>";
+    if (text.rfind("<|start_header_id|>system<|end_header_id|>", 0) == 0) return "<|eot_id|>";
+    if (text.rfind("<system>", 0) == 0) return "</system>";
+    return nullptr;
+}
+
+int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_vocab* vocab,
+                           const std::string& formatted_prompt, bool add_special) {
     if (vocab == nullptr || tokens.empty()) return 0;
+    // Do not turn leading user text into a system role when normalizing pieces.
+    const char* closing_tag = systemClosingTag(formatted_prompt);
+    if (closing_tag == nullptr) return 0;
 
     std::string accumulated;
     std::vector<size_t> token_end_offsets;
@@ -596,8 +615,17 @@ int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_v
 
     const size_t max_tokens_to_check = std::min(tokens.size(), static_cast<size_t>(512));
     for (size_t i = 0; i < max_tokens_to_check; i++) {
+        // Some templates rely on tokenization to insert a BOS before the role.
+        // It belongs to the preserved prefix but not to its textual marker.
+        if (i == 0 && add_special && tokens[i] == llama_vocab_bos(vocab)) {
+            token_end_offsets.push_back(0);
+            continue;
+        }
         char buf[256];
-        int32_t len = llama_token_to_piece(vocab, tokens[i], buf, sizeof(buf) - 1, 0, true);
+        // SentencePiece may prepend a space that was not in the rendered prompt.
+        // Strip it only at the beginning, after confirming the raw system role.
+        const int32_t lstrip = accumulated.empty() ? 1 : 0;
+        int32_t len = llama_token_to_piece(vocab, tokens[i], buf, sizeof(buf) - 1, lstrip, true);
         if (len < 0 || len > static_cast<int32_t>(sizeof(buf) - 1)) {
             return 0;
         }
@@ -607,33 +635,14 @@ int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_v
         token_end_offsets.push_back(accumulated.size());
     }
 
-    std::string closing_tag;
-    const std::string chatml_system_prefix = "<|im_start|>system";
-    const bool has_chatml_system_role =
-        accumulated.rfind(chatml_system_prefix, 0) == 0 &&
-        accumulated.size() > chatml_system_prefix.size() &&
-        (accumulated[chatml_system_prefix.size()] == '\n' ||
-         accumulated[chatml_system_prefix.size()] == '\r' ||
-         accumulated[chatml_system_prefix.size()] == ' ' ||
-         accumulated[chatml_system_prefix.size()] == '\t');
-
-    if (has_chatml_system_role) {
-        closing_tag = "<|im_end|>";
-    } else if (accumulated.rfind("<|start_header_id|>system<|end_header_id|>", 0) == 0) {
-        closing_tag = "<|eot_id|>";
-    } else if (accumulated.rfind("<system>", 0) == 0) {
-        closing_tag = "</system>";
-    }
-
-    if (closing_tag.empty()) {
-        return 0;
-    }
+    const char* decoded_closing_tag = systemClosingTag(accumulated);
+    if (decoded_closing_tag == nullptr || std::strcmp(closing_tag, decoded_closing_tag) != 0) return 0;
 
     const size_t end_tag = accumulated.find(closing_tag);
     if (end_tag == std::string::npos) {
         return 0;
     }
-    const size_t system_end_pos = end_tag + closing_tag.size();
+    const size_t system_end_pos = end_tag + std::strlen(closing_tag);
 
     for (size_t i = 0; i < token_end_offsets.size(); i++) {
         if (token_end_offsets[i] >= system_end_pos) {
@@ -664,17 +673,16 @@ CacheIdentity makeCacheIdentity(const ModelRuntime& runtime) {
     return identity;
 }
 
-// PIR-05: explicit, clamped system-prefix boundary. The detection heuristic is
-// unchanged, but it is only ever applied to a prompt that is about to be fully
-// evaluated, and the result is clamped to the token count that will actually be
-// committed so a partial decode can never leave an out-of-range prefix that a
-// later shift would trust.
+// PIR-05: apply the system-prefix heuristic to the prompt being evaluated and
+// clamp it to the token count actually committed. A partial decode must never
+// leave an out-of-range prefix that a later shift would trust.
 int computeSystemPrefixLength(const std::vector<llama_token>& tokens, std::size_t limit,
-                              const llama_vocab* vocab) {
+                              const llama_vocab* vocab, const std::string& formatted_prompt,
+                              bool add_special) {
     if (limit == 0) {
         return 0;
     }
-    const int detected = findSystemPrefixLength(tokens, vocab);
+    const int detected = findSystemPrefixLength(tokens, vocab, formatted_prompt, add_special);
     return static_cast<int>(std::min(static_cast<std::size_t>(detected), limit));
 }
 
@@ -1341,7 +1349,8 @@ struct Engine::Impl {
             logCacheIdentity("prefix_decision", cache_identity, runtime->conversation);
 
             runtime->system_prefix_length = computeSystemPrefixLength(
-                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab);
+                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab,
+                formatted_prompt, add_special);
 
             int32_t tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
 
@@ -1381,7 +1390,8 @@ struct Engine::Impl {
 
             // Restore the current prompt's prefix metadata after any reset/shift.
             runtime->system_prefix_length = computeSystemPrefixLength(
-                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab);
+                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab,
+                formatted_prompt, add_special);
 
             // PIR-05: an all-cached request samples from logits left by a prior
             // decode. If the prefix was truncated (a tail was removed) those logits
@@ -1430,7 +1440,8 @@ struct Engine::Impl {
                             runtime->current_position = usable_prompt_tokens;
                             runtime->active_tokens = prompt_tokens;
                             runtime->system_prefix_length = computeSystemPrefixLength(
-                                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab);
+                                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab,
+                                formatted_prompt, add_special);
                             runtime->conversation.markCommitted(cache_identity_key, runtime->current_position, true);
                             LOGI("prefix_cache_retry_success prompt_tokens=%d", usable_prompt_tokens);
                         } else {

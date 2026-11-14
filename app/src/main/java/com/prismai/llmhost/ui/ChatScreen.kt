@@ -894,6 +894,7 @@ fun ChatScreen(
                             ) {
                                 MemoryBrowser(
                                     memories = memories,
+                                    currentChatId = currentChatId,
                                     onDelete = { id -> service?.deleteMemory(id) },
                                     onRefresh = { service?.refreshMemories() },
                                     onAddMemory = { fact, category -> service?.addMemory(fact, category) },

@@ -36,7 +36,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,6 +49,7 @@ import kotlin.math.roundToInt
 @Composable
 internal fun MemoryBrowser(
     memories: List<MemoryFact>,
+    currentChatId: String?,
     onDelete: (String) -> Unit,
     onRefresh: () -> Unit,
     onAddMemory: ((String, MemoryCategory) -> Unit)? = null,
@@ -60,27 +60,40 @@ internal fun MemoryBrowser(
     var newFactText by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf(MemoryCategory.GENERAL) }
     var categoryDropdownExpanded by remember { mutableStateOf(false) }
+    var showAll by remember { mutableStateOf(false) }
 
-    val filteredMemories by remember {
-        derivedStateOf {
-            if (searchQuery.isBlank()) memories
-            else memories.filter { it.fact.contains(searchQuery, ignoreCase = true) }
+    val filteredMemories = remember(memories, currentChatId, searchQuery, showAll) {
+        memories.filter { fact ->
+            (showAll || (!currentChatId.isNullOrBlank() && fact.sourceChatId == currentChatId)) &&
+                (searchQuery.isBlank() || fact.fact.contains(searchQuery, ignoreCase = true))
         }
     }
 
     DashboardCard {
         SectionHeader(
             title = "Memory",
-            subtitle = "${memories.size} facts stored",
+            subtitle = "Facts are used only in their source chat",
             action = {
                 Button(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    enabled = !currentChatId.isNullOrBlank(),
                     onClick = { showAddDialog = true },
                 ) {
                     Text("+ Add Fact", maxLines = 1, softWrap = false)
                 }
             },
         )
+
+        TextButton(onClick = { showAll = !showAll }) {
+            Text(if (showAll) "Show this chat" else "Manage all saved facts")
+        }
+        if (showAll) {
+            Text(
+                text = "Facts from other chats and older unscoped facts are not used in this chat.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         OutlinedTextField(
             value = searchQuery,
@@ -93,7 +106,7 @@ internal fun MemoryBrowser(
 
         if (filteredMemories.isEmpty()) {
             Text(
-                text = "No memories stored yet. Memories are extracted automatically or can be added manually above.",
+                text = "No saved facts for this view. Add a fact for this chat above.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(vertical = 8.dp),
@@ -106,6 +119,11 @@ internal fun MemoryBrowser(
                 items(filteredMemories, key = { it.id }) { memory ->
                     MemoryFactRow(
                         fact = memory,
+                        scopeLabel = when {
+                            memory.sourceChatId == null -> "Unscoped older fact"
+                            memory.sourceChatId == currentChatId -> "This chat"
+                            else -> "Another chat"
+                        },
                         onDelete = { deleteTarget = memory },
                     )
                 }
@@ -156,7 +174,7 @@ internal fun MemoryBrowser(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        text = "Manual memories initialize at 85% confidence until reinforced.",
+                        text = "This fact is saved for the current chat and used only when relevant.",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -222,6 +240,7 @@ internal fun MemoryBrowser(
 @Composable
 private fun MemoryFactRow(
     fact: MemoryFact,
+    scopeLabel: String,
     onDelete: () -> Unit,
 ) {
     val categoryColor = when (fact.category) {
@@ -269,6 +288,7 @@ private fun MemoryFactRow(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface,
             )
+            Text(scopeLabel, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         TextButton(
             onClick = onDelete,

@@ -205,7 +205,7 @@ class GenerationOrchestrator(
             }
         }
         val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
-        val memoryContext = if (benchmarkPreset == null && selectedDocumentId == null) promptBuilder.buildMemoryContext(prompt) else ""
+        val memoryContext = if (benchmarkPreset == null && selectedDocumentId == null) promptBuilder.buildMemoryContext(prompt, uiState.currentChatId.value) else ""
         return SendAcceptance.forChat(
             currentModel = uiState.currentModel.value,
             settings = settings,
@@ -244,7 +244,7 @@ class GenerationOrchestrator(
         // newly refused here.
         val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
         val agentEnabled = settings.agentEnabled
-        val memoryContext = if (benchmarkPreset == null && selectedDocumentId == null) promptBuilder.buildMemoryContext(prompt) else ""
+        val memoryContext = if (benchmarkPreset == null && selectedDocumentId == null) promptBuilder.buildMemoryContext(prompt, uiState.currentChatId.value) else ""
         val acceptance = evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId)
         if (!acceptance.accepted) {
             refuseLaunch(acceptance.reason ?: "Request refused")

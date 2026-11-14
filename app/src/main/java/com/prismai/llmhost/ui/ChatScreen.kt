@@ -193,6 +193,7 @@ fun ChatScreen(
                         val recoveryTranscript by (service?.recoveryTranscript ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
                         val chatSessions by (service?.chatSessions ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = emptyList())
                         val currentChatId by (service?.currentChatId ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
+                        var selectedDocumentId by remember(currentChatId) { mutableStateOf<String?>(null) }
                         val transcript by (service?.transcript ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = emptyList())
                         val generationSettings by (service?.generationSettings ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = GenerationSettings()
@@ -695,6 +696,21 @@ fun ChatScreen(
                             Spacer(modifier = Modifier.height(8.dp))
                         }
 
+                        selectedDocumentId?.let { documentId ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "Asking document: $documentId",
+                                    modifier = Modifier.weight(1f),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 1,
+                                )
+                                TextButton(onClick = { selectedDocumentId = null }) { Text("Clear") }
+                            }
+                        }
+
                         PromptComposer(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -708,7 +724,8 @@ fun ChatScreen(
                             attachments = attachments,
                             isShortHeight = isShortHeight,
                             canContinue = generationPerformance?.terminalReason == "MAX_TOKENS" &&
-                                transcript.lastOrNull()?.role == TranscriptRole.ASSISTANT,
+                                transcript.lastOrNull()?.role == TranscriptRole.ASSISTANT &&
+                                transcript.lastOrNull()?.documentScope == null,
                             onPromptChange = { prompt = it },
                             onAddAttachment = {
                                 onImportPickerStarted()
@@ -733,6 +750,7 @@ fun ChatScreen(
                                         snackbarMessage = "Service unavailable"
                                     } else {
                                         val originatingChatId = currentChatId
+                                        val originatingDocumentId = selectedDocumentId
                                         val originatingPrompt = prompt
                                         val originatingAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode)
                                         val sendToken = java.util.UUID.randomUUID().toString()
@@ -741,6 +759,7 @@ fun ChatScreen(
                                             prompt = text,
                                             sourceChatId = originatingChatId,
                                             sendToken = sendToken,
+                                            selectedDocumentId = originatingDocumentId,
                                             onAccepted = {
                                                 scope.launch {
                                                     isSending = false
@@ -911,6 +930,10 @@ fun ChatScreen(
                                         service?.queryVectorStore(query) ?: emptyList()
                                     },
                                     onRefresh = { service?.refreshVectorStore() },
+                                    onSelectDocument = { documentId ->
+                                        selectedDocumentId = documentId
+                                        ragBrowserVisible = false
+                                    },
                                 )
                             }
                         }

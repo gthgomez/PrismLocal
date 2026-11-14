@@ -57,6 +57,7 @@ fun DocumentBrowser(
     onQueryVectorStore: suspend (query: String) -> List<Pair<VectorChunk, Float>>,
     onRefresh: () -> Unit,
     onDeleteStaleDocuments: () -> Unit,
+    onSelectDocument: (documentId: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val coroutineScope = rememberCoroutineScope()
@@ -247,6 +248,8 @@ fun DocumentBrowser(
                         searchableChunkCount = doc.searchableChunkCount,
                         legacyChunkCount = doc.legacyChunkCount,
                         previewText = doc.previewText,
+                        canSelect = doc.fullySearchable,
+                        onSelect = { onSelectDocument(doc.documentId) },
                         onDelete = { deleteTargetDocId = doc.documentId },
                     )
                 }
@@ -414,6 +417,8 @@ private fun DocumentSummaryRow(
     searchableChunkCount: Int,
     legacyChunkCount: Int = 0,
     previewText: String,
+    canSelect: Boolean,
+    onSelect: () -> Unit,
     onDelete: () -> Unit,
 ) {
     Row(
@@ -465,6 +470,9 @@ private fun DocumentSummaryRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+        }
+        TextButton(onClick = onSelect, enabled = canSelect, contentPadding = PaddingValues(horizontal = 4.dp)) {
+            Text("Ask")
         }
         TextButton(
             onClick = onDelete,

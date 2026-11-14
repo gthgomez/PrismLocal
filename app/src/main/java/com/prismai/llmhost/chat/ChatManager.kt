@@ -379,7 +379,7 @@ class ChatManager(
      * Appends a message to the current transcript, auto-creating a chat if
      * none exists. Returns the assigned message id.
      */
-    fun appendTranscriptMessage(role: TranscriptRole, text: String): Long {
+    fun appendTranscriptMessage(role: TranscriptRole, text: String, documentScope: String? = null): Long {
         if (uiState._currentChatId.value == null) {
             createChat()
         }
@@ -393,7 +393,7 @@ class ChatManager(
                     ?.takeIf { it.isNotBlank() }
             } else null
             val mutable = uiState._transcript.value.toMutableList()
-            mutable.add(TranscriptMessage(id, role, text, sum))
+            mutable.add(TranscriptMessage(id, role, text, sum, documentScope = documentScope))
             uiState._transcript.value = mutable
         }
         touchCurrentChat(uiState._transcript.value, updateTitle = role == TranscriptRole.USER)

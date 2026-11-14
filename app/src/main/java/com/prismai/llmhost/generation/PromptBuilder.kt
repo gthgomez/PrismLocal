@@ -47,7 +47,7 @@ class PromptBuilder(
                 }
             }
             val history = transcript.filter { message ->
-                message.text.isNotBlank() && message.id != activeAssistantTranscriptId
+                message.text.isNotBlank() && message.id != activeAssistantTranscriptId && message.documentScope == null
             }
             val selected = ArrayDeque<TranscriptMessage>()
             var estimatedTokens = GenerationBudget.estimateTokens(newPrompt) +
@@ -97,6 +97,11 @@ class PromptBuilder(
         }.getOrDefault("")
     }
 
+    internal suspend fun buildDocumentAnswerContext(userPrompt: String, documentId: String): DocumentAnswerContext {
+        val rag = checkNotNull(ragManager) { "Document search is unavailable" }
+        return DocumentAnswerContext.create(documentId, rag.queryDocument(userPrompt, documentId))
+    }
+
     // ── Full prompt with recent context ─────────────────────────────────
 
     fun buildPromptWithRecentContext(
@@ -107,7 +112,7 @@ class PromptBuilder(
     ): String {
         val memoryContext = buildMemoryContext(newPrompt)
         val history = transcript.filter { message ->
-            message.text.isNotBlank() && message.id != activeAssistantTranscriptId
+            message.text.isNotBlank() && message.id != activeAssistantTranscriptId && message.documentScope == null
         }
         if (history.isEmpty() && memoryContext.isEmpty()) {
             return newPrompt

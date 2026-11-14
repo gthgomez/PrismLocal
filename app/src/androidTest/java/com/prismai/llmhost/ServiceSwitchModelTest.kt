@@ -17,17 +17,62 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class ServiceSwitchModelTest {
+    @Test
+    fun storedDocumentsReturnAfterServiceRestartAndModelReload() = runBlocking {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val intent = Intent(context, InferenceService::class.java)
+        val documentId = "service-restart-${UUID.randomUUID()}"
+        val store = VectorStore(context)
+        val identity = EmbeddingIdentity.of(
+            "0cbe6769faaa77f4cdbf2f39dbc5f0fb9b3d62f7f9bc5760aa364946e6f2d0f5",
+            VectorStore.EMBEDDING_REVISION,
+        )
+        context.stopService(intent)
+        stageModel(instrumentation, "modelA")
+        store.replaceDocument(
+            documentId,
+            listOf(VectorChunk("$documentId:0", documentId, 0, "Stored restart fixture", FloatArray(64) { if (it == 0) 1f else 0f })),
+            identity,
+        )
+        var first: BoundService? = null
+        var second: BoundService? = null
+        try {
+            val firstBound = bindService(context)
+            first = firstBound
+            withTimeout(15_000) { firstBound.service.vectorDocuments.first { rows -> rows.any { it.documentId == documentId } } }
+            assertTrue(firstBound.service.switchModel("modelA"))
+            withTimeout(15_000) { firstBound.service.vectorDocuments.first { rows -> rows.any { it.documentId == documentId && it.fullySearchable } } }
+            context.unbindService(firstBound.connection)
+            first = null
+            context.stopService(intent)
+            delay(500)
+
+            val secondBound = bindService(context)
+            second = secondBound
+            assertNotSame("the regression must exercise a new service instance", firstBound.service, secondBound.service)
+            withTimeout(15_000) { secondBound.service.vectorDocuments.first { rows -> rows.any { it.documentId == documentId && it.fullySearchable } } }
+        } finally {
+            first?.let { context.unbindService(it.connection) }
+            second?.let { context.unbindService(it.connection) }
+            store.deleteByDocument(documentId)
+        }
+    }
+
     @Test
     fun switchModelLoadsStagedModel() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()

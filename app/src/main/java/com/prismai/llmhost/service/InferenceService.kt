@@ -1990,11 +1990,17 @@ class InferenceService : Service() {
 
     /** Public API for the memory browser UI. Adds a manual memory fact and refreshes the observable list. */
     fun addMemory(fact: String, category: MemoryCategory = MemoryCategory.GENERAL, confidence: Float = 0.85f) {
+        val chatId = _currentChatId.value
+        if (chatId.isNullOrBlank()) {
+            publishUiEvent("Open a chat before saving a memory")
+            return
+        }
         memoryStore.insert(
             MemoryFact(
                 fact = fact,
                 category = category,
                 confidence = confidence,
+                sourceChatId = chatId,
             )
         )
         refreshMemoriesList()

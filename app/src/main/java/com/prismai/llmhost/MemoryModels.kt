@@ -175,6 +175,18 @@ object MemoryRetriever {
     /** Minimum relevance score for a memory to be injected. */
     const val MIN_RELEVANCE_SCORE = 0.15f
 
+    /** Unscoped legacy facts remain stored, but are never injected into a chat. */
+    fun forChat(memories: List<MemoryFact>, chatId: String?): List<MemoryFact> =
+        if (chatId.isNullOrBlank()) emptyList()
+        else memories.filter { !it.decayed && it.sourceChatId == chatId }
+
+    fun queryForChat(query: String, memories: List<MemoryFact>, chatId: String?, limit: Int): List<MemoryMatch> =
+        forChat(memories, chatId)
+            .map { MemoryMatch(it, score(query, it.fact)) }
+            .filter { it.score > 0f }
+            .sortedByDescending { it.score }
+            .take(limit.coerceAtLeast(0))
+
     /**
      * Score a fact against a query using token overlap.
      * Returns 0-1 where higher = more relevant.
@@ -212,7 +224,7 @@ object MemoryRetriever {
         if (matches.isEmpty()) return ""
 
         return buildString {
-            appendLine("Relevant information about the user (from previous conversations):")
+            appendLine("Relevant information saved for this chat:")
             matches.forEach { match ->
                 appendLine("- ${match.fact.cleanFact()}")
             }

@@ -81,9 +81,9 @@ class PromptBuilder(
 
     // ── Memory context ──────────────────────────────────────────────────
 
-    fun buildMemoryContext(userPrompt: String): String {
+    fun buildMemoryContext(userPrompt: String, sourceChatId: String? = null): String {
         val memories = runCatching { memoryStore.getAllActive() }.getOrDefault(emptyList())
-        return MemoryRetriever.buildMemoryContext(userPrompt, memories)
+        return MemoryRetriever.buildMemoryContext(userPrompt, MemoryRetriever.forChat(memories, sourceChatId))
     }
 
     // ── RAG context ─────────────────────────────────────────────────────
@@ -109,8 +109,9 @@ class PromptBuilder(
         transcript: List<TranscriptMessage>,
         activeAssistantTranscriptId: Long?,
         tokenBudget: Int = DEFAULT_TOKEN_BUDGET,
+        sourceChatId: String? = null,
     ): String {
-        val memoryContext = buildMemoryContext(newPrompt)
+        val memoryContext = buildMemoryContext(newPrompt, sourceChatId)
         val history = transcript.filter { message ->
             message.text.isNotBlank() && message.id != activeAssistantTranscriptId && message.documentScope == null
         }

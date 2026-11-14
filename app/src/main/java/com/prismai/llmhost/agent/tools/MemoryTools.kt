@@ -18,12 +18,14 @@ class MemoryTools(
 ) {
     fun rememberFact(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "User confirmation required to store a fact")
+        val chatId = currentChatId()?.takeIf { it.isNotBlank() }
+            ?: return toolFailure(call, AgentToolErrorCode.FAILED, "Open a chat before saving a memory")
         val factText = call.arguments.optString("fact").trim().take(300)
         if (factText.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Fact text is required")
         val category = runCatching {
             MemoryCategory.valueOf(call.arguments.optString("category", "GENERAL").uppercase())
         }.getOrDefault(MemoryCategory.GENERAL)
-        val existing = memoryStore.queryRelevant(factText, limit = 3)
+        val existing = MemoryRetriever.queryForChat(factText, memoryStore.getAllActive(), chatId, limit = 3)
         if (existing.isNotEmpty() && existing.first().score > 0.75f) {
             val updated = memoryStore.update(existing.first().fact.id, factText, existing.first().fact.confidence)
             if (updated) refreshMemoriesList()
@@ -34,7 +36,7 @@ class MemoryTools(
                 toolFailure(call, AgentToolErrorCode.FAILED, "Failed to update memory")
             }
         }
-        val fact = MemoryFact(fact = factText, category = category, confidence = 0.6f, sourceChatId = currentChatId())
+        val fact = MemoryFact(fact = factText, category = category, confidence = 0.6f, sourceChatId = chatId)
         val stored = memoryStore.insert(fact)
         refreshMemoriesList()
         return toolSuccess(call, "Stored: ${factText.take(80)}",
@@ -45,7 +47,7 @@ class MemoryTools(
         val query = call.arguments.optString("query").trim().take(200)
         if (query.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Query is required")
         val maxResults = call.arguments.optInt("max_results", 5).coerceIn(1, 10)
-        val matches = memoryStore.queryRelevant(query, limit = maxResults)
+        val matches = MemoryRetriever.queryForChat(query, memoryStore.getAllActive(), currentChatId(), limit = maxResults)
         val resultsArray = JSONArray()
         matches.forEach { match ->
             resultsArray.put(JSONObject()
@@ -61,6 +63,9 @@ class MemoryTools(
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "User confirmation required to delete a memory")
         val factId = call.arguments.optString("fact_id").trim().take(20)
         if (factId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "fact_id is required")
+        if (MemoryRetriever.forChat(memoryStore.getAllActive(), currentChatId()).none { it.id == factId }) {
+            return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "No memory found with id: $factId")
+        }
         val deleted = memoryStore.delete(factId)
         if (deleted) refreshMemoriesList()
         return if (deleted) {
@@ -73,7 +78,7 @@ class MemoryTools(
     fun listMemories(call: AgentToolCall): AgentToolResult {
         val categoryFilter = call.arguments.optString("category", "all").lowercase()
         val limit = call.arguments.optInt("limit", 30).coerceIn(5, 100)
-        val allActive = memoryStore.getAllActive()
+        val allActive = MemoryRetriever.forChat(memoryStore.getAllActive(), currentChatId())
         val filtered = if (categoryFilter == "all") {
             allActive
         } else {

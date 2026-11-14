@@ -83,10 +83,13 @@ class RealInferenceSmokeTest {
     fun realGenerationCompactionPreservesExplicitSystemPrefix() = runBlocking {
         val model = requireTinyModel()
         val settings = GenerationSettings(
-            maxTokens = 1,
+            maxTokens = 8,
             threadCount = 2,
             contextLength = 512,
             batchSize = 128,
+            temperature = 0f,
+            topK = 1,
+            repeatPenalty = 1f,
         )
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {
@@ -101,8 +104,8 @@ class RealInferenceSmokeTest {
 
             val first = engine.generate(explicitSystemPrompt, settings).toList()
             assertTrue("first generation did not terminate normally", first.any { it.isTerminal && it.terminalReason != "ERROR" })
-            assertTrue("first generation emitted no tokens", first.sumOf { it.tokenCount } >= 1)
-            assertTrue("prompt did not force a continuation shift", first.maxOf { it.promptTokens } in 494..503)
+            assertTrue("first generation did not fill enough context", first.sumOf { it.tokenCount } >= 5)
+            assertEquals("unexpected system-prompt fixture token count", 492, first.maxOf { it.promptTokens })
 
             val continued = engine.generate("", settings, continueFromContext = true).toList()
             assertTrue("continued generation emitted no tokens", continued.sumOf { it.tokenCount } >= 1)
@@ -117,10 +120,13 @@ class RealInferenceSmokeTest {
     fun realUserOnlyPromptDoesNotInferSystemPrefix() = runBlocking {
         val model = requireTinyModel()
         val settings = GenerationSettings(
-            maxTokens = 1,
+            maxTokens = 8,
             threadCount = 2,
             contextLength = 512,
             batchSize = 128,
+            temperature = 0f,
+            topK = 1,
+            repeatPenalty = 1f,
         )
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {
@@ -132,7 +138,7 @@ class RealInferenceSmokeTest {
             val first = engine.generate(userPrompt, settings).toList()
             assertTrue("user-only generation did not terminate normally", first.any { it.isTerminal && it.terminalReason != "ERROR" })
             assertTrue("user-only generation emitted no tokens", first.sumOf { it.tokenCount } >= 1)
-            assertTrue("prompt did not force a continuation shift", first.maxOf { it.promptTokens } in 494..503)
+            assertEquals("unexpected boundary fixture token count", 496, first.maxOf { it.promptTokens })
 
             val continued = engine.generate("", settings, continueFromContext = true).toList()
             assertTrue("user-only continuation emitted no tokens", continued.sumOf { it.tokenCount } >= 1)

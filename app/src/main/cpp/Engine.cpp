@@ -746,6 +746,7 @@ void shrinkCommittedPrefix(ModelRuntime& runtime, const std::string& identity,
     runtime.conversation.markCommitted(identity, common_prefix, /*logits_valid=*/false);
 }
 
+// required_tokens excludes headroom: the limit below already reserves it, just as prompt admission does.
 bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, bool allow_full_reset,
                                  const CacheIdentity& cache_identity) {
     if (runtime.ctx == nullptr) {
@@ -760,14 +761,14 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
             LOGW("kv_shift_unverified_state; forcing full reset");
             logCacheIdentity("shift_unverified_reset", cache_identity, runtime.conversation);
             resetRuntimeContext(runtime, false);
-            return required_tokens < static_cast<llama_pos>(runtime.context_length - kContextHeadroom);
+            return required_tokens <= static_cast<llama_pos>(runtime.context_length - kContextHeadroom);
         }
         LOGW("kv_shift_unverified_state; refusing to shift uncommitted context");
         return false;
     }
 
     const llama_pos limit = static_cast<llama_pos>(runtime.context_length - kContextHeadroom);
-    if (runtime.current_position + required_tokens < limit) {
+    if (runtime.current_position + required_tokens <= limit) {
         return true;
     }
 
@@ -777,7 +778,7 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
     if (available_tokens <= 0) {
         if (allow_full_reset) {
             resetRuntimeContext(runtime, false);
-            return required_tokens < limit;
+            return required_tokens <= limit;
         }
         return false;
     }
@@ -802,7 +803,7 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
             LOGW("KV compaction token range mismatch: prefix=%d drop=%d active=%zu",
                  system_prefix_tokens, drop_count, runtime.active_tokens.size());
             resetRuntimeContext(runtime, false);
-            return allow_full_reset && required_tokens < limit;
+            return allow_full_reset && required_tokens <= limit;
         }
         runtime.active_tokens.erase(runtime.active_tokens.begin() + system_prefix_tokens,
                                     runtime.active_tokens.begin() + system_prefix_tokens + drop_count);
@@ -811,7 +812,7 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
             LOGW("KV compaction position mismatch: pos=%d active=%zu; resetting context",
                  static_cast<int>(runtime.current_position), runtime.active_tokens.size());
             resetRuntimeContext(runtime, false);
-            return allow_full_reset && required_tokens < limit;
+            return allow_full_reset && required_tokens <= limit;
         }
         assert(runtime.current_position == static_cast<llama_pos>(runtime.active_tokens.size()));
         // PIR-05: the compacted remainder is a proven committed prefix. The tail
@@ -826,11 +827,11 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
         LOGW("llama_memory_seq_rm failed; allow_full_reset=%s", allow_full_reset ? "true" : "false");
         if (allow_full_reset) {
             resetRuntimeContext(runtime, false);
-            return required_tokens < limit;
+            return required_tokens <= limit;
         }
         return false;
     }
-    return (runtime.current_position + required_tokens) < limit;
+    return (runtime.current_position + required_tokens) <= limit;
 }
 
 // Returns:
@@ -1219,7 +1220,7 @@ struct Engine::Impl {
                 finishSession(session, StreamState::Error);
                 return;
             }
-            if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens + kContextHeadroom, false,
+            if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens, false,
                                              cache_identity)) {
                 ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::CONTEXT_SHIFT_FAILED), std::memory_order_release);
                 LOGE("continue_context_shift_failed n_ctx=%d current_position=%d required=%d",
@@ -1344,7 +1345,7 @@ struct Engine::Impl {
 
             int32_t tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
 
-            if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens + kContextHeadroom, true,
+            if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens, true,
                                              cache_identity)) {
                 ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::CONTEXT_SHIFT_FAILED), std::memory_order_release);
                 LOGE("context_shift_failed n_ctx=%d current_position=%d required=%d",

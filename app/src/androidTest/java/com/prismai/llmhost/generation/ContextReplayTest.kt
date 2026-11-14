@@ -69,8 +69,8 @@ class ContextReplayTest {
 
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {
-            assumeTrue(
-                "GGUF fixture failed to load; skipping device context-replay test",
+            assertTrue(
+                "The selected GGUF fixture failed to load: ${fixture.absolutePath}",
                 engine.loadModel(fixture.absolutePath, GREEDY_SETTINGS),
             )
 
@@ -163,8 +163,10 @@ class ContextReplayTest {
         )
     }
 
-    /** An installed model if present, else the smallest `.gguf` pushed on device. */
+    /** An explicit fixture first, then an installed model or the smallest pushed `.gguf`. */
     private fun smallestAvailableModel(): File? {
+        val explicit = InstrumentationRegistry.getArguments().getString("prismContextModelPath")
+        if (!explicit.isNullOrBlank()) return File(explicit)
         val context = InstrumentationRegistry.getInstrumentation().targetContext
 
         val installed = ModelStorageManager(context)

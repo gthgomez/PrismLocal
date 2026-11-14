@@ -91,7 +91,9 @@ class RealInferenceSmokeTest {
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {
             assertTrue("real model failed to load", engine.loadModel(model.file.absolutePath, settings))
-            val repeatedContext = "Remember this context item for the next response. ".repeat(40)
+            // Keep the initial prompt inside the native headroom while filling enough of the
+            // context that the continuation must use the sliding-window path.
+            val repeatedContext = "Remember this context item for the next response. ".repeat(49)
             val explicitSystemPrompt =
                 "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n" +
                     "<|im_start|>user\n$repeatedContext<|im_end|>\n" +
@@ -99,6 +101,8 @@ class RealInferenceSmokeTest {
 
             val first = engine.generate(explicitSystemPrompt, settings).toList()
             assertTrue("first generation did not terminate normally", first.any { it.isTerminal && it.terminalReason != "ERROR" })
+            assertTrue("first generation emitted no tokens", first.sumOf { it.tokenCount } >= 1)
+            assertTrue("prompt did not force a continuation shift", first.maxOf { it.promptTokens } in 494..503)
 
             val continued = engine.generate("", settings, continueFromContext = true).toList()
             assertTrue("continued generation emitted no tokens", continued.sumOf { it.tokenCount } >= 1)
@@ -123,10 +127,12 @@ class RealInferenceSmokeTest {
             assertTrue("real model failed to load", engine.loadModel(model.file.absolutePath, settings))
             val userPrompt =
                 "<|im_start|>user\n" +
-                    "This is a user-only prompt with no system role. " .repeat(40) +
+                    "This is a user-only prompt with no system role. ".repeat(39) +
                     "<|im_end|>\n<|im_start|>assistant\n"
             val first = engine.generate(userPrompt, settings).toList()
             assertTrue("user-only generation did not terminate normally", first.any { it.isTerminal && it.terminalReason != "ERROR" })
+            assertTrue("user-only generation emitted no tokens", first.sumOf { it.tokenCount } >= 1)
+            assertTrue("prompt did not force a continuation shift", first.maxOf { it.promptTokens } in 494..503)
 
             val continued = engine.generate("", settings, continueFromContext = true).toList()
             assertTrue("user-only continuation emitted no tokens", continued.sumOf { it.tokenCount } >= 1)

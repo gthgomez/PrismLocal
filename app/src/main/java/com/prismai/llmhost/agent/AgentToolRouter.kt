@@ -632,6 +632,8 @@ class AgentToolRouter(
 
     fun shouldContinueAfterTool(call: AgentToolCall): Boolean =
         when (call.name) {
+            // A follow-up reuses the pre-deletion original prompt, which can contain the forgotten fact.
+            "forget_fact" -> false
             "set_runtime_settings",
             "restore_previous_runtime_settings",
             "rename_current_chat",
@@ -643,7 +645,6 @@ class AgentToolRouter(
             "cancel_active_job",
             "cancel_active_operation",
             "remember_fact",
-            "forget_fact",
             // Phase 2 RAG
             "ingest_document",
             "delete_document",

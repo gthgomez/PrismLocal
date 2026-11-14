@@ -51,7 +51,7 @@ class PromptBuilder(
                     append(memoryContext)
                 }
             }
-            val history = transcript.filter { message ->
+            val history = transcript.sinceContextBoundary().filter { message ->
                 message.text.isNotBlank() && message.id != activeAssistantTranscriptId && message.documentScope == null
             }
             val selected = ArrayDeque<TranscriptMessage>()
@@ -122,7 +122,7 @@ class PromptBuilder(
         sourceChatId: String? = null,
     ): String {
         val memoryContext = buildMemoryContext(newPrompt, sourceChatId)
-        val history = transcript.filter { message ->
+        val history = transcript.sinceContextBoundary().filter { message ->
             message.text.isNotBlank() && message.id != activeAssistantTranscriptId && message.documentScope == null
         }
         if (history.isEmpty() && memoryContext.isEmpty()) {

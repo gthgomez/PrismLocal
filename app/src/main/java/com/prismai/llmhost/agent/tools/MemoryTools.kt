@@ -15,6 +15,7 @@ class MemoryTools(
     private val memoryStore: SqlMemoryStore,
     private val currentChatId: () -> String?,
     private val refreshMemoriesList: () -> Unit,
+    private val deleteMemory: suspend (String) -> Boolean,
 ) {
     fun rememberFact(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "User confirmation required to store a fact")
@@ -59,19 +60,18 @@ class MemoryTools(
             JSONObject().put("query", query).put("matches", resultsArray).put("untrusted_data", true))
     }
 
-    fun forgetFact(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
+    suspend fun forgetFact(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "User confirmation required to delete a memory")
         val factId = call.arguments.optString("fact_id").trim().take(20)
         if (factId.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "fact_id is required")
         if (MemoryRetriever.forChat(memoryStore.getAllActive(), currentChatId()).none { it.id == factId }) {
             return toolFailure(call, AgentToolErrorCode.NOT_FOUND, "No memory found with id: $factId")
         }
-        val deleted = memoryStore.delete(factId)
-        if (deleted) refreshMemoriesList()
+        val deleted = deleteMemory(factId)
         return if (deleted) {
             toolSuccess(call, "Memory deleted", JSONObject().put("deleted", true).put("fact_id", factId))
         } else {
-            toolFailure(call, AgentToolErrorCode.NOT_FOUND, "No memory found with id: $factId")
+            toolFailure(call, AgentToolErrorCode.FAILED, "Could not delete memory safely; check the app for details")
         }
     }
 

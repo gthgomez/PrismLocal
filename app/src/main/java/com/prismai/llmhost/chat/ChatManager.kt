@@ -428,6 +428,25 @@ class ChatManager(
         // persisted on append/rename/delete instead.
     }
 
+    /**
+     * Start a fresh model context without removing visible messages. Publish the boundary
+     * before deleting a saved fact, so a restart cannot replay an older answer using it.
+     */
+    fun markContextBoundaryForCurrentChat(chatId: String): Boolean = synchronized(lock) {
+        if (uiState._currentChatId.value != chatId || uiState._isGenerating.value) return@synchronized false
+        val messages = uiState._transcript.value
+        if (messages.isEmpty() || messages.last().contextBoundaryAfter) return@synchronized true
+        val updated = messages.dropLast(1) + messages.last().copy(contextBoundaryAfter = true)
+        runCatching {
+            transcriptWriteGate.invalidateAndRun(chatId) {
+                transcriptStore.writeTranscriptFile(transcriptStore.transcriptFile(chatId), updated)
+                uiState._transcript.value = updated
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "failed to persist memory context boundary", error)
+        }.isSuccess
+    }
+
     // ── Persist transcript to disk (thread-safe under ioMutex) ─────────────
 
     /** Persists transcript messages for [chatId] under [ioMutex] to avoid disk races. */

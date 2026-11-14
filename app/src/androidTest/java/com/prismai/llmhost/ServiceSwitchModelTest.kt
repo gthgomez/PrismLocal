@@ -15,6 +15,7 @@ import android.net.Uri
 import android.os.IBinder
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.prismai.llmhost.chat.TranscriptStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -31,6 +32,52 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class ServiceSwitchModelTest {
+    @Test
+    fun deletingChatMemoryPersistsContextBoundaryWithoutErasingMessages() = runBlocking {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        stageModel(instrumentation, "modelA")
+        val bound = bindService(context)
+        val previousSettings = bound.service.generationSettings.value
+        var chatId: String? = null
+        var factId: String? = null
+        val uniqueFact = "Synthetic deletion ${UUID.randomUUID()}"
+        try {
+            val service = bound.service
+            val previousChat = service.currentChatId.value
+            service.createChat()
+            chatId = withTimeout(15_000) { service.currentChatId.first { it != null && it != previousChat } }
+            assertTrue(service.switchModel("modelA"))
+            service.updateGenerationSettings(GenerationSettings(maxTokens = 8, threadCount = 1))
+            service.generateSafely("Hello from the memory boundary test")
+            withTimeout(60_000) {
+                service.transcript.first { messages -> messages.any { it.role == TranscriptRole.ASSISTANT && it.text.isNotBlank() } }
+                service.isGenerating.first { !it }
+            }
+            val before = service.transcript.value
+            assertTrue(before.any { it.role == TranscriptRole.ASSISTANT && it.text.isNotBlank() })
+            service.addMemory(uniqueFact, MemoryCategory.PREFERENCE)
+            val fact = service.memories.value.first { it.fact == uniqueFact && it.sourceChatId == chatId }
+            factId = fact.id
+
+            assertTrue(service.deleteMemory(fact.id))
+            assertTrue(service.memories.value.none { it.id == fact.id })
+            assertEquals(before.map { it.text }, service.transcript.value.map { it.text })
+            assertTrue(service.transcript.value.last().contextBoundaryAfter)
+            val store = TranscriptStore(context)
+            val restored = store.readTranscriptFile(store.transcriptFile(requireNotNull(chatId)))
+            assertEquals(before.map { it.text }, restored.map { it.text })
+            assertTrue(restored.last().contextBoundaryAfter)
+        } finally {
+            bound.service.cancelGeneration()
+            waitForGenerating(bound.service, expected = false)
+            bound.service.updateGenerationSettings(previousSettings)
+            factId?.let { SqlMemoryStore(context).delete(it) }
+            chatId?.let { bound.service.deleteChat(it) }
+            context.unbindService(bound.connection)
+        }
+    }
+
     @Test
     fun storedDocumentsReturnAfterServiceRestartAndModelReload() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()

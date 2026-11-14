@@ -75,6 +75,7 @@ class TranscriptStore(private val context: Context) {
                             text = item.optString("text", ""),
                             summary = item.optString("summary").takeIf { it.isNotBlank() },
                             documentScope = item.optString("documentScope").takeIf { it.isNotBlank() },
+                            contextBoundaryAfter = item.optBoolean("contextBoundaryAfter", false),
                         )
                     )
                 }
@@ -105,6 +106,9 @@ class TranscriptStore(private val context: Context) {
             }
             if (message.documentScope != null) {
                 obj.put("documentScope", message.documentScope)
+            }
+            if (message.contextBoundaryAfter) {
+                obj.put("contextBoundaryAfter", true)
             }
             array.put(obj)
         }

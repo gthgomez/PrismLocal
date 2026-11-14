@@ -622,6 +622,7 @@ class InferenceService : Service() {
             memoryStore = memoryStore,
             currentChatId = { _currentChatId.value },
             refreshMemoriesList = { refreshMemoriesList() },
+            deleteMemory = { id -> deleteMemorySafely(id, fromAgent = true) },
         )
         ragHandlerTools = com.prismai.llmhost.agent.tools.RagTools(
             ragManager = ragManager,
@@ -1983,10 +1984,43 @@ class InferenceService : Service() {
         runCatching { _memories.value = memoryStore.getAllActive() }
     }
 
-    /** Public API for the memory browser UI. Deletes a single memory fact by id and refreshes the observable list. */
-    fun deleteMemory(id: String) {
-        memoryStore.delete(id)
+    /** Delete a fact only after older conversation context is durably excluded. */
+    suspend fun deleteMemory(id: String): Boolean = deleteMemorySafely(id, fromAgent = false)
+
+    private suspend fun deleteMemorySafely(id: String, fromAgent: Boolean): Boolean = operationMutex.withLock {
+        if (_isGenerating.value || backgroundGenerationOwnership.hasOwner() || agentFollowUpScheduled ||
+            (!fromAgent && (_pendingAgentToolAction.value != null || hasActiveAgentToolJobs()))
+        ) {
+            publishUiEvent("Finish or stop the current operation before deleting a memory")
+            return@withLock false
+        }
+        val fact = withContext(Dispatchers.IO) { memoryStore.getAllActive().firstOrNull { it.id == id } }
+            ?: return@withLock false
+        val sourceChatId = fact.sourceChatId
+        if (sourceChatId != null && sourceChatId != _currentChatId.value) {
+            publishUiEvent("Open the source chat before deleting this memory")
+            return@withLock false
+        }
+        if (sourceChatId != null) {
+            val marked = withContext(Dispatchers.IO) { chatManager.markContextBoundaryForCurrentChat(sourceChatId) }
+            if (!marked) {
+                publishUiEvent("Could not start a fresh chat context; memory was not deleted")
+                return@withLock false
+            }
+            try {
+                engine.resetConversation()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w(TAG, "could not reset native conversation after memory deletion request", error)
+                publishUiEvent("Could not reset model context; memory was not deleted")
+                return@withLock false
+            }
+        }
+        val deleted = withContext(Dispatchers.IO) { memoryStore.delete(id) }
         refreshMemoriesList()
+        if (!deleted) publishUiEvent("Could not delete memory")
+        deleted
     }
 
     /** Public API for the memory browser UI. Reloads the observable memory list from the store. */

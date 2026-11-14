@@ -165,8 +165,10 @@ class ServiceSwitchModelTest {
             service.service.generateSafely("Once upon a time in a small local runtime")
             assertTrue("foreground state did not become active", waitForForeground(service.service, expected = true))
 
+            service.service.uiMessage.value?.let { service.service.clearUiMessage(it) }
             service.service.cancelGeneration()
             assertTrue("foreground state did not stop after cancel", waitForForeground(service.service, expected = false))
+            withTimeout(5_000) { service.service.uiMessage.first { it == "Generation stopped" } }
         } finally {
             service.service.cancelGeneration()
             targetContext.unbindService(service.connection)

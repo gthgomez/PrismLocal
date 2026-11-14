@@ -923,7 +923,9 @@ class InferenceService : Service() {
                 backgroundAgentManager.cancelTask(backgroundTaskId)
             } else {
                 operationMutex.withLock {
+                    val wasGenerating = _isGenerating.value
                     cancelAndJoinGenerationLocked("user cancel")
+                    if (wasGenerating) publishUiEvent("Generation stopped")
                 }
             }
         }

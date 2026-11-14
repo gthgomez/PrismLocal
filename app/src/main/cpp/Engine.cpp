@@ -844,15 +844,15 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
 
 // Returns:
 //   0        = success
-//   negative = llama_decode error
-//   -999     = cancelled between batch chunks (prompt eval only)
+//   other    = llama_decode warning/error
+//   -999     = cancellation before or during llama_decode
 int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t count,
                    llama_pos start_pos, const std::atomic<bool>* cancel_flag = nullptr) {
     if (count <= 0) {
         return 0;
     }
     if (count == 1) {
-        // Single-token fast path — no cancellation check needed (5-30ms)
+        // Single-token fast path; the native abort callback can interrupt this too.
         if (!runtime.single_batch_initialized) {
             runtime.single_batch = llama_batch_init(1, 0, 1);
             runtime.single_batch_initialized = true;
@@ -863,7 +863,9 @@ int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t cou
         runtime.single_batch.n_seq_id[0] = 1;
         runtime.single_batch.seq_id[0][0] = kMainSequence;
         runtime.single_batch.logits[0] = 1;
-        return llama_decode(runtime.ctx, runtime.single_batch);
+        const int result = llama_decode(runtime.ctx, runtime.single_batch);
+        return result == 2 && cancel_flag != nullptr && cancel_flag->load(std::memory_order_acquire)
+            ? -999 : result;
     }
     const int batch_size = runtime.batch_size;
     llama_batch batch = llama_batch_init(std::min(count, batch_size), 0, 1);
@@ -885,7 +887,8 @@ int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t cou
         int result = llama_decode(runtime.ctx, batch);
         if (result != 0) {
             llama_batch_free(batch);
-            return result;
+            return result == 2 && cancel_flag != nullptr && cancel_flag->load(std::memory_order_acquire)
+                ? -999 : result;
         }
     }
     llama_batch_free(batch);
@@ -1444,6 +1447,10 @@ struct Engine::Impl {
                                 formatted_prompt, add_special);
                             runtime->conversation.markCommitted(cache_identity_key, runtime->current_position, true);
                             LOGI("prefix_cache_retry_success prompt_tokens=%d", usable_prompt_tokens);
+                        } else if (retry_rc == -999) {
+                            runtime->conversation.invalidate();
+                            finishSession(session, StreamState::Cancelled);
+                            return;
                         } else {
                             runtime->conversation.invalidate(); // PIR-05: invalidate-on-abort
                             ctrl->error_code.store(static_cast<uint32_t>(5000 + std::abs(retry_rc)), std::memory_order_release);
@@ -1612,7 +1619,7 @@ struct Engine::Impl {
                 LOGI("generation_breadcrumb stage=decode_1_begin generation_id=%u token=%d kv_pos=%d",
                      session->generation_id, static_cast<int>(token), static_cast<int>(runtime->current_position));
             }
-            const int next_decode_result = decodeTokensAt(*runtime, &token, 1, runtime->current_position);
+            const int next_decode_result = decodeTokensAt(*runtime, &token, 1, runtime->current_position, &session->cancel_requested);
             if (i == 0) {
                 LOGI("generation_breadcrumb stage=decode_1_complete generation_id=%u rc=%d",
                      session->generation_id, next_decode_result);
@@ -1622,6 +1629,10 @@ struct Engine::Impl {
             decode_times_us.push_back(token_decode_us);
             if (next_decode_result != 0) {
                 runtime->conversation.invalidate(); // PIR-05: invalidate-on-abort
+                if (next_decode_result == -999) {
+                    finishSession(session, StreamState::Cancelled);
+                    return;
+                }
                 ctrl->error_code.store(static_cast<uint32_t>(5100 + std::abs(next_decode_result)), std::memory_order_release);
                 LOGE("token_eval_failed rc=%d", next_decode_result);
                 finishSession(session, StreamState::Error);

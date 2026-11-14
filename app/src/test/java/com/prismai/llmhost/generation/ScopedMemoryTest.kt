@@ -50,4 +50,30 @@ class ScopedMemoryTest {
         assertEquals(listOf("mine"), MemoryRetriever.queryForChat("mint tea", facts, "chat-a", 1).map { it.fact.id })
         assertTrue(MemoryRetriever.queryForChat("mint tea", facts, null, 1).isEmpty())
     }
+
+    @Test
+    fun relevantSavedFactIsPlacedBesideTheQuestionOnlyInItsOwnChat() {
+        val store = Store()
+        val fact = store.insert(MemoryFact(id = "one", fact = "My preferred tea is jasmine oolong", sourceChatId = "chat-a"))
+        store.insert(MemoryFact(id = "other", fact = "My preferred tea is black tea", sourceChatId = "chat-b"))
+        val builder = PromptBuilder(store)
+        val memory = builder.buildPromptMemory("Which tea do I prefer", "chat-a")
+        val messages = builder.buildMessages(
+            newPrompt = "Which tea do I prefer",
+            transcript = emptyList(),
+            activeAssistantTranscriptId = null,
+            memoryContext = memory.systemContext,
+            memoryFactLines = memory.factLines,
+        )
+        assertEquals(
+            "For this question, my saved information is:\n- My preferred tea is jasmine oolong\n\nQuestion: Which tea do I prefer",
+            messages.last().content,
+        )
+        assertFalse(messages.any { it.content.contains("black tea") })
+        assertTrue(builder.buildPromptMemory("Which tea do I prefer", "chat-b").factLines.contains("black tea"))
+        store.delete(fact.id)
+        val afterDeletion = builder.buildPromptMemory("Which tea do I prefer", "chat-a")
+        assertTrue(afterDeletion.systemContext.isEmpty())
+        assertEquals("Which tea do I prefer", PromptBuilder.withQuestionMemory("Which tea do I prefer", afterDeletion.factLines))
+    }
 }

@@ -205,12 +205,15 @@ class GenerationOrchestrator(
             }
         }
         val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
-        val memoryContext = if (benchmarkPreset == null && selectedDocumentId == null) promptBuilder.buildMemoryContext(prompt, uiState.currentChatId.value) else ""
+        val memory = if (benchmarkPreset == null && selectedDocumentId == null) {
+            promptBuilder.buildPromptMemory(prompt, uiState.currentChatId.value)
+        } else MemoryRetriever.PromptMemory.EMPTY
+        val budgetPrompt = if (settings.agentEnabled) prompt else PromptBuilder.withQuestionMemory(prompt, memory.factLines)
         return SendAcceptance.forChat(
             currentModel = uiState.currentModel.value,
             settings = settings,
-            prompt = prompt,
-            memoryContext = memoryContext,
+            prompt = budgetPrompt,
+            memoryContext = memory.systemContext,
             enforceBudget = benchmarkPreset == null,
         )
     }
@@ -244,7 +247,10 @@ class GenerationOrchestrator(
         // newly refused here.
         val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
         val agentEnabled = settings.agentEnabled
-        val memoryContext = if (benchmarkPreset == null && selectedDocumentId == null) promptBuilder.buildMemoryContext(prompt, uiState.currentChatId.value) else ""
+        val memory = if (benchmarkPreset == null && selectedDocumentId == null) {
+            promptBuilder.buildPromptMemory(prompt, uiState.currentChatId.value)
+        } else MemoryRetriever.PromptMemory.EMPTY
+        val memoryContext = memory.systemContext
         val acceptance = evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId)
         if (!acceptance.accepted) {
             refuseLaunch(acceptance.reason ?: "Request refused")
@@ -320,6 +326,7 @@ class GenerationOrchestrator(
                 transcript = uiState.transcript.value,
                 activeAssistantTranscriptId = null,
                 memoryContext = memoryContext,
+                memoryFactLines = memory.factLines,
                 tokenBudget = GenerationBudget.calculateNonAgentTokenBudget(
                     contextLength = settings.contextLength,
                     maxTokens = settings.maxTokens,

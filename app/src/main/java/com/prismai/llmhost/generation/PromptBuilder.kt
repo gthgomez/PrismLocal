@@ -27,6 +27,10 @@ class PromptBuilder(
         private const val SYSTEM_PROMPT =
             "You are Assistant in a local Android chat. Use the recent conversation for context."
 
+        internal fun withQuestionMemory(question: String, factLines: String): String =
+            if (factLines.isBlank()) question else
+                "For this question, my saved information is:\n$factLines\n\nQuestion: $question"
+
         /**
          * Pure, Android-free assembly of the structured (role-preserving) message
          * list. Mirrors the recent-history token budgeting of
@@ -38,6 +42,7 @@ class PromptBuilder(
             activeAssistantTranscriptId: Long?,
             memoryContext: String,
             tokenBudget: Int,
+            memoryFactLines: String = "",
         ): List<ChatMessage> {
             val system = buildString {
                 append(SYSTEM_PROMPT)
@@ -50,7 +55,8 @@ class PromptBuilder(
                 message.text.isNotBlank() && message.id != activeAssistantTranscriptId && message.documentScope == null
             }
             val selected = ArrayDeque<TranscriptMessage>()
-            var estimatedTokens = GenerationBudget.estimateTokens(newPrompt) +
+            val userMessage = withQuestionMemory(newPrompt, memoryFactLines)
+            var estimatedTokens = GenerationBudget.estimateTokens(userMessage) +
                 GenerationBudget.estimateTokens(memoryContext) +
                 GenerationBudget.MESSAGE_TEMPLATE_TOKENS
             for (message in history.asReversed()) {
@@ -66,7 +72,7 @@ class PromptBuilder(
             val messages = ArrayList<ChatMessage>(selected.size + 2)
             messages += ChatMessage(ChatMessage.ROLE_SYSTEM, system)
             selected.forEach { message -> messages += message.toChatMessage() }
-            messages += ChatMessage(ChatMessage.ROLE_USER, newPrompt)
+            messages += ChatMessage(ChatMessage.ROLE_USER, userMessage)
             return messages
         }
 
@@ -82,8 +88,12 @@ class PromptBuilder(
     // ── Memory context ──────────────────────────────────────────────────
 
     fun buildMemoryContext(userPrompt: String, sourceChatId: String? = null): String {
+        return buildPromptMemory(userPrompt, sourceChatId).systemContext
+    }
+
+    fun buildPromptMemory(userPrompt: String, sourceChatId: String? = null): MemoryRetriever.PromptMemory {
         val memories = runCatching { memoryStore.getAllActive() }.getOrDefault(emptyList())
-        return MemoryRetriever.buildMemoryContext(userPrompt, MemoryRetriever.forChat(memories, sourceChatId))
+        return MemoryRetriever.buildPromptMemory(userPrompt, MemoryRetriever.forChat(memories, sourceChatId))
     }
 
     // ── RAG context ─────────────────────────────────────────────────────
@@ -159,12 +169,14 @@ class PromptBuilder(
         activeAssistantTranscriptId: Long?,
         memoryContext: String = "",
         tokenBudget: Int = DEFAULT_TOKEN_BUDGET,
+        memoryFactLines: String = "",
     ): List<ChatMessage> = assembleChatMessages(
         newPrompt = newPrompt,
         transcript = transcript,
         activeAssistantTranscriptId = activeAssistantTranscriptId,
         memoryContext = memoryContext,
         tokenBudget = tokenBudget,
+        memoryFactLines = memoryFactLines,
     )
 
     // ── Helpers ─────────────────────────────────────────────────────────

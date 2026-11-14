@@ -217,6 +217,19 @@ class RagManager(
             vectorStore.search(queryEmbedding, topK = topK, minScore = DEFAULT_MIN_RAG_SCORE, expectedIdentity = identity)
         }
 
+    /** Search only the explicitly selected document, preserving the encoder guard. */
+    suspend fun queryDocument(userPrompt: String, documentId: String, topK: Int = 3): DocumentSearchResult =
+        withContext(Dispatchers.IO) {
+            require(userPrompt.isNotBlank() && documentId.isNotBlank())
+            val identity = vectorStore.currentEmbeddingIdentity()
+            val embedding = encodeOrNull(userPrompt.take(DocumentChunker.QUERY_MAX_CHARS))
+            check(embedding != null && embedding.isNotEmpty()) { "Could not encode the document question" }
+            check(vectorStore.currentEmbeddingIdentity() == identity) { "The loaded model changed during document search" }
+            val result = vectorStore.searchDocument(documentId, embedding, topK.coerceIn(1, 10), DEFAULT_MIN_RAG_SCORE, identity)
+            check(result.matches.all { it.first.documentId == documentId }) { "Document search returned an unexpected source" }
+            result
+        }
+
     /**
      * Encode one text, converting ordinary failures to `null` but letting [CancellationException]
      * propagate. `runCatching` swallows cancellation, which would let a cancelled ingest keep

@@ -90,6 +90,25 @@ class VectorStoreRevisionMigrationTest {
     }
 
     @Test
+    fun selectedDocumentSearchFiltersBeforeRankingAndVersionsTheSnapshot() {
+        val store = VectorStore(context)
+        val identity = EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION)
+        store.setEmbeddingIdentityProvider { identity }
+        fun chunk(id: String, document: String, text: String, vector: FloatArray) =
+            VectorChunk(id, document, 0, text, vector)
+        store.replaceDocument("cedar", listOf(chunk("c1", "cedar", "Owner: Mira", floatArrayOf(0.8f, 0.6f))), identity)
+        store.replaceDocument("distractor", listOf(chunk("d1", "distractor", "Owner: Owen", floatArrayOf(1f, 0f))), identity)
+
+        val first = store.searchDocument("cedar", floatArrayOf(1f, 0f), 1, -1f, identity)
+        assertEquals(listOf("c1"), first.matches.map { it.first.id })
+        assertEquals(64, first.documentVersion.length)
+        store.replaceDocument("cedar", listOf(chunk("c2", "cedar", "Owner: Mira, revised", floatArrayOf(0.8f, 0.6f))), identity)
+        val revised = store.searchDocument("cedar", floatArrayOf(1f, 0f), 1, -1f, identity)
+        assertTrue("changed indexed text must have a different snapshot version", first.documentVersion != revised.documentVersion)
+        assertEquals(listOf("c2"), revised.matches.map { it.first.id })
+    }
+
+    @Test
     fun encoderSwitch_makesRowsUnsearchableButNeverObsoleteOrDeletable() {
         val store = VectorStore(context)
         var encoderId = "sha-a"

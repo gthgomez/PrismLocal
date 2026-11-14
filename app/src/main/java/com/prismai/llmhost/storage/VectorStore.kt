@@ -13,6 +13,7 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.util.PriorityQueue
 import java.util.UUID
 import java.util.concurrent.locks.ReentrantLock
@@ -75,6 +76,12 @@ data class VectorChunk(
         return result
     }
 }
+
+/** Hash of the indexed text snapshot and the ranked passages from that same snapshot. */
+data class DocumentSearchResult(
+    val documentVersion: String,
+    val matches: List<Pair<VectorChunk, Float>>,
+)
 
 /**
  * Bounded, per-document projection for the document browser: counts plus one short preview. It
@@ -175,6 +182,15 @@ interface VectorIndex {
         minScore: Float = 0.0f,
         expectedIdentity: EmbeddingIdentity? = null,
     ): List<Pair<VectorChunk, Float>> = search(queryEmbedding, topK, minScore)
+
+    /** Implementations without scoped search must fail closed, never search the global corpus. */
+    fun searchDocument(
+        documentId: String,
+        queryEmbedding: FloatArray,
+        topK: Int,
+        minScore: Float,
+        expectedIdentity: EmbeddingIdentity,
+    ): DocumentSearchResult = throw UnsupportedOperationException("Document-scoped search is unavailable")
     fun deleteByDocument(documentId: String): Int
     fun documentCount(): Int
     fun chunkCount(): Int
@@ -385,6 +401,47 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
             )
             try {
                 return selectTopK(chunkScoreIterator(cursor, queryEmbedding), topK, minScore)
+            } finally {
+                cursor.close()
+            }
+        }
+    }
+
+    override fun searchDocument(
+        documentId: String,
+        queryEmbedding: FloatArray,
+        topK: Int,
+        minScore: Float,
+        expectedIdentity: EmbeddingIdentity,
+    ): DocumentSearchResult {
+        require(documentId.isNotBlank())
+        require(queryEmbedding.isNotEmpty() && topK > 0)
+        lock.withLock {
+            check(expectedIdentity == currentIdentity()) { "The loaded model changed during document search" }
+            val cursor = dbHelper.readableDatabase.query(
+                TABLE, null,
+                "$COL_DOCUMENT_ID = ? AND $COL_EMBEDDING_REVISION = ? AND $COL_ENCODER_IDENTITY = ? AND $COL_EMBEDDING_DIM = ?",
+                arrayOf(documentId, EMBEDDING_REVISION.toString(), expectedIdentity.token, queryEmbedding.size.toString()),
+                null, null, "$COL_CHUNK_INDEX ASC, $COL_ID ASC",
+            )
+            try {
+                val digest = MessageDigest.getInstance("SHA-256")
+                val scored = chunkScoreIterator(cursor, queryEmbedding)
+                var count = 0
+                val versioned = object : Iterator<Pair<VectorChunk, Float>> {
+                    override fun hasNext() = scored.hasNext()
+                    override fun next(): Pair<VectorChunk, Float> {
+                        val entry = scored.next()
+                        val bytes = entry.first.text.toByteArray(Charsets.UTF_8)
+                        digest.update(ByteBuffer.allocate(8).putInt(entry.first.chunkIndex).putInt(bytes.size).array())
+                        digest.update(bytes)
+                        count++
+                        return entry
+                    }
+                }
+                val matches = selectTopK(versioned, topK, minScore)
+                val version = if (count == 0) "" else digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+                return DocumentSearchResult(version, matches)
             } finally {
                 cursor.close()
             }

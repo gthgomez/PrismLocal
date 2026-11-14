@@ -19,4 +19,6 @@ data class TranscriptMessage(
     val text: String,
     val summary: String? = null,
     val regenerationHistory: List<String> = emptyList(),
+    /** Non-null for document Q&A turns, which must not be replayed into another context. */
+    val documentScope: String? = null,
 )

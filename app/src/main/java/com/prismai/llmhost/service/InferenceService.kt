@@ -1158,6 +1158,7 @@ class InferenceService : Service() {
         sendToken: String? = null,
         onAccepted: (() -> Unit)? = null,
         onRefused: ((String) -> Unit)? = null,
+        selectedDocumentId: String? = null,
     ) {
         serviceScope.launch {
             generateSafelyAndAwait(
@@ -1168,6 +1169,7 @@ class InferenceService : Service() {
                     sendToken = sendToken,
                 onAccepted = onAccepted,
                 onRefused = onRefused,
+                selectedDocumentId = selectedDocumentId,
             )
         }
     }
@@ -1188,7 +1190,11 @@ class InferenceService : Service() {
         sendToken: String? = null,
         onAccepted: (() -> Unit)? = null,
         onRefused: ((String) -> Unit)? = null,
+        selectedDocumentId: String? = null,
     ): String {
+        if (selectedDocumentId != null && initiatedByBackground) {
+            return refuseSend(onRefused, "Document questions are available in chat only")
+        }
         if (sendToken != null && !inFlightSendTokens.add(sendToken)) {
             return refuseSend(onRefused, "Duplicate send in flight")
         }
@@ -1235,7 +1241,7 @@ class InferenceService : Service() {
             }
             val startGateReserved = true
             try {
-                val acceptance = generationOrchestrator.evaluateSendAcceptance(prompt, benchmarkPreset)
+                val acceptance = generationOrchestrator.evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId)
                 if (!acceptance.accepted) {
                     val reason = acceptance.reason ?: "Generation was refused"
                     publishUiEvent(reason)
@@ -1262,14 +1268,14 @@ class InferenceService : Service() {
                 }
                 val previousSessionId = generationSession
                 val previousAgentChainId = agentTrace.activeChainId
-                generationOrchestrator.generate(prompt, benchmarkPreset)
+                generationOrchestrator.generate(prompt, benchmarkPreset, selectedDocumentId)
                 launchResult = generationOrchestrator.takeLaunchResult()
                 // Authoritative admission result: only now may the caller treat the send as
                 // accepted (and clear the composer), or report the refusal.
                 if (launchResult.acceptsMessage()) {
                     onAccepted?.invoke()
                 } else {
-                    onRefused?.invoke("Generation was refused")
+                    onRefused?.invoke(generationOrchestrator.takeLaunchRefusalReason() ?: "Generation was refused")
                 }
                 if (generationSession != previousSessionId) resultSessionId = generationSession
                 val startedAgentChainId = agentTrace.activeChainId

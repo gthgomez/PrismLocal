@@ -21,4 +21,13 @@ object ModelLoadLimits {
      * This never blocks a load by itself — RISKY models still load.
      */
     const val LARGE_MODEL_BYTES = 3_000_000_000L
+
+    /** The UI and service must agree when the memory admission gate will reject a load. */
+    fun isLoadBlocked(
+        modelBytes: Long,
+        requiredRamBytes: Long,
+        availableRamAfterUnloadBytes: Long,
+        provenUsable: Boolean,
+    ): Boolean = modelBytes > HARD_CAP_BYTES ||
+        (requiredRamBytes > availableRamAfterUnloadBytes && !provenUsable)
 }

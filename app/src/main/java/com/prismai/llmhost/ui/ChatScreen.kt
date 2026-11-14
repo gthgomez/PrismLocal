@@ -150,6 +150,7 @@ fun ChatScreen(
         var memoriesVisible by remember { mutableStateOf(false) }
         var ragBrowserVisible by remember { mutableStateOf(false) }
         var ingestStatus by remember { mutableStateOf<String?>(null) }
+        var isIndexingDocument by remember { mutableStateOf(false) }
         val controlSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val chatSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val memoriesSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -710,6 +711,12 @@ fun ChatScreen(
                                 TextButton(onClick = { selectedDocumentId = null }) { Text("Clear") }
                             }
                         }
+                        if (isIndexingDocument || (isSending && selectedDocumentId != null)) {
+                            Text(
+                                text = if (isIndexingDocument) "Indexing document on this device…" else "Searching selected document…",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
 
                         PromptComposer(
                             modifier = Modifier
@@ -742,7 +749,9 @@ fun ChatScreen(
                             onContinue = { service?.continueGenerationSafely() },
                             isSending = isSending,
                             onSend = {
-                                if (!isSending) {
+                                if (isIndexingDocument) {
+                                    snackbarMessage = "Wait for document indexing to finish"
+                                } else if (!isSending) {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 val svc = service
                                 if (text.isNotEmpty()) {
@@ -917,13 +926,27 @@ fun ChatScreen(
                                     documents = vectorDocuments,
                                     staleChunkCount = staleVectorChunkCount,
                                     ingestStatus = ingestStatus,
+                                    isIndexing = isIndexingDocument,
+                                    canIngest = service != null && currentModel != null && !isGenerating && !isSending,
                                     onDeleteStaleDocuments = { service?.deleteStaleVectorChunks() },
                                     onIngestDocument = { id, title, text ->
-                                        ingestStatus = null
-                                        scope.launch {
-                                            ingestStatus = withContext(Dispatchers.IO) {
-                                                service?.ingestDocument(id, title, text)
-                                            } ?: "Indexing unavailable"
+                                        if (!isIndexingDocument) {
+                                            isIndexingDocument = true
+                                            ingestStatus = "Indexing $id on this device…"
+                                            scope.launch {
+                                                try {
+                                                    ingestStatus = withContext(Dispatchers.IO) {
+                                                        service?.ingestDocument(id, title, text)
+                                                    } ?: "Indexing unavailable"
+                                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                                    throw cancelled
+                                                } catch (error: Exception) {
+                                                    ingestStatus = "Indexing failed: ${error.message ?: "unknown error"}"
+                                                    snackbarMessage = ingestStatus
+                                                } finally {
+                                                    isIndexingDocument = false
+                                                }
+                                            }
                                         }
                                     },
                                     onDeleteDocument = { id -> service?.deleteDocument(id) },

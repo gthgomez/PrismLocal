@@ -118,6 +118,33 @@ scripts/emulator/run-tests.sh high -- \
   -Pandroid.testInstrumentationRunnerArguments.class=com.prismai.llmhost.ModelStorageManagerTest
 ```
 
+For a reproducible context-replay run, pass an app-readable **real** model path
+instead of relying on the smallest installed file. A selected file that fails to
+load fails the test; absence of any fixture is reported as a skip:
+
+```bash
+adb -s "$ANDROID_SERIAL" shell am instrument -w -r \
+  -e class com.prismai.llmhost.generation.ContextReplayTest \
+  -e prismContextModelPath "$TINY_MODEL_ON_DEVICE" \
+  com.prismai.llmhost.dev.debug.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+For the pinned Qwen model procedure and SHA-256 see
+[`tools/inference-conformance/README.md`](../../tools/inference-conformance/README.md).
+The following optional Android comparison indexes only task-generated Cedar
+fixtures, compares native embedding scores with a simple lexical overlap, and
+deletes only the uniquely named test documents afterward:
+
+```bash
+adb -s "$ANDROID_SERIAL" shell am instrument -w -r \
+  -e class com.prismai.llmhost.generation.QwenRetrievalComparisonTest \
+  -e prismQwenModelPath "$QWEN_MODEL_ON_DEVICE" \
+  com.prismai.llmhost.dev.debug.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+These instrumentation tests do not establish that the app UI or an ARM/GPU
+target has passed the offline user journey.
+
 ## Manual control
 
 ```bash

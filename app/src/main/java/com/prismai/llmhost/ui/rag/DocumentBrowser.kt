@@ -52,6 +52,8 @@ fun DocumentBrowser(
     documents: List<VectorDocumentSummary>,
     staleChunkCount: Int,
     ingestStatus: String?,
+    isIndexing: Boolean,
+    canIngest: Boolean,
     onIngestDocument: (id: String, title: String, text: String) -> Unit,
     onDeleteDocument: (documentId: String) -> Unit,
     onQueryVectorStore: suspend (query: String) -> List<Pair<VectorChunk, Float>>,
@@ -82,6 +84,7 @@ fun DocumentBrowser(
             action = {
                 Button(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    enabled = canIngest && !isIndexing,
                     onClick = { showIngestDialog = true },
                 ) {
                     Text("+ Ingest Doc", maxLines = 1, softWrap = false)
@@ -127,6 +130,7 @@ fun DocumentBrowser(
                     )
                     TextButton(
                         onClick = onDeleteStaleDocuments,
+                        enabled = !isIndexing,
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                     ) {
                         Text(
@@ -165,7 +169,7 @@ fun DocumentBrowser(
                     textStyle = MaterialTheme.typography.bodySmall,
                 )
                 Button(
-                    enabled = searchQuery.isNotBlank() && !isSearching,
+                    enabled = searchQuery.isNotBlank() && !isSearching && !isIndexing,
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     onClick = {
                         isSearching = true
@@ -248,8 +252,9 @@ fun DocumentBrowser(
                         searchableChunkCount = doc.searchableChunkCount,
                         legacyChunkCount = doc.legacyChunkCount,
                         previewText = doc.previewText,
-                        canSelect = doc.fullySearchable,
+                        canSelect = doc.fullySearchable && !isIndexing,
                         onSelect = { onSelectDocument(doc.documentId) },
+                        canDelete = !isIndexing,
                         onDelete = { deleteTargetDocId = doc.documentId },
                     )
                 }
@@ -305,7 +310,7 @@ fun DocumentBrowser(
             },
             confirmButton = {
                 TextButton(
-                    enabled = ingestDocId.isNotBlank() && ingestText.isNotBlank(),
+                    enabled = ingestDocId.isNotBlank() && ingestText.isNotBlank() && canIngest && !isIndexing,
                     onClick = {
                         val docId = ingestDocId.trim()
                         val title = ingestTitle.ifBlank { ingestDocId }.trim()
@@ -342,6 +347,7 @@ fun DocumentBrowser(
             confirmButton = {
                 TextButton(
                     colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    enabled = !isIndexing,
                     onClick = {
                         onDeleteDocument(docId)
                         deleteTargetDocId = null
@@ -419,6 +425,7 @@ private fun DocumentSummaryRow(
     previewText: String,
     canSelect: Boolean,
     onSelect: () -> Unit,
+    canDelete: Boolean,
     onDelete: () -> Unit,
 ) {
     Row(
@@ -476,6 +483,7 @@ private fun DocumentSummaryRow(
         }
         TextButton(
             onClick = onDelete,
+            enabled = canDelete,
             contentPadding = PaddingValues(0.dp),
         ) {
             Text(

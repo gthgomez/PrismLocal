@@ -152,6 +152,7 @@ class InferenceService : Service() {
     private val teardownStarted = AtomicBoolean(false)
     private val inFlightSendTokens = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val modelEpoch = java.util.concurrent.atomic.AtomicLong(1L)
+    private val vectorRefreshLock = Any()
 
     // Single owner of the native memory-pressure level. Writes are funneled
     // through an unbounded channel consumed by exactly one coroutine, so the
@@ -421,6 +422,8 @@ class InferenceService : Service() {
         ragManager = RagManager(vectorStore, DocumentChunker) { text ->
             engine.encode(text)
         }
+        // Stored documents must be visible after service recreation, even before a model loads.
+        serviceScope.launch(Dispatchers.IO) { refreshVectorChunksList() }
         // Phase 4 — Voice I/O manager
         voiceIoManager = VoiceIoManager(this).also { mgr ->
             mgr.onSpeechResult = { text ->
@@ -849,11 +852,13 @@ class InferenceService : Service() {
                     finalizeActiveTrace = !preserveConfirmedChain,
                     preserveActiveTrace = preserveConfirmedChain,
                 )
-                modelManager.switchModel(modelId).also { loaded ->
-                    if (loaded) {
-                        modelEpoch.incrementAndGet()
-                    }
+                val loaded = modelManager.switchModel(modelId)
+                if (loaded) {
+                    modelEpoch.incrementAndGet()
                 }
+                // Searchability depends on the active encoder, including failed reloads that unload it.
+                withContext(Dispatchers.IO) { refreshVectorChunksList() }
+                loaded
             } finally {
                 if (preserveConfirmedChain) {
                     agentTrace.releaseChainPreservation(confirmedAuthorization.chainId)
@@ -889,11 +894,12 @@ class InferenceService : Service() {
                     finalizeActiveTrace = !preserveConfirmedChain,
                     preserveActiveTrace = preserveConfirmedChain,
                 )
-                modelManager.deleteModel(modelId, identity).also { deleted ->
-                    if (deleted) {
-                        modelEpoch.incrementAndGet()
-                    }
+                val deleted = modelManager.deleteModel(modelId, identity)
+                if (deleted) {
+                    modelEpoch.incrementAndGet()
+                    withContext(Dispatchers.IO) { refreshVectorChunksList() }
                 }
+                deleted
             } finally {
                 if (preserveConfirmedChain) {
                     agentTrace.releaseChainPreservation(confirmedAuthorization.chainId)
@@ -2086,9 +2092,11 @@ class InferenceService : Service() {
      * shown as stored and are never offered for deletion.
      */
     private fun refreshVectorChunksList() {
-        runCatching {
-            uiState._vectorDocuments.value = vectorStore.getDocumentSummaries()
-            uiState._staleVectorChunkCount.value = vectorStore.countObsoleteChunks()
+        synchronized(vectorRefreshLock) {
+            runCatching {
+                uiState._vectorDocuments.value = vectorStore.getDocumentSummaries()
+                uiState._staleVectorChunkCount.value = vectorStore.countObsoleteChunks()
+            }.onFailure { error -> Log.w(TAG, "failed to refresh stored documents", error) }
         }
     }
 

@@ -83,6 +83,31 @@ class ChatSearchAndDeletionConsistencyTest {
     }
 
     @Test
+    fun memoryContextBoundarySurvivesRestartAndRejectsStaleTranscriptWrites(): Unit = runBlocking {
+        val context = TestContext(tempFolder.newFolder("memory_context_boundary"))
+        val store = TranscriptStore(context)
+        val state = ServiceUiState()
+        val manager = ChatManager(context, store, ChatSearchIndex(), state, UiEventBus(), this)
+        val chatId = manager.createChatInternal("Memory test")
+        manager.appendTranscriptMessage(TranscriptRole.USER, "Which tea do I prefer?")
+        manager.appendTranscriptMessage(TranscriptRole.ASSISTANT, "You prefer jasmine oolong.")
+        val oldMessages = state.transcript.value
+        val staleRevision = manager.transcriptWriteRevision(chatId)
+
+        assertFalse(manager.markContextBoundaryForCurrentChat("different-chat"))
+        state._isGenerating.value = true
+        assertFalse(manager.markContextBoundaryForCurrentChat(chatId))
+        state._isGenerating.value = false
+        assertTrue(manager.markContextBoundaryForCurrentChat(chatId))
+        manager.persistTranscript(chatId, oldMessages, staleRevision)
+
+        val restored = store.readTranscriptFile(store.transcriptFile(chatId))
+        assertEquals(oldMessages.map { it.text }, restored.map { it.text })
+        assertTrue(restored.last().contextBoundaryAfter)
+        assertTrue(state.transcript.value.last().contextBoundaryAfter)
+    }
+
+    @Test
     fun clearedTranscriptIsEvictedFromSearchImmediately(): Unit = runBlocking {
         val baseDir = tempFolder.newFolder("chat_test_clear")
         val context = TestContext(baseDir)

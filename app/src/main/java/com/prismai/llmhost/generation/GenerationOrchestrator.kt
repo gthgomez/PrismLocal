@@ -477,7 +477,7 @@ class GenerationOrchestrator(
             eventBus.publish("The last response did not stop at the token limit")
             return
         }
-        val transcript = uiState.transcript.value
+        val transcript = uiState.transcript.value.sinceContextBoundary()
         val assistantMessage = transcript.lastOrNull {
             it.role == TranscriptRole.ASSISTANT && it.text.isNotBlank()
         }
@@ -953,7 +953,7 @@ class GenerationOrchestrator(
 
     private fun getFormattedHistoryForAgent(excludeIds: Set<Long>, maxHistoryTokens: Int): String {
         if (maxHistoryTokens <= 0) return ""
-        val history = uiState.transcript.value.filter { message ->
+        val history = uiState.transcript.value.sinceContextBoundary().filter { message ->
             message.text.isNotBlank() && message.id !in excludeIds && message.documentScope == null
         }
         if (history.isEmpty()) return ""

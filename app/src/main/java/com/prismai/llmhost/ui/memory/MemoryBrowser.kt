@@ -144,13 +144,18 @@ internal fun MemoryBrowser(
             title = { Text("Delete memory fact?") },
             text = {
                 Text(
-                    text = "Are you sure you want to delete \"${fact.fact}\"?",
+                    text = when {
+                        fact.sourceChatId == null -> "Delete \"${fact.fact}\"? This older fact is not used in chat."
+                        fact.sourceChatId != currentChatId -> "Open this fact's source chat before deleting it."
+                        else -> "Delete \"${fact.fact}\"? Earlier messages will remain visible, but a fresh context will be used for later replies."
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                 )
             },
             confirmButton = {
                 TextButton(
                     colors = androidx.compose.material3.ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    enabled = fact.sourceChatId == null || fact.sourceChatId == currentChatId,
                     onClick = {
                         onDelete(fact.id)
                         deleteTarget = null

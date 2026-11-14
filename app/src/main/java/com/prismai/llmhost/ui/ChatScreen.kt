@@ -606,6 +606,13 @@ fun ChatScreen(
                                             }
                                         }
                                     }
+                                    if (message.contextBoundaryAfter) {
+                                        Text(
+                                            text = "New context starts here. Earlier messages remain visible but are not automatically included in later prompts.",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                                        )
+                                    }
                                 }
                                 item(key = "bottom-anchor") {
                                     Spacer(modifier = Modifier.fillMaxWidth().height(1.dp))
@@ -732,7 +739,8 @@ fun ChatScreen(
                             isShortHeight = isShortHeight,
                             canContinue = generationPerformance?.terminalReason == "MAX_TOKENS" &&
                                 transcript.lastOrNull()?.role == TranscriptRole.ASSISTANT &&
-                                transcript.lastOrNull()?.documentScope == null,
+                                transcript.lastOrNull()?.documentScope == null &&
+                                transcript.lastOrNull()?.contextBoundaryAfter != true,
                             onPromptChange = { prompt = it },
                             onAddAttachment = {
                                 onImportPickerStarted()
@@ -904,7 +912,7 @@ fun ChatScreen(
                                 MemoryBrowser(
                                     memories = memories,
                                     currentChatId = currentChatId,
-                                    onDelete = { id -> service?.deleteMemory(id) },
+                                    onDelete = { id -> scope.launch { service?.deleteMemory(id) } },
                                     onRefresh = { service?.refreshMemories() },
                                     onAddMemory = { fact, category -> service?.addMemory(fact, category) },
                                 )

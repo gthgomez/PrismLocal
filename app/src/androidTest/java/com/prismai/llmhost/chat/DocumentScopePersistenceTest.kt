@@ -21,7 +21,7 @@ class DocumentScopePersistenceTest {
             val messages = listOf(
                 TranscriptMessage(1, TranscriptRole.USER, "Who owns it?", documentScope = "cedar"),
                 TranscriptMessage(2, TranscriptRole.ASSISTANT, "Mira", documentScope = "cedar"),
-                TranscriptMessage(3, TranscriptRole.USER, "ordinary chat"),
+                TranscriptMessage(3, TranscriptRole.USER, "ordinary chat", contextBoundaryAfter = true),
             )
             store.writeTranscriptFile(file, messages)
             assertEquals(messages, store.readTranscriptFile(file))

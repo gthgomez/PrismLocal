@@ -167,6 +167,16 @@ class AgentToolRouterTraceTest {
     }
 
     @Test
+    fun successfulForgetDoesNotReplayTheOriginalPrompt() = runBlocking {
+        val harness = newHarness()
+        val chainId = harness.trace.beginChain("Forget my tea preference")
+        val call = AgentToolCall("forget_fact", JSONObject().put("fact_id", "test-fact"))
+        val result = AgentToolResult(call = call, success = true, summary = "Memory deleted")
+        assertFalse(harness.router.completeConfirmedTool(call, result, 0, 5, chainId))
+        assertTrue(harness.awaitArtifact().getBoolean("success"))
+    }
+
+    @Test
     fun stalePendingCancellationCannotFinalizeNewChain() = runBlocking {
         val harness = newHarness(capabilityRegistry = agentEnabledRegistry())
         val oldChainId = harness.trace.beginChain("old prompt")

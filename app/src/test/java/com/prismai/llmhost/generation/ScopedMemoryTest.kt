@@ -4,6 +4,8 @@ import com.prismai.llmhost.MemoryFact
 import com.prismai.llmhost.MemoryMatch
 import com.prismai.llmhost.MemoryRetriever
 import com.prismai.llmhost.MemoryStore
+import com.prismai.llmhost.TranscriptMessage
+import com.prismai.llmhost.TranscriptRole
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -75,5 +77,23 @@ class ScopedMemoryTest {
         val afterDeletion = builder.buildPromptMemory("Which tea do I prefer", "chat-a")
         assertTrue(afterDeletion.systemContext.isEmpty())
         assertEquals("Which tea do I prefer", PromptBuilder.withQuestionMemory("Which tea do I prefer", afterDeletion.factLines))
+    }
+
+    @Test
+    fun memoryDeletionBoundaryKeepsVisibleMessagesOutOfLaterPrompts() {
+        val builder = PromptBuilder(Store())
+        val transcript = listOf(
+            TranscriptMessage(1, TranscriptRole.USER, "Which tea do I prefer?"),
+            TranscriptMessage(2, TranscriptRole.ASSISTANT, "You prefer jasmine oolong.", contextBoundaryAfter = true),
+            TranscriptMessage(3, TranscriptRole.USER, "My name is Mira."),
+            TranscriptMessage(4, TranscriptRole.ASSISTANT, "Hello, Mira."),
+        )
+        val structured = builder.buildMessages("What is my name?", transcript, null)
+        assertFalse(structured.any { it.content.contains("jasmine") || it.content.contains("Which tea") })
+        assertTrue(structured.any { it.content.contains("My name is Mira") })
+        val legacy = builder.buildPromptWithRecentContext("What is my name?", transcript, null)
+        assertFalse(legacy.contains("jasmine"))
+        assertTrue(legacy.contains("My name is Mira"))
+        assertEquals("You prefer jasmine oolong.", transcript[1].text)
     }
 }

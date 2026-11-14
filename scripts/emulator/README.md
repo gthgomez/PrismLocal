@@ -91,8 +91,27 @@ smoke-model/tinyllama-v0.q8_0.gguf   # 6,750,304 bytes
 ```
 
 That directory is **gitignored**, so a fresh clone does not have it and those
-tests will fail. Stage the model before running the full suite (or filter to
-non-inference classes with a runner argument):
+tests will fail. With Python 3.10 or later, acquire and stage the fixture before
+building the instrumentation APK:
+
+```bash
+python3 scripts/emulator/acquire-smoke-model.py
+```
+
+The script downloads `tinyllama-v0.q8_0.gguf` from the pinned revision of
+[`afrideva/TinyLLama-v0-GGUF`](https://huggingface.co/afrideva/TinyLLama-v0-GGUF)
+and verifies SHA-256
+`0cbe6769faaa77f4cdbf2f39dbc5f0fb9b3d62f7f9bc5760aa364946e6f2d0f5`
+before making it available to the tests. Both the GGUF publisher and the
+[upstream model card](https://huggingface.co/Maykeye/TinyLLama-v0) label it
+Apache-2.0; review those model cards for your use. This tiny
+proof-of-concept model is a lifecycle smoke fixture, not a semantic-quality
+qualification model. Model weights remain outside Git.
+
+For an already downloaded copy, pass `--source /path/to/tinyllama-v0.q8_0.gguf`;
+the same hash check applies. Reruns verify the existing asset. A mismatched
+existing file or manifest is preserved and causes an error. Use `--output-dir`
+to stage elsewhere. Alternatively, filter to non-inference classes:
 
 ```bash
 scripts/emulator/run-tests.sh high -- \

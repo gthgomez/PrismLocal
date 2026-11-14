@@ -392,7 +392,6 @@ class ModelStorageManager(
                 integrity = integrity,
             )
             writeManifestAtomically(modelRoot, manifest)
-            pruneInactiveVersions(modelRoot, versionId)
 
             // The staged bytes were just hashed and promotion is a rename that preserves content, so
             // record the verified artifact instead of hashing the multi-gigabyte file a second time.
@@ -461,19 +460,6 @@ class ModelStorageManager(
         val resolved = parseManifest(modelRoot, HashPolicy.NONE)
         val installed = (resolved as? ModelResolveResult.Success)?.model ?: return false
         return confirmedIdentity.matches(installed)
-    }
-
-    private fun pruneInactiveVersions(modelRoot: File, activeVersionId: String) {
-        val versionsDir = File(modelRoot, "versions")
-        if (!versionsDir.exists()) return
-        versionsDir.listFiles()?.forEach { versionDir ->
-            if (versionDir.isDirectory && versionDir.name != activeVersionId) {
-                runCatching {
-                    versionDir.deleteRecursively()
-                    Log.d(TAG, "pruned inactive model version dir=${versionDir.absolutePath}")
-                }
-            }
-        }
     }
 
     fun resolveActiveModel(modelId: String, verifyHash: Boolean = true): ModelResolveResult =

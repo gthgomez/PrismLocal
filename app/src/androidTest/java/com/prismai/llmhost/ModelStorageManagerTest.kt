@@ -10,6 +10,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
@@ -171,6 +172,8 @@ class ModelStorageManagerTest {
         assertNotEquals(firstModel.versionId, secondModel.versionId)
         assertTrue(firstModel.file.exists())
         assertTrue(secondModel.file.exists())
+        assertArrayEquals("the earlier version's bytes must be preserved", validGgufBytes(seed = 1), firstModel.file.readBytes())
+        assertArrayEquals("the active version's bytes must be intact", validGgufBytes(seed = 2), secondModel.file.readBytes())
 
         val manifest = JSONObject(File(modelsDir(), "duplicate-model/manifest.json").readText())
         assertEquals(secondModel.versionId, manifest.getString("active_version"))

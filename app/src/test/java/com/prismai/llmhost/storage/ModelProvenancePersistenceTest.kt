@@ -69,10 +69,15 @@ class ModelProvenancePersistenceTest {
 
     @Test
     fun modelShapeDoesNotDependOnKeyOrderAndHandlesPerLayerHeads() {
-        val modelsDir = tempFolder.newFolder("shapes")
+        verifyPerLayerHeads(explicitKvHeads = true)
+        verifyPerLayerHeads(explicitKvHeads = false)
+    }
+
+    private fun verifyPerLayerHeads(explicitKvHeads: Boolean) {
+        val modelsDir = tempFolder.newFolder("shapes-$explicitKvHeads")
         val modelId = "shape-model"
         val header = ByteBuffer.allocate(512).order(ByteOrder.LITTLE_ENDIAN)
-            .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(6)
+            .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(if (explicitKvHeads) 6L else 5L)
         fun writeKey(key: String, type: Int) {
             val name = key.toByteArray()
             header.putLong(name.size.toLong()).put(name).putInt(type)
@@ -87,25 +92,27 @@ class ModelProvenancePersistenceTest {
         writeKey("qwen2.embedding_length", 4)
         header.putInt(1024)
         headCounts("qwen2.attention.head_count", 16, 8, 0)
-        headCounts("qwen2.attention.head_count_kv", 2, 4, 0)
+        if (explicitKvHeads) headCounts("qwen2.attention.head_count_kv", 2, 4, 0)
         writeKey("qwen2.attention.value_length", 4)
         header.putInt(96)
         writeKey("general.architecture", 8)
         header.putLong(5).put("qwen2".toByteArray())
-        createModelWithManifest(modelsDir, modelId, integrity = null, bytes = header.array())
-        val manifestFile = File(modelsDir, "$modelId/manifest.json")
-        val manifest = JSONObject(manifestFile.readText())
-        manifest.getJSONObject("versions").getJSONObject("v1").remove("validation")
-        manifestFile.writeText(manifest.toString())
+        createModelWithManifest(
+            modelsDir, modelId, integrity = DownloadIntegrity.UNVERIFIED.name,
+            bytes = header.array(), validationStatus = "container_checked_v1",
+        )
 
-        val metadata = checkNotNull(ModelStorageManager(FakeTestContext(), modelsDir)
-            .activeModelInfo(modelId)?.validation?.metadata)
+        val manager = ModelStorageManager(FakeTestContext(), modelsDir)
+        val metadata = checkNotNull(manager.activeModelInfo(modelId)?.validation?.metadata)
         assertEquals("qwen2", metadata.architecture)
         assertEquals(3, metadata.blockCount)
         assertEquals(1024, metadata.embeddingLength)
         assertEquals(8, metadata.attentionHeadCount)
-        assertEquals(4, metadata.attentionHeadCountKv)
+        assertEquals(if (explicitKvHeads) 4 else 16, metadata.attentionHeadCountKv)
         assertEquals(96, metadata.attentionValueLength)
+        val activation = manager.resolveActiveModelForActivation(modelId)
+        assertEquals(ModelStorageManager.ModelStorageError.Code.INVALID_GGUF_HEADER,
+            (activation as ModelStorageManager.ModelResolveResult.Failure).error.code)
     }
 
     private fun createModelWithManifest(
@@ -114,6 +121,7 @@ class ModelProvenancePersistenceTest {
         integrity: String?,
         bytes: ByteArray = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
             .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(0).array(),
+        validationStatus: String = if (integrity == null) "imported" else "container_checked_v2",
     ) {
         val modelFile = File(modelsDir, "$modelId/versions/v1/model.gguf")
         modelFile.parentFile!!.mkdirs()
@@ -134,7 +142,7 @@ class ModelProvenancePersistenceTest {
                 JSONObject()
                     .put("format", "GGUF")
                     .put("gguf_version", 3)
-                    .put("status", if (integrity == null) "imported" else "container_checked_v1")
+                    .put("status", validationStatus)
                     .put("validated_at", "2026-10-09T00:00:00Z"),
             )
         if (integrity != null) {

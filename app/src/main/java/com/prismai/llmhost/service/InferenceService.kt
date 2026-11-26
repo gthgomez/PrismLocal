@@ -129,6 +129,7 @@ class InferenceService : Service() {
         // for the off-main teardown to finish before returning; the teardown
         // job itself keeps running if it overruns (see onDestroy).
         private const val NATIVE_TEARDOWN_WAIT_MS = 2_000L
+        private const val GENERATION_WAIT_MS = 30 * 60 * 1000L
     }
 
     private fun pendingAgentActionKey(chatId: String): String = "$KEY_PENDING_AGENT_ACTION_PREFIX$chatId"
@@ -1227,6 +1228,7 @@ class InferenceService : Service() {
         var resultAgentChainId: Long? = null
         var resultRetained = false
         var launchResult = GenerationOrchestrator.GenerationLaunch.REFUSED
+        val documentAnswer = selectedDocumentId?.let { CompletableDeferred<String?>() }
         operationMutex.withLock {
             if (!initiatedByBackground && backgroundGenerationOwnership.hasOwner()) {
                 publishUiEvent("A background task currently owns the generation engine")
@@ -1292,7 +1294,9 @@ class InferenceService : Service() {
                 }
                 val previousSessionId = generationSession
                 val previousAgentChainId = agentTrace.activeChainId
-                generationOrchestrator.generate(prompt, benchmarkPreset, selectedDocumentId, memory, settings)
+                generationOrchestrator.generate(prompt, benchmarkPreset, selectedDocumentId, memory, settings) {
+                    documentAnswer?.complete(it)
+                }
                 launchResult = generationOrchestrator.takeLaunchResult()
                 // Authoritative admission result: only now may the caller treat the send as
                 // accepted, or report the refusal. A document draft stays in the composer
@@ -1307,7 +1311,7 @@ class InferenceService : Service() {
                 if (startedAgentChainId != previousAgentChainId) {
                     resultAgentChainId = startedAgentChainId
                 }
-                if (resultSessionId != null || resultAgentChainId != null) {
+                if (documentAnswer == null && (resultSessionId != null || resultAgentChainId != null)) {
                     generationOrchestrator.retainGenerationOutput(resultSessionId, resultAgentChainId)
                     resultRetained = true
                 }
@@ -1321,6 +1325,15 @@ class InferenceService : Service() {
                 if (startGateReserved) generationStartGate.finishStart()
             }
         }
+        if (documentAnswer != null) {
+            if (!launchResult.acceptsMessage()) return "Document question was refused"
+            val answer = withTimeoutOrNull(GENERATION_WAIT_MS) { documentAnswer.await() }
+            if (answer == null) {
+                return refuseSend(onRefused, "No completed document answer; the question was kept")
+            }
+            onAccepted?.invoke()
+            return answer
+        }
         try {
             if (!awaitGenerationSessionIdle()) {
                 if (initiatedByBackground) {
@@ -1328,9 +1341,6 @@ class InferenceService : Service() {
                         cancelGenerationAndJoin("background generation wait timed out")
                     }
                     throw IllegalStateException("Generation session exceeded its bounded wait")
-                }
-                if (selectedDocumentId != null && launchResult.acceptsMessage()) {
-                    return refuseSend(onRefused, "The document answer is taking too long; the question was kept")
                 }
                 return "Generation session wait timed out"
             }
@@ -1345,16 +1355,6 @@ class InferenceService : Service() {
                 sessionId = resultSessionId ?: -1L,
                 agentChainId = resultAgentChainId,
             )
-            if (selectedDocumentId != null && launchResult.acceptsMessage()) {
-                when {
-                    (terminalReason == "EOF" || terminalReason == "MAX_TOKENS") && !ownedOutput.isNullOrBlank() ->
-                        onAccepted?.invoke()
-                    terminalReason == "CANCELLED" ->
-                        onRefused?.invoke("Document answer stopped; the question was kept")
-                    else ->
-                        onRefused?.invoke("The model could not answer from the selected passages; the question was kept")
-                }
-            }
             if (initiatedByBackground) {
                 when (launchResult) {
                     GenerationOrchestrator.GenerationLaunch.REFUSED ->
@@ -1483,7 +1483,7 @@ class InferenceService : Service() {
 
     private suspend fun awaitGenerationSessionIdle(
         pollMs: Long = 20L,
-        maxWaitMs: Long = 30 * 60 * 1000L,
+        maxWaitMs: Long = GENERATION_WAIT_MS,
     ): Boolean {
         return com.prismai.llmhost.generation.GenerationSessionWait.awaitSessionIdle(
             isGenerating = { shouldWaitForGenerationSession() },
@@ -1951,11 +1951,11 @@ class InferenceService : Service() {
             "list_memories" -> memoryTools.listMemories(call)
             // ── RAG tools ────────────────────────────────────────────────────
             "ingest_document" -> indexForAgent(call) { ragHandlerTools.ingestDocument(call, confirmed) }
-            "search_documents" -> ragHandlerTools.searchDocuments(call)
+            "search_documents" -> searchForAgent(call) { ragHandlerTools.searchDocuments(call) }
             "list_documents" -> ragHandlerTools.listDocuments(call)
             "delete_document" -> indexForAgent(call) { ragHandlerTools.deleteDocument(call, confirmed) }
             // ── Knowledge Pack tools ─────────────────────────────────────────
-            "search_knowledge" -> knowledgePackHandlerTools.searchKnowledge(call)
+            "search_knowledge" -> searchForAgent(call) { knowledgePackHandlerTools.searchKnowledge(call) }
             "fetch_grokipedia_article" -> indexForAgent(call) { knowledgePackHandlerTools.fetchGrokipediaArticle(call, confirmed) }
             "list_knowledge_packs" -> knowledgePackHandlerTools.listKnowledgePacks(call)
             "download_knowledge_pack" -> indexForAgent(call) { knowledgePackHandlerTools.downloadKnowledgePack(call, confirmed) }
@@ -2117,19 +2117,40 @@ class InferenceService : Service() {
             call, success = false, summary = "Finish the current model operation before changing documents",
         )
 
+    private suspend fun searchForAgent(call: AgentToolCall, action: suspend () -> AgentToolResult): AgentToolResult {
+        val chainId = agentTrace.activeChainId
+        val sourceChat = _currentChatId.value
+        // A model-issued tool can start while the preceding turn is still draining.
+        generationJob?.join()
+        return withIdleModel {
+            if (chainId == null || !agentTrace.isCurrentChain(chainId) ||
+                sourceChat != _currentChatId.value || !_generationSettings.value.agentEnabled
+            ) {
+                toolFailure(call, AgentToolErrorCode.FAILED, "Document search no longer belongs to the active chat")
+            } else {
+                action()
+            }
+        } ?: toolFailure(call, AgentToolErrorCode.BUSY, "Finish the current model operation before searching documents")
+    }
+
     /** Hold native ownership through encoding and index publication, without queuing work behind generation. */
-    private suspend fun <T : Any> indexDocuments(action: suspend () -> T): T? {
-        if (!operationMutex.tryLock()) return null
-        try {
-            if (_isGenerating.value) return null
+    private suspend fun <T : Any> indexDocuments(action: suspend () -> T): T? =
+        withIdleModel {
             indexingDocument.value = true
-            return action()
-        } finally {
-            if (indexingDocument.value) {
+            try {
+                action()
+            } finally {
                 // A cancelled caller may already have reached SQLite's commit point.
                 refreshVectorChunksList()
                 indexingDocument.value = false
             }
+        }
+
+    private suspend fun <T : Any> withIdleModel(action: suspend () -> T): T? {
+        if (!operationMutex.tryLock()) return null
+        try {
+            return if (_isGenerating.value) null else action()
+        } finally {
             operationMutex.unlock()
         }
     }
@@ -2150,14 +2171,8 @@ class InferenceService : Service() {
     }
 
     /** Public API for the document browser UI. Performs vector cosine similarity search. */
-    suspend fun queryVectorStore(query: String, topK: Int = 5): List<Pair<com.prismai.llmhost.storage.VectorChunk, Float>> {
-        if (!operationMutex.tryLock()) return emptyList()
-        try {
-            return if (_isGenerating.value) emptyList() else ragManager.query(query, topK = topK)
-        } finally {
-            operationMutex.unlock()
-        }
-    }
+    suspend fun queryVectorStore(query: String, topK: Int = 5): List<Pair<com.prismai.llmhost.storage.VectorChunk, Float>> =
+        withIdleModel { ragManager.query(query, topK = topK) }.orEmpty()
 
     /** Public API to force refresh vector store chunks StateFlow. */
     fun refreshVectorStore() {

@@ -232,6 +232,7 @@ class GenerationOrchestrator(
         selectedDocumentId: String?,
         memory: MemoryRetriever.PromptMemory,
         baseSettings: GenerationSettings,
+        onDocumentAnswerCompleted: (String?) -> Unit,
     ) {
         launchResult.set(GenerationLaunch.REFUSED)
         launchRefusalReason.set(null)
@@ -396,6 +397,7 @@ class GenerationOrchestrator(
 
         Log.d(TAG, "generate start promptLength=${enginePrompt.length} model=${uiState.currentModel.value} session=$session settings=$settings")
 
+        var finalizedDocumentAnswer: String? = null
         val job = runGenerationFlow(
             session = session,
             enginePrompt = enginePrompt,
@@ -445,10 +447,14 @@ class GenerationOrchestrator(
             } else ""
 
             val response = if (agentToolCall == null) result.finalOutput else reasoningPrefix
-            val withSources = if (documentContext != null && response.isNotBlank() &&
-                result.finalReason in setOf("EOF", "MAX_TOKENS")
-            ) "$response\n\n${documentContext.sources()}" else response
-            chatManager.updateTranscriptMessage(assistantMessageId, withSources)
+            if (documentContext != null && response.isNotBlank() &&
+                (result.finalReason == "EOF" || result.finalReason == "MAX_TOKENS")
+            ) {
+                chatManager.updateTranscriptMessage(assistantMessageId, "$response\n\n${documentContext.sources()}")
+                finalizedDocumentAnswer = response
+            } else {
+                chatManager.updateTranscriptMessage(assistantMessageId, response)
+            }
 
             // Benchmark queue drain handled by InferenceService
 
@@ -463,6 +469,11 @@ class GenerationOrchestrator(
         }
 
         storeGenerationJob(job)
+        if (documentContext != null) {
+            job.invokeOnCompletion { cause ->
+                onDocumentAnswerCompleted(if (cause == null) finalizedDocumentAnswer else null)
+            }
+        }
     }
 
     /** Continuation generation. Acquires [InferenceService]'s operation mutex via [com.prismai.llmhost.InferenceService.continueGenerationSafely]. */

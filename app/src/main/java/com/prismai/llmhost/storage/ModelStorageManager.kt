@@ -503,8 +503,8 @@ class ModelStorageManager(
      * changed, or whose digest no longer matches, is rejected with [HASH_MISMATCH] and never
      * handed to the native loader.
      */
-    fun resolveActiveModelForActivation(modelId: String): ModelResolveResult =
-        parseManifest(File(modelsDir, modelId), HashPolicy.CACHED)
+    fun resolveActiveModelForActivation(modelId: String, maxLoadBytes: Long = Long.MAX_VALUE): ModelResolveResult =
+        parseManifest(File(modelsDir, modelId), HashPolicy.CACHED, maxLoadBytes)
 
     fun activeModelInfo(modelId: String): ActiveModelInfo? =
         (resolveActiveModel(modelId, verifyHash = false) as? ModelResolveResult.Success)?.model
@@ -572,7 +572,11 @@ class ModelStorageManager(
         CACHED,
     }
 
-    private fun parseManifest(modelRoot: File, hashPolicy: HashPolicy): ModelResolveResult {
+    private fun parseManifest(
+        modelRoot: File,
+        hashPolicy: HashPolicy,
+        maxLoadBytes: Long = Long.MAX_VALUE,
+    ): ModelResolveResult {
         val modelId = modelRoot.name
         val manifestFile = File(modelRoot, MANIFEST_FILE)
         if (!manifestFile.exists()) {
@@ -604,6 +608,15 @@ class ModelStorageManager(
                         ModelStorageError.Code.MISSING_MODEL_FILE,
                         "Model $modelId is missing its active GGUF file",
                         modelFile.absolutePath,
+                    )
+                )
+            }
+            val actualBytes = modelFile.length()
+            if (actualBytes > maxLoadBytes) {
+                return ModelResolveResult.Failure(
+                    ModelStorageError(
+                        ModelStorageError.Code.FILE_TOO_LARGE,
+                        "Model $modelId exceeds this build's ${maxLoadBytes / (1024 * 1024)} MiB load cap",
                     )
                 )
             }
@@ -651,7 +664,7 @@ class ModelStorageManager(
                     file = modelFile,
                     fileName = activeObj.optString("original_file_name", modelFile.name),
                     sha256 = expectedSha.lowercase(Locale.US),
-                    bytes = modelFile.length(),
+                    bytes = actualBytes,
                     importedAt = activeObj.optString("imported_at", ""),
                     validation = validation,
                     integrity = integrity,
@@ -851,8 +864,8 @@ class ModelStorageManager(
     private fun parseValidation(activeObj: JSONObject): ModelValidation? {
         val validation = activeObj.optJSONObject("validation") ?: return null
         val status = validation.optString("status")
-        // V1 checked container extents but could omit shape fields used by the RAM estimate.
-        if (status == "container_checked_v1") return null
+        // Refresh extents and shape summaries from receipts predating per-layer cache sizing.
+        if (status == "container_checked_v1" || status == "container_checked_v2") return null
         return ModelValidation(
             format = validation.optString("format", "GGUF"),
             ggufVersion = validation.optInt("gguf_version", -1),
@@ -1253,7 +1266,7 @@ class ModelStorageManager(
             "context_length", "block_count", "embedding_length", "attention.head_count",
             "attention.head_count_kv", "attention.key_length", "attention.value_length",
         )
-        private const val CONTAINER_CHECKED = "container_checked_v2"
+        private const val CONTAINER_CHECKED = "container_checked_v3"
         const val MANIFEST_FILE = "manifest.json"
         const val MODEL_FILE = "model.gguf"
         const val IMPORT_STAGING_DIR = ".imports"

@@ -28,6 +28,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.io.RandomAccessFile
 import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
@@ -206,18 +207,23 @@ class ServiceSwitchModelTest {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val targetContext = instrumentation.targetContext
         stageModel(instrumentation, "modelA")
-        stageOversizedModel(instrumentation, "oversizedModel")
-
+        stageModel(instrumentation, "oversizedModel")
+        val modelsDir = targetContext.getExternalFilesDir("models") ?: File(targetContext.filesDir, "models")
+        val oversizedRoot = File(modelsDir, "oversizedModel")
         val service = bindService(targetContext)
         try {
             assertTrue(service.service.switchModel("modelA"))
 
+            val oversizedFile = File(oversizedRoot, "tinyllama-v0.q8_0.gguf")
+            RandomAccessFile(oversizedFile, "rw").use { it.setLength(ModelLoadLimits.HARD_CAP_BYTES + 1) }
             assertFalse(service.service.switchModel("oversizedModel"))
+            assertTrue(service.service.modelLoadDiagnostics.value?.message.orEmpty().contains("load cap"))
 
             assertEquals("modelA", service.service.currentModel.value)
             assertFalse(service.service.isGenerating.value)
             assertFalse(service.service.debugIsGenerationForegroundActive())
         } finally {
+            oversizedRoot.deleteRecursively()
             service.service.cancelGeneration()
             targetContext.unbindService(service.connection)
         }
@@ -354,30 +360,6 @@ class ServiceSwitchModelTest {
         modelRoot.mkdirs()
         copyAsset(instrumentation, "smoke-model/manifest.json", File(modelRoot, "manifest.json"))
         copyAsset(instrumentation, "smoke-model/tinyllama-v0.q8_0.gguf", File(modelRoot, "tinyllama-v0.q8_0.gguf"))
-    }
-
-    private fun stageOversizedModel(instrumentation: Instrumentation, modelId: String) {
-        val targetContext = instrumentation.targetContext
-        val modelsDir = targetContext.getExternalFilesDir("models") ?: File(targetContext.filesDir, "models")
-        val modelRoot = File(modelsDir, modelId)
-        modelRoot.deleteRecursively()
-        modelRoot.mkdirs()
-        copyAsset(instrumentation, "smoke-model/tinyllama-v0.q8_0.gguf", File(modelRoot, "tinyllama-v0.q8_0.gguf"))
-        File(modelRoot, "manifest.json").writeText(
-            """
-            {
-              "active_version": "v1",
-              "versions": {
-                "v1": {
-                  "file": "tinyllama-v0.q8_0.gguf",
-                  "original_file_name": "oversized.gguf",
-                  "sha256": "0cbe6769faaa77f4cdbf2f39dbc5f0fb9b3d62f7f9bc5760aa364946e6f2d0f5",
-                  "bytes": 3221225473
-                }
-              }
-            }
-            """.trimIndent()
-        )
     }
 
     private fun copyAsset(instrumentation: Instrumentation, assetPath: String, destination: File) {

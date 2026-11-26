@@ -146,14 +146,16 @@ class ModelStorageManagerTest {
                 as ModelStorageManager.ImportResult.Success
             val manifestFile = File(modelsDir(), "$modelId/manifest.json")
             val manifest = org.json.JSONObject(manifestFile.readText())
-            manifest.getJSONObject("versions").getJSONObject(installed.model.versionId)
-                .getJSONObject("validation").put("status", "container_checked_v1")
-            manifestFile.writeText(manifest.toString())
-
-            val activated = manager.resolveActiveModelForActivation(modelId) as ModelStorageManager.ModelResolveResult.Success
-            assertEquals("container_checked_v2", activated.model.validation.status)
-            assertEquals(installed.model.sha256, activated.model.sha256)
-            assertEquals(installed.model.versionId, activated.model.versionId)
+            val validation = manifest.getJSONObject("versions").getJSONObject(installed.model.versionId)
+                .getJSONObject("validation")
+            for (prior in listOf("container_checked_v1", "container_checked_v2")) {
+                validation.put("status", prior)
+                manifestFile.writeText(manifest.toString())
+                val activated = manager.resolveActiveModelForActivation(modelId) as ModelStorageManager.ModelResolveResult.Success
+                assertEquals("container_checked_v3", activated.model.validation.status)
+                assertEquals(installed.model.sha256, activated.model.sha256)
+                assertEquals(installed.model.versionId, activated.model.versionId)
+            }
         } finally {
             cleanup(modelId)
         }

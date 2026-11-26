@@ -278,9 +278,10 @@ fun ChatScreen(
                         // draft is read here, never captured from a previous composition,
                         // so a switch cannot clobber the incoming chat with stale values.
                         LaunchedEffect(currentChatId, service) {
-                            if (service == null) return@LaunchedEffect
+                            val boundService = service ?: return@LaunchedEffect
+                            val boundChatId = boundService.currentChatId.value
                             val loaded = draftStore.applyLiveDraft(
-                                     currentChatId = currentChatId,
+                                currentChatId = boundChatId,
                                 liveText = prompt,
                                 liveAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode),
                             ) ?: return@LaunchedEffect
@@ -792,7 +793,7 @@ fun ChatScreen(
                                      snackbarMessage = "Wait for document indexing to finish"
                                  } else if (selectedDocumentId != null && attachments.isNotEmpty()) {
                                      snackbarMessage = "Remove attachments before asking the selected document"
-                                 } else if (!isSending) {
+                                 } else if (!isSendingChat && pendingDocumentSend == null) {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 val svc = service
                                 if (text.isNotEmpty()) {

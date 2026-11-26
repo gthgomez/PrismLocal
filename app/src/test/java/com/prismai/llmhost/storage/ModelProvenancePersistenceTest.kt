@@ -122,7 +122,7 @@ class ModelProvenancePersistenceTest {
         integrity: String?,
         bytes: ByteArray = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
             .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(0).array(),
-        validationStatus: String = if (integrity == null) "imported" else "container_checked_v2",
+        validationStatus: String = if (integrity == null) "imported" else "container_checked_v3",
     ) {
         val modelFile = File(modelsDir, "$modelId/versions/v1/model.gguf")
         modelFile.parentFile!!.mkdirs()

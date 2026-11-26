@@ -2024,21 +2024,30 @@ std::vector<int32_t> Engine::drainTokens(int generation_id, int max_tokens) {
     return result;
 }
 
-bool Engine::acknowledgeDrainedTokens(int generation_id, int expected_tail, int token_count) {
-    if (!impl_ || token_count <= 0) return false;
+DrainAcknowledgement Engine::acknowledgeDrainedTokens(int generation_id, int expected_tail, int token_count) {
+    if (!impl_) return DrainAcknowledgement::Retired;
+    if (token_count <= 0) return DrainAcknowledgement::Invalid;
     auto lifecycle_lock = impl_->lifecycle_gate.enter();
-    auto* ctrl = impl_->buffers.control;
-    if (ctrl->generation_id.load(std::memory_order_acquire) != static_cast<uint32_t>(generation_id)) {
-        return false;
+    // Worker cancellation can still leave an owned batch. Only replacement or
+    // retirement of the session permits ignoring a stale acknowledgement.
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        if (!impl_->active_session ||
+            impl_->active_session->generation_id != static_cast<uint32_t>(generation_id)) {
+            return DrainAcknowledgement::Retired;
+        }
     }
+    auto* ctrl = impl_->buffers.control;
     const uint32_t tail = ctrl->tail.load(std::memory_order_acquire);
     const uint32_t head = ctrl->head.load(std::memory_order_acquire);
     const uint32_t capacity = ctrl->capacity.load(std::memory_order_acquire);
     const uint32_t available = head >= tail ? head - tail : capacity - tail + head;
-    if (!validDrainAcknowledgement(expected_tail, tail, token_count, available)) return false;
+    if (!validDrainAcknowledgement(expected_tail, tail, token_count, available)) {
+        return DrainAcknowledgement::Invalid;
+    }
     ctrl->tail.store((tail + static_cast<uint32_t>(token_count)) % capacity, std::memory_order_release);
     ctrl->drained_tokens.fetch_add(static_cast<uint32_t>(token_count), std::memory_order_acq_rel);
-    return true;
+    return DrainAcknowledgement::Acknowledged;
 }
 
 void Engine::ackEof(int generation_id) {

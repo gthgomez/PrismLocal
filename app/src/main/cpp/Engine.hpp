@@ -18,6 +18,12 @@ enum class StreamState : uint32_t {
     MaxTokens = 7,
 };
 
+enum class DrainAcknowledgement : int {
+    Invalid = 0,
+    Acknowledged = 1,
+    Retired = 2,
+};
+
 struct LoraAdapterSpec {
     std::string path;
     float scale = 1.0f;
@@ -67,7 +73,7 @@ public:
     std::string runBenchmark(GenerationConfig config, int prompt_tokens, int generation_tokens, int repetitions);
     void cancelGeneration(int generation_id);
     std::vector<int32_t> drainTokens(int generation_id, int max_tokens);
-    bool acknowledgeDrainedTokens(int generation_id, int expected_tail, int token_count);
+    DrainAcknowledgement acknowledgeDrainedTokens(int generation_id, int expected_tail, int token_count);
     void ackEof(int generation_id);
     std::string decodeTokens(int generation_id, const std::vector<int32_t>& tokens);
     int getState(int generation_id) const;

@@ -494,12 +494,13 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeAckEof(JNIEnv*, jobject, j
     lease->ackEof(gen_id);
 }
 
-extern "C" JNIEXPORT jboolean JNICALL
+extern "C" JNIEXPORT jint JNICALL
 Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeAckDrainedTokens(
         JNIEnv*, jobject, jlong handle, jint gen_id, jint expected_tail, jint token_count) {
     auto lease = NativeHandleRegistry::instance().acquire(handle);
-    return lease && lease->acknowledgeDrainedTokens(gen_id, expected_tail, token_count)
-        ? JNI_TRUE : JNI_FALSE;
+    return static_cast<jint>(lease
+        ? lease->acknowledgeDrainedTokens(gen_id, expected_tail, token_count)
+        : llmhost::DrainAcknowledgement::Retired);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

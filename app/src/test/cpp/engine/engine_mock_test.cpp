@@ -118,6 +118,28 @@ int testFullMockGenerationProducesExactTokenSequence() {
     return 0;
 }
 
+int testDrainAcknowledgementDistinguishesInvalidBatchFromRetiredRing() {
+    using llmhost::DrainAcknowledgement;
+    llmhost::Engine engine(true);
+    CHECK(engine.loadModel("DEBUG_MOCK_MODEL"));
+    const int genId = 9151;
+    CHECK(engine.startGeneration("DEBUG_SIMULATE_RING", genId, llmhost::GenerationConfig{}) == genId);
+    auto batch = engine.drainDecodeAndState(genId, 64);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (batch.tokens.empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        batch = engine.drainDecodeAndState(genId, 64);
+    }
+    CHECK(!batch.tokens.empty());
+    const int count = static_cast<int>(batch.tokens.size());
+    // Acknowledge an incorrect tail in a still-owned session.
+    CHECK(engine.acknowledgeDrainedTokens(genId, batch.drain_tail + 1, count) == DrainAcknowledgement::Invalid);
+    // Deliver the same in-flight batch after unloading its owner.
+    engine.unloadModel();
+    CHECK(engine.acknowledgeDrainedTokens(genId, batch.drain_tail, count) == DrainAcknowledgement::Retired);
+    return 0;
+}
+
 int testCancelGenerationReachesCancelledAndClearsRing() {
     g_engine = new llmhost::Engine(true);
     CHECK(g_engine->loadModel("DEBUG_MOCK_MODEL"));
@@ -363,6 +385,7 @@ int main() {
         {"start_generation_without_model_fails", testStartGenerationWithoutModelFails},
         {"full_mock_generation_exact_sequence", testFullMockGenerationProducesExactTokenSequence},
         {"cancel_generation_reaches_cancelled", testCancelGenerationReachesCancelledAndClearsRing},
+        {"drain_ack_distinguishes_invalid_from_retired", testDrainAcknowledgementDistinguishesInvalidBatchFromRetiredRing},
         {"reset_conversation_no_stale_tokens", testResetConversationGivesNextGenerationNoStaleTokens},
         {"critical_memory_pressure_cancels", testCriticalMemoryPressureCancelsActiveGeneration},
         {"unload_model_during_generation_safe", testUnloadModelDuringGenerationIsSafe},

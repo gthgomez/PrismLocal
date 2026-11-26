@@ -90,7 +90,7 @@ class ModelManager(
             message = "Loading model",
         )
 
-        when (val resolved = modelStorageManager.resolveActiveModelForActivation(modelId)) {
+        when (val resolved = modelStorageManager.resolveActiveModelForActivation(modelId, ModelLoadLimits.HARD_CAP_BYTES)) {
             is ModelStorageManager.ModelResolveResult.Failure -> {
                 if (uiState._currentModel.value == modelId) {
                     engine.unloadModel()

@@ -1295,9 +1295,10 @@ class InferenceService : Service() {
                 generationOrchestrator.generate(prompt, benchmarkPreset, selectedDocumentId, memory, settings)
                 launchResult = generationOrchestrator.takeLaunchResult()
                 // Authoritative admission result: only now may the caller treat the send as
-                // accepted (and clear the composer), or report the refusal.
+                // accepted, or report the refusal. A document draft stays in the composer
+                // through native tokenization, whose exact budget check can still refuse it.
                 if (launchResult.acceptsMessage()) {
-                    onAccepted?.invoke()
+                    if (selectedDocumentId == null) onAccepted?.invoke()
                 } else {
                     onRefused?.invoke(generationOrchestrator.takeLaunchRefusalReason() ?: "Generation was refused")
                 }
@@ -1328,6 +1329,9 @@ class InferenceService : Service() {
                     }
                     throw IllegalStateException("Generation session exceeded its bounded wait")
                 }
+                if (selectedDocumentId != null && launchResult.acceptsMessage()) {
+                    return refuseSend(onRefused, "The document answer is taking too long; the question was kept")
+                }
                 return "Generation session wait timed out"
             }
             if (initiatedByBackground && !backgroundGenerationOwnership.isOwner(backgroundTaskId)) {
@@ -1341,6 +1345,16 @@ class InferenceService : Service() {
                 sessionId = resultSessionId ?: -1L,
                 agentChainId = resultAgentChainId,
             )
+            if (selectedDocumentId != null && launchResult.acceptsMessage()) {
+                when {
+                    (terminalReason == "EOF" || terminalReason == "MAX_TOKENS") && !ownedOutput.isNullOrBlank() ->
+                        onAccepted?.invoke()
+                    terminalReason == "CANCELLED" ->
+                        onRefused?.invoke("Document answer stopped; the question was kept")
+                    else ->
+                        onRefused?.invoke("The model could not answer from the selected passages; the question was kept")
+                }
+            }
             if (initiatedByBackground) {
                 when (launchResult) {
                     GenerationOrchestrator.GenerationLaunch.REFUSED ->

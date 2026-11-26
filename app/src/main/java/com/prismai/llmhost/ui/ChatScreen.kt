@@ -720,7 +720,7 @@ fun ChatScreen(
                                 TextButton(onClick = { selectedDocumentId = null }) { Text("Clear") }
                             }
                         }
-                        if (isIndexingDocument || (isSending && selectedDocumentId != null)) {
+                         if (isIndexingDocument || (isSending && !isGenerating && selectedDocumentId != null)) {
                             Text(
                                 text = if (isIndexingDocument) "Indexing document on this device…" else "Searching selected document…",
                                 style = MaterialTheme.typography.bodySmall,

@@ -1,6 +1,7 @@
 package com.prismai.llmhost.model
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -15,5 +16,13 @@ class ModelLoadAdmissionTest {
     fun previouslyProvenModelCanPassEstimateButNeverTheHardSizeCap() {
         assertFalse(ModelLoadLimits.isLoadBlocked(1_000, 2_001, 2_000, true))
         assertTrue(ModelLoadLimits.isLoadBlocked(ModelLoadLimits.HARD_CAP_BYTES + 1, 1, 2, true))
+    }
+
+    @Test
+    fun largeKvEstimateCannotWrapIntoAnAdmissibleLoad() {
+        val estimate = ModelReadinessAssessor.requiredMemoryWithKv(4_000, Long.MAX_VALUE)
+        assertEquals(Long.MAX_VALUE, estimate)
+        assertTrue(ModelLoadLimits.isLoadBlocked(1_000, estimate, 3_000, false))
+        assertEquals(6_000L, ModelReadinessAssessor.requiredMemoryWithKv(4_000, 2_000))
     }
 }

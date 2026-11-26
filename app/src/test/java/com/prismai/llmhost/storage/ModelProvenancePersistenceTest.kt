@@ -67,11 +67,57 @@ class ModelProvenancePersistenceTest {
             (incomplete as ModelStorageManager.ModelResolveResult.Failure).error.code)
     }
 
-    private fun createModelWithManifest(modelsDir: File, modelId: String, integrity: String?) {
+    @Test
+    fun modelShapeDoesNotDependOnKeyOrderAndHandlesPerLayerHeads() {
+        val modelsDir = tempFolder.newFolder("shapes")
+        val modelId = "shape-model"
+        val header = ByteBuffer.allocate(512).order(ByteOrder.LITTLE_ENDIAN)
+            .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(6)
+        fun writeKey(key: String, type: Int) {
+            val name = key.toByteArray()
+            header.putLong(name.size.toLong()).put(name).putInt(type)
+        }
+        fun headCounts(key: String, vararg heads: Int) {
+            writeKey(key, 9) // array
+            header.putInt(4).putLong(heads.size.toLong())
+            heads.forEach { header.putInt(it) }
+        }
+        writeKey("qwen2.block_count", 4)
+        header.putInt(3)
+        writeKey("qwen2.embedding_length", 4)
+        header.putInt(1024)
+        headCounts("qwen2.attention.head_count", 16, 8, 0)
+        headCounts("qwen2.attention.head_count_kv", 2, 4, 0)
+        writeKey("qwen2.attention.value_length", 4)
+        header.putInt(96)
+        writeKey("general.architecture", 8)
+        header.putLong(5).put("qwen2".toByteArray())
+        createModelWithManifest(modelsDir, modelId, integrity = null, bytes = header.array())
+        val manifestFile = File(modelsDir, "$modelId/manifest.json")
+        val manifest = JSONObject(manifestFile.readText())
+        manifest.getJSONObject("versions").getJSONObject("v1").remove("validation")
+        manifestFile.writeText(manifest.toString())
+
+        val metadata = checkNotNull(ModelStorageManager(FakeTestContext(), modelsDir)
+            .activeModelInfo(modelId)?.validation?.metadata)
+        assertEquals("qwen2", metadata.architecture)
+        assertEquals(3, metadata.blockCount)
+        assertEquals(1024, metadata.embeddingLength)
+        assertEquals(8, metadata.attentionHeadCount)
+        assertEquals(4, metadata.attentionHeadCountKv)
+        assertEquals(96, metadata.attentionValueLength)
+    }
+
+    private fun createModelWithManifest(
+        modelsDir: File,
+        modelId: String,
+        integrity: String?,
+        bytes: ByteArray = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
+            .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(0).array(),
+    ) {
         val modelFile = File(modelsDir, "$modelId/versions/v1/model.gguf")
         modelFile.parentFile!!.mkdirs()
-        modelFile.writeBytes(ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
-            .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(0).array())
+        modelFile.writeBytes(bytes)
 
         val sha = java.security.MessageDigest.getInstance("SHA-256")
             .digest(modelFile.readBytes())

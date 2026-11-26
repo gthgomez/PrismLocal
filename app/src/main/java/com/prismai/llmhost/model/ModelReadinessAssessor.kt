@@ -128,6 +128,8 @@ class ModelReadinessAssessor(
             attentionHeadCountKv: Int?,
             kvTypeK: String,
             kvTypeV: String,
+            attentionKeyLength: Int? = null,
+            attentionValueLength: Int? = null,
         ): Long {
             val layers = blockCount ?: 0
             val embd = embeddingLength ?: 0
@@ -137,10 +139,14 @@ class ModelReadinessAssessor(
             val heads = (attentionHeadCount ?: 0).takeIf { it > 0 }
             val headDim = if (heads != null) (embd / heads).coerceAtLeast(1) else DEFAULT_HEAD_DIM
             val kvHeads = (attentionHeadCountKv ?: 0).takeIf { it > 0 } ?: heads ?: 1
-            val bytesPerToken = layers.toDouble() * kvHeads.toDouble() * headDim.toDouble() *
-                (kvBytesPerElement(kvTypeK) + kvBytesPerElement(kvTypeV))
+            val keys = (attentionKeyLength ?: headDim) * kvBytesPerElement(kvTypeK)
+            val values = (attentionValueLength ?: headDim) * kvBytesPerElement(kvTypeV)
+            val bytesPerToken = layers.toDouble() * kvHeads.toDouble() * (keys + values)
             return (contextLength.toDouble() * bytesPerToken).toLong().coerceAtLeast(0L)
         }
+
+        internal fun requiredMemoryWithKv(baseBytes: Long, kvBytes: Long): Long =
+            baseBytes + kvBytes.coerceAtMost(Long.MAX_VALUE - baseBytes)
 
         /**
          * Pure fitness rating used by [estimateModelFit] and unit tests.
@@ -253,8 +259,8 @@ class ModelReadinessAssessor(
             MODEL_RUNTIME_MIN_OVERHEAD_BYTES,
             (info.bytes * quantizationOverheadMultiplier(quantization)).toLong(),
         )
-        // The loader allocates the requested context; n_ctx_train is a model property, not a cap.
-        val activeContext = settings.contextLength
+        // Pinned llama.cpp rounds the requested context up to 256 slots, even past n_ctx_train.
+        val activeContext = (settings.contextLength + 255) / 256 * 256
         val kvCacheEstimateBytes = estimateKvCacheBytes(
             contextLength = activeContext,
             blockCount = metadata?.blockCount,
@@ -264,11 +270,11 @@ class ModelReadinessAssessor(
             // The loader can retry an unsupported requested KV format with F16.
             kvTypeK = "f16",
             kvTypeV = "f16",
+            attentionKeyLength = metadata?.attentionKeyLength,
+            attentionValueLength = metadata?.attentionValueLength,
         )
-        val requiredRam = info.bytes +
-            runtimeOverhead +
-            kvCacheEstimateBytes +
-            (settings.threadCount * MODEL_THREAD_SCRATCH_BYTES)
+        val baseBytes = info.bytes + runtimeOverhead + (settings.threadCount * MODEL_THREAD_SCRATCH_BYTES)
+        val requiredRam = requiredMemoryWithKv(baseBytes, kvCacheEstimateBytes)
         val staticRating = rateModelFit(
             modelBytes = info.bytes,
             requiredRamBytes = requiredRam,

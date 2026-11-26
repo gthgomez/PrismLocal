@@ -210,6 +210,8 @@ class ModelStorageManager(
         val attentionHeadCount: Int? = null,
         val attentionHeadCountKv: Int? = null,
         val hasChatTemplate: Boolean = false,
+        val attentionKeyLength: Int? = null,
+        val attentionValueLength: Int? = null,
     )
 
     data class ImportProgress(
@@ -595,7 +597,7 @@ class ModelStorageManager(
                     )
                 )
             }
-            if (!modelFile.exists()) {
+            if (!modelFile.isFile) {
                 return ModelResolveResult.Failure(
                     ModelStorageError(
                         ModelStorageError.Code.MISSING_MODEL_FILE,
@@ -648,7 +650,7 @@ class ModelStorageManager(
                     file = modelFile,
                     fileName = activeObj.optString("original_file_name", modelFile.name),
                     sha256 = expectedSha.lowercase(Locale.US),
-                    bytes = activeObj.optLong("bytes", modelFile.length()),
+                    bytes = modelFile.length(),
                     importedAt = activeObj.optString("imported_at", ""),
                     validation = validation,
                     integrity = integrity,
@@ -723,6 +725,8 @@ class ModelStorageManager(
                                         .put("embedding_length", metadata.embeddingLength)
                                         .put("attention_head_count", metadata.attentionHeadCount)
                                         .put("attention_head_count_kv", metadata.attentionHeadCountKv)
+                                        .put("attention_key_length", metadata.attentionKeyLength)
+                                        .put("attention_value_length", metadata.attentionValueLength)
                                         .put("has_chat_template", metadata.hasChatTemplate)
                                 )
                             }
@@ -866,30 +870,34 @@ class ModelStorageManager(
             attentionHeadCount = metadata.optIntOrNull("attention_head_count"),
             attentionHeadCountKv = metadata.optIntOrNull("attention_head_count_kv"),
             hasChatTemplate = metadata.optBoolean("has_chat_template", false),
+            attentionKeyLength = metadata.optIntOrNull("attention_key_length"),
+            attentionValueLength = metadata.optIntOrNull("attention_value_length"),
         )
     }
 
     private fun parseGgufMetadata(reader: GgufReader, checkCancelled: () -> Unit): Pair<GgufMetadataSummary, Long> {
         val kvCount = reader.readCount(minOf(4096L, reader.remaining / 13), "metadata count")
         val keys = HashSet<String>()
+        val shapeValues = mutableMapOf<String, Int>()
         var alignment = 32L
         var architecture: String? = null
         var name: String? = null
         var sizeLabel: String? = null
         var fileType: Int? = null
-        var contextLength: Int? = null
-        var blockCount: Int? = null
-        var embeddingLength: Int? = null
-        var attentionHeadCount: Int? = null
-        var attentionHeadCountKv: Int? = null
         var hasChatTemplate = false
 
         repeat(kvCount.toInt()) {
             checkCancelled()
-            val key = reader.readGgufString()
+            val key = reader.readGgufString(4_096)
             if (key.isEmpty() || '\u0000' in key || !keys.add(key)) throw IOException("Invalid GGUF metadata key")
+            val shapeField = key.substringAfter('.', "")
             val type = reader.readU32()
-            val value = reader.readMetadataValue(type)
+            val reduction = when (shapeField) {
+                "attention.head_count" -> ArrayReduction.MIN_POSITIVE
+                "attention.head_count_kv" -> ArrayReduction.MAX
+                else -> null
+            }
+            val value = reader.readMetadataValue(type, reduction)
             when (key) {
                 "general.alignment" -> {
                     alignment = if (type == 4) (value as Number).toLong() else 0
@@ -903,31 +911,27 @@ class ModelStorageManager(
                 "general.file_type" -> fileType = (value as? Number)?.toInt()
                 "tokenizer.chat_template" -> hasChatTemplate = (value as? String)?.isNotBlank() == true
                 else -> {
-                    val prefix = architecture?.let { "$it." }
-                    if (prefix != null && key.startsWith(prefix)) {
-                        when (key.removePrefix(prefix)) {
-                            "context_length" -> contextLength = (value as? Number)?.toInt()
-                            "block_count" -> blockCount = (value as? Number)?.toInt()
-                            "embedding_length" -> embeddingLength = (value as? Number)?.toInt()
-                            "attention.head_count" -> attentionHeadCount = (value as? Number)?.toInt()
-                            "attention.head_count_kv" -> attentionHeadCountKv = (value as? Number)?.toInt()
-                        }
+                    if (shapeField in GGUF_SHAPE_FIELDS && value is Number && value.toLong() > 0L) {
+                        shapeValues[key] = value.toLong().coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                     }
                 }
             }
         }
 
+        fun shape(field: String): Int? = architecture?.let { shapeValues["$it.$field"] }
         return GgufMetadataSummary(
             architecture = architecture,
             name = name,
             sizeLabel = sizeLabel,
             fileType = fileType,
-            contextLength = contextLength,
-            blockCount = blockCount,
-            embeddingLength = embeddingLength,
-            attentionHeadCount = attentionHeadCount,
-            attentionHeadCountKv = attentionHeadCountKv,
+            contextLength = shape("context_length"),
+            blockCount = shape("block_count"),
+            embeddingLength = shape("embedding_length"),
+            attentionHeadCount = shape("attention.head_count"),
+            attentionHeadCountKv = shape("attention.head_count_kv"),
             hasChatTemplate = hasChatTemplate,
+            attentionKeyLength = shape("attention.key_length"),
+            attentionValueLength = shape("attention.value_length"),
         ) to alignment
     }
 
@@ -968,6 +972,8 @@ class ModelStorageManager(
 
     private fun JSONObject.optIntOrNull(name: String): Int? =
         if (has(name) && !isNull(name)) optInt(name) else null
+
+    private enum class ArrayReduction { MIN_POSITIVE, MAX }
 
     private class GgufReader(private val input: DataInputStream, size: Long) {
         private val scratch = ByteArray(8)
@@ -1010,7 +1016,7 @@ class ModelStorageManager(
             if (it !in 0..maximum) throw IOException("Invalid GGUF $label")
         }
 
-        fun readMetadataValue(type: Int): Any? =
+        fun readMetadataValue(type: Int, reduction: ArrayReduction?): Any? =
             when (type) {
                 0, 1 -> readScalar(1)
                 2, 3 -> readScalar(2)
@@ -1021,12 +1027,28 @@ class ModelStorageManager(
                     val elementType = readU32()
                     val elementBytes = metadataElementBytes(elementType)
                     val count = readCount(minOf(1_000_000L, remaining / elementBytes), "array length")
-                    if (elementType == 8) {
-                        repeat(count.toInt()) { skipFully(readU64()) }
-                    } else {
-                        skipFully(count * elementBytes)
+                    when {
+                        reduction != null && elementType in 0..5 -> {
+                            var result = 0L
+                            repeat(count.toInt()) {
+                                val value = readScalar(elementBytes.toInt())
+                                if (reduction == ArrayReduction.MAX) {
+                                    result = maxOf(result, value)
+                                } else if (value > 0L) {
+                                    result = if (result == 0L) value else minOf(result, value)
+                                }
+                            }
+                            result
+                        }
+                        elementType == 8 -> {
+                            repeat(count.toInt()) { skipFully(readU64()) }
+                            null
+                        }
+                        else -> {
+                            skipFully(count * elementBytes)
+                            null
+                        }
                     }
-                    null
                 }
                 10, 11, 12 -> readScalar(8)
                 else -> throw IOException("Invalid GGUF metadata type")
@@ -1205,6 +1227,10 @@ class ModelStorageManager(
             freeBytes > MIN_FREE_SPACE_AFTER_IMPORT
 
         const val TAG = "ModelStorageManager"
+        private val GGUF_SHAPE_FIELDS = setOf(
+            "context_length", "block_count", "embedding_length", "attention.head_count",
+            "attention.head_count_kv", "attention.key_length", "attention.value_length",
+        )
         private const val CONTAINER_CHECKED = "container_checked_v1"
         const val MANIFEST_FILE = "manifest.json"
         const val MODEL_FILE = "model.gguf"

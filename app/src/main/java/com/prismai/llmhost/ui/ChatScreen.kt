@@ -311,7 +311,10 @@ fun ChatScreen(
                             }
                             if (documentId != null && (savedChatId != chatId || selectedDocumentId != documentId)) return@LaunchedEffect
                             val sentAttachments = request.drop(4).filterNotNull()
-                            if (savedChatId == chatId && prompt == question && savedAttachments == sentAttachments) {
+                            if (savedChatId == chatId) {
+                                // The store can still have the pre-edit snapshot after recreation.
+                                // Keep its attachment payloads if the live draft still references them.
+                                if (prompt != question || savedAttachments != sentAttachments) return@LaunchedEffect
                                 prompt = ""
                                 savedAttachments = emptyList()
                             }

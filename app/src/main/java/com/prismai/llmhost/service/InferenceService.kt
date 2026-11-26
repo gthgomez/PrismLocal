@@ -1265,28 +1265,25 @@ class InferenceService : Service() {
             ) {
                 throw BackgroundTaskDeferredException()
             }
-            val selectedChatId = _currentChatId.value
-            val chatChanged = if (sendToken != null) sourceChatId != selectedChatId
-                else serviceGenerationOwnership.shouldRefuseUserSend(sourceChatId, selectedChatId)
-            if (!initiatedByBackground && chatChanged) {
-                // The composer captured this send while its source chat was
-                // selected, but the selection changed before the operation mutex
-                // was granted. Refuse under the admission lock, before any
-                // cancellation or transcript mutation, so a send can never
-                // execute in a chat it did not originate from.
-                publishUiEvent("Chat changed before the send was admitted")
-                return refuseSend(onRefused, "Chat changed before the send was admitted")
-            }
             if (!generationStartGate.beginStart()) {
                 if (initiatedByBackground) throw BackgroundTaskDeferredException()
                 return refuseSend(onRefused, "Generation deferred while a chat transition completes")
             }
             val startGateReserved = true
             try {
+                // Also hold the transition gate: some chat switches can start
+                // outside the operation mutex and must not race this snapshot.
+                val selectedChatId = _currentChatId.value
+                val chatChanged = if (sendToken != null) sourceChatId != selectedChatId
+                    else serviceGenerationOwnership.shouldRefuseUserSend(sourceChatId, selectedChatId)
+                if (!initiatedByBackground && chatChanged) {
+                    publishUiEvent("Chat changed before the send was admitted")
+                    return refuseSend(onRefused, "Chat changed before the send was admitted")
+                }
                 val settings = _generationSettings.value.clamped()
                 val memory = generationOrchestrator.preparePromptMemory(
                     prompt, benchmarkPreset, selectedDocumentId,
-                    if (initiatedByBackground) sourceChatId else _currentChatId.value,
+                    if (initiatedByBackground) sourceChatId else selectedChatId,
                 )
                 val acceptance = generationOrchestrator.evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId, memory, settings)
                 if (!acceptance.accepted) {

@@ -25,6 +25,16 @@ if [[ -z "$LLAMA_CPP_DIR" || -z "$LLAMA_LIB_DIR" ]]; then
   echo "LLAMA_CPP_DIR and LLAMA_LIB_DIR are required" >&2
   exit 2
 fi
+if [[ "$(git -C "$LLAMA_CPP_DIR" rev-parse HEAD)" != "bbeb89d76c41bc250f16e4a6fefcc9b530d6e3f3" ]]; then
+  echo "The probe requires the pinned llama.cpp revision" >&2
+  exit 2
+fi
+model_sha="$(sha256sum -- "$MODEL")"
+case "${model_sha%% *}" in
+  74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db|ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e)
+    echo "model_sha256=${model_sha%% *}" ;;
+  *) echo "The model does not match a pinned Qwen fixture SHA-256" >&2; exit 2 ;;
+esac
 
 PROBE="$ROOT/tools/inference-conformance/prism_loop_probe.cpp"
 BIN="${PROBE_BIN:-/tmp/prism_loop_probe}"
@@ -46,33 +56,6 @@ OUT="${PROBE_OUT:-/tmp/prism_loop_probe.out}"
 echo "----- probe stdout -----"
 cat "$OUT"
 
-python3 - "$OUT" "$ROOT/tools/inference-conformance/fixtures/qwen2.5-0.5b-instruct-greedy.txt" <<'PY'
-import pathlib, sys
-out = pathlib.Path(sys.argv[1]).read_text()
-fix = pathlib.Path(sys.argv[2]).read_text()
-need = {}
-for line in fix.splitlines():
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, value = line.split("=", 1)
-    need[key] = value
-checks = {
-    "prompt_tokens": f"prompt_tokens={need['prompt_tokens']} ",
-    "prompt_ids": f"ids={need['prompt_ids']}",
-    "top1_id": f"top_logits {need['top1_id']}:",
-    "greedy_ids": f"ids={need['greedy_ids']}",
-    "greedy_text": need["greedy_text"],
-    "second_text": need["second_text"],
-}
-failed = False
-for name, needle in checks.items():
-    if needle not in out:
-        print(f"MISSING {name}: {needle}", file=sys.stderr)
-        failed = True
-if "add_special=0" not in out:
-    print("Qwen ChatML prompt unexpectedly requested a BOS token", file=sys.stderr)
-    failed = True
-sys.exit(1 if failed else 0)
-PY
+python3 "$ROOT/tools/inference-conformance/check_greedy_output.py" "$OUT"
 
 echo "greedy fixture matched"

@@ -46,6 +46,8 @@ LLAMA_LIB_DIR="$libs" MODEL="$MODEL" \
 
 The script checks the exact ChatML prompt IDs, top token `785`, generated IDs,
 first answer, and a teacher-forced second turn against the checked-in fixture.
-It exits 77 if the model is absent and 1 if the fixture differs. Preserve its
+It checks the source revision and model SHA-256 before running. Build the
+libraries from that checkout; the script cannot establish the provenance of
+prebuilt libraries. It exits 77 if the model is absent and 1 if the fixture differs. Preserve its
 stdout, stderr, exit code, model hash, source commit, compiler, and backend
 observations. A host pass is not Android or physical ARM qualification.

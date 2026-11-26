@@ -9,6 +9,8 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
  * PL-F16: Integrity verification provenance must be persisted in manifest and round-trip
@@ -57,12 +59,14 @@ class ModelProvenancePersistenceTest {
         val cachedPinned = freshManager.resolveActiveModelForActivation("pinned-model")
         assertNotNull(cachedPinned)
         assertEquals(DownloadIntegrity.VERIFIED_PINNED, (cachedPinned as ModelStorageManager.ModelResolveResult.Success).model.integrity)
+        assertEquals(true, cachedPinned.model.validation.metadataChecked)
     }
 
     private fun createModelWithManifest(modelsDir: File, modelId: String, integrity: String?) {
         val modelFile = File(modelsDir, "$modelId/versions/v1/model.gguf")
         modelFile.parentFile!!.mkdirs()
-        modelFile.writeText("gguf-bytes-for-$modelId")
+        modelFile.writeBytes(ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
+            .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(0).array())
 
         val sha = java.security.MessageDigest.getInstance("SHA-256")
             .digest(modelFile.readBytes())

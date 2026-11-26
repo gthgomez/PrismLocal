@@ -150,7 +150,7 @@ fun ChatScreen(
         var memoriesVisible by remember { mutableStateOf(false) }
         var ragBrowserVisible by remember { mutableStateOf(false) }
         var ingestStatus by remember { mutableStateOf<String?>(null) }
-        var isIndexingDocument by remember { mutableStateOf(false) }
+        var documentImportJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
         val controlSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val chatSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val memoriesSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -232,7 +232,9 @@ fun ChatScreen(
                         val memories by (service?.memories ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
-                        val vectorDocuments by (service?.vectorDocuments ?: emptyFlow()).collectAsStateWithLifecycle(
+                         val isIndexingDocument by (service?.isIndexingDocument ?: emptyFlow())
+                             .collectAsStateWithLifecycle(initialValue = false)
+                         val vectorDocuments by (service?.vectorDocuments ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
                         val staleVectorChunkCount by (service?.staleVectorChunkCount ?: emptyFlow())
@@ -274,7 +276,7 @@ fun ChatScreen(
                         LaunchedEffect(currentChatId, service) {
                             if (service == null) return@LaunchedEffect
                             val loaded = draftStore.applyLiveDraft(
-                                currentChatId = currentChatId,
+                                     currentChatId = currentChatId,
                                 liveText = prompt,
                                 liveAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode),
                             ) ?: return@LaunchedEffect
@@ -737,7 +739,8 @@ fun ChatScreen(
                             performance = generationPerformance,
                             attachments = attachments,
                             isShortHeight = isShortHeight,
-                            canContinue = generationPerformance?.terminalReason == "MAX_TOKENS" &&
+                             canContinue = selectedDocumentId == null &&
+                                 generationPerformance?.terminalReason == "MAX_TOKENS" &&
                                 transcript.lastOrNull()?.role == TranscriptRole.ASSISTANT &&
                                 transcript.lastOrNull()?.documentScope == null &&
                                 transcript.lastOrNull()?.contextBoundaryAfter != true,
@@ -800,7 +803,7 @@ fun ChatScreen(
                                 }
                                 }
                             },
-                            onVoiceClick = { service?.startVoiceInput() },
+                             onVoiceClick = if (selectedDocumentId == null) ({ service?.startVoiceInput() }) else null,
                             voiceState = voiceState,
                         )
 
@@ -909,9 +912,10 @@ fun ChatScreen(
                                 contentColor = MaterialTheme.colorScheme.onSurface,
                                 dragHandle = { SheetDragHandle() },
                             ) {
-                                MemoryBrowser(
-                                    memories = memories,
-                                    currentChatId = currentChatId,
+                                 MemoryBrowser(
+                                     memories = memories,
+                                     currentChatId = currentChatId,
+                                     existingChatIds = chatSessions.mapTo(mutableSetOf()) { it.id },
                                     onDelete = { id -> scope.launch { service?.deleteMemory(id) } },
                                     onRefresh = { service?.refreshMemories() },
                                     onAddMemory = { fact, category -> service?.addMemory(fact, category) },
@@ -933,26 +937,27 @@ fun ChatScreen(
                                 DocumentBrowser(
                                     documents = vectorDocuments,
                                     staleChunkCount = staleVectorChunkCount,
-                                    ingestStatus = ingestStatus,
-                                    isIndexing = isIndexingDocument,
+                                     ingestStatus = ingestStatus,
+                                     isIndexing = isIndexingDocument,
+                                     onCancelIndexing = if (documentImportJob != null) ({ documentImportJob?.cancel() }) else null,
                                     canIngest = service != null && currentModel != null && !isGenerating && !isSending,
                                     onDeleteStaleDocuments = { service?.deleteStaleVectorChunks() },
                                     onIngestDocument = { id, title, text ->
-                                        if (!isIndexingDocument) {
-                                            isIndexingDocument = true
-                                            ingestStatus = "Indexing $id on this device…"
-                                            scope.launch {
+                                         if (!isIndexingDocument && documentImportJob == null) {
+                                             ingestStatus = "Indexing $id on this device…"
+                                             documentImportJob = scope.launch {
                                                 try {
                                                     ingestStatus = withContext(Dispatchers.IO) {
                                                         service?.ingestDocument(id, title, text)
                                                     } ?: "Indexing unavailable"
-                                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                                                    throw cancelled
+                                                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                                     ingestStatus = "Document indexing stopped"
+                                                     throw cancelled
                                                 } catch (error: Exception) {
                                                     ingestStatus = "Indexing failed: ${error.message ?: "unknown error"}"
                                                     snackbarMessage = ingestStatus
                                                 } finally {
-                                                    isIndexingDocument = false
+                                                     documentImportJob = null
                                                 }
                                             }
                                         }
@@ -962,10 +967,14 @@ fun ChatScreen(
                                         service?.queryVectorStore(query) ?: emptyList()
                                     },
                                     onRefresh = { service?.refreshVectorStore() },
-                                    onSelectDocument = { documentId ->
-                                        selectedDocumentId = documentId
-                                        ragBrowserVisible = false
-                                    },
+                                     onSelectDocument = { documentId ->
+                                         if (voiceState.isListening) {
+                                             snackbarMessage = "Finish voice input before selecting a document"
+                                         } else {
+                                             selectedDocumentId = documentId
+                                             ragBrowserVisible = false
+                                         }
+                                     },
                                 )
                             }
                         }

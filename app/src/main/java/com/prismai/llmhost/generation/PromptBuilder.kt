@@ -51,8 +51,8 @@ class PromptBuilder(
                     append(memoryContext)
                 }
             }
-            val history = transcript.sinceContextBoundary().filter { message ->
-                message.text.isNotBlank() && message.id != activeAssistantTranscriptId && message.documentScope == null
+            val history = transcript.modelVisibleMessages().filter { message ->
+                message.text.isNotBlank() && message.id != activeAssistantTranscriptId
             }
             val selected = ArrayDeque<TranscriptMessage>()
             val userMessage = withQuestionMemory(newPrompt, memoryFactLines)
@@ -122,8 +122,8 @@ class PromptBuilder(
         sourceChatId: String? = null,
     ): String {
         val memoryContext = buildMemoryContext(newPrompt, sourceChatId)
-        val history = transcript.sinceContextBoundary().filter { message ->
-            message.text.isNotBlank() && message.id != activeAssistantTranscriptId && message.documentScope == null
+        val history = transcript.modelVisibleMessages().filter { message ->
+            message.text.isNotBlank() && message.id != activeAssistantTranscriptId
         }
         if (history.isEmpty() && memoryContext.isEmpty()) {
             return newPrompt

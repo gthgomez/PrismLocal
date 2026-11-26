@@ -11,6 +11,7 @@ import com.prismai.llmhost.BuildConfig
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
@@ -164,6 +165,7 @@ class RagManager(
                 )
             }
 
+            val filteredText = DocumentInstructionFilter.mask(text)
             val vectorChunks = chunks.mapIndexed { index, chunk ->
                 VectorChunk(
                     id = UUID.randomUUID().toString().take(12),
@@ -171,6 +173,7 @@ class RagManager(
                     chunkIndex = chunk.index,
                     text = chunk.text,
                     embedding = checkNotNull(embeddings[index]),
+                    modelText = filteredText.substring(chunk.sourceStart, chunk.sourceEnd).trim(),
                 )
             }
             // Replace rather than mix: a re-ingest must not leave the document's previous rows
@@ -178,6 +181,7 @@ class RagManager(
             // delete+insert is one transaction inside the store, so a concurrent search never sees
             // the document missing and a failed insert cannot lose the previous index. The stamp is
             // the identity snapshot taken before encoding, not the live encoder.
+            coroutineContext.ensureActive()
             vectorStore.replaceDocument(documentId, vectorChunks, identity)
 
             Log.i(TAG, "ingestDocument documentId=$documentId chunks=${vectorChunks.size} committed=true")

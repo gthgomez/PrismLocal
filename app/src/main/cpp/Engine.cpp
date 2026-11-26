@@ -609,16 +609,14 @@ int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_v
     const char* closing_tag = systemClosingTag(formatted_prompt);
     if (closing_tag == nullptr) return 0;
 
+    const size_t close = formatted_prompt.find(closing_tag);
+    if (close == std::string::npos) return 0;
+    const size_t end_offset = close + std::strlen(closing_tag);
     std::string accumulated;
-    std::vector<size_t> token_end_offsets;
-    token_end_offsets.reserve(std::min(tokens.size(), static_cast<size_t>(512)));
-
-    const size_t max_tokens_to_check = std::min(tokens.size(), static_cast<size_t>(512));
-    for (size_t i = 0; i < max_tokens_to_check; i++) {
+    for (size_t i = 0; i < tokens.size(); i++) {
         // Some templates rely on tokenization to insert a BOS before the role.
         // It belongs to the preserved prefix but not to its textual marker.
         if (i == 0 && add_special && tokens[i] == llama_vocab_bos(vocab)) {
-            token_end_offsets.push_back(0);
             continue;
         }
         char buf[256];
@@ -632,21 +630,9 @@ int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_v
         if (len > 0) {
             accumulated.append(buf, static_cast<size_t>(len));
         }
-        token_end_offsets.push_back(accumulated.size());
-    }
-
-    const char* decoded_closing_tag = systemClosingTag(accumulated);
-    if (decoded_closing_tag == nullptr || std::strcmp(closing_tag, decoded_closing_tag) != 0) return 0;
-
-    const size_t end_tag = accumulated.find(closing_tag);
-    if (end_tag == std::string::npos) {
-        return 0;
-    }
-    const size_t system_end_pos = end_tag + std::strlen(closing_tag);
-
-    for (size_t i = 0; i < token_end_offsets.size(); i++) {
-        if (token_end_offsets[i] >= system_end_pos) {
-            return static_cast<int>(i + 1);
+        if (accumulated.size() >= end_offset) {
+            return accumulated.compare(0, end_offset, formatted_prompt, 0, end_offset) == 0
+                ? static_cast<int>(i + 1) : 0;
         }
     }
 
@@ -678,11 +664,10 @@ CacheIdentity makeCacheIdentity(const ModelRuntime& runtime) {
 // leave an out-of-range prefix that a later shift would trust.
 int computeSystemPrefixLength(const std::vector<llama_token>& tokens, std::size_t limit,
                               const llama_vocab* vocab, const std::string& formatted_prompt,
-                              bool add_special) {
-    if (limit == 0) {
-        return 0;
-    }
+                              bool add_special, bool has_system_message) {
     const int detected = findSystemPrefixLength(tokens, vocab, formatted_prompt, add_special);
+    // Do not compact a structured prompt when its template has no verified system boundary.
+    if (has_system_message && detected == 0) return -1;
     return static_cast<int>(std::min(static_cast<std::size_t>(detected), limit));
 }
 
@@ -780,10 +765,13 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
         return true;
     }
 
-    const int max_prefix = static_cast<int>(runtime.current_position) / 2;
-    const int system_prefix_tokens = std::min(runtime.system_prefix_length, max_prefix);
-    const int available_tokens = static_cast<int>(runtime.current_position) - system_prefix_tokens;
-    if (available_tokens <= 0) {
+    auto* memory = llama_get_memory(runtime.ctx);
+    const int system_prefix_tokens = runtime.system_prefix_length;
+    const int required_drop = runtime.current_position + required_tokens - limit;
+    // Preserve the full known prefix and the last token, whose logits seed continuation.
+    const int available_tokens = runtime.current_position - system_prefix_tokens - 1;
+    if (system_prefix_tokens < 0 || required_drop > available_tokens ||
+        memory == nullptr || !llama_memory_can_shift(memory)) {
         if (allow_full_reset) {
             resetRuntimeContext(runtime, false);
             return required_tokens <= limit;
@@ -791,11 +779,8 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
         return false;
     }
 
-    int drop_count = available_tokens / 4;
-    if (drop_count < 1) drop_count = 1;
-    if (drop_count > available_tokens) drop_count = available_tokens;
+    const int drop_count = std::max(required_drop, available_tokens / 4);
 
-    auto* memory = llama_get_memory(runtime.ctx);
     const llama_pos seq_start = static_cast<llama_pos>(system_prefix_tokens);
     const llama_pos seq_end = seq_start + static_cast<llama_pos>(drop_count);
 
@@ -851,6 +836,13 @@ int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t cou
     if (count <= 0) {
         return 0;
     }
+    const auto classifyDecode = [cancel_flag](int result) {
+        if (result == 2 && cancel_flag != nullptr && cancel_flag->load(std::memory_order_acquire)) {
+            LOGI("llama_decode_aborted_by_request rc=%d", result);
+            return -999;
+        }
+        return result;
+    };
     if (count == 1) {
         // Single-token fast path; the native abort callback can interrupt this too.
         if (!runtime.single_batch_initialized) {
@@ -863,9 +855,7 @@ int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t cou
         runtime.single_batch.n_seq_id[0] = 1;
         runtime.single_batch.seq_id[0][0] = kMainSequence;
         runtime.single_batch.logits[0] = 1;
-        const int result = llama_decode(runtime.ctx, runtime.single_batch);
-        return result == 2 && cancel_flag != nullptr && cancel_flag->load(std::memory_order_acquire)
-            ? -999 : result;
+        return classifyDecode(llama_decode(runtime.ctx, runtime.single_batch));
     }
     const int batch_size = runtime.batch_size;
     llama_batch batch = llama_batch_init(std::min(count, batch_size), 0, 1);
@@ -887,8 +877,7 @@ int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t cou
         int result = llama_decode(runtime.ctx, batch);
         if (result != 0) {
             llama_batch_free(batch);
-            return result == 2 && cancel_flag != nullptr && cancel_flag->load(std::memory_order_acquire)
-                ? -999 : result;
+            return classifyDecode(result);
         }
     }
     llama_batch_free(batch);
@@ -917,16 +906,16 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     model_params.n_gpu_layers = gpu_requested ? config.gpu_layers : 0;
     bool cpu_pinned = false;
     // Static: llama retains the pointer for the lifetime of the model.
-    static ggml_backend_dev_t s_cpu_only_devices[] = {nullptr, nullptr};
     if (!gpu_requested) {
-        ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu_device != nullptr) {
-            s_cpu_only_devices[0] = cpu_device;
-            model_params.devices = s_cpu_only_devices;
-            cpu_pinned = true;
-        } else {
-            LOGW("cpu_only_device_unavailable; relying on n_gpu_layers=0 and op_offload=0");
+        static ggml_backend_dev_t s_cpu_only_devices[] = {
+            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr,
+        };
+        if (s_cpu_only_devices[0] == nullptr) {
+            LOGE("cpu_only_device_unavailable; cannot enforce CPU-only execution");
+            return nullptr;
         }
+        model_params.devices = s_cpu_only_devices;
+        cpu_pinned = true;
     }
     auto applyOffloadBoundary = [&](llama_context_params& params) {
         params.offload_kqv = gpu_requested;
@@ -1299,6 +1288,11 @@ struct Engine::Impl {
                 return;
             }
             prompt_tokens.resize(static_cast<size_t>(actual_tokens));
+            const bool has_system_message = std::any_of(session->messages.begin(), session->messages.end(),
+                [](const auto& message) { return message.role == "system"; });
+            const int system_prefix_length = computeSystemPrefixLength(
+                prompt_tokens, prompt_tokens.size(), runtime->vocab, formatted_prompt, add_special,
+                has_system_message);
             const int max_prompt_tokens = runtime->context_length - session->config.max_tokens - kContextHeadroom;
             if (usable_prompt_tokens > max_prompt_tokens) {
                 if (max_prompt_tokens <= 0) {
@@ -1351,9 +1345,7 @@ struct Engine::Impl {
             // PIR-05: explicit post-reset/post-truncation cache identity line.
             logCacheIdentity("prefix_decision", cache_identity, runtime->conversation);
 
-            runtime->system_prefix_length = computeSystemPrefixLength(
-                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab,
-                formatted_prompt, add_special);
+            runtime->system_prefix_length = system_prefix_length;
 
             int32_t tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
 
@@ -1392,9 +1384,7 @@ struct Engine::Impl {
             logCacheIdentity("post_shift_decision", cache_identity, runtime->conversation);
 
             // Restore the current prompt's prefix metadata after any reset/shift.
-            runtime->system_prefix_length = computeSystemPrefixLength(
-                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab,
-                formatted_prompt, add_special);
+            runtime->system_prefix_length = system_prefix_length;
 
             // PIR-05: an all-cached request samples from logits left by a prior
             // decode. If the prefix was truncated (a tail was removed) those logits
@@ -1442,9 +1432,7 @@ struct Engine::Impl {
                         if (retry_rc == 0) {
                             runtime->current_position = usable_prompt_tokens;
                             runtime->active_tokens = prompt_tokens;
-                            runtime->system_prefix_length = computeSystemPrefixLength(
-                                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab,
-                                formatted_prompt, add_special);
+                            runtime->system_prefix_length = system_prefix_length;
                             runtime->conversation.markCommitted(cache_identity_key, runtime->current_position, true);
                             LOGI("prefix_cache_retry_success prompt_tokens=%d", usable_prompt_tokens);
                         } else if (retry_rc == -999) {

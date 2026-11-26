@@ -50,6 +50,7 @@ import kotlin.math.roundToInt
 internal fun MemoryBrowser(
     memories: List<MemoryFact>,
     currentChatId: String?,
+    existingChatIds: Set<String>,
     onDelete: (String) -> Unit,
     onRefresh: () -> Unit,
     onAddMemory: ((String, MemoryCategory) -> Unit)? = null,
@@ -122,6 +123,7 @@ internal fun MemoryBrowser(
                         scopeLabel = when {
                             memory.sourceChatId == null -> "Unscoped older fact"
                             memory.sourceChatId == currentChatId -> "This chat"
+                            memory.sourceChatId !in existingChatIds -> "Deleted chat"
                             else -> "Another chat"
                         },
                         onDelete = { deleteTarget = memory },
@@ -139,6 +141,7 @@ internal fun MemoryBrowser(
     }
 
     deleteTarget?.let { fact ->
+        val sourceChatExists = fact.sourceChatId in existingChatIds
         AlertDialog(
             onDismissRequest = { deleteTarget = null },
             title = { Text("Delete memory fact?") },
@@ -146,6 +149,7 @@ internal fun MemoryBrowser(
                 Text(
                     text = when {
                         fact.sourceChatId == null -> "Delete \"${fact.fact}\"? This older fact is not used in chat."
+                        !sourceChatExists -> "Delete \"${fact.fact}\"? Its source chat was deleted."
                         fact.sourceChatId != currentChatId -> "Open this fact's source chat before deleting it."
                         else -> "Delete \"${fact.fact}\"? Earlier messages will remain visible, but a fresh context will be used for later replies."
                     },
@@ -155,7 +159,7 @@ internal fun MemoryBrowser(
             confirmButton = {
                 TextButton(
                     colors = androidx.compose.material3.ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                    enabled = fact.sourceChatId == null || fact.sourceChatId == currentChatId,
+                    enabled = !sourceChatExists || fact.sourceChatId == currentChatId,
                     onClick = {
                         onDelete(fact.id)
                         deleteTarget = null

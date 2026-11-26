@@ -11,12 +11,9 @@ import com.prismai.llmhost.storage.RagManager
 import com.prismai.llmhost.storage.VectorStore
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
-import java.io.File
 import java.util.UUID
-import java.security.MessageDigest
 
 /** Compares the existing native embeddings to a simple word-overlap baseline on synthetic data. */
 @RunWith(AndroidJUnit4::class)
@@ -24,28 +21,14 @@ class QwenRetrievalComparisonTest {
     @Test
     fun selectedCorpusAndLexicalBaseline() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val path = InstrumentationRegistry.getArguments().getString("prismQwenModelPath")
-        assumeTrue("Pass prismQwenModelPath for real embedding comparison", !path.isNullOrBlank())
-        val model = File(requireNotNull(path))
-        assertTrue(model.isFile && model.canRead())
-        val digest = MessageDigest.getInstance("SHA-256")
-        model.inputStream().buffered().use { input ->
-            val buffer = ByteArray(1024 * 1024)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                digest.update(buffer, 0, count)
-            }
-        }
-        val hash = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
-        assertTrue("unexpected model hash: $hash", hash == "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db")
+        val model = requiredPinnedQwenModel()
         val docs = listOf("cedar-revision-2.txt", "cedar-distractor.txt").map { name ->
             instrumentation.context.assets.open("qualification/$name").bufferedReader().use { it.readText() }
         }
         val suffix = UUID.randomUUID().toString()
         val ids = listOf("qualification-cedar-$suffix", "qualification-distractor-$suffix")
         val store = VectorStore(instrumentation.targetContext)
-        val identity = EmbeddingIdentity(hash, VectorStore.EMBEDDING_REVISION)
+        val identity = EmbeddingIdentity(PINNED_QWEN_SHA256, VectorStore.EMBEDDING_REVISION)
         store.setEmbeddingIdentityProvider { identity }
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {

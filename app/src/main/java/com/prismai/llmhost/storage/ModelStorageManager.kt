@@ -19,6 +19,7 @@ import org.json.JSONException
 import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
 import java.io.File
+import java.io.DataInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.RandomAccessFile
@@ -183,7 +184,9 @@ class ModelStorageManager(
         val status: String,
         val validatedAt: String,
         val metadata: GgufMetadataSummary? = null,
-    )
+    ) {
+        val metadataChecked: Boolean get() = status == METADATA_CHECKED
+    }
 
     data class GgufMetadataSummary(
         val architecture: String? = null,
@@ -264,6 +267,7 @@ class ModelStorageManager(
 
     fun importModel(
         uri: Uri,
+        checkCancelled: () -> Unit = {},
         onProgress: (ImportProgress) -> Unit = {},
     ): ImportResult {
         val displayName = displayNameFor(uri)
@@ -288,6 +292,7 @@ class ModelStorageManager(
                 input = it,
                 expectedLifecycleRevision = expectedRevision,
                 onProgress = onProgress,
+                checkCancelled = checkCancelled,
             )
         }
     }
@@ -303,6 +308,7 @@ class ModelStorageManager(
         expectedLifecycleRevision: Long? = null,
         onProgress: (ImportProgress) -> Unit = {},
         integrity: DownloadIntegrity = DownloadIntegrity.UNKNOWN_LEGACY,
+        checkCancelled: () -> Unit = {},
     ): ImportResult = ModelStorageLifecycleGate.withLock {
         val modelId = modelIdFromDisplayName(displayName)
         val expected = expectedLifecycleRevision ?: ModelStorageLifecycleGate.revision(modelId)
@@ -315,7 +321,7 @@ class ModelStorageManager(
                 ),
             )
         } else {
-            importModelFromStreamLocked(displayName, reportedSize, input, onProgress, integrity)
+            importModelFromStreamLocked(displayName, reportedSize, input, onProgress, integrity, checkCancelled)
         }
     }
 
@@ -324,7 +330,8 @@ class ModelStorageManager(
         reportedSize: Long,
         input: InputStream,
         onProgress: (ImportProgress) -> Unit,
-        integrity: DownloadIntegrity = DownloadIntegrity.UNKNOWN_LEGACY,
+        integrity: DownloadIntegrity,
+        checkCancelled: () -> Unit,
     ): ImportResult {
         val modelId = modelIdFrom(displayName)
         val versionId = newVersionId()
@@ -332,13 +339,13 @@ class ModelStorageManager(
         val stagingDir = File(modelsDir, "$IMPORT_STAGING_DIR/$modelId-$versionId-${UUID.randomUUID()}")
         val stagedModel = File(stagingDir, MODEL_FILE)
 
-        val existingManifest = File(modelsDir, "$modelId/$MANIFEST_FILE")
-        if (existingManifest.exists()) {
-            val existing = parseManifest(File(modelsDir, modelId), HashPolicy.NONE)
-            if (existing is ModelResolveResult.Failure) {
-                return ImportResult.Failure(existing.error)
+        val modelRoot = File(modelsDir, modelId)
+        val existing = if (File(modelRoot, MANIFEST_FILE).exists()) {
+            when (val result = parseManifest(modelRoot, HashPolicy.NONE)) {
+                is ModelResolveResult.Failure -> return ImportResult.Failure(result.error)
+                is ModelResolveResult.Success -> result.model
             }
-        }
+        } else null
 
         if (reportedSize > MAX_MODEL_BYTES) {
             return ImportResult.Failure(
@@ -354,30 +361,34 @@ class ModelStorageManager(
         }
 
         return try {
+            checkCancelled()
             stagingDir.mkdirs()
-            copyStream(input, stagedModel, reportedSize, onProgress)
+            copyStream(input, stagedModel, reportedSize, onProgress, checkCancelled)
             val bytes = stagedModel.length()
-            validateSize(bytes)?.let { return ImportResult.Failure(it).also { cleanup(stagingDir) } }
+            checkCancelled()
+            validateSize(bytes)?.let { return ImportResult.Failure(it) }
             // The model bytes are already on disk at this point and promotion is a
             // rename, so only the reserve must remain. Requiring the full size again
             // made a fitting model fail after the entire copy completed.
             if (!hasReserveSpace()) {
-                return ImportResult.Failure(insufficientSpaceError(bytes)).also { cleanup(stagingDir) }
+                return ImportResult.Failure(insufficientSpaceError(bytes))
             }
             val validation = validateGguf(stagedModel)
                 ?: return ImportResult.Failure(
                     ModelStorageError(
                         ModelStorageError.Code.INVALID_GGUF_HEADER,
-                        "Selected file is not a valid GGUF model",
+                        "Selected file has an unsupported GGUF version or invalid GGUF metadata",
                     )
-                ).also { cleanup(stagingDir) }
-            val sha256 = sha256(stagedModel)
-            val modelRoot = File(modelsDir, modelId)
+                )
+            val sha256 = sha256(stagedModel, checkCancelled)
+            // A retry of the same content and provenance should not consume another model's
+            // worth of disk, but do not reuse an artifact that has lost integrity.
+            if (existing?.sha256 == sha256 && existing.integrity == integrity) {
+                val resolved = resolveActiveModelForActivation(modelId)
+                if (resolved is ModelResolveResult.Success) return ImportResult.Success(resolved.model)
+            }
             val targetVersionDir = File(modelRoot, "versions/$versionId")
             modelRoot.mkdirs()
-            promoteDirectory(stagingDir, targetVersionDir)
-
-            val activeFile = File(targetVersionDir, MODEL_FILE)
             val versionFile = "versions/$versionId/$MODEL_FILE"
             val manifest = mergedManifest(
                 modelRoot = modelRoot,
@@ -386,30 +397,31 @@ class ModelStorageManager(
                 versionFile = versionFile,
                 displayName = displayName,
                 sha256 = sha256,
-                bytes = activeFile.length(),
+                bytes = bytes,
                 importedAt = now,
                 validation = validation,
                 integrity = integrity,
             )
-            writeManifestAtomically(modelRoot, manifest)
+            checkCancelled()
+            promoteDirectory(stagingDir, targetVersionDir)
+            try {
+                writeManifestAtomically(modelRoot, manifest)
+            } catch (error: Exception) {
+                cleanup(targetVersionDir)
+                throw error
+            }
 
             // The staged bytes were just hashed and promotion is a rename that preserves content, so
             // record the verified artifact instead of hashing the multi-gigabyte file a second time.
+            val activeFile = File(targetVersionDir, MODEL_FILE)
             ModelArtifactVerificationCache.remember(activeFile, sha256)
-
-            val resolved = resolveActiveModelForActivation(modelId)
-            if (resolved is ModelResolveResult.Success) {
-                ImportResult.Success(resolved.model)
-            } else {
-                val failure = resolved as ModelResolveResult.Failure
-                ImportResult.Failure(failure.error)
-            }
+            ImportResult.Success(
+                ActiveModelInfo(modelId, versionId, activeFile, displayName, sha256, bytes, now, validation, integrity)
+            )
         } catch (e: CancellationException) {
-            cleanup(stagingDir)
             throw e
         } catch (e: IOException) {
             Log.e(TAG, "Import failed for displayName=$displayName", e)
-            cleanup(stagingDir)
             ImportResult.Failure(
                 ModelStorageError(
                     ModelStorageError.Code.COPY_FAILED,
@@ -419,7 +431,6 @@ class ModelStorageManager(
             )
         } catch (e: Exception) {
             Log.e(TAG, "Import failed for displayName=$displayName", e)
-            cleanup(stagingDir)
             ImportResult.Failure(
                 ModelStorageError(
                     ModelStorageError.Code.PROMOTION_FAILED,
@@ -427,6 +438,8 @@ class ModelStorageManager(
                     e.message,
                 )
             )
+        } finally {
+            cleanup(stagingDir)
         }
     }
 
@@ -487,10 +500,15 @@ class ModelStorageManager(
     )
 
     fun getStorageBreakdown(): StorageBreakdown {
-        val installedBytes = listInstalledModelInfos().sumOf { it.bytes }
+        val directory = modelsDir.also { it.mkdirs() }
+        val installedBytes = directory.listFiles().orEmpty()
+            .filter { it.isDirectory && it.name != IMPORT_STAGING_DIR }
+            .sumOf { root ->
+                root.walkTopDown().filter { it.isFile && it.extension.equals("gguf", true) }.sumOf { it.length() }
+            }
         val downloadsDir = File(context.filesDir, "hf-downloads")
         val cacheBytes = if (downloadsDir.exists()) downloadsDir.walkTopDown().filter { it.isFile }.sumOf { it.length() } else 0L
-        val stat = StatFs(modelsDir.absolutePath)
+        val stat = StatFs(directory.absolutePath)
         val freeBytes = stat.availableBytes
         val totalBytes = stat.totalBytes
         return StorageBreakdown(
@@ -570,14 +588,6 @@ class ModelStorageManager(
                     )
                 )
             }
-            val validation = parseValidation(activeObj)
-                ?: validateGguf(modelFile)
-                ?: return ModelResolveResult.Failure(
-                    ModelStorageError(
-                        ModelStorageError.Code.INVALID_GGUF_HEADER,
-                        "Model $modelId is not a valid GGUF model",
-                    )
-                )
             val expectedSha = activeObj.getString("sha256")
             if (hashPolicy != HashPolicy.NONE) {
                 val cachedMatch = hashPolicy == HashPolicy.CACHED &&
@@ -598,6 +608,16 @@ class ModelStorageManager(
                     }
                 }
             }
+            val recordedValidation = parseValidation(activeObj)
+            val validation = recordedValidation
+                ?.takeIf { hashPolicy == HashPolicy.NONE || it.status == METADATA_CHECKED }
+                ?: validateGguf(modelFile)
+                ?: return ModelResolveResult.Failure(
+                    ModelStorageError(
+                        ModelStorageError.Code.INVALID_GGUF_HEADER,
+                        "Model $modelId has an unsupported GGUF version or invalid GGUF metadata",
+                    )
+                )
             val integrity = when (activeObj.optString("integrity", "")) {
                 DownloadIntegrity.VERIFIED_PINNED.name -> DownloadIntegrity.VERIFIED_PINNED
                 DownloadIntegrity.VERIFIED_PROVIDER_METADATA.name -> DownloadIntegrity.VERIFIED_PROVIDER_METADATA
@@ -702,8 +722,12 @@ class ModelStorageManager(
 
     private fun writeManifestAtomically(modelRoot: File, manifest: JSONObject) {
         val tmp = File(modelRoot, "$MANIFEST_FILE.tmp-${UUID.randomUUID()}")
-        tmp.writeText(manifest.toString(2))
-        moveAtomically(tmp, File(modelRoot, MANIFEST_FILE))
+        try {
+            tmp.writeText(manifest.toString(2))
+            moveAtomically(tmp, File(modelRoot, MANIFEST_FILE))
+        } finally {
+            if (tmp.exists()) tmp.delete()
+        }
     }
 
     private fun copyStream(
@@ -711,6 +735,7 @@ class ModelStorageManager(
         destination: File,
         totalBytes: Long,
         onProgress: (ImportProgress) -> Unit,
+        checkCancelled: () -> Unit,
     ) {
         destination.parentFile?.mkdirs()
         var copied = 0L
@@ -720,6 +745,7 @@ class ModelStorageManager(
         val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
         destination.outputStream().use { output ->
             while (true) {
+                checkCancelled()
                 val read = input.read(buffer)
                 if (read == -1) break
                 output.write(buffer, 0, read)
@@ -770,25 +796,25 @@ class ModelStorageManager(
         else -> null
     }
 
-    private fun validateGguf(file: File): ModelValidation? {
-        file.inputStream().use { input ->
-            val reader = GgufReader(input)
-            if (reader.readAscii(4) != "GGUF") {
-                return null
-            }
+    private fun validateGguf(file: File): ModelValidation? = try {
+        DataInputStream(file.inputStream().buffered(64 * 1024)).use { input ->
+            val reader = GgufReader(input, file.length())
+            if (reader.readAscii(4) != "GGUF") return@use null
             val version = reader.readU32()
-            if (version !in 1..4) return null
-            val metadata = runCatching { parseGgufMetadata(reader, version) }
-                .onFailure { error -> Log.w(TAG, "GGUF metadata parse failed file=${file.name}", error) }
-                .getOrNull()
-            return ModelValidation(
+            // The vendored gguf reader accepts little-endian GGUF v2 and v3.
+            if (version !in 2..3) return@use null
+            val metadata = parseGgufMetadata(reader)
+            ModelValidation(
                 format = "GGUF",
                 ggufVersion = version,
-                status = "verified",
+                status = METADATA_CHECKED,
                 validatedAt = Instant.now().toString(),
                 metadata = metadata,
             )
         }
+    } catch (error: IOException) {
+        Log.w(TAG, "GGUF metadata parse failed file=${file.name}", error)
+        null
     }
 
     private fun parseValidation(activeObj: JSONObject): ModelValidation? {
@@ -796,7 +822,7 @@ class ModelStorageManager(
         return ModelValidation(
             format = validation.optString("format", "GGUF"),
             ggufVersion = validation.optInt("gguf_version", -1),
-            status = validation.optString("status", "unknown"),
+            status = if (validation.optString("status") == METADATA_CHECKED) METADATA_CHECKED else "legacy_header_only",
             validatedAt = validation.optString("validated_at", ""),
             metadata = parseMetadataSummary(validation.optJSONObject("metadata")),
         ).takeIf { it.format == "GGUF" && it.ggufVersion in 1..4 }
@@ -818,12 +844,9 @@ class ModelStorageManager(
         )
     }
 
-    private fun parseGgufMetadata(reader: GgufReader, version: Int): GgufMetadataSummary? {
-        if (version == 1) {
-            return null
-        }
-        reader.readU64() // tensor_count
-        val kvCount = reader.readU64().coerceAtMost(4096L)
+    private fun parseGgufMetadata(reader: GgufReader): GgufMetadataSummary {
+        reader.readCount(reader.remaining / 24, "tensor count")
+        val kvCount = reader.readCount(minOf(4096L, reader.remaining / 13), "metadata count")
         var architecture: String? = null
         var name: String? = null
         var sizeLabel: String? = null
@@ -877,8 +900,10 @@ class ModelStorageManager(
     private fun JSONObject.optIntOrNull(name: String): Int? =
         if (has(name) && !isNull(name)) optInt(name) else null
 
-    private class GgufReader(private val input: InputStream) {
+    private class GgufReader(private val input: DataInputStream, size: Long) {
         private val scratch = ByteArray(8)
+        var remaining: Long = size
+            private set
 
         fun readAscii(length: Int): String {
             val bytes = ByteArray(length)
@@ -904,10 +929,14 @@ class ModelStorageManager(
         }
 
         fun readGgufString(): String {
-            val length = readU64().coerceAtMost(1_000_000L).toInt()
+            val length = readCount(minOf(1_000_000L, remaining), "string length").toInt()
             val bytes = ByteArray(length)
             readFully(bytes)
             return bytes.toString(Charsets.UTF_8)
+        }
+
+        fun readCount(maximum: Long, label: String): Long = readU64().also {
+            if (it !in 0..maximum) throw IOException("Invalid GGUF $label")
         }
 
         fun readMetadataValue(type: Int): Any? =
@@ -919,23 +948,26 @@ class ModelStorageManager(
                 8 -> readGgufString()
                 9 -> {
                     val elementType = readU32()
-                    val count = readU64().coerceAtMost(1_000_000L).toInt()
-                    repeat(count) { skipMetadataValue(elementType) }
+                    val elementBytes = metadataElementBytes(elementType)
+                    val maxCount = if (elementType == 8) 1_000_000L else 1L shl 30
+                    val count = readCount(minOf(maxCount, remaining / elementBytes), "array length")
+                    if (elementType == 8) {
+                        repeat(count.toInt()) { skipFully(readU64()) }
+                    } else {
+                        skipFully(count * elementBytes)
+                    }
                     null
                 }
                 10, 11, 12 -> readScalar(8)
-                else -> null
+                else -> throw IOException("Invalid GGUF metadata type")
             }
 
-        private fun skipMetadataValue(type: Int) {
-            when (type) {
-                0, 1, 7 -> skipFully(1)
-                2, 3 -> skipFully(2)
-                4, 5, 6 -> skipFully(4)
-                8 -> skipFully(readU64().coerceAtMost(1_000_000L))
-                10, 11, 12 -> skipFully(8)
-                else -> Unit
-            }
+        private fun metadataElementBytes(type: Int): Long = when (type) {
+            0, 1, 7 -> 1
+            2, 3 -> 2
+            4, 5, 6 -> 4
+            8, 10, 11, 12 -> 8
+            else -> throw IOException("Invalid GGUF array element type")
         }
 
         private fun readScalar(bytes: Int): Long {
@@ -948,33 +980,32 @@ class ModelStorageManager(
         }
 
         private fun readFully(buffer: ByteArray, length: Int = buffer.size) {
-            var offset = 0
-            while (offset < length) {
-                val read = input.read(buffer, offset, length - offset)
-                if (read < 0) throw IOException("Unexpected EOF")
-                offset += read
-            }
+            input.readFully(buffer, 0, length)
+            remaining -= length
         }
 
         private fun skipFully(bytes: Long) {
-            var remaining = bytes
-            while (remaining > 0L) {
-                val skipped = input.skip(remaining)
-                if (skipped <= 0L) {
-                    if (input.read() == -1) throw IOException("Unexpected EOF")
-                    remaining--
+            if (bytes !in 0..remaining) throw IOException("Truncated GGUF metadata")
+            var pending = bytes
+            while (pending > 0) {
+                val skipped = input.skip(pending)
+                if (skipped == 0L) {
+                    if (input.read() == -1) throw IOException("Truncated GGUF metadata")
+                    pending--
                 } else {
-                    remaining -= skipped
+                    pending -= skipped
                 }
             }
+            remaining -= bytes
         }
     }
 
-    private fun sha256(file: File): String {
+    private fun sha256(file: File, checkCancelled: () -> Unit = {}): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
             val buffer = ByteArray(64 * 1024)
             while (true) {
+                checkCancelled()
                 val read = input.read(buffer)
                 if (read == -1) break
                 digest.update(buffer, 0, read)
@@ -1029,7 +1060,7 @@ class ModelStorageManager(
         return modelIdFromDisplayName(displayName)
     }
 
-    private fun newVersionId(): String = "v${System.currentTimeMillis()}"
+    private fun newVersionId(): String = "v${UUID.randomUUID()}"
 
     private fun promoteDirectory(stagingDir: File, targetVersionDir: File) {
         if (targetVersionDir.exists()) {
@@ -1097,6 +1128,7 @@ class ModelStorageManager(
             freeBytes > MIN_FREE_SPACE_AFTER_IMPORT
 
         const val TAG = "ModelStorageManager"
+        private const val METADATA_CHECKED = "metadata_checked"
         const val MANIFEST_FILE = "manifest.json"
         const val MODEL_FILE = "model.gguf"
         const val IMPORT_STAGING_DIR = ".imports"

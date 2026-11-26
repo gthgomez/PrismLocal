@@ -155,6 +155,34 @@ class RealInferenceSmokeTest {
     }
 
     @Test
+    fun aLongSystemPrefixSurvivesCompactionAndImpossibleContinueLeavesContextUsable() = runBlocking {
+        val model = requireTinyModel()
+        val settings = GenerationSettings(
+            maxTokens = 8, threadCount = 2, contextLength = 512, batchSize = 128,
+            temperature = 0f, topK = 1, repeatPenalty = 1f,
+        )
+        val engine = NativeLlmBridge.create(debugHooksEnabled = false)
+        try {
+            assertTrue(engine.loadModel(model.file.absolutePath, settings))
+            val prompt = "<|im_start|>system\n" + "Keep this rule. ".repeat(75) +
+                "<|im_end|>\n<|im_start|>user\n" + "Remember this context item. ".repeat(23) +
+                "<|im_end|>\n<|im_start|>assistant\n"
+            val first = engine.generate(prompt, settings).toList()
+            assertTrue(first.sumOf { it.tokenCount } > 0)
+            val before = observedShiftPrefixLengths().size
+            val impossible = engine.generate("", settings.copy(maxTokens = 400), continueFromContext = true).toList()
+            assertTrue(impossible.any { it.isTerminal && it.terminalReason == "ERROR" })
+            assertEquals("An impossible continuation must not move the cache", before, observedShiftPrefixLengths().size)
+            val continued = engine.generate("", settings.copy(maxTokens = 88), continueFromContext = true).toList()
+            assertTrue("the next feasible continuation must still work", continued.sumOf { it.tokenCount } > 0)
+            assertTrue("preserved system block must exceed the old half-window cap",
+                newShiftPrefixLength(before) > (first.maxOf { it.promptTokens } + first.sumOf { it.tokenCount }) / 2)
+        } finally {
+            engine.destroySafely()
+        }
+    }
+
+    @Test
     fun realInsertedBosStillPreservesExplicitSystemPrefix() = runBlocking {
         val model = requireTinyModel()
         val settings = GenerationSettings(

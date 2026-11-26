@@ -183,14 +183,21 @@ class ModelReadinessAssessor(
         )
     }
 
+    /** A previous file under the same model ID must not bypass memory admission for its replacement. */
+    private fun completedRunsFor(info: ModelStorageManager.ActiveModelInfo): List<BenchmarkRun> {
+        val hashPrefix = info.sha256.take(12)
+        return uiState._benchmarkRuns.value.filter {
+            it.modelId == info.id && it.modelSha256Prefix == hashPrefix && it.modelBytes == info.bytes &&
+                it.generatedTokens > 0 && it.decodeMs > 0L && it.terminalReason in setOf("EOF", "MAX_TOKENS")
+        }
+    }
+
     private fun summarizeModelPerformance(
         info: ModelStorageManager.ActiveModelInfo,
         fit: ModelFitEstimate,
         prediction: PerformancePrediction,
     ): ModelPerformanceSummary {
-        val exactRuns = uiState._benchmarkRuns.value.filter {
-            it.modelId == info.id && it.generatedTokens > 0 && it.decodeMs > 0L
-        }
+        val exactRuns = completedRunsFor(info)
         val actualAverage = exactRuns.takeIf { it.isNotEmpty() }
             ?.map { it.tokensPerSecond }
             ?.average()
@@ -269,9 +276,7 @@ class ModelReadinessAssessor(
         )
 
         // Empirical performance override: check past benchmark runs
-        val exactRuns = uiState._benchmarkRuns.value.filter {
-            it.modelId == info.id && it.generatedTokens > 0 && it.decodeMs > 0L
-        }
+        val exactRuns = completedRunsFor(info)
         val actualAverage = exactRuns.takeIf { it.isNotEmpty() }
             ?.map { it.tokensPerSecond }
             ?.average()
@@ -313,7 +318,7 @@ class ModelReadinessAssessor(
         profile: DeviceCapabilityProfile,
     ): PerformancePrediction {
         val completedRuns = uiState._benchmarkRuns.value.filter { it.generatedTokens > 0 && it.decodeMs > 0L }
-        val modelRuns = completedRuns.filter { it.modelId == info.id }
+        val modelRuns = completedRunsFor(info)
         if (modelRuns.isNotEmpty()) {
             val average = modelRuns.map { it.tokensPerSecond }.average().coerceAtLeast(0.1)
             val spread = if (modelRuns.size == 1) 0.25 else 0.18

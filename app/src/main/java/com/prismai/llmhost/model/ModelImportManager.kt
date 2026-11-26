@@ -44,7 +44,7 @@ class ModelImportManager(
         uiState._importState.value = ImportState.Running(fileName = "selected model", bytesCopied = 0, totalBytes = null)
         val job = serviceScope.launch(Dispatchers.IO) {
             try {
-                val result = modelStorageManager.importModel(uri) { progress ->
+                val result = modelStorageManager.importModel(uri, checkCancelled = { ensureActive() }) { progress ->
                     ensureActive()
                     uiState._importState.value = ImportState.Running(
                         fileName = "selected model",

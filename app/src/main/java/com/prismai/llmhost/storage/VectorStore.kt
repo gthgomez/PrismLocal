@@ -54,6 +54,8 @@ data class VectorChunk(
     val text: String,
     val embedding: FloatArray,
     val createdAt: Long = System.currentTimeMillis(),
+    /** Null means the source paragraphs were not checked before chunking. */
+    val modelText: String? = null,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -63,7 +65,8 @@ data class VectorChunk(
                 chunkIndex == other.chunkIndex &&
                 text == other.text &&
                 embedding.contentEquals(other.embedding) &&
-                createdAt == other.createdAt
+                createdAt == other.createdAt &&
+                modelText == other.modelText
     }
 
     override fun hashCode(): Int {
@@ -73,6 +76,7 @@ data class VectorChunk(
         result = 31 * result + text.hashCode()
         result = 31 * result + embedding.contentHashCode()
         result = 31 * result + createdAt.hashCode()
+        result = 31 * result + modelText.hashCode()
         return result
     }
 }
@@ -105,10 +109,12 @@ data class VectorDocumentSummary(
     val previewText: String,
     val createdAt: Long,
     val legacyChunkCount: Int = 0,
+    val uncheckedChunkCount: Int = 0,
 ) {
     /** True when the currently loaded encoder can score every stored chunk of this document. */
     val fullySearchable: Boolean get() = storedChunkCount > 0 && searchableChunkCount == storedChunkCount && legacyChunkCount == 0
     val hasLegacyChunks: Boolean get() = legacyChunkCount > 0
+    val readyForQuestions: Boolean get() = fullySearchable && uncheckedChunkCount == 0
 }
 
 /**
@@ -461,6 +467,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
         val documentIndex = cursor.getColumnIndexOrThrow(COL_DOCUMENT_ID)
         val chunkIndex = cursor.getColumnIndexOrThrow(COL_CHUNK_INDEX)
         val textIndex = cursor.getColumnIndexOrThrow(COL_TEXT)
+        val modelTextIndex = cursor.getColumnIndexOrThrow(COL_MODEL_TEXT)
         val embeddingIndex = cursor.getColumnIndexOrThrow(COL_EMBEDDING)
         val createdIndex = cursor.getColumnIndexOrThrow(COL_CREATED)
 
@@ -480,6 +487,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                     text = cursor.getString(textIndex),
                     embedding = embedding,
                     createdAt = cursor.getLong(createdIndex),
+                    modelText = cursor.getString(modelTextIndex),
                 )
                 hasNextRow = cursor.moveToNext()
                 return chunk to score
@@ -580,7 +588,8 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                             AND i.$COL_EMBEDDING_REVISION = ?
                           ORDER BY i.$COL_CHUNK_INDEX ASC, i.$COL_CREATED ASC
                           LIMIT 1) AS preview,
-                       SUM(CASE WHEN o.$COL_EMBEDDING_REVISION != ? OR o.$COL_ENCODER_IDENTITY = '' OR o.$COL_ENCODER_IDENTITY IS NULL OR o.$COL_EMBEDDING_DIM <= 0 THEN 1 ELSE 0 END) AS legacy_count
+                       SUM(CASE WHEN o.$COL_EMBEDDING_REVISION != ? OR o.$COL_ENCODER_IDENTITY = '' OR o.$COL_ENCODER_IDENTITY IS NULL OR o.$COL_EMBEDDING_DIM <= 0 THEN 1 ELSE 0 END) AS legacy_count,
+                       SUM(CASE WHEN o.$COL_MODEL_TEXT IS NULL THEN 1 ELSE 0 END) AS unchecked_count
                 FROM $TABLE o
                 GROUP BY o.$COL_DOCUMENT_ID
                 ORDER BY first_created ASC
@@ -599,6 +608,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                             previewText = (cursor.getString(4) ?: "").take(PREVIEW_MAX_CHARS),
                             createdAt = cursor.getLong(3),
                             legacyChunkCount = cursor.getInt(5),
+                            uncheckedChunkCount = cursor.getInt(6),
                         )
                     )
                 }
@@ -693,7 +703,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     companion object {
         const val DB_NAME = "prism_vector_store.db"
-        const val DB_VERSION = 3
+        const val DB_VERSION = 4
         const val TABLE = "vector_chunks"
 
         /**
@@ -710,6 +720,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
         const val COL_DOCUMENT_ID = "document_id"
         const val COL_CHUNK_INDEX = "chunk_index"
         const val COL_TEXT = "text"
+        const val COL_MODEL_TEXT = "model_text"
         const val COL_EMBEDDING = "embedding"
         const val COL_EMBEDDING_REVISION = "embedding_revision"
         /** Encoder artifact + algorithm identity token; see [EmbeddingIdentity.token]. */
@@ -738,6 +749,7 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                 $COL_DOCUMENT_ID TEXT NOT NULL,
                 $COL_CHUNK_INDEX INTEGER NOT NULL,
                 $COL_TEXT TEXT NOT NULL,
+                $COL_MODEL_TEXT TEXT,
                 $COL_EMBEDDING BLOB NOT NULL,
                 $COL_EMBEDDING_REVISION INTEGER NOT NULL DEFAULT 1,
                 $COL_ENCODER_IDENTITY TEXT NOT NULL DEFAULT '',
@@ -825,15 +837,17 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
         text = c.getString(c.getColumnIndexOrThrow(COL_TEXT)),
         embedding = bytesToFloatArray(c.getBlob(c.getColumnIndexOrThrow(COL_EMBEDDING))),
         createdAt = c.getLong(c.getColumnIndexOrThrow(COL_CREATED)),
+        modelText = c.getString(c.getColumnIndexOrThrow(COL_MODEL_TEXT)),
     )
 
     // ---- Value mapping ----
 
-    private fun toValues(chunk: VectorChunk, identity: EmbeddingIdentity): ContentValues = ContentValues(9).apply {
+    private fun toValues(chunk: VectorChunk, identity: EmbeddingIdentity): ContentValues = ContentValues(10).apply {
         put(COL_ID, chunk.id)
         put(COL_DOCUMENT_ID, chunk.documentId)
         put(COL_CHUNK_INDEX, chunk.chunkIndex)
         put(COL_TEXT, chunk.text)
+        put(COL_MODEL_TEXT, chunk.modelText)
         put(COL_EMBEDDING, floatArrayToBytes(chunk.embedding))
         put(COL_EMBEDDING_REVISION, EMBEDDING_REVISION)
         put(COL_ENCODER_IDENTITY, identity.token)
@@ -863,8 +877,8 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
                 db.execSQL(ADD_ENCODER_IDENTITY_SQL)
                 db.execSQL(ADD_EMBEDDING_DIM_SQL)
             }
+            if (oldVersion < 4) db.execSQL("ALTER TABLE $TABLE ADD COLUMN $COL_MODEL_TEXT TEXT")
         }
     }
 
 }
-

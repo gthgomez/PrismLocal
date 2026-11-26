@@ -136,7 +136,7 @@ class HuggingFaceDownloadWorker(
                 else -> null
             }
             val installLabel = when (integrity) {
-                DownloadIntegrity.VERIFIED_PINNED -> "Installing verified GGUF"
+                DownloadIntegrity.VERIFIED_PINNED -> "Installing GGUF (pinned checksum matched)"
                 DownloadIntegrity.VERIFIED_PROVIDER_METADATA -> "Installing GGUF (provider metadata verified)"
                 DownloadIntegrity.UNVERIFIED,
                 DownloadIntegrity.UNKNOWN_LEGACY -> "Installing GGUF (unverified)"
@@ -153,6 +153,7 @@ class HuggingFaceDownloadWorker(
                 totalBytes = partialFile.length(),
                 message = installLabel,
             )
+            val workerContext = currentCoroutineContext()
             val importResult = partialFile.inputStream().use { input ->
                 storage.importModelFromStream(
                     displayName = entry.fileName,
@@ -174,6 +175,7 @@ class HuggingFaceDownloadWorker(
                     },
                     expectedLifecycleRevision = storageRevision,
                     integrity = integrity,
+                    checkCancelled = { workerContext.ensureActive() },
                 )
             }
             when (importResult) {

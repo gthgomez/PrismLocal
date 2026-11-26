@@ -6,6 +6,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -106,6 +108,38 @@ class VectorStoreRevisionMigrationTest {
         val revised = store.searchDocument("cedar", floatArrayOf(1f, 0f), 1, -1f, identity)
         assertTrue("changed indexed text must have a different snapshot version", first.documentVersion != revised.documentVersion)
         assertEquals(listOf("c2"), revised.matches.map { it.first.id })
+    }
+
+    @Test
+    fun populatedVersion3IndexRemainsReadableUntilReindexedForQuestions() {
+        val identity = EmbeddingIdentity("sha-a", VectorStore.EMBEDDING_REVISION)
+        val dbFile = context.getDatabasePath(VectorStore.DB_NAME)
+        dbFile.parentFile?.mkdirs()
+        SQLiteDatabase.openOrCreateDatabase(dbFile, null).use { db ->
+            val version3 = VectorStore.CREATE_TABLE_SQL.lineSequence()
+                .filterNot { it.trimStart().startsWith("${VectorStore.COL_MODEL_TEXT} ") }
+                .joinToString("\n")
+            db.execSQL(version3)
+            db.execSQL(
+                "INSERT INTO ${VectorStore.TABLE} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                arrayOf("c1", "cedar", 0, "Owner: Mira",
+                    VectorStore.floatArrayToBytes(floatArrayOf(1f)), VectorStore.EMBEDDING_REVISION,
+                    identity.token, 1, 1L),
+            )
+            db.version = 3
+        }
+        val store = VectorStore(context)
+        store.setEmbeddingIdentityProvider { identity }
+        val old = store.getDocumentSummaries().single()
+        assertTrue(old.fullySearchable)
+        assertFalse(old.readyForQuestions)
+        assertEquals("Owner: Mira", old.previewText)
+        val before = store.searchDocument("cedar", floatArrayOf(1f), 1, -1f, identity).matches.single().first
+        assertNull(before.modelText)
+        store.replaceDocument("cedar", listOf(before.copy(modelText = "Owner: Mira")), identity)
+        assertTrue(store.getDocumentSummaries().single().readyForQuestions)
+        assertEquals("Owner: Mira",
+            store.searchDocument("cedar", floatArrayOf(1f), 1, -1f, identity).matches.single().first.modelText)
     }
 
     @Test

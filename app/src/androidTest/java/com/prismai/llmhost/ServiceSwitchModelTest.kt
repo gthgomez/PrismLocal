@@ -140,7 +140,9 @@ class ServiceSwitchModelTest {
         val targetContext = instrumentation.targetContext
         File(targetContext.getExternalFilesDir("models"), "service-import").deleteRecursively()
         val source = File(targetContext.cacheDir, "service-import.gguf")
-        source.writeBytes(validGgufBytes())
+        instrumentation.context.assets.open("smoke-model/tinyllama-v0.q8_0.gguf").use { input ->
+            source.outputStream().use { input.copyTo(it) }
+        }
 
         val service = bindService(targetContext)
         try {
@@ -463,19 +465,6 @@ class ServiceSwitchModelTest {
         return requireNotNull(service.generationPerformance.value) {
             "generation performance was not published"
         }
-    }
-
-    private fun validGgufBytes(): ByteArray {
-        val bytes = ByteArray(64) { index -> (3 + index).toByte() }
-        bytes[0] = 'G'.code.toByte()
-        bytes[1] = 'G'.code.toByte()
-        bytes[2] = 'U'.code.toByte()
-        bytes[3] = 'F'.code.toByte()
-        bytes[4] = 3
-        bytes[5] = 0
-        bytes[6] = 0
-        bytes[7] = 0
-        return bytes
     }
 
     private data class BoundService(

@@ -906,7 +906,11 @@ private fun ModelMetadata(
             listOfNotNull(
                 "Size" to formatBytes(model.bytes),
                 "Format" to "GGUF v${model.validation.ggufVersion}",
-                "Validation" to model.validation.status.replaceFirstChar { it.titlecase(Locale.US) },
+                "GGUF format" to if (model.validation.metadataChecked) {
+                    "Metadata checked; loading is a separate check"
+                } else {
+                    "Legacy header check; metadata checked on load"
+                },
                 "SHA-256" to shortHash(model.sha256),
                 metadata?.architecture?.let { "Family" to it.uppercase(Locale.US) },
                 metadata?.sizeLabel?.let { "Params" to it },

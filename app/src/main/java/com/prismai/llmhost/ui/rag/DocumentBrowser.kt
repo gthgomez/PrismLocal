@@ -53,6 +53,7 @@ fun DocumentBrowser(
     staleChunkCount: Int,
     ingestStatus: String?,
     isIndexing: Boolean,
+    onCancelIndexing: (() -> Unit)?,
     canIngest: Boolean,
     onIngestDocument: (id: String, title: String, text: String) -> Unit,
     onDeleteDocument: (documentId: String) -> Unit,
@@ -93,13 +94,18 @@ fun DocumentBrowser(
         )
 
         // ── Ingest Status Line ──
-        ingestStatus?.let { status ->
-            Text(
-                text = status,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(vertical = 2.dp),
-            )
+        (ingestStatus ?: if (isIndexing) "Indexing on this device…" else null)?.let { status ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = status,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f).padding(vertical = 2.dp),
+                )
+                if (isIndexing && onCancelIndexing != null) {
+                    TextButton(onClick = onCancelIndexing) { Text("Stop indexing") }
+                }
+            }
         }
 
         // ── Stale Revision Banner ──
@@ -250,9 +256,10 @@ fun DocumentBrowser(
                         docId = doc.documentId,
                         storedChunkCount = doc.storedChunkCount,
                         searchableChunkCount = doc.searchableChunkCount,
-                        legacyChunkCount = doc.legacyChunkCount,
+                         legacyChunkCount = doc.legacyChunkCount,
+                         requiresReindex = doc.fullySearchable && !doc.readyForQuestions,
                         previewText = doc.previewText,
-                        canSelect = doc.fullySearchable && !isIndexing,
+                         canSelect = doc.readyForQuestions && !isIndexing,
                         onSelect = { onSelectDocument(doc.documentId) },
                         canDelete = !isIndexing,
                         onDelete = { deleteTargetDocId = doc.documentId },
@@ -421,7 +428,8 @@ private fun DocumentSummaryRow(
     docId: String,
     storedChunkCount: Int,
     searchableChunkCount: Int,
-    legacyChunkCount: Int = 0,
+     legacyChunkCount: Int = 0,
+    requiresReindex: Boolean,
     previewText: String,
     canSelect: Boolean,
     onSelect: () -> Unit,
@@ -459,6 +467,13 @@ private fun DocumentSummaryRow(
                     InfoBadge(
                         text = "$searchableChunkCount searchable now",
                         color = PrismSlate,
+                    )
+                }
+                if (requiresReindex) {
+                    Text(
+                        text = "Index the original text again to ask questions",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 if (legacyChunkCount > 0) {

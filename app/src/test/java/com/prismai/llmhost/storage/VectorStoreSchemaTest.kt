@@ -49,7 +49,8 @@ class VectorStoreSchemaTest {
 
     @Test
     fun dbVersion_isBumpedForTheEncoderIdentityMigration() {
-        assertEquals(3, VectorStore.DB_VERSION)
+        assertEquals(4, VectorStore.DB_VERSION)
+        assertTrue(VectorStore.CREATE_TABLE_SQL.contains(VectorStore.COL_MODEL_TEXT))
     }
 
     @Test

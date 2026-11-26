@@ -28,3 +28,7 @@ data class TranscriptMessage(
 /** Preserve the transcript while excluding all turns before the most recent context reset. */
 internal fun List<TranscriptMessage>.sinceContextBoundary(): List<TranscriptMessage> =
     drop(indexOfLast { it.contextBoundaryAfter } + 1)
+
+/** Human-viewable archive and selected-document turns are excluded from general model context. */
+internal fun List<TranscriptMessage>.modelVisibleMessages(): List<TranscriptMessage> =
+    sinceContextBoundary().filter { it.documentScope == null }

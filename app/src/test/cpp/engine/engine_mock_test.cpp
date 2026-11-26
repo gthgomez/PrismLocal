@@ -16,6 +16,7 @@
 // Eof=3, Cancelled=4, Error=5, Tombstoned=6, MaxTokens=7.
 
 #include "Engine.hpp"
+#include "runtime/NativeErrorCode.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -147,6 +148,26 @@ int testDrainAcknowledgementDistinguishesInvalidBatchFromRetiredRing() {
     CHECK(retired.tokens.empty());
     CHECK(!retired.pending);
     CHECK(retired.state == kStateCancelled);
+    return 0;
+}
+
+int testFailedReplacementPreservesGenerationError() {
+    llmhost::Engine engine(true);
+    CHECK(engine.loadModel("DEBUG_MOCK_MODEL"));
+    const int genId = 9152;
+    CHECK(engine.startGeneration("UNSUPPORTED_DEBUG_PROMPT", genId, llmhost::GenerationConfig{}) == genId);
+    const auto error = static_cast<int>(llmhost::StreamState::Error);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (engine.getState(genId) != error && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(engine.getState(genId) == error);
+    CHECK(!engine.loadModel(""));
+    const auto retired = engine.drainDecodeAndState(genId, 64);
+    CHECK(retired.state == error);
+    CHECK(retired.error_code == static_cast<int>(llmhost::NativeErrorCode::DEBUG_GENERATION_REJECTED));
+    CHECK(retired.tokens.empty());
+    CHECK(!retired.pending);
     return 0;
 }
 
@@ -396,6 +417,7 @@ int main() {
         {"full_mock_generation_exact_sequence", testFullMockGenerationProducesExactTokenSequence},
         {"cancel_generation_reaches_cancelled", testCancelGenerationReachesCancelledAndClearsRing},
         {"drain_ack_distinguishes_invalid_from_retired", testDrainAcknowledgementDistinguishesInvalidBatchFromRetiredRing},
+        {"failed_replacement_preserves_generation_error", testFailedReplacementPreservesGenerationError},
         {"reset_conversation_no_stale_tokens", testResetConversationGivesNextGenerationNoStaleTokens},
         {"critical_memory_pressure_cancels", testCriticalMemoryPressureCancelsActiveGeneration},
         {"unload_model_during_generation_safe", testUnloadModelDuringGenerationIsSafe},

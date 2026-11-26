@@ -153,11 +153,13 @@ void ensureLlamaBackend() {
     });
 }
 
-void clearRing(ControlBlock* ctrl) {
+void clearRing(ControlBlock* ctrl, bool preserve_error = false) {
     ctrl->head.store(0, std::memory_order_release);
     ctrl->tail.store(0, std::memory_order_release);
     ctrl->overflow.store(0, std::memory_order_release);
-    ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::OK), std::memory_order_release);
+    if (!preserve_error) {
+        ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::OK), std::memory_order_release);
+    }
     // PIR-02: a cleared ring has no produced/drained backlog. Reset the
     // accounting so a subsequent terminal cannot inherit stale pending output.
     ctrl->produced_tokens.store(0, std::memory_order_release);
@@ -1078,8 +1080,12 @@ struct Engine::Impl {
             // The caller owns the lifecycle gate (or is destroying the engine).
             // No drain may return an unacknowledgeable batch after retirement.
             auto* ctrl = buffers.control;
-            clearRing(ctrl);
-            ctrl->state.store(static_cast<uint32_t>(StreamState::Cancelled), std::memory_order_release);
+            const bool preserve_error =
+                ctrl->state.load(std::memory_order_acquire) == static_cast<uint32_t>(StreamState::Error);
+            clearRing(ctrl, preserve_error);
+            if (!preserve_error) {
+                ctrl->state.store(static_cast<uint32_t>(StreamState::Cancelled), std::memory_order_release);
+            }
         }
     }
 

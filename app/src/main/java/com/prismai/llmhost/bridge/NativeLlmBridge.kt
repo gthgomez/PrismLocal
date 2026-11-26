@@ -381,9 +381,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             )
                         )
                         if (dataSent == StreamSendResult.CLOSED) break
-                        if (!nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)) {
-                            throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
-                        }
+                        if (!acknowledgeDeliveredBatch(genId, reusableResult.drainTail, tokenCount)) continue
                     }
                 }
 
@@ -425,10 +423,8 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             errorCode = reusableResult.errorCode,
                         )
                     ) == StreamSendResult.SENT
-                    if (holdAckForTerminal && observedTerminal && tokenCount > 0 &&
-                        !nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)
-                    ) {
-                        throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
+                    if (holdAckForTerminal && observedTerminal && tokenCount > 0) {
+                        acknowledgeDeliveredBatch(genId, reusableResult.drainTail, tokenCount)
                     }
                     break
                 }
@@ -447,9 +443,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                         )
                     )
                     if (dataSent != StreamSendResult.SENT) break
-                    if (!nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)) {
-                        throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
-                    }
+                    if (!acknowledgeDeliveredBatch(genId, reusableResult.drainTail, tokenCount)) continue
                 }
 
                 // Pending terminal output stays on the ring until this loop drains it.
@@ -480,6 +474,16 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         }
         close()
     }.buffer(generationStreamBufferCapacity(maxTokens))
+
+    private fun acknowledgeDeliveredBatch(genId: Int, tail: Int, tokenCount: Int): Boolean {
+        if (nativeAckDrainedTokens(nativeHandle, genId, tail, tokenCount)) return true
+        // Delivery can suspend while unload/reset/cancel retires the ring. Re-read
+        // the session state and let the next poll report that terminal boundary.
+        return when (nativeGetState(nativeHandle, genId)) {
+            NATIVE_STATE_IDLE, NATIVE_STATE_CANCELLED, NATIVE_STATE_TOMBSTONED -> false
+            else -> error("Native drain acknowledgement rejected for generation $genId")
+        }
+    }
 
     fun generate(
         prompt: String,

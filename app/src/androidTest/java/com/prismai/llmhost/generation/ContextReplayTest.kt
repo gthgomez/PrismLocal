@@ -2,7 +2,6 @@ package com.prismai.llmhost.generation
 
 import com.prismai.llmhost.GenerationSettings
 import com.prismai.llmhost.bridge.NativeLlmBridge
-import com.prismai.llmhost.storage.ModelStorageManager
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -10,7 +9,6 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
@@ -18,10 +16,7 @@ import java.io.File
 /**
  * PIR-05 device-side context-replay test.
  *
- * Requires a real device/emulator with a small GGUF fixture available (an
- * installed model from [ModelStorageManager] or any `.gguf` pushed under the
- * app's external `models/` directory). Without one the test marks itself
- * skipped via [assumeTrue] — it never fakes a pass.
+ * Uses the pinned Qwen GGUF fixture, or an explicit `prismContextModelPath`.
  *
  * What it exercises, through the real [NativeLlmBridge]:
  *  - a clean-cache reference for a distinct continuation prompt;
@@ -59,13 +54,8 @@ class ContextReplayTest {
 
     @Test
     fun multiTurnReuseMatchesFullReplayAndResetReplaysCleanly() = runBlocking {
-        val model = smallestAvailableModel()
-        assumeTrue(
-            "No small GGUF model fixture installed or pushed under the app's models dir; " +
-                "skipping device context-replay test",
-            model != null,
-        )
-        val fixture = model!! // assumeTrue above throws when null
+        val explicit = InstrumentationRegistry.getArguments().getString("prismContextModelPath")
+        val fixture = explicit?.takeIf { it.isNotBlank() }?.let(::File) ?: requiredPinnedQwenModel()
 
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {
@@ -161,28 +151,5 @@ class ContextReplayTest {
             errorCode = chunks.maxOfOrNull { chunk -> chunk.errorCode } ?: 0,
             sawTerminalError = chunks.any { chunk -> chunk.isTerminal && chunk.terminalReason == "ERROR" },
         )
-    }
-
-    /** An explicit fixture first, then an installed model or the smallest pushed `.gguf`. */
-    private fun smallestAvailableModel(): File? {
-        val explicit = InstrumentationRegistry.getArguments().getString("prismContextModelPath")
-        if (!explicit.isNullOrBlank()) return File(explicit)
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
-
-        val installed = ModelStorageManager(context)
-            .listInstalledModelInfos()
-            .map { info -> info.file }
-            .filter { file -> file.isFile }
-        if (installed.isNotEmpty()) {
-            return installed.minByOrNull { file -> file.length() }
-        }
-
-        val modelsDir = context.getExternalFilesDir("models") ?: File(context.filesDir, "models")
-        if (!modelsDir.isDirectory) {
-            return null
-        }
-        return modelsDir.walkTopDown()
-            .filter { file -> file.isFile && file.extension.equals("gguf", ignoreCase = true) }
-            .minByOrNull { file -> file.length() }
     }
 }

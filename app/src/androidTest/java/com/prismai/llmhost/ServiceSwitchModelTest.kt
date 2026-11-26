@@ -79,7 +79,7 @@ class ServiceSwitchModelTest {
     }
 
     @Test
-    fun storedDocumentsReturnAfterServiceRestartAndModelReload() = runBlocking {
+    fun storedDocumentsReturnAfterServiceRestartAndModelReload() = runBlocking<Unit> {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val intent = Intent(context, InferenceService::class.java)
@@ -156,7 +156,7 @@ class ServiceSwitchModelTest {
     }
 
     @Test
-    fun cancelGenerationStopsForegroundState() = runBlocking {
+    fun cancelGenerationStopsForegroundState() = runBlocking<Unit> {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val targetContext = instrumentation.targetContext
         stageModel(instrumentation, "modelA")

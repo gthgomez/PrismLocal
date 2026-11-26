@@ -90,9 +90,11 @@ class ModelManager(
             message = "Loading model",
         )
 
-        when (val resolved = modelStorageManager.resolveActiveModelForActivation(modelId)) {
+        when (val resolved = modelStorageManager.resolveActiveModelForActivation(modelId, ModelLoadLimits.HARD_CAP_BYTES)) {
             is ModelStorageManager.ModelResolveResult.Failure -> {
-                if (uiState._currentModel.value == modelId) {
+                val loadedFile = uiState._activeModelInfo.value?.file
+                val rejectsLoadedFile = resolved.rejectedFile == null || resolved.rejectedFile == loadedFile?.canonicalFile
+                if (uiState._currentModel.value == modelId && rejectsLoadedFile) {
                     engine.unloadModel()
                     lastLoadedPlanKey = null
                     uiState.streamState.clear()
@@ -152,7 +154,7 @@ class ModelManager(
                     )
                     return@withContext true
                 }
-                val loadRejection = nativeLoadRejection(activeModel)
+                val loadRejection = nativeLoadRejection(activeModel, requestedSettings)
                 if (loadRejection != null) {
                     val memory = deviceProfiler.deviceMemorySnapshot()
                     uiState._runtimeStatus.value = RuntimeStatus.ERROR
@@ -237,16 +239,19 @@ class ModelManager(
         }
     }
 
-    private fun nativeLoadRejection(model: ModelStorageManager.ActiveModelInfo): NativeLoadRejection? {
+    private fun nativeLoadRejection(model: ModelStorageManager.ActiveModelInfo, settings: GenerationSettings): NativeLoadRejection? {
         val profile = deviceProfiler.captureProfile()
-        val fit = modelReadinessAssessor.estimateModelFit(model, profile)
+        val fit = modelReadinessAssessor.estimateModelFit(model, profile, settings)
         val overHardCap = model.bytes > ModelLoadLimits.HARD_CAP_BYTES
-        // Block only when the model physically cannot fit. A tight-but-fitting model
-        // (RISKY) still loads — slow is not blocked — and a model already proven on
-        // this device overrides even the physical projection.
-        val exceedsAvailableRam = fit.requiredRamBytes > fit.availableRamAfterUnloadBytes
-        val allowed = !overHardCap && (!exceedsAvailableRam || fit.provenUsable)
-        if (allowed) {
+        // A tight-but-fitting model (RISKY) still loads. Historical benchmark
+        // settings do not establish that this load fits current memory.
+        val blocked = ModelLoadLimits.isLoadBlocked(
+            modelBytes = model.bytes,
+            requiredRamBytes = fit.requiredRamBytes,
+            availableRamAfterUnloadBytes = fit.availableRamAfterUnloadBytes,
+            provenUsable = fit.provenUsable,
+        )
+        if (!blocked) {
             if (fit.rating == ModelFitRating.RISKY) {
                 Log.i(
                     TAG,

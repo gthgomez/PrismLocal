@@ -6,12 +6,15 @@ import android.content.SharedPreferences
 import com.prismai.llmhost.ChatSession
 import com.prismai.llmhost.TranscriptMessage
 import com.prismai.llmhost.TranscriptRole
+import com.prismai.llmhost.agent.tools.ChatTools
+import com.prismai.llmhost.tools.AgentToolCall
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.ui.UiEventBus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.runBlocking
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -83,6 +86,59 @@ class ChatSearchAndDeletionConsistencyTest {
     }
 
     @Test
+    fun memoryContextBoundarySurvivesRestartAndRejectsStaleTranscriptWrites(): Unit = runBlocking {
+        val context = TestContext(tempFolder.newFolder("memory_context_boundary"))
+        val store = TranscriptStore(context)
+        val state = ServiceUiState()
+        val manager = ChatManager(context, store, ChatSearchIndex(), state, UiEventBus(), this)
+        val chatId = manager.createChatInternal("Memory test")
+        manager.appendTranscriptMessage(TranscriptRole.USER, "Which tea do I prefer?")
+        manager.appendTranscriptMessage(TranscriptRole.ASSISTANT, "You prefer jasmine oolong.")
+        val oldMessages = state.transcript.value
+        val staleRevision = manager.transcriptWriteRevision(chatId)
+
+        assertFalse(manager.markContextBoundaryForCurrentChat("different-chat"))
+        state._isGenerating.value = true
+        assertFalse(manager.markContextBoundaryForCurrentChat(chatId))
+        state._isGenerating.value = false
+        assertTrue(manager.markContextBoundaryForCurrentChat(chatId))
+        manager.persistTranscript(chatId, oldMessages, staleRevision)
+
+        val restored = store.readTranscriptFile(store.transcriptFile(chatId))
+        assertEquals(oldMessages.map { it.text }, restored.map { it.text })
+        assertTrue(restored.last().contextBoundaryAfter)
+        assertTrue(state.transcript.value.last().contextBoundaryAfter)
+    }
+
+    @Test
+    fun modelFacingArchiveToolsDoNotReadPreBoundaryOrDocumentScopedText(): Unit = runBlocking {
+        val context = TestContext(tempFolder.newFolder("model_archive"))
+        val store = TranscriptStore(context)
+        val state = ServiceUiState()
+        val manager = ChatManager(context, store, ChatSearchIndex(), state, UiEventBus(), this)
+        val chatId = manager.createChatInternal("privateforgotten")
+        manager.appendTranscriptMessage(TranscriptRole.USER, "privateforgotten")
+        assertTrue(manager.markContextBoundaryForCurrentChat(chatId))
+        manager.appendTranscriptMessage(TranscriptRole.ASSISTANT, "selecteddocument", documentScope = "cedar")
+        manager.appendTranscriptMessage(TranscriptRole.USER, "ordinarymessage")
+        val tools = ChatTools(
+            chatManager = manager, transcriptStore = store, currentChatId = { state.currentChatId.value },
+            chatSessions = { state.chatSessions.value }, transcript = { state.transcript.value },
+            isGenerating = { false }, filesDir = context.filesDir, onPersistTranscript = {},
+            onSwitchChat = { false }, onClearTranscript = { false }, onDeleteChat = { false },
+            onRenameChat = { _, _ -> }, onResetNativeConversation = {},
+        )
+        val summary = tools.summarizeCurrentChat(AgentToolCall("summarize_current_chat")).details.toString()
+        assertFalse(summary.contains("privateforgotten"))
+        assertFalse(summary.contains("selecteddocument"))
+        assertTrue(summary.contains("ordinarymessage"))
+        for (query in listOf("privateforgotten", "selecteddocument", "ordinarymessage")) {
+            val result = tools.searchChats(AgentToolCall("search_chats", JSONObject().put("query", query)))
+            assertEquals(if (query == "ordinarymessage") 1 else 0, result.details?.getJSONArray("results")?.length())
+        }
+    }
+
+    @Test
     fun clearedTranscriptIsEvictedFromSearchImmediately(): Unit = runBlocking {
         val baseDir = tempFolder.newFolder("chat_test_clear")
         val context = TestContext(baseDir)
@@ -122,7 +178,8 @@ class ChatSearchAndDeletionConsistencyTest {
         assertEquals(chatId, beforeClear[0].first.id)
 
         // Clear transcript
-        chatManager.clearTranscript()
+        assertTrue(chatManager.clearTranscript())
+        assertTrue(transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(chatId)).isEmpty())
 
         // Verify search index is updated and no longer matches the cleared term
         val afterClear = searchIndex.search("extraterrestrial", uiState.chatSessions.value, transcriptStore)

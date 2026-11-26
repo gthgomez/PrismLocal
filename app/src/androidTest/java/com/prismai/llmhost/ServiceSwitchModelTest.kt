@@ -15,19 +15,112 @@ import android.net.Uri
 import android.os.IBinder
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.prismai.llmhost.chat.TranscriptStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.io.RandomAccessFile
+import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class ServiceSwitchModelTest {
+    @Test
+    fun deletingChatMemoryPersistsContextBoundaryWithoutErasingMessages() = runBlocking {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        stageModel(instrumentation, "modelA")
+        val bound = bindService(context)
+        val previousSettings = bound.service.generationSettings.value
+        var chatId: String? = null
+        var factId: String? = null
+        val uniqueFact = "Synthetic deletion ${UUID.randomUUID()}"
+        try {
+            val service = bound.service
+            val previousChat = service.currentChatId.value
+            service.createChat()
+            chatId = withTimeout(15_000) { service.currentChatId.first { it != null && it != previousChat } }
+            assertTrue(service.switchModel("modelA"))
+            service.updateGenerationSettings(GenerationSettings(maxTokens = 8, threadCount = 1))
+            service.generateSafely("Hello from the memory boundary test")
+            withTimeout(60_000) {
+                service.transcript.first { messages -> messages.any { it.role == TranscriptRole.ASSISTANT && it.text.isNotBlank() } }
+                service.isGenerating.first { !it }
+            }
+            val before = service.transcript.value
+            assertTrue(before.any { it.role == TranscriptRole.ASSISTANT && it.text.isNotBlank() })
+            service.addMemory(uniqueFact, MemoryCategory.PREFERENCE)
+            val fact = service.memories.value.first { it.fact == uniqueFact && it.sourceChatId == chatId }
+            factId = fact.id
+
+            assertTrue(service.deleteMemory(fact.id))
+            assertTrue(service.memories.value.none { it.id == fact.id })
+            assertEquals(before.map { it.text }, service.transcript.value.map { it.text })
+            assertTrue(service.transcript.value.last().contextBoundaryAfter)
+            val store = TranscriptStore(context)
+            val restored = store.readTranscriptFile(store.transcriptFile(requireNotNull(chatId)))
+            assertEquals(before.map { it.text }, restored.map { it.text })
+            assertTrue(restored.last().contextBoundaryAfter)
+        } finally {
+            bound.service.cancelGeneration()
+            waitForGenerating(bound.service, expected = false)
+            bound.service.updateGenerationSettings(previousSettings)
+            factId?.let { SqlMemoryStore(context).delete(it) }
+            chatId?.let { bound.service.deleteChat(it) }
+            context.unbindService(bound.connection)
+        }
+    }
+
+    @Test
+    fun storedDocumentsReturnAfterServiceRestartAndModelReload() = runBlocking<Unit> {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val intent = Intent(context, InferenceService::class.java)
+        val documentId = "service-restart-${UUID.randomUUID()}"
+        val store = VectorStore(context)
+        val identity = EmbeddingIdentity.of(
+            "0cbe6769faaa77f4cdbf2f39dbc5f0fb9b3d62f7f9bc5760aa364946e6f2d0f5",
+            VectorStore.EMBEDDING_REVISION,
+        )
+        context.stopService(intent)
+        stageModel(instrumentation, "modelA")
+        store.replaceDocument(
+            documentId,
+            listOf(VectorChunk("$documentId:0", documentId, 0, "Stored restart fixture", FloatArray(64) { if (it == 0) 1f else 0f })),
+            identity,
+        )
+        var first: BoundService? = null
+        var second: BoundService? = null
+        try {
+            val firstBound = bindService(context)
+            first = firstBound
+            withTimeout(15_000) { firstBound.service.vectorDocuments.first { rows -> rows.any { it.documentId == documentId } } }
+            assertTrue(firstBound.service.switchModel("modelA"))
+            withTimeout(15_000) { firstBound.service.vectorDocuments.first { rows -> rows.any { it.documentId == documentId && it.fullySearchable } } }
+            context.unbindService(firstBound.connection)
+            first = null
+            context.stopService(intent)
+            delay(500)
+
+            val secondBound = bindService(context)
+            second = secondBound
+            assertNotSame("the regression must exercise a new service instance", firstBound.service, secondBound.service)
+            withTimeout(15_000) { secondBound.service.vectorDocuments.first { rows -> rows.any { it.documentId == documentId && it.fullySearchable } } }
+        } finally {
+            first?.let { context.unbindService(it.connection) }
+            second?.let { context.unbindService(it.connection) }
+            store.deleteByDocument(documentId)
+        }
+    }
+
     @Test
     fun switchModelLoadsStagedModel() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -48,7 +141,9 @@ class ServiceSwitchModelTest {
         val targetContext = instrumentation.targetContext
         File(targetContext.getExternalFilesDir("models"), "service-import").deleteRecursively()
         val source = File(targetContext.cacheDir, "service-import.gguf")
-        source.writeBytes(validGgufBytes())
+        instrumentation.context.assets.open("smoke-model/tinyllama-v0.q8_0.gguf").use { input ->
+            source.outputStream().use { input.copyTo(it) }
+        }
 
         val service = bindService(targetContext)
         try {
@@ -62,7 +157,7 @@ class ServiceSwitchModelTest {
     }
 
     @Test
-    fun cancelGenerationStopsForegroundState() = runBlocking {
+    fun cancelGenerationStopsForegroundState() = runBlocking<Unit> {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val targetContext = instrumentation.targetContext
         stageModel(instrumentation, "modelA")
@@ -73,8 +168,10 @@ class ServiceSwitchModelTest {
             service.service.generateSafely("Once upon a time in a small local runtime")
             assertTrue("foreground state did not become active", waitForForeground(service.service, expected = true))
 
+            service.service.uiMessage.value?.let { service.service.clearUiMessage(it) }
             service.service.cancelGeneration()
             assertTrue("foreground state did not stop after cancel", waitForForeground(service.service, expected = false))
+            withTimeout(5_000) { service.service.uiMessage.first { it == "Generation stopped" } }
         } finally {
             service.service.cancelGeneration()
             targetContext.unbindService(service.connection)
@@ -106,22 +203,39 @@ class ServiceSwitchModelTest {
     }
 
     @Test
-    fun oversizedModelIsRejectedWithoutUnloadingCurrentModel() = runBlocking {
+    fun oversizedReplacementIsRejectedWithoutUnloadingPreviousVersion() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val targetContext = instrumentation.targetContext
-        stageModel(instrumentation, "modelA")
-        stageOversizedModel(instrumentation, "oversizedModel")
-
+        val modelId = "oversizedReplacement"
+        stageModel(instrumentation, modelId)
+        val modelsDir = targetContext.getExternalFilesDir("models") ?: File(targetContext.filesDir, "models")
+        val modelRoot = File(modelsDir, modelId)
+        val manifestFile = File(modelRoot, "manifest.json")
+        val originalManifest = manifestFile.readText()
+        val replacementFile = File(modelRoot, "oversized.gguf")
         val service = bindService(targetContext)
         try {
-            assertTrue(service.service.switchModel("modelA"))
+            assertTrue(service.service.switchModel(modelId))
+            val priorVersion = service.service.activeModelInfo.value?.versionId
+            val manifest = org.json.JSONObject(originalManifest)
+            val versions = manifest.getJSONObject("versions")
+            val replacement = org.json.JSONObject(versions.getJSONObject(manifest.getString("active_version")).toString())
+                .put("file", replacementFile.name)
+            versions.put("oversized", replacement)
+            manifest.put("active_version", "oversized")
+            RandomAccessFile(replacementFile, "rw").use { it.setLength(ModelLoadLimits.HARD_CAP_BYTES + 1) }
+            manifestFile.writeText(manifest.toString())
 
-            assertFalse(service.service.switchModel("oversizedModel"))
+            assertFalse(service.service.switchModel(modelId))
+            assertTrue(service.service.modelLoadDiagnostics.value?.message.orEmpty().contains("load cap"))
 
-            assertEquals("modelA", service.service.currentModel.value)
+            assertEquals(modelId, service.service.currentModel.value)
+            assertEquals(priorVersion, service.service.activeModelInfo.value?.versionId)
             assertFalse(service.service.isGenerating.value)
             assertFalse(service.service.debugIsGenerationForegroundActive())
         } finally {
+            manifestFile.writeText(originalManifest)
+            replacementFile.delete()
             service.service.cancelGeneration()
             targetContext.unbindService(service.connection)
         }
@@ -260,30 +374,6 @@ class ServiceSwitchModelTest {
         copyAsset(instrumentation, "smoke-model/tinyllama-v0.q8_0.gguf", File(modelRoot, "tinyllama-v0.q8_0.gguf"))
     }
 
-    private fun stageOversizedModel(instrumentation: Instrumentation, modelId: String) {
-        val targetContext = instrumentation.targetContext
-        val modelsDir = targetContext.getExternalFilesDir("models") ?: File(targetContext.filesDir, "models")
-        val modelRoot = File(modelsDir, modelId)
-        modelRoot.deleteRecursively()
-        modelRoot.mkdirs()
-        copyAsset(instrumentation, "smoke-model/tinyllama-v0.q8_0.gguf", File(modelRoot, "tinyllama-v0.q8_0.gguf"))
-        File(modelRoot, "manifest.json").writeText(
-            """
-            {
-              "active_version": "v1",
-              "versions": {
-                "v1": {
-                  "file": "tinyllama-v0.q8_0.gguf",
-                  "original_file_name": "oversized.gguf",
-                  "sha256": "0cbe6769faaa77f4cdbf2f39dbc5f0fb9b3d62f7f9bc5760aa364946e6f2d0f5",
-                  "bytes": 3221225473
-                }
-              }
-            }
-            """.trimIndent()
-        )
-    }
-
     private fun copyAsset(instrumentation: Instrumentation, assetPath: String, destination: File) {
         destination.parentFile?.mkdirs()
         instrumentation.context.assets.open(assetPath).use { input ->
@@ -369,19 +459,6 @@ class ServiceSwitchModelTest {
         return requireNotNull(service.generationPerformance.value) {
             "generation performance was not published"
         }
-    }
-
-    private fun validGgufBytes(): ByteArray {
-        val bytes = ByteArray(64) { index -> (3 + index).toByte() }
-        bytes[0] = 'G'.code.toByte()
-        bytes[1] = 'G'.code.toByte()
-        bytes[2] = 'U'.code.toByte()
-        bytes[3] = 'F'.code.toByte()
-        bytes[4] = 3
-        bytes[5] = 0
-        bytes[6] = 0
-        bytes[7] = 0
-        return bytes
     }
 
     private data class BoundService(

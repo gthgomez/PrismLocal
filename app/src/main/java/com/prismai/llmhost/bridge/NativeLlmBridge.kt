@@ -26,6 +26,9 @@ import java.util.concurrent.atomic.AtomicInteger
 class NativeLlmBridge private constructor(handle: Long, private val instanceId: Int) {
     companion object {
         private const val TAG = "NativeLlmBridge"
+        // Values from DrainAcknowledgement in Engine.hpp.
+        private const val DRAIN_ACKNOWLEDGED = 1
+        private const val DRAIN_RETIRED = 2
         private val bridgeInstanceCounter = AtomicInteger(0)
 
         init {
@@ -42,6 +45,12 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
         @JvmStatic
         private external fun nativeCreateEngine(debugHooksEnabled: Boolean): Long
+
+        internal fun ggmlTensorRowBytes(type: Int, width: Long): Long =
+            nativeGgmlTensorRowBytes(type, width)
+
+        @JvmStatic
+        private external fun nativeGgmlTensorRowBytes(type: Int, width: Long): Long
     }
 
     // modelMutex serializes model lifecycle: load, unload, reset, destroy.
@@ -128,7 +137,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     private external fun nativeCancelGeneration(handle: Long, genId: Int)
     private external fun nativeDrainTokens(handle: Long, genId: Int, maxTokens: Int): IntArray
     private external fun nativeAckEof(handle: Long, genId: Int)
-    private external fun nativeAckDrainedTokens(handle: Long, genId: Int, expectedTail: Int, tokenCount: Int): Boolean
+    private external fun nativeAckDrainedTokens(handle: Long, genId: Int, expectedTail: Int, tokenCount: Int): Int
     private external fun nativeDecodeTokens(handle: Long, genId: Int, tokens: IntArray): String
     private external fun nativeGetState(handle: Long, genId: Int): Int
     private external fun nativeDrainDecodeAndState(handle: Long, genId: Int, maxTokens: Int, outResult: NativeDrainResult)
@@ -375,9 +384,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             )
                         )
                         if (dataSent == StreamSendResult.CLOSED) break
-                        if (!nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)) {
-                            throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
-                        }
+                        if (!acknowledgeDeliveredBatch(genId, reusableResult.drainTail, tokenCount)) continue
                     }
                 }
 
@@ -419,10 +426,8 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                             errorCode = reusableResult.errorCode,
                         )
                     ) == StreamSendResult.SENT
-                    if (holdAckForTerminal && observedTerminal && tokenCount > 0 &&
-                        !nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)
-                    ) {
-                        throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
+                    if (holdAckForTerminal && observedTerminal && tokenCount > 0) {
+                        acknowledgeDeliveredBatch(genId, reusableResult.drainTail, tokenCount)
                     }
                     break
                 }
@@ -441,9 +446,7 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
                         )
                     )
                     if (dataSent != StreamSendResult.SENT) break
-                    if (!nativeAckDrainedTokens(nativeHandle, genId, reusableResult.drainTail, tokenCount)) {
-                        throw IllegalStateException("Native drain acknowledgement rejected for generation $genId")
-                    }
+                    if (!acknowledgeDeliveredBatch(genId, reusableResult.drainTail, tokenCount)) continue
                 }
 
                 // Pending terminal output stays on the ring until this loop drains it.
@@ -474,6 +477,13 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         }
         close()
     }.buffer(generationStreamBufferCapacity(maxTokens))
+
+    private fun acknowledgeDeliveredBatch(genId: Int, tail: Int, tokenCount: Int): Boolean =
+        when (nativeAckDrainedTokens(nativeHandle, genId, tail, tokenCount)) {
+            DRAIN_ACKNOWLEDGED -> true
+            DRAIN_RETIRED -> false
+            else -> error("Native drain acknowledgement rejected for generation $genId")
+        }
 
     fun generate(
         prompt: String,
@@ -550,7 +560,8 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
     @VisibleForTesting
     suspend fun debugAcknowledgeDrainedForTesting(generationId: Int, expectedTail: Int, tokenCount: Int): Boolean =
         modelMutex.withLock {
-            !isDestroyed && nativeAckDrainedTokens(nativeHandle, generationId, expectedTail, tokenCount)
+            !isDestroyed &&
+                nativeAckDrainedTokens(nativeHandle, generationId, expectedTail, tokenCount) == DRAIN_ACKNOWLEDGED
         }
 
     @VisibleForTesting

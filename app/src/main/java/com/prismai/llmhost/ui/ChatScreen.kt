@@ -150,6 +150,7 @@ fun ChatScreen(
         var memoriesVisible by remember { mutableStateOf(false) }
         var ragBrowserVisible by remember { mutableStateOf(false) }
         var ingestStatus by remember { mutableStateOf<String?>(null) }
+        var documentImportJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
         val controlSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val chatSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val memoriesSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -193,6 +194,10 @@ fun ChatScreen(
                         val recoveryTranscript by (service?.recoveryTranscript ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
                         val chatSessions by (service?.chatSessions ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = emptyList())
                         val currentChatId by (service?.currentChatId ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
+                        var selectedDocumentId by rememberSaveable { mutableStateOf<String?>(null) }
+                        var pendingComposerSend by rememberSaveable { mutableStateOf<ArrayList<String?>?>(null) }
+                        val composerSendStatus by (service?.composerSendStatus ?: emptyFlow())
+                            .collectAsStateWithLifecycle(initialValue = null)
                         val transcript by (service?.transcript ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = emptyList())
                         val generationSettings by (service?.generationSettings ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = GenerationSettings()
@@ -230,7 +235,9 @@ fun ChatScreen(
                         val memories by (service?.memories ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
-                        val vectorDocuments by (service?.vectorDocuments ?: emptyFlow()).collectAsStateWithLifecycle(
+                         val isIndexingDocument by (service?.isIndexingDocument ?: emptyFlow())
+                             .collectAsStateWithLifecycle(initialValue = false)
+                         val vectorDocuments by (service?.vectorDocuments ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = emptyList()
                         )
                         val staleVectorChunkCount by (service?.staleVectorChunkCount ?: emptyFlow())
@@ -245,7 +252,7 @@ fun ChatScreen(
                         var prompt by rememberSaveable { mutableStateOf("") }
                         var savedAttachments by rememberSaveable { mutableStateOf(emptyList<String>()) }
                         var savedChatId by rememberSaveable { mutableStateOf<String?>(null) }
-                        var isSending by remember { mutableStateOf(false) }
+                        val isSending = pendingComposerSend != null
                         val attachments: List<PromptAttachment> =
                             remember(savedAttachments) {
                                 savedAttachments.mapNotNull(AttachmentTextCodec::decode)
@@ -270,15 +277,48 @@ fun ChatScreen(
                         // draft is read here, never captured from a previous composition,
                         // so a switch cannot clobber the incoming chat with stale values.
                         LaunchedEffect(currentChatId, service) {
-                            if (service == null) return@LaunchedEffect
+                            val boundService = service ?: return@LaunchedEffect
+                            val boundChatId = boundService.currentChatId.value
                             val loaded = draftStore.applyLiveDraft(
-                                currentChatId = currentChatId,
+                                currentChatId = boundChatId,
                                 liveText = prompt,
                                 liveAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode),
                             ) ?: return@LaunchedEffect
+                            selectedDocumentId = null
                             prompt = loaded.first
                             savedAttachments = loaded.second.map(AttachmentTextCodec::encode)
                             savedChatId = draftStore.chatId
+                        }
+
+                        LaunchedEffect(composerSendStatus, service, currentChatId) {
+                            val request = pendingComposerSend ?: return@LaunchedEffect
+                            val (token, chatId, documentId, question) = request
+                            // The service owns the request across activity recreation. A missing token
+                            // after service recreation leaves the draft available for another send.
+                            val status = service?.composerSendStatus?.value ?: run {
+                                if (service != null) pendingComposerSend = null
+                                return@LaunchedEffect
+                            }
+                            if (status.token != token) {
+                                pendingComposerSend = null
+                                return@LaunchedEffect
+                            }
+                            if (status.pending) return@LaunchedEffect
+                            pendingComposerSend = null
+                            if (status.refusal != null) {
+                                snackbarMessage = status.refusal
+                                return@LaunchedEffect
+                            }
+                            if (documentId != null && (savedChatId != chatId || selectedDocumentId != documentId)) return@LaunchedEffect
+                            val sentAttachments = request.drop(4).filterNotNull()
+                            if (savedChatId == chatId) {
+                                // The store can still have the pre-edit snapshot after recreation.
+                                // Keep its attachment payloads if the live draft still references them.
+                                if (prompt != question || savedAttachments != sentAttachments) return@LaunchedEffect
+                                prompt = ""
+                                savedAttachments = emptyList()
+                            }
+                            draftStore.clearIfMatches(chatId, question.orEmpty(), sentAttachments.mapNotNull(AttachmentTextCodec::decode))
                         }
 
                         var importStatus by remember { mutableStateOf("") }
@@ -604,6 +644,13 @@ fun ChatScreen(
                                             }
                                         }
                                     }
+                                    if (message.contextBoundaryAfter) {
+                                        Text(
+                                            text = "New context starts here. Earlier messages remain visible but are not automatically included in later prompts.",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                                        )
+                                    }
                                 }
                                 item(key = "bottom-anchor") {
                                     Spacer(modifier = Modifier.fillMaxWidth().height(1.dp))
@@ -695,6 +742,27 @@ fun ChatScreen(
                             Spacer(modifier = Modifier.height(8.dp))
                         }
 
+                        selectedDocumentId?.let { documentId ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "Asking document: $documentId",
+                                    modifier = Modifier.weight(1f),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 1,
+                                )
+                                TextButton(onClick = { selectedDocumentId = null }) { Text("Clear") }
+                            }
+                        }
+                         if (isIndexingDocument || (isSending && !isGenerating && selectedDocumentId != null)) {
+                            Text(
+                                text = if (isIndexingDocument) "Indexing document on this device…" else "Searching selected document…",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+
                         PromptComposer(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -707,8 +775,11 @@ fun ChatScreen(
                             performance = generationPerformance,
                             attachments = attachments,
                             isShortHeight = isShortHeight,
-                            canContinue = generationPerformance?.terminalReason == "MAX_TOKENS" &&
-                                transcript.lastOrNull()?.role == TranscriptRole.ASSISTANT,
+                             canContinue = selectedDocumentId == null &&
+                                 generationPerformance?.terminalReason == "MAX_TOKENS" &&
+                                transcript.lastOrNull()?.role == TranscriptRole.ASSISTANT &&
+                                transcript.lastOrNull()?.documentScope == null &&
+                                transcript.lastOrNull()?.contextBoundaryAfter != true,
                             onPromptChange = { prompt = it },
                             onAddAttachment = {
                                 onImportPickerStarted()
@@ -725,46 +796,36 @@ fun ChatScreen(
                             onContinue = { service?.continueGenerationSafely() },
                             isSending = isSending,
                             onSend = {
-                                if (!isSending) {
+                                 if (isIndexingDocument) {
+                                     snackbarMessage = "Wait for document indexing to finish"
+                                 } else if (selectedDocumentId != null && attachments.isNotEmpty()) {
+                                     snackbarMessage = "Remove attachments before asking the selected document"
+                                 } else if (pendingComposerSend == null) {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 val svc = service
                                 if (text.isNotEmpty()) {
                                     if (svc == null) {
                                         snackbarMessage = "Service unavailable"
                                     } else {
-                                        val originatingChatId = currentChatId
-                                        val originatingPrompt = prompt
-                                        val originatingAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode)
-                                        val sendToken = java.util.UUID.randomUUID().toString()
-                                        isSending = true
-                                        svc.generateSafely(
-                                            prompt = text,
-                                            sourceChatId = originatingChatId,
-                                            sendToken = sendToken,
-                                            onAccepted = {
-                                                scope.launch {
-                                                    isSending = false
-                                                    if (currentChatId == originatingChatId) {
-                                                        if (prompt == originatingPrompt) {
-                                                            prompt = ""
-                                                        }
-                                                        if (savedAttachments.mapNotNull(AttachmentTextCodec::decode) == originatingAttachments) {
-                                                            savedAttachments = emptyList()
-                                                        }
-                                                    }
-                                                    draftStore.clearIfMatches(originatingChatId, originatingPrompt, originatingAttachments)
-                                                }
-                                            },
-                                            onRefused = { reason ->
-                                                isSending = false
-                                                snackbarMessage = reason
-                                            },
-                                        )
+                                        val owner = draftStore.chatId
+                                        if (svc.currentChatId.value != owner) {
+                                            snackbarMessage = "Wait for the selected chat before sending"
+                                        } else {
+                                            val sendToken = java.util.UUID.randomUUID().toString()
+                                            pendingComposerSend = arrayListOf(sendToken, owner, selectedDocumentId, prompt)
+                                                .apply { addAll(savedAttachments) }
+                                            svc.generateSafely(
+                                                prompt = text,
+                                                sourceChatId = owner,
+                                                sendToken = sendToken,
+                                                selectedDocumentId = selectedDocumentId,
+                                            )
+                                        }
                                     }
                                 }
                                 }
                             },
-                            onVoiceClick = { service?.startVoiceInput() },
+                             onVoiceClick = if (selectedDocumentId == null) ({ service?.startVoiceInput() }) else null,
                             voiceState = voiceState,
                         )
 
@@ -873,9 +934,11 @@ fun ChatScreen(
                                 contentColor = MaterialTheme.colorScheme.onSurface,
                                 dragHandle = { SheetDragHandle() },
                             ) {
-                                MemoryBrowser(
-                                    memories = memories,
-                                    onDelete = { id -> service?.deleteMemory(id) },
+                                 MemoryBrowser(
+                                     memories = memories,
+                                     currentChatId = currentChatId,
+                                     existingChatIds = chatSessions.mapTo(mutableSetOf()) { it.id },
+                                    onDelete = { id -> scope.launch { service?.deleteMemory(id) } },
                                     onRefresh = { service?.refreshMemories() },
                                     onAddMemory = { fact, category -> service?.addMemory(fact, category) },
                                 )
@@ -896,14 +959,29 @@ fun ChatScreen(
                                 DocumentBrowser(
                                     documents = vectorDocuments,
                                     staleChunkCount = staleVectorChunkCount,
-                                    ingestStatus = ingestStatus,
+                                     ingestStatus = ingestStatus,
+                                     isIndexing = isIndexingDocument,
+                                     onCancelIndexing = if (documentImportJob != null) ({ documentImportJob?.cancel() }) else null,
+                                    canIngest = service != null && currentModel != null && !isGenerating && !isSending,
                                     onDeleteStaleDocuments = { service?.deleteStaleVectorChunks() },
                                     onIngestDocument = { id, title, text ->
-                                        ingestStatus = null
-                                        scope.launch {
-                                            ingestStatus = withContext(Dispatchers.IO) {
-                                                service?.ingestDocument(id, title, text)
-                                            } ?: "Indexing unavailable"
+                                         if (!isIndexingDocument && documentImportJob == null) {
+                                             ingestStatus = "Indexing $id on this device…"
+                                             documentImportJob = scope.launch {
+                                                try {
+                                                    ingestStatus = withContext(Dispatchers.IO) {
+                                                        service?.ingestDocument(id, title, text)
+                                                    } ?: "Indexing unavailable"
+                                                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                                     ingestStatus = "Document indexing stopped"
+                                                     throw cancelled
+                                                } catch (error: Exception) {
+                                                    ingestStatus = "Indexing failed: ${error.message ?: "unknown error"}"
+                                                    snackbarMessage = ingestStatus
+                                                } finally {
+                                                     documentImportJob = null
+                                                }
+                                            }
                                         }
                                     },
                                     onDeleteDocument = { id -> service?.deleteDocument(id) },
@@ -911,6 +989,14 @@ fun ChatScreen(
                                         service?.queryVectorStore(query) ?: emptyList()
                                     },
                                     onRefresh = { service?.refreshVectorStore() },
+                                     onSelectDocument = { documentId ->
+                                         if (voiceState.isListening) {
+                                             snackbarMessage = "Finish voice input before selecting a document"
+                                         } else {
+                                             selectedDocumentId = documentId
+                                             ragBrowserVisible = false
+                                         }
+                                     },
                                 )
                             }
                         }

@@ -7,6 +7,8 @@ import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
 import android.os.SystemClock
+import android.os.ParcelFileDescriptor
+import android.os.Process
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.delay
@@ -83,15 +85,20 @@ class RealInferenceSmokeTest {
     fun realGenerationCompactionPreservesExplicitSystemPrefix() = runBlocking {
         val model = requireTinyModel()
         val settings = GenerationSettings(
-            maxTokens = 1,
+            maxTokens = 8,
             threadCount = 2,
             contextLength = 512,
             batchSize = 128,
+            temperature = 0f,
+            topK = 1,
+            repeatPenalty = 1f,
         )
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {
             assertTrue("real model failed to load", engine.loadModel(model.file.absolutePath, settings))
-            val repeatedContext = "Remember this context item for the next response. ".repeat(40)
+            // Keep the initial prompt inside the native headroom while filling enough of the
+            // context that the continuation must use the sliding-window path.
+            val repeatedContext = "Remember this context item for the next response. ".repeat(49)
             val explicitSystemPrompt =
                 "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n" +
                     "<|im_start|>user\n$repeatedContext<|im_end|>\n" +
@@ -99,11 +106,15 @@ class RealInferenceSmokeTest {
 
             val first = engine.generate(explicitSystemPrompt, settings).toList()
             assertTrue("first generation did not terminate normally", first.any { it.isTerminal && it.terminalReason != "ERROR" })
+            assertTrue("first generation did not fill enough context", first.sumOf { it.tokenCount } >= 5)
+            assertEquals("unexpected system-prompt fixture token count", 492, first.maxOf { it.promptTokens })
 
+            val previousShiftCount = observedShiftPrefixLengths().size
             val continued = engine.generate("", settings, continueFromContext = true).toList()
             assertTrue("continued generation emitted no tokens", continued.sumOf { it.tokenCount } >= 1)
             assertTrue("continued generation entered native error", continued.none { it.isTerminal && it.terminalReason == "ERROR" })
             assertEquals("continued generation reported a native error code", 0, continued.maxOf { it.errorCode })
+            assertEquals("the actual KV shift must preserve the complete system prefix", 21, newShiftPrefixLength(previousShiftCount))
         } finally {
             engine.destroySafely()
         }
@@ -113,27 +124,115 @@ class RealInferenceSmokeTest {
     fun realUserOnlyPromptDoesNotInferSystemPrefix() = runBlocking {
         val model = requireTinyModel()
         val settings = GenerationSettings(
-            maxTokens = 1,
+            maxTokens = 8,
             threadCount = 2,
             contextLength = 512,
             batchSize = 128,
+            temperature = 0f,
+            topK = 1,
+            repeatPenalty = 1f,
         )
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {
             assertTrue("real model failed to load", engine.loadModel(model.file.absolutePath, settings))
             val userPrompt =
                 "<|im_start|>user\n" +
-                    "This is a user-only prompt with no system role. " .repeat(40) +
+                    "This is a user-only prompt with no system role. ".repeat(39) +
                     "<|im_end|>\n<|im_start|>assistant\n"
             val first = engine.generate(userPrompt, settings).toList()
             assertTrue("user-only generation did not terminate normally", first.any { it.isTerminal && it.terminalReason != "ERROR" })
+            assertTrue("user-only generation emitted no tokens", first.sumOf { it.tokenCount } >= 1)
+            assertEquals("unexpected boundary fixture token count", 496, first.maxOf { it.promptTokens })
 
+            val previousShiftCount = observedShiftPrefixLengths().size
             val continued = engine.generate("", settings, continueFromContext = true).toList()
             assertTrue("user-only continuation emitted no tokens", continued.sumOf { it.tokenCount } >= 1)
             assertTrue("user-only continuation entered native error", continued.none { it.isTerminal && it.terminalReason == "ERROR" })
+            assertEquals("a user-only prompt must not acquire a system prefix", 0, newShiftPrefixLength(previousShiftCount))
         } finally {
             engine.destroySafely()
         }
+    }
+
+    @Test
+    fun aLongSystemPrefixSurvivesCompactionAndImpossibleContinueLeavesContextUsable() = runBlocking {
+        val model = requireTinyModel()
+        val settings = GenerationSettings(
+            maxTokens = 8, threadCount = 2, contextLength = 512, batchSize = 128,
+            temperature = 0f, topK = 1, repeatPenalty = 1f,
+        )
+        val engine = NativeLlmBridge.create(debugHooksEnabled = false)
+        try {
+            assertTrue(engine.loadModel(model.file.absolutePath, settings))
+            val prompt = "<|im_start|>system\n" + "Keep this rule. ".repeat(75) +
+                "<|im_end|>\n<|im_start|>user\n" + "Remember this context item. ".repeat(23) +
+                "<|im_end|>\n<|im_start|>assistant\n"
+            val first = engine.generate(prompt, settings).toList()
+            assertTrue(first.sumOf { it.tokenCount } > 0)
+            val before = observedShiftPrefixLengths().size
+            val impossible = engine.generate("", settings.copy(maxTokens = 400), continueFromContext = true).toList()
+            assertTrue(impossible.any { it.isTerminal && it.terminalReason == "ERROR" })
+            assertEquals("An impossible continuation must not move the cache", before, observedShiftPrefixLengths().size)
+            val continued = engine.generate("", settings.copy(maxTokens = 88), continueFromContext = true).toList()
+            assertTrue("the next feasible continuation must still work", continued.sumOf { it.tokenCount } > 0)
+            assertEquals("the entire long system prefix must be retained", 317, newShiftPrefixLength(before))
+            val replayed = engine.generate(prompt, settings).toList()
+            engine.resetConversation()
+            val cold = engine.generate(prompt, settings).toList()
+            assertEquals(first.sumOf { it.tokenCount }, replayed.sumOf { it.tokenCount })
+            assertEquals(cold.joinToString("") { it.text }, replayed.joinToString("") { it.text })
+        } finally {
+            engine.destroySafely()
+        }
+    }
+
+    @Test
+    fun realInsertedBosStillPreservesExplicitSystemPrefix() = runBlocking {
+        val model = requireTinyModel()
+        val settings = GenerationSettings(
+            maxTokens = 7,
+            threadCount = 2,
+            contextLength = 512,
+            batchSize = 128,
+            temperature = 0f,
+            topK = 1,
+            repeatPenalty = 1f,
+        )
+        val engine = NativeLlmBridge.create(debugHooksEnabled = false)
+        try {
+            assertTrue("real model failed to load", engine.loadModel(model.file.absolutePath, settings))
+            // This template causes the tokenizer to insert a BOS before the system role.
+            val prompt = "<|start_header_id|>system<|end_header_id|>\n" +
+                "You are a concise assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n" +
+                "Remember this context item for the next response. ".repeat(46) +
+                "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+            val first = engine.generate(prompt, settings).toList()
+            assertEquals("unexpected BOS fixture token count", 497, first.maxOf { it.promptTokens })
+            assertTrue("first generation emitted no tokens", first.sumOf { it.tokenCount } >= 1)
+            assertTrue("first generation entered native error", first.none { it.isTerminal && it.terminalReason == "ERROR" })
+
+            val previousShiftCount = observedShiftPrefixLengths().size
+            val continued = engine.generate("", settings, continueFromContext = true).toList()
+            assertTrue("continued generation emitted no tokens", continued.sumOf { it.tokenCount } >= 1)
+            assertTrue("continued generation entered native error", continued.none { it.isTerminal && it.terminalReason == "ERROR" })
+            assertEquals("the KV shift must retain BOS and the complete system prefix", 34, newShiftPrefixLength(previousShiftCount))
+        } finally {
+            engine.destroySafely()
+        }
+    }
+
+    private fun observedShiftPrefixLengths(): List<Int> {
+        val command = "logcat -d --pid=${Process.myPid()} -s LlmHostNative:I"
+        val descriptor = InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command)
+        val logs = ParcelFileDescriptor.AutoCloseInputStream(descriptor).bufferedReader().use { it.readText() }
+        return Regex("kv_cache_sliding_window_shift .*?prefix=(\\d+)")
+            .findAll(logs).map { it.groupValues[1].toInt() }.toList()
+    }
+
+    private fun newShiftPrefixLength(previousCount: Int): Int {
+        val shifts = observedShiftPrefixLengths()
+        assertTrue("expected a new native KV-cache shift", shifts.size > previousCount)
+        return shifts.last()
     }
 
     @Test

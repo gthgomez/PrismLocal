@@ -16,6 +16,7 @@
 // Eof=3, Cancelled=4, Error=5, Tombstoned=6, MaxTokens=7.
 
 #include "Engine.hpp"
+#include "runtime/NativeErrorCode.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -115,6 +116,58 @@ int testFullMockGenerationProducesExactTokenSequence() {
     delete g_engine;
     g_engine = nullptr;
     std::puts("  full mock generation produces the exact 3072-token sequence and drains cleanly to EOF");
+    return 0;
+}
+
+int testDrainAcknowledgementDistinguishesInvalidBatchFromRetiredRing() {
+    using llmhost::DrainAcknowledgement;
+    llmhost::Engine engine(true);
+    CHECK(engine.loadModel("DEBUG_MOCK_MODEL"));
+    const int genId = 9151;
+    CHECK(engine.startGeneration("DEBUG_SIMULATE_RING", genId, llmhost::GenerationConfig{}) == genId);
+    auto batch = engine.drainDecodeAndState(genId, 64);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (batch.tokens.empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        batch = engine.drainDecodeAndState(genId, 64);
+    }
+    CHECK(!batch.tokens.empty());
+    const int count = static_cast<int>(batch.tokens.size());
+    engine.setMemoryPressure(3);
+    const auto cancelDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (engine.getState(genId) != kStateCancelled && std::chrono::steady_clock::now() < cancelDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(engine.getState(genId) == kStateCancelled);
+    // A worker can report CANCELLED while its unacknowledged batch is still owned.
+    CHECK(engine.acknowledgeDrainedTokens(genId, batch.drain_tail + 1, count) == DrainAcknowledgement::Invalid);
+    // A failed replacement still retires the old session and discards its ring.
+    CHECK(!engine.loadModel(""));
+    CHECK(engine.acknowledgeDrainedTokens(genId, batch.drain_tail, count) == DrainAcknowledgement::Retired);
+    const auto retired = engine.drainDecodeAndState(genId, 64);
+    CHECK(retired.tokens.empty());
+    CHECK(!retired.pending);
+    CHECK(retired.state == kStateCancelled);
+    return 0;
+}
+
+int testFailedReplacementPreservesGenerationError() {
+    llmhost::Engine engine(true);
+    CHECK(engine.loadModel("DEBUG_MOCK_MODEL"));
+    const int genId = 9152;
+    CHECK(engine.startGeneration("UNSUPPORTED_DEBUG_PROMPT", genId, llmhost::GenerationConfig{}) == genId);
+    const auto error = static_cast<int>(llmhost::StreamState::Error);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (engine.getState(genId) != error && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(engine.getState(genId) == error);
+    CHECK(!engine.loadModel(""));
+    const auto retired = engine.drainDecodeAndState(genId, 64);
+    CHECK(retired.state == error);
+    CHECK(retired.error_code == static_cast<int>(llmhost::NativeErrorCode::DEBUG_GENERATION_REJECTED));
+    CHECK(retired.tokens.empty());
+    CHECK(!retired.pending);
     return 0;
 }
 
@@ -363,6 +416,8 @@ int main() {
         {"start_generation_without_model_fails", testStartGenerationWithoutModelFails},
         {"full_mock_generation_exact_sequence", testFullMockGenerationProducesExactTokenSequence},
         {"cancel_generation_reaches_cancelled", testCancelGenerationReachesCancelledAndClearsRing},
+        {"drain_ack_distinguishes_invalid_from_retired", testDrainAcknowledgementDistinguishesInvalidBatchFromRetiredRing},
+        {"failed_replacement_preserves_generation_error", testFailedReplacementPreservesGenerationError},
         {"reset_conversation_no_stale_tokens", testResetConversationGivesNextGenerationNoStaleTokens},
         {"critical_memory_pressure_cancels", testCriticalMemoryPressureCancelsActiveGeneration},
         {"unload_model_during_generation_safe", testUnloadModelDuringGenerationIsSafe},

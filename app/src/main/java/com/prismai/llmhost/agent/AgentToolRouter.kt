@@ -14,11 +14,14 @@ import com.prismai.llmhost.ui.ServiceUiState
 import org.json.JSONObject
 import java.io.File
 import java.util.Locale
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -72,6 +75,13 @@ class AgentToolRouter(
         val chainId: Long,
         val chatId: String,
     )
+
+    internal class ToolDispatch(
+        val owner: AgentToolJobOwner,
+        val producingGeneration: Job?,
+    ) : AbstractCoroutineContextElement(Key) {
+        companion object Key : CoroutineContext.Key<ToolDispatch>
+    }
 
     private val toolJobsLock = Any()
     private val toolJobsByChain = mutableMapOf<Long, MutableSet<OwnedToolJob>>()
@@ -303,6 +313,7 @@ class AgentToolRouter(
         originalPrompt: String,
         depth: Int,
         chainId: Long? = null,
+        producingGeneration: Job? = null,
     ) {
         val sourceChatId = currentChatId()
         if (chainId == null || sourceChatId.isNullOrBlank() || !isCurrentOwner(chainId, sourceChatId)) return
@@ -507,7 +518,9 @@ class AgentToolRouter(
                 launchOwnedToolJob(chainId, sourceChatId) toolJob@{
                     val stepStart = clock()
                     val result = try {
-                        executeTool(validatedCall, false)
+                        withContext(ToolDispatch(AgentToolJobOwner(chainId, sourceChatId), producingGeneration)) {
+                            executeTool(validatedCall, false)
+                        }
                     } catch (e: CancellationException) {
                         failTrace(chainId, "Tool execution cancelled")
                         throw e
@@ -632,18 +645,17 @@ class AgentToolRouter(
 
     fun shouldContinueAfterTool(call: AgentToolCall): Boolean =
         when (call.name) {
+            // A follow-up would replay the original prompt across the deleted data boundary.
+            "forget_fact", "clear_chat", "delete_chat", "delete_or_clear_chat" -> false
             "set_runtime_settings",
             "restore_previous_runtime_settings",
             "rename_current_chat",
-            "clear_chat",
-            "delete_or_clear_chat",
             "delete_model",
             "download_model",
             "switch_model",
             "cancel_active_job",
             "cancel_active_operation",
             "remember_fact",
-            "forget_fact",
             // Phase 2 RAG
             "ingest_document",
             "delete_document",

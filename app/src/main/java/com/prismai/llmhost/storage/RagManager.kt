@@ -11,6 +11,7 @@ import com.prismai.llmhost.BuildConfig
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
@@ -164,6 +165,7 @@ class RagManager(
                 )
             }
 
+            val filteredText = DocumentInstructionFilter.mask(text)
             val vectorChunks = chunks.mapIndexed { index, chunk ->
                 VectorChunk(
                     id = UUID.randomUUID().toString().take(12),
@@ -171,6 +173,7 @@ class RagManager(
                     chunkIndex = chunk.index,
                     text = chunk.text,
                     embedding = checkNotNull(embeddings[index]),
+                    modelText = filteredText.substring(chunk.sourceStart, chunk.sourceEnd).trim(),
                 )
             }
             // Replace rather than mix: a re-ingest must not leave the document's previous rows
@@ -178,6 +181,7 @@ class RagManager(
             // delete+insert is one transaction inside the store, so a concurrent search never sees
             // the document missing and a failed insert cannot lose the previous index. The stamp is
             // the identity snapshot taken before encoding, not the live encoder.
+            coroutineContext.ensureActive()
             vectorStore.replaceDocument(documentId, vectorChunks, identity)
 
             Log.i(TAG, "ingestDocument documentId=$documentId chunks=${vectorChunks.size} committed=true")
@@ -215,6 +219,19 @@ class RagManager(
             }
 
             vectorStore.search(queryEmbedding, topK = topK, minScore = DEFAULT_MIN_RAG_SCORE, expectedIdentity = identity)
+        }
+
+    /** Search only the explicitly selected document, preserving the encoder guard. */
+    suspend fun queryDocument(userPrompt: String, documentId: String, topK: Int = 3): DocumentSearchResult =
+        withContext(Dispatchers.IO) {
+            require(userPrompt.isNotBlank() && documentId.isNotBlank())
+            val identity = vectorStore.currentEmbeddingIdentity()
+            val embedding = encodeOrNull(userPrompt.take(DocumentChunker.QUERY_MAX_CHARS))
+            check(embedding != null && embedding.isNotEmpty()) { "Could not encode the document question" }
+            check(vectorStore.currentEmbeddingIdentity() == identity) { "The loaded model changed during document search" }
+            val result = vectorStore.searchDocument(documentId, embedding, topK.coerceIn(1, 10), DEFAULT_MIN_RAG_SCORE, identity)
+            check(result.matches.all { it.first.documentId == documentId }) { "Document search returned an unexpected source" }
+            result
         }
 
     /**

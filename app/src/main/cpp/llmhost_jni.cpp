@@ -3,11 +3,13 @@
 #include "Engine.hpp"
 #include "runtime/HandleRegistry.hpp"
 #include "runtime/NativeErrorCode.hpp"
+#include "ggml.h"
 
 #include <android/log.h>
 
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -223,6 +225,19 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeCreateEngine(JNIEnv*, jcla
 extern "C" JNIEXPORT void JNICALL
 Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDestroyEngine(JNIEnv*, jobject, jlong handle) {
     NativeHandleRegistry::instance().close(handle);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeGgmlTensorRowBytes(
+    JNIEnv*, jclass, jint type, jlong width) {
+    if (type < 0 || type >= GGML_TYPE_COUNT || width <= 0) return 0;
+    const auto kind = static_cast<ggml_type>(type);
+    const auto block = ggml_blck_size(kind);
+    const auto size = ggml_type_size(kind);
+    if (block <= 0 || size == 0 || width % block != 0) return 0;
+    const auto rows = static_cast<uint64_t>(width / block);
+    if (rows > static_cast<uint64_t>(std::numeric_limits<jlong>::max()) / size) return 0;
+    return static_cast<jlong>(rows * size);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -479,12 +494,13 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeAckEof(JNIEnv*, jobject, j
     lease->ackEof(gen_id);
 }
 
-extern "C" JNIEXPORT jboolean JNICALL
+extern "C" JNIEXPORT jint JNICALL
 Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeAckDrainedTokens(
         JNIEnv*, jobject, jlong handle, jint gen_id, jint expected_tail, jint token_count) {
     auto lease = NativeHandleRegistry::instance().acquire(handle);
-    return lease && lease->acknowledgeDrainedTokens(gen_id, expected_tail, token_count)
-        ? JNI_TRUE : JNI_FALSE;
+    return static_cast<jint>(lease
+        ? lease->acknowledgeDrainedTokens(gen_id, expected_tail, token_count)
+        : llmhost::DrainAcknowledgement::Retired);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

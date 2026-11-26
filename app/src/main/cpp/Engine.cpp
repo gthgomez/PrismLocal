@@ -153,11 +153,13 @@ void ensureLlamaBackend() {
     });
 }
 
-void clearRing(ControlBlock* ctrl) {
+void clearRing(ControlBlock* ctrl, bool preserve_error = false) {
     ctrl->head.store(0, std::memory_order_release);
     ctrl->tail.store(0, std::memory_order_release);
     ctrl->overflow.store(0, std::memory_order_release);
-    ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::OK), std::memory_order_release);
+    if (!preserve_error) {
+        ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::OK), std::memory_order_release);
+    }
     // PIR-02: a cleared ring has no produced/drained backlog. Reset the
     // accounting so a subsequent terminal cannot inherit stale pending output.
     ctrl->produced_tokens.store(0, std::memory_order_release);
@@ -400,6 +402,7 @@ struct ModelRuntime {
     std::string actual_backend_name = "CPU"; // compile-time label; cpu_execution_pinned is the load decision
     llama_pos current_position = 0;
     int system_prefix_length = 0;
+    bool context_has_shifted = false;
     std::string model_path;
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
@@ -587,57 +590,53 @@ const char* streamTerminalName(StreamTerminal terminal) {
     }
 }
 
-int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_vocab* vocab) {
+const char* systemClosingTag(const std::string& text) {
+    const std::string chatml_system_prefix = "<|im_start|>system";
+    const bool has_chatml_system_role =
+        text.rfind(chatml_system_prefix, 0) == 0 &&
+        text.size() > chatml_system_prefix.size() &&
+        (text[chatml_system_prefix.size()] == '\n' ||
+         text[chatml_system_prefix.size()] == '\r' ||
+         text[chatml_system_prefix.size()] == ' ' ||
+         text[chatml_system_prefix.size()] == '\t');
+    if (has_chatml_system_role) return "<|im_end|>";
+    if (text.rfind("<|start_header_id|>system<|end_header_id|>", 0) == 0) return "<|eot_id|>";
+    if (text.rfind("<|system|>", 0) == 0) return "<|end|>";
+    if (text.rfind("<system>", 0) == 0) return "</system>";
+    return nullptr;
+}
+
+int findSystemPrefixLength(const std::vector<llama_token>& tokens, const llama_vocab* vocab,
+                           const std::string& formatted_prompt, bool add_special) {
     if (vocab == nullptr || tokens.empty()) return 0;
+    // Do not turn leading user text into a system role when normalizing pieces.
+    const char* closing_tag = systemClosingTag(formatted_prompt);
+    if (closing_tag == nullptr) return 0;
 
+    const size_t close = formatted_prompt.find(closing_tag);
+    if (close == std::string::npos) return 0;
+    const size_t end_offset = close + std::strlen(closing_tag);
     std::string accumulated;
-    std::vector<size_t> token_end_offsets;
-    token_end_offsets.reserve(std::min(tokens.size(), static_cast<size_t>(512)));
-
-    const size_t max_tokens_to_check = std::min(tokens.size(), static_cast<size_t>(512));
-    for (size_t i = 0; i < max_tokens_to_check; i++) {
+    for (size_t i = 0; i < tokens.size(); i++) {
+        // Some templates rely on tokenization to insert a BOS before the role.
+        // It belongs to the preserved prefix but not to its textual marker.
+        if (i == 0 && add_special && tokens[i] == llama_vocab_bos(vocab)) {
+            continue;
+        }
         char buf[256];
-        int32_t len = llama_token_to_piece(vocab, tokens[i], buf, sizeof(buf) - 1, 0, true);
+        // SentencePiece may prepend a space that was not in the rendered prompt.
+        // Strip it only at the beginning, after confirming the raw system role.
+        const int32_t lstrip = accumulated.empty() ? 1 : 0;
+        int32_t len = llama_token_to_piece(vocab, tokens[i], buf, sizeof(buf) - 1, lstrip, true);
         if (len < 0 || len > static_cast<int32_t>(sizeof(buf) - 1)) {
             return 0;
         }
         if (len > 0) {
             accumulated.append(buf, static_cast<size_t>(len));
         }
-        token_end_offsets.push_back(accumulated.size());
-    }
-
-    std::string closing_tag;
-    const std::string chatml_system_prefix = "<|im_start|>system";
-    const bool has_chatml_system_role =
-        accumulated.rfind(chatml_system_prefix, 0) == 0 &&
-        accumulated.size() > chatml_system_prefix.size() &&
-        (accumulated[chatml_system_prefix.size()] == '\n' ||
-         accumulated[chatml_system_prefix.size()] == '\r' ||
-         accumulated[chatml_system_prefix.size()] == ' ' ||
-         accumulated[chatml_system_prefix.size()] == '\t');
-
-    if (has_chatml_system_role) {
-        closing_tag = "<|im_end|>";
-    } else if (accumulated.rfind("<|start_header_id|>system<|end_header_id|>", 0) == 0) {
-        closing_tag = "<|eot_id|>";
-    } else if (accumulated.rfind("<system>", 0) == 0) {
-        closing_tag = "</system>";
-    }
-
-    if (closing_tag.empty()) {
-        return 0;
-    }
-
-    const size_t end_tag = accumulated.find(closing_tag);
-    if (end_tag == std::string::npos) {
-        return 0;
-    }
-    const size_t system_end_pos = end_tag + closing_tag.size();
-
-    for (size_t i = 0; i < token_end_offsets.size(); i++) {
-        if (token_end_offsets[i] >= system_end_pos) {
-            return static_cast<int>(i + 1);
+        if (accumulated.size() >= end_offset) {
+            return accumulated.compare(0, end_offset, formatted_prompt, 0, end_offset) == 0
+                ? static_cast<int>(i + 1) : 0;
         }
     }
 
@@ -664,17 +663,15 @@ CacheIdentity makeCacheIdentity(const ModelRuntime& runtime) {
     return identity;
 }
 
-// PIR-05: explicit, clamped system-prefix boundary. The detection heuristic is
-// unchanged, but it is only ever applied to a prompt that is about to be fully
-// evaluated, and the result is clamped to the token count that will actually be
-// committed so a partial decode can never leave an out-of-range prefix that a
-// later shift would trust.
+// PIR-05: apply the system-prefix heuristic to the prompt being evaluated and
+// clamp it to the token count actually committed. A partial decode must never
+// leave an out-of-range prefix that a later shift would trust.
 int computeSystemPrefixLength(const std::vector<llama_token>& tokens, std::size_t limit,
-                              const llama_vocab* vocab) {
-    if (limit == 0) {
-        return 0;
-    }
-    const int detected = findSystemPrefixLength(tokens, vocab);
+                              const llama_vocab* vocab, const std::string& formatted_prompt,
+                              bool add_special, bool has_system_message) {
+    const int detected = findSystemPrefixLength(tokens, vocab, formatted_prompt, add_special);
+    // Do not compact a structured prompt when its template has no verified system boundary.
+    if (detected == 0 && (has_system_message || systemClosingTag(formatted_prompt) != nullptr)) return -1;
     return static_cast<int>(std::min(static_cast<std::size_t>(detected), limit));
 }
 
@@ -703,6 +700,7 @@ void resetRuntimeContext(ModelRuntime& runtime, bool clear_data) {
     runtime.current_position = 0;
     runtime.active_tokens.clear();
     runtime.system_prefix_length = 0;
+    runtime.context_has_shifted = false;
     // PIR-05: a cleared KV cache can never back a reusable prefix.
     runtime.conversation.invalidate();
 }
@@ -746,6 +744,7 @@ void shrinkCommittedPrefix(ModelRuntime& runtime, const std::string& identity,
     runtime.conversation.markCommitted(identity, common_prefix, /*logits_valid=*/false);
 }
 
+// required_tokens excludes headroom: the limit below already reserves it, just as prompt admission does.
 bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, bool allow_full_reset,
                                  const CacheIdentity& cache_identity) {
     if (runtime.ctx == nullptr) {
@@ -760,33 +759,33 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
             LOGW("kv_shift_unverified_state; forcing full reset");
             logCacheIdentity("shift_unverified_reset", cache_identity, runtime.conversation);
             resetRuntimeContext(runtime, false);
-            return required_tokens < static_cast<llama_pos>(runtime.context_length - kContextHeadroom);
+            return required_tokens <= static_cast<llama_pos>(runtime.context_length - kContextHeadroom);
         }
         LOGW("kv_shift_unverified_state; refusing to shift uncommitted context");
         return false;
     }
 
     const llama_pos limit = static_cast<llama_pos>(runtime.context_length - kContextHeadroom);
-    if (runtime.current_position + required_tokens < limit) {
+    if (runtime.current_position + required_tokens <= limit) {
         return true;
     }
 
-    const int max_prefix = static_cast<int>(runtime.current_position) / 2;
-    const int system_prefix_tokens = std::min(runtime.system_prefix_length, max_prefix);
-    const int available_tokens = static_cast<int>(runtime.current_position) - system_prefix_tokens;
-    if (available_tokens <= 0) {
+    auto* memory = llama_get_memory(runtime.ctx);
+    const int system_prefix_tokens = runtime.system_prefix_length;
+    const int required_drop = runtime.current_position + required_tokens - limit;
+    // Preserve the full known prefix and the last token, whose logits seed continuation.
+    const int available_tokens = runtime.current_position - system_prefix_tokens - 1;
+    if (system_prefix_tokens < 0 || required_drop > available_tokens ||
+        memory == nullptr || !llama_memory_can_shift(memory)) {
         if (allow_full_reset) {
             resetRuntimeContext(runtime, false);
-            return required_tokens < limit;
+            return required_tokens <= limit;
         }
         return false;
     }
 
-    int drop_count = available_tokens / 4;
-    if (drop_count < 1) drop_count = 1;
-    if (drop_count > available_tokens) drop_count = available_tokens;
+    const int drop_count = std::max(required_drop, available_tokens / 4);
 
-    auto* memory = llama_get_memory(runtime.ctx);
     const llama_pos seq_start = static_cast<llama_pos>(system_prefix_tokens);
     const llama_pos seq_end = seq_start + static_cast<llama_pos>(drop_count);
 
@@ -802,7 +801,7 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
             LOGW("KV compaction token range mismatch: prefix=%d drop=%d active=%zu",
                  system_prefix_tokens, drop_count, runtime.active_tokens.size());
             resetRuntimeContext(runtime, false);
-            return allow_full_reset && required_tokens < limit;
+            return allow_full_reset && required_tokens <= limit;
         }
         runtime.active_tokens.erase(runtime.active_tokens.begin() + system_prefix_tokens,
                                     runtime.active_tokens.begin() + system_prefix_tokens + drop_count);
@@ -811,7 +810,7 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
             LOGW("KV compaction position mismatch: pos=%d active=%zu; resetting context",
                  static_cast<int>(runtime.current_position), runtime.active_tokens.size());
             resetRuntimeContext(runtime, false);
-            return allow_full_reset && required_tokens < limit;
+            return allow_full_reset && required_tokens <= limit;
         }
         assert(runtime.current_position == static_cast<llama_pos>(runtime.active_tokens.size()));
         // PIR-05: the compacted remainder is a proven committed prefix. The tail
@@ -819,6 +818,9 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
         runtime.conversation.markCommitted(cache_identity.key(),
                                           runtime.active_tokens.size(),
                                           runtime.conversation.last_logits_valid);
+        // The shifted tail attended to removed tokens. It remains usable for
+        // Continue, but a new prompt must be replayed against its own history.
+        runtime.context_has_shifted = true;
         LOGI("kv_cache_sliding_window_shift dropped=%d prefix=%d new_pos=%d limit=%d",
              drop_count, system_prefix_tokens, static_cast<int>(runtime.current_position), static_cast<int>(limit));
         logCacheIdentity("shift_committed", cache_identity, runtime.conversation);
@@ -826,24 +828,31 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
         LOGW("llama_memory_seq_rm failed; allow_full_reset=%s", allow_full_reset ? "true" : "false");
         if (allow_full_reset) {
             resetRuntimeContext(runtime, false);
-            return required_tokens < limit;
+            return required_tokens <= limit;
         }
         return false;
     }
-    return (runtime.current_position + required_tokens) < limit;
+    return (runtime.current_position + required_tokens) <= limit;
 }
 
 // Returns:
 //   0        = success
-//   negative = llama_decode error
-//   -999     = cancelled between batch chunks (prompt eval only)
+//   other    = llama_decode warning/error
+//   -999     = cancellation before or during llama_decode
 int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t count,
                    llama_pos start_pos, const std::atomic<bool>* cancel_flag = nullptr) {
     if (count <= 0) {
         return 0;
     }
+    const auto classifyDecode = [cancel_flag](int result) {
+        if (result == 2 && cancel_flag != nullptr && cancel_flag->load(std::memory_order_acquire)) {
+            LOGI("llama_decode_aborted_by_request rc=%d", result);
+            return -999;
+        }
+        return result;
+    };
     if (count == 1) {
-        // Single-token fast path — no cancellation check needed (5-30ms)
+        // Single-token fast path; the native abort callback can interrupt this too.
         if (!runtime.single_batch_initialized) {
             runtime.single_batch = llama_batch_init(1, 0, 1);
             runtime.single_batch_initialized = true;
@@ -854,7 +863,7 @@ int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t cou
         runtime.single_batch.n_seq_id[0] = 1;
         runtime.single_batch.seq_id[0][0] = kMainSequence;
         runtime.single_batch.logits[0] = 1;
-        return llama_decode(runtime.ctx, runtime.single_batch);
+        return classifyDecode(llama_decode(runtime.ctx, runtime.single_batch));
     }
     const int batch_size = runtime.batch_size;
     llama_batch batch = llama_batch_init(std::min(count, batch_size), 0, 1);
@@ -876,7 +885,7 @@ int decodeTokensAt(ModelRuntime& runtime, const llama_token* tokens, int32_t cou
         int result = llama_decode(runtime.ctx, batch);
         if (result != 0) {
             llama_batch_free(batch);
-            return result;
+            return classifyDecode(result);
         }
     }
     llama_batch_free(batch);
@@ -905,16 +914,16 @@ std::shared_ptr<ModelRuntime> loadRealRuntime(const std::string& path, bool use_
     model_params.n_gpu_layers = gpu_requested ? config.gpu_layers : 0;
     bool cpu_pinned = false;
     // Static: llama retains the pointer for the lifetime of the model.
-    static ggml_backend_dev_t s_cpu_only_devices[] = {nullptr, nullptr};
     if (!gpu_requested) {
-        ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu_device != nullptr) {
-            s_cpu_only_devices[0] = cpu_device;
-            model_params.devices = s_cpu_only_devices;
-            cpu_pinned = true;
-        } else {
-            LOGW("cpu_only_device_unavailable; relying on n_gpu_layers=0 and op_offload=0");
+        static ggml_backend_dev_t s_cpu_only_devices[] = {
+            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr,
+        };
+        if (s_cpu_only_devices[0] == nullptr) {
+            LOGE("cpu_only_device_unavailable; cannot enforce CPU-only execution");
+            return nullptr;
         }
+        model_params.devices = s_cpu_only_devices;
+        cpu_pinned = true;
     }
     auto applyOffloadBoundary = [&](llama_context_params& params) {
         params.offload_kqv = gpu_requested;
@@ -1066,6 +1075,17 @@ struct Engine::Impl {
         }
         if (session_to_join && session_to_join->worker.joinable()) {
             session_to_join->worker.join();
+        }
+        if (session_to_join) {
+            // The caller owns the lifecycle gate (or is destroying the engine).
+            // No drain may return an unacknowledgeable batch after retirement.
+            auto* ctrl = buffers.control;
+            const bool preserve_error =
+                ctrl->state.load(std::memory_order_acquire) == static_cast<uint32_t>(StreamState::Error);
+            clearRing(ctrl, preserve_error);
+            if (!preserve_error) {
+                ctrl->state.store(static_cast<uint32_t>(StreamState::Cancelled), std::memory_order_release);
+            }
         }
     }
 
@@ -1219,7 +1239,7 @@ struct Engine::Impl {
                 finishSession(session, StreamState::Error);
                 return;
             }
-            if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens + kContextHeadroom, false,
+            if (!shiftRuntimeContextIfNeeded(*runtime, session->config.max_tokens, false,
                                              cache_identity)) {
                 ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::CONTEXT_SHIFT_FAILED), std::memory_order_release);
                 LOGE("continue_context_shift_failed n_ctx=%d current_position=%d required=%d",
@@ -1287,6 +1307,11 @@ struct Engine::Impl {
                 return;
             }
             prompt_tokens.resize(static_cast<size_t>(actual_tokens));
+            const bool has_system_message = std::any_of(session->messages.begin(), session->messages.end(),
+                [](const auto& message) { return message.role == "system"; });
+            const int system_prefix_length = computeSystemPrefixLength(
+                prompt_tokens, prompt_tokens.size(), runtime->vocab, formatted_prompt, add_special,
+                has_system_message);
             const int max_prompt_tokens = runtime->context_length - session->config.max_tokens - kContextHeadroom;
             if (usable_prompt_tokens > max_prompt_tokens) {
                 if (max_prompt_tokens <= 0) {
@@ -1311,7 +1336,7 @@ struct Engine::Impl {
             // PIR-05: only trust the stored prefix when it was proven committed
             // under the current cache identity. Otherwise the cache is invalid and
             // the request must be replayed from scratch.
-            const bool identity_match = runtime->conversation.valid &&
+            const bool identity_match = runtime->conversation.valid && !runtime->context_has_shifted &&
                 runtime->conversation.cache_identity == cache_identity_key;
             std::size_t common_prefix = 0;
             if (identity_match) {
@@ -1339,12 +1364,11 @@ struct Engine::Impl {
             // PIR-05: explicit post-reset/post-truncation cache identity line.
             logCacheIdentity("prefix_decision", cache_identity, runtime->conversation);
 
-            runtime->system_prefix_length = computeSystemPrefixLength(
-                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab);
+            runtime->system_prefix_length = system_prefix_length;
 
             int32_t tokens_to_decode = usable_prompt_tokens - static_cast<int32_t>(common_prefix);
 
-            if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens + kContextHeadroom, true,
+            if (!shiftRuntimeContextIfNeeded(*runtime, tokens_to_decode + session->config.max_tokens, true,
                                              cache_identity)) {
                 ctrl->error_code.store(static_cast<uint32_t>(NativeErrorCode::CONTEXT_SHIFT_FAILED), std::memory_order_release);
                 LOGE("context_shift_failed n_ctx=%d current_position=%d required=%d",
@@ -1379,8 +1403,7 @@ struct Engine::Impl {
             logCacheIdentity("post_shift_decision", cache_identity, runtime->conversation);
 
             // Restore the current prompt's prefix metadata after any reset/shift.
-            runtime->system_prefix_length = computeSystemPrefixLength(
-                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab);
+            runtime->system_prefix_length = system_prefix_length;
 
             // PIR-05: an all-cached request samples from logits left by a prior
             // decode. If the prefix was truncated (a tail was removed) those logits
@@ -1428,10 +1451,13 @@ struct Engine::Impl {
                         if (retry_rc == 0) {
                             runtime->current_position = usable_prompt_tokens;
                             runtime->active_tokens = prompt_tokens;
-                            runtime->system_prefix_length = computeSystemPrefixLength(
-                                prompt_tokens, static_cast<std::size_t>(usable_prompt_tokens), runtime->vocab);
+                            runtime->system_prefix_length = system_prefix_length;
                             runtime->conversation.markCommitted(cache_identity_key, runtime->current_position, true);
                             LOGI("prefix_cache_retry_success prompt_tokens=%d", usable_prompt_tokens);
+                        } else if (retry_rc == -999) {
+                            runtime->conversation.invalidate();
+                            finishSession(session, StreamState::Cancelled);
+                            return;
                         } else {
                             runtime->conversation.invalidate(); // PIR-05: invalidate-on-abort
                             ctrl->error_code.store(static_cast<uint32_t>(5000 + std::abs(retry_rc)), std::memory_order_release);
@@ -1600,7 +1626,7 @@ struct Engine::Impl {
                 LOGI("generation_breadcrumb stage=decode_1_begin generation_id=%u token=%d kv_pos=%d",
                      session->generation_id, static_cast<int>(token), static_cast<int>(runtime->current_position));
             }
-            const int next_decode_result = decodeTokensAt(*runtime, &token, 1, runtime->current_position);
+            const int next_decode_result = decodeTokensAt(*runtime, &token, 1, runtime->current_position, &session->cancel_requested);
             if (i == 0) {
                 LOGI("generation_breadcrumb stage=decode_1_complete generation_id=%u rc=%d",
                      session->generation_id, next_decode_result);
@@ -1610,6 +1636,10 @@ struct Engine::Impl {
             decode_times_us.push_back(token_decode_us);
             if (next_decode_result != 0) {
                 runtime->conversation.invalidate(); // PIR-05: invalidate-on-abort
+                if (next_decode_result == -999) {
+                    finishSession(session, StreamState::Cancelled);
+                    return;
+                }
                 ctrl->error_code.store(static_cast<uint32_t>(5100 + std::abs(next_decode_result)), std::memory_order_release);
                 LOGE("token_eval_failed rc=%d", next_decode_result);
                 finishSession(session, StreamState::Error);
@@ -1674,19 +1704,11 @@ struct Engine::Impl {
         // drain/decode/ack. recursive_mutex is required because the combined
         // drain API composes the primitive public operations below.
         auto lifecycle_lock = lifecycle_gate.enter();
-        std::shared_ptr<GenerationSession> old_session;
+        cancelAndJoinActiveSession();
         std::shared_ptr<ModelRuntime> runtime;
         {
             std::lock_guard<std::mutex> lock(mu);
             runtime = active_runtime;
-            old_session = active_session;
-            if (old_session) {
-                old_session->cancel_requested.store(true, std::memory_order_release);
-            }
-            active_session.reset();
-        }
-        if (old_session && old_session->worker.joinable()) {
-            old_session->worker.join();
         }
         if (!runtime) {
             return -1;
@@ -2007,21 +2029,30 @@ std::vector<int32_t> Engine::drainTokens(int generation_id, int max_tokens) {
     return result;
 }
 
-bool Engine::acknowledgeDrainedTokens(int generation_id, int expected_tail, int token_count) {
-    if (!impl_ || token_count <= 0) return false;
+DrainAcknowledgement Engine::acknowledgeDrainedTokens(int generation_id, int expected_tail, int token_count) {
+    if (!impl_) return DrainAcknowledgement::Retired;
+    if (token_count <= 0) return DrainAcknowledgement::Invalid;
     auto lifecycle_lock = impl_->lifecycle_gate.enter();
-    auto* ctrl = impl_->buffers.control;
-    if (ctrl->generation_id.load(std::memory_order_acquire) != static_cast<uint32_t>(generation_id)) {
-        return false;
+    // Worker cancellation can still leave an owned batch. Only replacement or
+    // retirement of the session permits ignoring a stale acknowledgement.
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        if (!impl_->active_session ||
+            impl_->active_session->generation_id != static_cast<uint32_t>(generation_id)) {
+            return DrainAcknowledgement::Retired;
+        }
     }
+    auto* ctrl = impl_->buffers.control;
     const uint32_t tail = ctrl->tail.load(std::memory_order_acquire);
     const uint32_t head = ctrl->head.load(std::memory_order_acquire);
     const uint32_t capacity = ctrl->capacity.load(std::memory_order_acquire);
     const uint32_t available = head >= tail ? head - tail : capacity - tail + head;
-    if (!validDrainAcknowledgement(expected_tail, tail, token_count, available)) return false;
+    if (!validDrainAcknowledgement(expected_tail, tail, token_count, available)) {
+        return DrainAcknowledgement::Invalid;
+    }
     ctrl->tail.store((tail + static_cast<uint32_t>(token_count)) % capacity, std::memory_order_release);
     ctrl->drained_tokens.fetch_add(static_cast<uint32_t>(token_count), std::memory_order_acq_rel);
-    return true;
+    return DrainAcknowledgement::Acknowledged;
 }
 
 void Engine::ackEof(int generation_id) {

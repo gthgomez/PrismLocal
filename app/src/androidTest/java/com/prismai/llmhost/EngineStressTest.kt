@@ -7,11 +7,13 @@ import com.prismai.llmhost.ui.*
 import com.prismai.llmhost.model.*
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
@@ -199,15 +201,27 @@ class EngineStressTest {
     @Test
     fun loadUnloadRaceCancelsSafely() = runBlocking {
         val engine = NativeLlmBridge.create()
-        assertTrue(engine.loadModel("DEBUG_MOCK_MODEL"))
-
-        val job = launch {
-            engine.generate("DEBUG_SIMULATE_RING").collect { }
+        val firstChunk = CompletableDeferred<Unit>()
+        val resumeConsumer = CompletableDeferred<Unit>()
+        var terminalReason: String? = null
+        try {
+            assertTrue(engine.loadModel("DEBUG_MOCK_MODEL"))
+            withTimeout(10_000) {
+                val job = launch {
+                    engine.generate("DEBUG_SIMULATE_RING", GenerationSettings(maxTokens = 4)).collect { chunk ->
+                        if (chunk.isTerminal) terminalReason = chunk.terminalReason
+                        if (firstChunk.complete(Unit)) resumeConsumer.await()
+                    }
+                }
+                firstChunk.await()
+                delay(400) // Let the mock producer hit backpressure while the consumer is paused.
+                engine.unloadModel()
+                resumeConsumer.complete(Unit)
+                job.join()
+            }
+            assertEquals("CANCELLED", terminalReason)
+        } finally {
+            engine.destroySafely()
         }
-
-        delay(10)
-        engine.unloadModel()
-        job.cancelAndJoin()
-        engine.destroySafely()
     }
 }

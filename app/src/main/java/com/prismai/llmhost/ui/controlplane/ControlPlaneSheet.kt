@@ -342,7 +342,7 @@ internal fun ControlPlaneSheet(
                         ModelMetadata(
                             model = model,
                             diagnostics = modelLoadDiagnostics?.takeIf { it.modelId == model.id },
-                            readiness = modelReadiness.firstOrNull { it.info.id == model.id },
+                            readiness = modelReadiness.firstOrNull { it.info.id == model.id && it.info.sha256 == model.sha256 },
                         )
                     }
                 }
@@ -405,8 +405,13 @@ internal fun ControlPlaneSheet(
     }
 
     riskyModel?.let { readiness ->
-        val isTooLarge = readiness.fit.rating == ModelFitRating.TOO_LARGE
-        val isProvenUsable = readiness.fit.reason.startsWith("Proven usable")
+        val isTooLarge = ModelLoadLimits.isLoadBlocked(
+            modelBytes = readiness.info.bytes,
+            requiredRamBytes = readiness.fit.requiredRamBytes,
+            availableRamAfterUnloadBytes = readiness.fit.availableRamAfterUnloadBytes,
+            provenUsable = readiness.fit.provenUsable,
+        )
+        val isProvenUsable = readiness.fit.provenUsable
         AlertDialog(
             onDismissRequest = { riskyModel = null },
             title = {
@@ -436,7 +441,7 @@ internal fun ControlPlaneSheet(
                             modifier = Modifier.fillMaxWidth(),
                         ) {
                             Text(
-                                text = "Verified Usable: Past execution runs confirmed this model runs cleanly on your device without memory crashes.",
+                                text = "A previous recorded generation met the app's usable-speed threshold. Available memory can change.",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer,
                                 modifier = Modifier.padding(8.dp),
@@ -457,22 +462,26 @@ internal fun ControlPlaneSheet(
             },
             confirmButton = {
                 TextButton(
-                    enabled = !isLoadingModel && !isImporting,
+                    enabled = isTooLarge || (!isLoadingModel && !isImporting),
                     onClick = {
-                        pendingModelId = readiness.info.id
-                        onSwitchModel(readiness.info.id)
+                        if (!isTooLarge) {
+                            pendingModelId = readiness.info.id
+                            onSwitchModel(readiness.info.id)
+                        }
                         riskyModel = null
                     },
                 ) {
                     Text(
-                        text = if (isProvenUsable) "Load Model" else if (isTooLarge) "Load Model Anyway" else "Load Model",
-                        color = if (isProvenUsable) MaterialTheme.colorScheme.primary else if (isTooLarge) PrismRed else MaterialTheme.colorScheme.primary,
+                        text = if (isTooLarge) "OK" else "Load Model",
+                        color = MaterialTheme.colorScheme.primary,
                     )
                 }
             },
             dismissButton = {
-                TextButton(onClick = { riskyModel = null }) {
-                    Text("Cancel")
+                if (!isTooLarge) {
+                    TextButton(onClick = { riskyModel = null }) {
+                        Text("Cancel")
+                    }
                 }
             },
         )
@@ -897,7 +906,11 @@ private fun ModelMetadata(
             listOfNotNull(
                 "Size" to formatBytes(model.bytes),
                 "Format" to "GGUF v${model.validation.ggufVersion}",
-                "Validation" to model.validation.status.replaceFirstChar { it.titlecase(Locale.US) },
+                "GGUF format" to if (model.validation.metadataChecked) {
+                    "Container checked; loading is a separate check"
+                } else {
+                    "Legacy header check; container checked before loading"
+                },
                 "SHA-256" to shortHash(model.sha256),
                 metadata?.architecture?.let { "Family" to it.uppercase(Locale.US) },
                 metadata?.sizeLabel?.let { "Params" to it },

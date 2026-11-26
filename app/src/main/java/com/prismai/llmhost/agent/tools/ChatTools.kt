@@ -8,7 +8,6 @@ import com.prismai.llmhost.model.*
 
 import com.prismai.llmhost.*
 import com.prismai.llmhost.chat.ChatManager
-import com.prismai.llmhost.chat.ChatSearchIndex
 import com.prismai.llmhost.chat.TranscriptStore
 import com.prismai.llmhost.export.ChatExporter
 import kotlinx.coroutines.Dispatchers
@@ -20,7 +19,6 @@ import java.util.Locale
 
 class ChatTools(
     private val chatManager: ChatManager,
-    private val chatSearchIndex: ChatSearchIndex,
     private val transcriptStore: TranscriptStore,
     private val currentChatId: () -> String?,
     private val chatSessions: () -> List<ChatSession>,
@@ -37,7 +35,8 @@ class ChatTools(
     fun summarizeCurrentChat(call: AgentToolCall): AgentToolResult {
         val recentCount = call.arguments.optInt("recent_messages", 6).coerceIn(1, 30)
         val style = call.arguments.optString("summary_style", "brief").lowercase(Locale.US)
-        val messages = transcript()
+        val allMessages = transcript()
+        val messages = allMessages.modelVisibleMessages()
         val userTurns = messages.count { it.role == TranscriptRole.USER }
         val assistantTurns = messages.count { it.role == TranscriptRole.ASSISTANT && it.text.isNotBlank() }
         val latestUser = messages.lastOrNull { it.role == TranscriptRole.USER }?.text.orEmpty()
@@ -48,7 +47,7 @@ class ChatTools(
                 .put("role", message.role.name.lowercase(Locale.US))
                 .put("text", message.text.compactForAgent(360)))
         }
-        val currentTitle = chatSessions().firstOrNull { it.id == currentChatId() }?.title ?: ChatTitles.DEFAULT_TITLE
+        val currentTitle = visibleTitle(messages)
         val summary = if (messages.isEmpty()) "Current chat is empty"
         else "$currentTitle: $userTurns user turn${if (userTurns == 1) "" else "s"}, $assistantTurns assistant response${if (assistantTurns == 1) "" else "s"}"
         return AgentToolResult(call = call, success = true, summary = summary,
@@ -65,7 +64,7 @@ class ChatTools(
     fun renameCurrentChat(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return AgentToolResult(call, false, "Chat rename requires confirmation")
         val chatId = currentChatId() ?: return AgentToolResult(call, false, "No active chat")
-        val messages = transcript()
+        val messages = transcript().modelVisibleMessages()
         val requestedTitle = call.arguments.optString("title").takeIf { it.isNotBlank() }
             ?: messages.firstOrNull { it.role == TranscriptRole.USER }?.text?.let(ChatTitles::fromPrompt)
             ?: ChatTitles.DEFAULT_TITLE
@@ -82,20 +81,22 @@ class ChatTools(
         val limit = call.arguments.optInt("limit", 10).coerceIn(1, 25)
         val snippetLength = call.arguments.optInt("snippet_length", 240).coerceIn(80, 360)
         if (query.isBlank()) return toolFailure(call, AgentToolErrorCode.INVALID_ARGUMENT, "Missing search query")
-        onPersistTranscript()
+        val currentId = currentChatId()
+        val currentMessages = transcript()
         val terms = query.lowercase(Locale.US).split(' ').filter { it.length > 1 }
         val matches = withContext(Dispatchers.IO) {
             chatSessions().mapNotNull { session ->
-                val haystack = chatSearchIndex.get(session.id) ?: buildString {
-                    append(session.title)
+                val archived = if (session.id == currentId) currentMessages else
+                    transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id))
+                val messages = archived.modelVisibleMessages()
+                val title = visibleTitle(messages)
+                val haystack = buildString {
+                    append(title)
                     append(' ')
-                    transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id)).forEach { append(it.text).append(' ') }
+                    messages.forEach { append(it.text).append(' ') }
                 }.lowercase(Locale.US)
-                val score = terms.count { it in haystack } + if (query.lowercase(Locale.US) in session.title.lowercase(Locale.US)) 2 else 0
-                if (score <= 0) null else {
-                    val messages = transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id))
-                    Triple(session, messages, score)
-                }
+                val score = terms.count { it in haystack } + if (query.lowercase(Locale.US) in title.lowercase(Locale.US)) 2 else 0
+                if (score <= 0) null else Triple(session.copy(title = title), messages, score)
             }.sortedByDescending { it.third }.take(limit)
         }
         val results = JSONArray()
@@ -108,13 +109,17 @@ class ChatTools(
             results.put(JSONObject()
                 .put("chat_id", session.id).put("title", session.title)
                 .put("updated_at", session.updatedAt).put("model_id", session.modelId ?: "unknown")
-                .put("message_count", session.messageCount).put("snippet", snippet))
+                .put("message_count", sessionMessages.size).put("snippet", snippet))
         }
         return AgentToolResult(call = call, success = true,
             summary = "${matches.size} chat match${if (matches.size == 1) "" else "es"} for \"$query\"",
             details = JSONObject().put("query", query).put("untrusted_data", true)
                 .put("snippet_length", snippetLength).put("results", results))
     }
+
+    private fun visibleTitle(messages: List<TranscriptMessage>): String =
+        messages.firstOrNull { it.role == TranscriptRole.USER && it.text.isNotBlank() }
+            ?.let { ChatTitles.fromPrompt(it.text) } ?: ChatTitles.DEFAULT_TITLE
 
     suspend fun exportChat(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Chat export requires confirmation")

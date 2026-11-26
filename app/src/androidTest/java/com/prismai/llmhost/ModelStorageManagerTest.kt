@@ -10,6 +10,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
@@ -19,6 +20,8 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -43,8 +46,8 @@ class ModelStorageManagerTest {
         assertTrue("expected import success, got $result", result is ModelStorageManager.ImportResult.Success)
         val model = (result as ModelStorageManager.ImportResult.Success).model
         assertEquals("valid-model", model.id)
-        assertEquals("verified", model.validation.status)
-        assertEquals(64L, model.bytes)
+        assertTrue(model.validation.metadataChecked)
+        assertEquals(validGgufBytes().size.toLong(), model.bytes)
         assertTrue(model.file.path.contains("versions"))
 
         val resolved = manager.resolveActiveModel("valid-model")
@@ -83,6 +86,79 @@ class ModelStorageManagerTest {
         assertEquals(ModelStorageManager.ModelStorageError.Code.INVALID_GGUF_HEADER, failure.error.code)
         assertFalse(File(modelsDir(), "bad-header").exists())
         assertStagingEmpty()
+    }
+
+    @Test
+    fun truncatedMetadataDoesNotReplaceActiveVersion() {
+        val manager = ModelStorageManager(context)
+        val modelId = "truncated-metadata"
+        cleanup(modelId)
+        try {
+            val good = validGgufBytes()
+            val installed = manager.importModelFromStream(
+                "$modelId.gguf", good.size.toLong(), ByteArrayInputStream(good),
+            ) as ModelStorageManager.ImportResult.Success
+
+            // The v3 header advertises one KV entry. Its value advertises a
+            // 100-byte string, but only 10 value bytes fit in this file.
+            val truncated = ByteBuffer.wrap(good.copyOf(64)).order(ByteOrder.LITTLE_ENDIAN)
+                .putLong(16, 1).putLong(24, 10).putInt(42, 8).putLong(46, 100).array()
+            val result = manager.importModelFromStream(
+                "$modelId.gguf", truncated.size.toLong(), ByteArrayInputStream(truncated),
+            )
+            assertTrue("truncated metadata must fail, got $result", result is ModelStorageManager.ImportResult.Failure)
+            assertEquals(installed.model.versionId, manager.activeModelInfo(modelId)?.versionId)
+            assertArrayEquals(good, installed.model.file.readBytes())
+            assertStagingEmpty()
+        } finally {
+            cleanup(modelId)
+        }
+    }
+
+    @Test
+    fun truncatedTensorDataDoesNotReplaceActiveVersion() {
+        val manager = ModelStorageManager(context)
+        val modelId = "truncated-tensors"
+        cleanup(modelId)
+        try {
+            val good = validGgufBytes()
+            val initial = manager.importModelFromStream("$modelId.gguf", good.size.toLong(), good.inputStream())
+                as ModelStorageManager.ImportResult.Success
+            val truncated = validGgufBytes(truncateTensor = true)
+            val result = manager.importModelFromStream("$modelId.gguf", truncated.size.toLong(), truncated.inputStream())
+            assertTrue("missing tensor bytes must fail, got $result", result is ModelStorageManager.ImportResult.Failure)
+            assertEquals(initial.model.versionId, manager.activeModelInfo(modelId)?.versionId)
+            assertArrayEquals(good, initial.model.file.readBytes())
+            assertStagingEmpty()
+        } finally {
+            cleanup(modelId)
+        }
+    }
+
+    @Test
+    fun priorContainerReceiptRevalidatesWithLongMetadataKey() {
+        val manager = ModelStorageManager(context)
+        val modelId = "prior-container"
+        cleanup(modelId)
+        try {
+            val bytes = validGgufBytes(metadataKey = "custom." + "x".repeat(4096))
+            val installed = manager.importModelFromStream("$modelId.gguf", bytes.size.toLong(), bytes.inputStream())
+                as ModelStorageManager.ImportResult.Success
+            val manifestFile = File(modelsDir(), "$modelId/manifest.json")
+            val manifest = org.json.JSONObject(manifestFile.readText())
+            val validation = manifest.getJSONObject("versions").getJSONObject(installed.model.versionId)
+                .getJSONObject("validation")
+            for (prior in listOf("container_checked_v1", "container_checked_v2")) {
+                validation.put("status", prior)
+                manifestFile.writeText(manifest.toString())
+                val activated = manager.resolveActiveModelForActivation(modelId) as ModelStorageManager.ModelResolveResult.Success
+                assertEquals("container_checked_v3", activated.model.validation.status)
+                assertEquals(installed.model.sha256, activated.model.sha256)
+                assertEquals(installed.model.versionId, activated.model.versionId)
+            }
+        } finally {
+            cleanup(modelId)
+        }
     }
 
     @Test
@@ -151,13 +227,13 @@ class ModelStorageManagerTest {
     fun duplicateImportCreatesNewActiveVersionWithoutOverwritingOldFile() {
         val manager = ModelStorageManager(context)
         cleanup("duplicate-model")
+        val installedBytesBefore = manager.getStorageBreakdown().installedModelsBytes
 
         val first = manager.importModelFromStream(
             displayName = "duplicate-model.gguf",
             reportedSize = validGgufBytes(seed = 1).size.toLong(),
             input = ByteArrayInputStream(validGgufBytes(seed = 1)),
         )
-        Thread.sleep(2)
         val second = manager.importModelFromStream(
             displayName = "duplicate-model.gguf",
             reportedSize = validGgufBytes(seed = 2).size.toLong(),
@@ -171,10 +247,20 @@ class ModelStorageManagerTest {
         assertNotEquals(firstModel.versionId, secondModel.versionId)
         assertTrue(firstModel.file.exists())
         assertTrue(secondModel.file.exists())
+        assertArrayEquals("the earlier version's bytes must be preserved", validGgufBytes(seed = 1), firstModel.file.readBytes())
+        assertArrayEquals("the active version's bytes must be intact", validGgufBytes(seed = 2), secondModel.file.readBytes())
 
         val manifest = JSONObject(File(modelsDir(), "duplicate-model/manifest.json").readText())
         assertEquals(secondModel.versionId, manifest.getString("active_version"))
         assertEquals(2, manifest.getJSONObject("versions").length())
+        assertEquals(installedBytesBefore + firstModel.bytes + secondModel.bytes, manager.getStorageBreakdown().installedModelsBytes)
+        val duplicate = manager.importModelFromStream(
+            "duplicate-model.gguf", secondModel.bytes, ByteArrayInputStream(validGgufBytes(seed = 2)),
+        ) as ModelStorageManager.ImportResult.Success
+        assertEquals(secondModel.versionId, duplicate.model.versionId)
+        assertEquals(installedBytesBefore + firstModel.bytes + secondModel.bytes, manager.getStorageBreakdown().installedModelsBytes)
+        assertTrue(manager.deleteModel("duplicate-model"))
+        assertEquals(installedBytesBefore, manager.getStorageBreakdown().installedModelsBytes)
     }
 
     @Test
@@ -329,17 +415,22 @@ class ModelStorageManagerTest {
         }
     }
 
-    private fun validGgufBytes(seed: Int = 1): ByteArray {
-        val bytes = ByteArray(64) { index -> (seed + index).toByte() }
-        bytes[0] = 'G'.code.toByte()
-        bytes[1] = 'G'.code.toByte()
-        bytes[2] = 'U'.code.toByte()
-        bytes[3] = 'F'.code.toByte()
-        bytes[4] = 3
-        bytes[5] = 0
-        bytes[6] = 0
-        bytes[7] = 0
-        return bytes
+    private fun validGgufBytes(
+        seed: Int = 1,
+        truncateTensor: Boolean = false,
+        metadataKey: String = "test.value",
+    ): ByteArray {
+        // A well-formed container with one F32 tensor for storage tests.
+        // It has no architecture or tokenizer and is not an inference model.
+        val key = metadataKey.toByteArray()
+        val buffer = ByteBuffer.allocate(150 + key.size).order(ByteOrder.LITTLE_ENDIAN)
+            .put("GGUF".toByteArray()).putInt(3).putLong(1).putLong(1)
+            .putLong(key.size.toLong()).put(key).putInt(4).putInt(seed)
+            .putLong(11).put("test.weight".toByteArray()).putInt(1).putLong(1).putInt(0).putLong(0)
+        val tensorDataOffset = (buffer.position() + 31) / 32 * 32
+        buffer.putFloat(tensorDataOffset, seed.toFloat())
+        if (truncateTensor) return buffer.array().copyOf(tensorDataOffset + 2)
+        return buffer.array()
     }
 
     private fun cleanup(modelId: String) {

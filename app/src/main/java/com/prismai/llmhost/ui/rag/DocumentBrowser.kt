@@ -52,11 +52,15 @@ fun DocumentBrowser(
     documents: List<VectorDocumentSummary>,
     staleChunkCount: Int,
     ingestStatus: String?,
+    isIndexing: Boolean,
+    onCancelIndexing: (() -> Unit)?,
+    canIngest: Boolean,
     onIngestDocument: (id: String, title: String, text: String) -> Unit,
     onDeleteDocument: (documentId: String) -> Unit,
     onQueryVectorStore: suspend (query: String) -> List<Pair<VectorChunk, Float>>,
     onRefresh: () -> Unit,
     onDeleteStaleDocuments: () -> Unit,
+    onSelectDocument: (documentId: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val coroutineScope = rememberCoroutineScope()
@@ -81,6 +85,7 @@ fun DocumentBrowser(
             action = {
                 Button(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    enabled = canIngest && !isIndexing,
                     onClick = { showIngestDialog = true },
                 ) {
                     Text("+ Ingest Doc", maxLines = 1, softWrap = false)
@@ -89,13 +94,18 @@ fun DocumentBrowser(
         )
 
         // ── Ingest Status Line ──
-        ingestStatus?.let { status ->
-            Text(
-                text = status,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(vertical = 2.dp),
-            )
+        (ingestStatus ?: if (isIndexing) "Indexing on this device…" else null)?.let { status ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = status,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f).padding(vertical = 2.dp),
+                )
+                if (isIndexing && onCancelIndexing != null) {
+                    TextButton(onClick = onCancelIndexing) { Text("Stop indexing") }
+                }
+            }
         }
 
         // ── Stale Revision Banner ──
@@ -126,6 +136,7 @@ fun DocumentBrowser(
                     )
                     TextButton(
                         onClick = onDeleteStaleDocuments,
+                        enabled = !isIndexing,
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                     ) {
                         Text(
@@ -164,7 +175,7 @@ fun DocumentBrowser(
                     textStyle = MaterialTheme.typography.bodySmall,
                 )
                 Button(
-                    enabled = searchQuery.isNotBlank() && !isSearching,
+                    enabled = searchQuery.isNotBlank() && !isSearching && !isIndexing,
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     onClick = {
                         isSearching = true
@@ -245,8 +256,12 @@ fun DocumentBrowser(
                         docId = doc.documentId,
                         storedChunkCount = doc.storedChunkCount,
                         searchableChunkCount = doc.searchableChunkCount,
-                        legacyChunkCount = doc.legacyChunkCount,
+                         legacyChunkCount = doc.legacyChunkCount,
+                         requiresReindex = doc.fullySearchable && !doc.readyForQuestions,
                         previewText = doc.previewText,
+                         canSelect = doc.readyForQuestions && !isIndexing,
+                        onSelect = { onSelectDocument(doc.documentId) },
+                        canDelete = !isIndexing,
                         onDelete = { deleteTargetDocId = doc.documentId },
                     )
                 }
@@ -302,7 +317,7 @@ fun DocumentBrowser(
             },
             confirmButton = {
                 TextButton(
-                    enabled = ingestDocId.isNotBlank() && ingestText.isNotBlank(),
+                    enabled = ingestDocId.isNotBlank() && ingestText.isNotBlank() && canIngest && !isIndexing,
                     onClick = {
                         val docId = ingestDocId.trim()
                         val title = ingestTitle.ifBlank { ingestDocId }.trim()
@@ -339,6 +354,7 @@ fun DocumentBrowser(
             confirmButton = {
                 TextButton(
                     colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    enabled = !isIndexing,
                     onClick = {
                         onDeleteDocument(docId)
                         deleteTargetDocId = null
@@ -412,8 +428,12 @@ private fun DocumentSummaryRow(
     docId: String,
     storedChunkCount: Int,
     searchableChunkCount: Int,
-    legacyChunkCount: Int = 0,
+     legacyChunkCount: Int = 0,
+    requiresReindex: Boolean,
     previewText: String,
+    canSelect: Boolean,
+    onSelect: () -> Unit,
+    canDelete: Boolean,
     onDelete: () -> Unit,
 ) {
     Row(
@@ -449,6 +469,13 @@ private fun DocumentSummaryRow(
                         color = PrismSlate,
                     )
                 }
+                if (requiresReindex) {
+                    Text(
+                        text = "Index the original text again to ask questions",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 if (legacyChunkCount > 0) {
                     InfoBadge(
                         text = "$legacyChunkCount legacy chunks",
@@ -466,8 +493,12 @@ private fun DocumentSummaryRow(
                 )
             }
         }
+        TextButton(onClick = onSelect, enabled = canSelect, contentPadding = PaddingValues(horizontal = 4.dp)) {
+            Text("Ask")
+        }
         TextButton(
             onClick = onDelete,
+            enabled = canDelete,
             contentPadding = PaddingValues(0.dp),
         ) {
             Text(

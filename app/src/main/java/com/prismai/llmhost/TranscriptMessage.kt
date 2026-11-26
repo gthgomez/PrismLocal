@@ -19,4 +19,16 @@ data class TranscriptMessage(
     val text: String,
     val summary: String? = null,
     val regenerationHistory: List<String> = emptyList(),
+    /** Non-null for document Q&A turns, which must not be replayed into another context. */
+    val documentScope: String? = null,
+    /** Keep this message visible, but begin future model context after it. */
+    val contextBoundaryAfter: Boolean = false,
 )
+
+/** Preserve the transcript while excluding all turns before the most recent context reset. */
+internal fun List<TranscriptMessage>.sinceContextBoundary(): List<TranscriptMessage> =
+    drop(indexOfLast { it.contextBoundaryAfter } + 1)
+
+/** Human-viewable archive and selected-document turns are excluded from general model context. */
+internal fun List<TranscriptMessage>.modelVisibleMessages(): List<TranscriptMessage> =
+    sinceContextBoundary().filter { it.documentScope == null }

@@ -179,14 +179,36 @@ class GenerationOrchestrator(
     }
 
     private val launchResult = java.util.concurrent.atomic.AtomicReference(GenerationLaunch.REFUSED)
+    private val launchRefusalReason = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
     fun takeLaunchResult(): GenerationLaunch = launchResult.getAndSet(GenerationLaunch.REFUSED)
+    fun takeLaunchRefusalReason(): String? = launchRefusalReason.getAndSet(null)
 
-    fun evaluateSendAcceptance(
+    private fun refuseLaunch(reason: String) {
+        launchRefusalReason.set(reason)
+        eventBus.publish(reason)
+    }
+
+    internal fun preparePromptMemory(
         prompt: String,
-        benchmarkPreset: BenchmarkPreset? = null,
+        benchmarkPreset: BenchmarkPreset?,
+        selectedDocumentId: String?,
+        sourceChatId: String?,
+    ): MemoryRetriever.PromptMemory =
+        if (benchmarkPreset == null && selectedDocumentId == null) {
+            promptBuilder.buildPromptMemory(prompt, sourceChatId)
+        } else MemoryRetriever.PromptMemory.EMPTY
+
+    internal fun evaluateSendAcceptance(
+        prompt: String,
+        benchmarkPreset: BenchmarkPreset?,
+        selectedDocumentId: String?,
+        memory: MemoryRetriever.PromptMemory,
+        baseSettings: GenerationSettings,
     ): SendAcceptance.Result {
-        val baseSettings = uiState.generationSettings.value.clamped()
+        if (selectedDocumentId != null && (baseSettings.agentEnabled || benchmarkPreset != null)) {
+            return SendAcceptance.Result(false, "Turn off agent mode before asking a document")
+        }
         if (benchmarkPreset == null && baseSettings.agentEnabled && uiState.currentModel.value != null) {
             val directToolCall = agentToolRouter.directToolCall(prompt)
             if (directToolCall != null) {
@@ -194,25 +216,29 @@ class GenerationOrchestrator(
             }
         }
         val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
-        val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
+        val budgetPrompt = if (settings.agentEnabled) prompt else PromptBuilder.withQuestionMemory(prompt, memory.factLines)
         return SendAcceptance.forChat(
             currentModel = uiState.currentModel.value,
             settings = settings,
-            prompt = prompt,
-            memoryContext = memoryContext,
+            prompt = budgetPrompt,
+            memoryContext = memory.systemContext,
             enforceBudget = benchmarkPreset == null,
         )
     }
 
-    suspend fun generate(
+    internal suspend fun generate(
         prompt: String,
-        benchmarkPreset: BenchmarkPreset? = null,
+        benchmarkPreset: BenchmarkPreset?,
+        selectedDocumentId: String?,
+        memory: MemoryRetriever.PromptMemory,
+        baseSettings: GenerationSettings,
+        onDocumentAnswerCompleted: (String?) -> Unit,
     ) {
         launchResult.set(GenerationLaunch.REFUSED)
-        val baseSettings = uiState.generationSettings.value.clamped()
+        launchRefusalReason.set(null)
 
         // ── Direct NL → agent tool call path ────────────────────────────
-        if (benchmarkPreset == null && baseSettings.agentEnabled && uiState.currentModel.value != null) {
+        if (selectedDocumentId == null && benchmarkPreset == null && baseSettings.agentEnabled && uiState.currentModel.value != null) {
             val directToolCall = agentToolRouter.directToolCall(prompt)
             if (directToolCall != null) {
                 chatManager.appendTranscriptMessage(TranscriptRole.USER, prompt)
@@ -230,12 +256,37 @@ class GenerationOrchestrator(
         // only: benchmark presets were never budget-checked and must not be
         // newly refused here.
         val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
-        val agentEnabled = settings.agentEnabled
-        val memoryContext = if (benchmarkPreset == null) promptBuilder.buildMemoryContext(prompt) else ""
-        val acceptance = evaluateSendAcceptance(prompt, benchmarkPreset)
+        val agentEnabled = selectedDocumentId == null && settings.agentEnabled
+        val memoryContext = memory.systemContext
+        val acceptance = evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId, memory, baseSettings)
         if (!acceptance.accepted) {
-            eventBus.publish(acceptance.reason ?: "Request refused")
+            refuseLaunch(acceptance.reason ?: "Request refused")
             return
+        }
+
+        val documentContext = if (selectedDocumentId != null) {
+            try {
+                promptBuilder.buildDocumentAnswerContext(prompt, selectedDocumentId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                refuseLaunch(error.message ?: "Could not search the selected document")
+                return
+            }
+        } else null
+        val documentMessages = documentContext?.messages(prompt)
+        if (documentMessages != null) {
+            val documentAcceptance = SendAcceptance.evaluate(
+                currentModel = uiState.currentModel.value,
+                contextLength = settings.contextLength,
+                maxTokens = settings.maxTokens,
+                prompt = documentMessages.last().content,
+                instructionText = documentMessages.first().content,
+            )
+            if (!documentAcceptance.accepted) {
+                refuseLaunch(documentAcceptance.reason ?: "Document context is too long")
+                return
+            }
         }
 
         // Soft preflight: do not block, but surface low-RAM risk (B4).
@@ -258,11 +309,6 @@ class GenerationOrchestrator(
             runCatching { engine.resetConversation() }
         }
 
-        // Preset overrides apply only to this generation call — never write them into persisted UI settings.
-        if (baseSettings != uiState.generationSettings.value) {
-            uiState._generationSettings.value = baseSettings
-        }
-
         val agentChainId = if (agentEnabled) {
             agentTrace.beginChain(prompt)
         } else {
@@ -274,12 +320,15 @@ class GenerationOrchestrator(
         // Structured, role-preserving messages for normal chat. The legacy string
         // path stays for agent turns and benchmark presets, which build their own
         // protocol prompts and must keep byte-identical behavior.
-        val chatMessages: List<ChatMessage>? = if (benchmarkPreset == null && !agentEnabled) {
+        val chatMessages: List<ChatMessage>? = if (documentMessages != null) {
+            documentMessages
+        } else if (benchmarkPreset == null && !agentEnabled) {
             promptBuilder.buildMessages(
                 newPrompt = prompt,
                 transcript = uiState.transcript.value,
                 activeAssistantTranscriptId = null,
                 memoryContext = memoryContext,
+                memoryFactLines = memory.factLines,
                 tokenBudget = GenerationBudget.calculateNonAgentTokenBudget(
                     contextLength = settings.contextLength,
                     maxTokens = settings.maxTokens,
@@ -328,8 +377,8 @@ class GenerationOrchestrator(
         val session = incrementSession()
 
         uiState._generationPerformance.value = null
-        chatManager.appendTranscriptMessage(TranscriptRole.USER, prompt)
-        val assistantMessageId = chatManager.appendTranscriptMessage(TranscriptRole.ASSISTANT, "")
+        chatManager.appendTranscriptMessage(TranscriptRole.USER, prompt, selectedDocumentId)
+        val assistantMessageId = chatManager.appendTranscriptMessage(TranscriptRole.ASSISTANT, "", selectedDocumentId)
         chatManager.activeAssistantTranscriptId = assistantMessageId
         uiState.streamState.beginGeneration()
         val baselineMemoryUsed = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()
@@ -348,6 +397,7 @@ class GenerationOrchestrator(
 
         Log.d(TAG, "generate start promptLength=${enginePrompt.length} model=${uiState.currentModel.value} session=$session settings=$settings")
 
+        var finalizedDocumentAnswer: String? = null
         val job = runGenerationFlow(
             session = session,
             enginePrompt = enginePrompt,
@@ -366,14 +416,14 @@ class GenerationOrchestrator(
                 isCodingPreset = benchmarkPreset?.id == "coding",
                 notifyBenchmarkComplete = benchmarkPreset != null,
             ),
-        ) { result ->
+        ) { result, producingGeneration ->
             val agentToolCall = if (agentEnabled && result.finalReason == "EOF") {
                 AgentToolProtocol.parseToolCall(result.finalOutput)
             } else null
 
             if (agentToolCall == null) {
                 onRecordBenchmarkRun(
-                    if (agentEnabled) prompt else enginePrompt,
+                    if (agentEnabled || documentContext != null) prompt else enginePrompt,
                     result.finalOutput,
                     result.finalPerformance,
                     result.finalReason,
@@ -396,7 +446,15 @@ class GenerationOrchestrator(
                 AgentToolProtocol.extractReasoningPrefix(result.finalOutput)
             } else ""
 
-            chatManager.updateTranscriptMessage(assistantMessageId, if (agentToolCall == null) result.finalOutput else reasoningPrefix)
+            val response = if (agentToolCall == null) result.finalOutput else reasoningPrefix
+            if (documentContext != null && response.isNotBlank() &&
+                (result.finalReason == "EOF" || result.finalReason == "MAX_TOKENS")
+            ) {
+                chatManager.updateTranscriptMessage(assistantMessageId, "$response\n\n${documentContext.sources()}")
+                finalizedDocumentAnswer = response
+            } else {
+                chatManager.updateTranscriptMessage(assistantMessageId, response)
+            }
 
             // Benchmark queue drain handled by InferenceService
 
@@ -406,11 +464,17 @@ class GenerationOrchestrator(
                     prompt,
                     depth = 0,
                     chainId = agentChainId,
+                    producingGeneration = producingGeneration,
                 )
             }
         }
 
         storeGenerationJob(job)
+        if (documentContext != null) {
+            job.invokeOnCompletion { cause ->
+                onDocumentAnswerCompleted(if (cause == null) finalizedDocumentAnswer else null)
+            }
+        }
     }
 
     /** Continuation generation. Acquires [InferenceService]'s operation mutex via [com.prismai.llmhost.InferenceService.continueGenerationSafely]. */
@@ -426,12 +490,16 @@ class GenerationOrchestrator(
             eventBus.publish("The last response did not stop at the token limit")
             return
         }
-        val transcript = uiState.transcript.value
+        val transcript = uiState.transcript.value.sinceContextBoundary()
         val assistantMessage = transcript.lastOrNull {
             it.role == TranscriptRole.ASSISTANT && it.text.isNotBlank()
         }
         if (assistantMessage == null) {
             eventBus.publish("No assistant response to continue")
+            return
+        }
+        if (assistantMessage.documentScope != null) {
+            eventBus.publish("Ask another document question instead of continuing this answer")
             return
         }
 
@@ -465,7 +533,7 @@ class GenerationOrchestrator(
             agentChainId = agentChainId,
             startedAt = startedAt,
             config = GenerationFlowConfig(errorLabel = "continuation"),
-        ) { result ->
+        ) { result, producingGeneration ->
             val agentToolCall = if (agentEnabled && result.finalReason == "EOF") {
                 AgentToolProtocol.parseToolCall(result.finalOutput)
             } else null
@@ -500,6 +568,7 @@ class GenerationOrchestrator(
                     "[continue]",
                     depth = 0,
                     chainId = agentChainId,
+                    producingGeneration = producingGeneration,
                 )
             }
         }
@@ -604,7 +673,7 @@ class GenerationOrchestrator(
                 checkEmptyStart = false,
                 checkReload = true,
             ),
-        ) { result ->
+        ) { result, producingGeneration ->
             val nextToolCall = if (result.finalReason == "EOF") AgentToolProtocol.parseToolCall(result.finalOutput) else null
             agentTrace.recordGenerationTurn(
                 terminalReason = result.finalReason,
@@ -625,6 +694,7 @@ class GenerationOrchestrator(
                     originalPrompt,
                     depth,
                     chainId = agentChainId,
+                    producingGeneration = producingGeneration,
                 )
             }
         }
@@ -654,7 +724,7 @@ class GenerationOrchestrator(
         messages: List<ChatMessage>? = null,
         continueFromContext: Boolean = false,
         agentChainId: Long? = null,
-        onComplete: (GenerationFlowResult) -> Unit,
+        onComplete: (GenerationFlowResult, Job?) -> Unit,
     ): Job {
         val sessionOutput = GenerationOutputAccumulator(uiState.streamState.snapshotText())
         var firstTokenAt: Long? = null
@@ -860,6 +930,7 @@ class GenerationOrchestrator(
                         generatedTokens = generatedTokens,
                         terminalDetail = terminalDetail,
                     ),
+                    kotlinx.coroutines.currentCoroutineContext()[Job],
                 )
 
                 // ── Shared cleanup tail ────────────────────────────────────
@@ -898,8 +969,8 @@ class GenerationOrchestrator(
 
     private fun getFormattedHistoryForAgent(excludeIds: Set<Long>, maxHistoryTokens: Int): String {
         if (maxHistoryTokens <= 0) return ""
-        val history = uiState.transcript.value.filter { message ->
-            message.text.isNotBlank() && message.id !in excludeIds
+        val history = uiState.transcript.value.sinceContextBoundary().filter { message ->
+            message.text.isNotBlank() && message.id !in excludeIds && message.documentScope == null
         }
         if (history.isEmpty()) return ""
         val selected = ArrayDeque<TranscriptMessage>()

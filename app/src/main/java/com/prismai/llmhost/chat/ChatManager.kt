@@ -202,35 +202,38 @@ class ChatManager(
         return true
     }
 
-    fun clearTranscript() {
+    fun clearTranscript(): Boolean {
         if (uiState._isGenerating.value) {
             eventBus.publish("Cancel generation before clearing chat")
-            return
+            return false
         }
         val currentId = uiState._currentChatId.value
         synchronized(lock) {
-            uiState._transcript.value = emptyList()
+            try {
+                if (currentId == null) {
+                    uiState._transcript.value = emptyList()
+                } else {
+                    transcriptWriteGate.invalidateAndRun(currentId) {
+                        // A durable empty primary also prevents a legacy backup from being restored.
+                        transcriptStore.writeTranscriptFile(transcriptStore.transcriptFile(currentId), emptyList())
+                        val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == currentId }?.title
+                        searchIndex.update(currentId, emptyList(), sessionTitle)
+                        uiState._transcript.value = emptyList()
+                    }
+                }
+            } catch (error: Exception) {
+                Log.w(TAG, "failed to clear transcript", error)
+                eventBus.publish("Could not clear chat history")
+                return false
+            }
             nextTranscriptId = 1L
             activeAssistantTranscriptId = null
             lastTranscriptPersistAt = 0L
         }
         uiState.streamState.clear()
         touchCurrentChat(emptyList(), updateTitle = false)
-        if (currentId != null) {
-            runCatching {
-                transcriptWriteGate.invalidateAndRun(currentId) {
-                    // Update the index under the gate so a stale in-flight
-                    // publish cannot re-index the cleared transcript afterwards.
-                    val sessionTitle = uiState._chatSessions.value.firstOrNull { it.id == currentId }?.title
-                    searchIndex.update(currentId, emptyList(), sessionTitle)
-                    val file = transcriptStore.transcriptFile(currentId)
-                    if (file.exists()) file.delete() else true
-                }
-            }.onFailure { error ->
-                Log.w(TAG, "failed to delete transcript", error)
-            }
-        }
         persistChatIndex()
+        return true
     }
 
     // ── Chat state persistence ───────────────────────────────────────────
@@ -379,7 +382,7 @@ class ChatManager(
      * Appends a message to the current transcript, auto-creating a chat if
      * none exists. Returns the assigned message id.
      */
-    fun appendTranscriptMessage(role: TranscriptRole, text: String): Long {
+    fun appendTranscriptMessage(role: TranscriptRole, text: String, documentScope: String? = null): Long {
         if (uiState._currentChatId.value == null) {
             createChat()
         }
@@ -393,7 +396,7 @@ class ChatManager(
                     ?.takeIf { it.isNotBlank() }
             } else null
             val mutable = uiState._transcript.value.toMutableList()
-            mutable.add(TranscriptMessage(id, role, text, sum))
+            mutable.add(TranscriptMessage(id, role, text, sum, documentScope = documentScope))
             uiState._transcript.value = mutable
         }
         touchCurrentChat(uiState._transcript.value, updateTitle = role == TranscriptRole.USER)
@@ -426,6 +429,28 @@ class ChatManager(
         // calls this on a ~75 ms cadence; rewriting chat_index.json and
         // re-sorting every session per token is wasteful. The index is
         // persisted on append/rename/delete instead.
+    }
+
+    /**
+     * Start a fresh model context without removing visible messages. Publish the boundary
+     * before deleting a saved fact, so a restart cannot replay an older answer using it.
+     */
+    fun markContextBoundaryForCurrentChat(chatId: String): Boolean = synchronized(lock) {
+        if (uiState._currentChatId.value != chatId || uiState._isGenerating.value) return@synchronized false
+        val messages = uiState._transcript.value
+        val target = transcriptStore.transcriptFile(chatId)
+        if (messages.isEmpty() && transcriptStore.readTranscriptFile(target).isNotEmpty()) return@synchronized false
+        val updated = messages.lastOrNull()?.let { last ->
+            messages.dropLast(1) + last.copy(contextBoundaryAfter = true)
+        }.orEmpty()
+        runCatching {
+            transcriptWriteGate.invalidateAndRun(chatId) {
+                transcriptStore.writeTranscriptFile(target, updated)
+                uiState._transcript.value = updated
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "failed to persist memory context boundary", error)
+        }.isSuccess
     }
 
     // ── Persist transcript to disk (thread-safe under ioMutex) ─────────────
@@ -461,10 +486,11 @@ class ChatManager(
 
     // ── Private helpers ──────────────────────────────────────────────────
 
-    private fun persistTranscriptNow() {
-        val chatId = uiState._currentChatId.value ?: return
-        val revision = transcriptWriteRevision(chatId)
-        val messages = uiState._transcript.value
+    internal fun persistTranscriptNow() {
+        val (chatId, messages, revision) = synchronized(lock) {
+            val id = uiState._currentChatId.value ?: return
+            Triple(id, uiState._transcript.value, transcriptWriteRevision(id))
+        }
         scope.launch(Dispatchers.IO) {
             persistTranscript(chatId, messages, revision)
         }

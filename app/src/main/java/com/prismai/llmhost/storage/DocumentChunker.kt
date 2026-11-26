@@ -22,6 +22,8 @@ object DocumentChunker {
     data class Chunk(
         val text: String,
         val index: Int,
+        val sourceStart: Int,
+        val sourceEnd: Int,
     )
 
     /**
@@ -51,7 +53,7 @@ object DocumentChunker {
             val end = findChunkEnd(text, start, safeChunkSize)
             val chunkText = text.substring(start, end).trim()
             if (chunkText.isNotBlank()) {
-                result.add(Chunk(text = chunkText, index = index))
+                result.add(Chunk(text = chunkText, index = index, sourceStart = start, sourceEnd = end))
                 index++
             }
             if (end >= text.length) {

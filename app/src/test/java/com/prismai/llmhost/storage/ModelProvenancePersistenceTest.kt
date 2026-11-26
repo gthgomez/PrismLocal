@@ -9,6 +9,8 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
  * PL-F16: Integrity verification provenance must be persisted in manifest and round-trip
@@ -53,16 +55,78 @@ class ModelProvenancePersistenceTest {
         assertEquals(DownloadIntegrity.UNVERIFIED, freshManager.activeModelInfo("unverified-model")?.integrity)
         assertEquals(DownloadIntegrity.UNKNOWN_LEGACY, freshManager.activeModelInfo("legacy-model")?.integrity)
 
-        // Cache hit must not alter provenance
+        // Activation of an artifact with a current container receipt must not alter provenance.
         val cachedPinned = freshManager.resolveActiveModelForActivation("pinned-model")
         assertNotNull(cachedPinned)
         assertEquals(DownloadIntegrity.VERIFIED_PINNED, (cachedPinned as ModelStorageManager.ModelResolveResult.Success).model.integrity)
+        assertEquals(true, cachedPinned.model.validation.metadataChecked)
+
+        // Legacy provenance does not imply this metadata-only artifact has weights.
+        val incomplete = freshManager.resolveActiveModelForActivation("legacy-model")
+        assertEquals(ModelStorageManager.ModelStorageError.Code.INVALID_GGUF_HEADER,
+            (incomplete as ModelStorageManager.ModelResolveResult.Failure).error.code)
     }
 
-    private fun createModelWithManifest(modelsDir: File, modelId: String, integrity: String?) {
+    @Test
+    fun modelShapeDoesNotDependOnKeyOrderAndHandlesPerLayerHeads() {
+        verifyPerLayerHeads(explicitKvHeads = true)
+        verifyPerLayerHeads(explicitKvHeads = false)
+    }
+
+    private fun verifyPerLayerHeads(explicitKvHeads: Boolean) {
+        val modelsDir = tempFolder.newFolder("shapes-$explicitKvHeads")
+        val modelId = "shape-model"
+        val header = ByteBuffer.allocate(512).order(ByteOrder.LITTLE_ENDIAN)
+            .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(if (explicitKvHeads) 6L else 5L)
+        fun writeKey(key: String, type: Int) {
+            val name = key.toByteArray()
+            header.putLong(name.size.toLong()).put(name).putInt(type)
+        }
+        fun headCounts(key: String, vararg heads: Int) {
+            writeKey(key, 9) // array
+            header.putInt(4).putLong(heads.size.toLong())
+            heads.forEach { header.putInt(it) }
+        }
+        writeKey("qwen2.block_count", 4)
+        header.putInt(3)
+        writeKey("qwen2.embedding_length", 4)
+        header.putInt(1024)
+        headCounts("qwen2.attention.head_count", 16, 8, 0)
+        if (explicitKvHeads) headCounts("qwen2.attention.head_count_kv", 2, 4, 0)
+        writeKey("qwen2.attention.value_length", 4)
+        header.putInt(96)
+        writeKey("general.architecture", 8)
+        header.putLong(5).put("qwen2".toByteArray())
+        createModelWithManifest(
+            modelsDir, modelId, integrity = DownloadIntegrity.UNVERIFIED.name,
+            bytes = header.array(), validationStatus = "container_checked_v1",
+        )
+
+        val manager = ModelStorageManager(FakeTestContext(), modelsDir)
+        val metadata = checkNotNull(manager.activeModelInfo(modelId)?.validation?.metadata)
+        assertEquals("qwen2", metadata.architecture)
+        assertEquals(3, metadata.blockCount)
+        assertEquals(1024, metadata.embeddingLength)
+        assertEquals(16, metadata.attentionHeadCount)
+        assertEquals(if (explicitKvHeads) 4 else 16, metadata.attentionHeadCountKv)
+        assertEquals(if (explicitKvHeads) 6L else 24L, metadata.attentionKvHeadLayerSum)
+        assertEquals(96, metadata.attentionValueLength)
+        val activation = manager.resolveActiveModelForActivation(modelId)
+        assertEquals(ModelStorageManager.ModelStorageError.Code.INVALID_GGUF_HEADER,
+            (activation as ModelStorageManager.ModelResolveResult.Failure).error.code)
+    }
+
+    private fun createModelWithManifest(
+        modelsDir: File,
+        modelId: String,
+        integrity: String?,
+        bytes: ByteArray = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
+            .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(0).array(),
+        validationStatus: String = if (integrity == null) "imported" else "container_checked_v3",
+    ) {
         val modelFile = File(modelsDir, "$modelId/versions/v1/model.gguf")
         modelFile.parentFile!!.mkdirs()
-        modelFile.writeText("gguf-bytes-for-$modelId")
+        modelFile.writeBytes(bytes)
 
         val sha = java.security.MessageDigest.getInstance("SHA-256")
             .digest(modelFile.readBytes())
@@ -79,7 +143,7 @@ class ModelProvenancePersistenceTest {
                 JSONObject()
                     .put("format", "GGUF")
                     .put("gguf_version", 3)
-                    .put("status", "imported")
+                    .put("status", validationStatus)
                     .put("validated_at", "2026-10-09T00:00:00Z"),
             )
         if (integrity != null) {

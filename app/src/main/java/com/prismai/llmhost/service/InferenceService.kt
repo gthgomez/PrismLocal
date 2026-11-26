@@ -129,6 +129,7 @@ class InferenceService : Service() {
         // for the off-main teardown to finish before returning; the teardown
         // job itself keeps running if it overruns (see onDestroy).
         private const val NATIVE_TEARDOWN_WAIT_MS = 2_000L
+        private const val GENERATION_WAIT_MS = 30 * 60 * 1000L
     }
 
     private fun pendingAgentActionKey(chatId: String): String = "$KEY_PENDING_AGENT_ACTION_PREFIX$chatId"
@@ -151,7 +152,12 @@ class InferenceService : Service() {
     // avoids enqueuing redundant cancellation work.
     private val teardownStarted = AtomicBoolean(false)
     private val inFlightSendTokens = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    data class ComposerSendStatus(val token: String, val pending: Boolean, val refusal: String? = null)
+
+    private val _composerSendStatus = MutableStateFlow<ComposerSendStatus?>(null)
+    val composerSendStatus: StateFlow<ComposerSendStatus?> = _composerSendStatus.asStateFlow()
     private val modelEpoch = java.util.concurrent.atomic.AtomicLong(1L)
+    private val vectorRefreshLock = Any()
 
     // Single owner of the native memory-pressure level. Writes are funneled
     // through an unbounded channel consumed by exactly one coroutine, so the
@@ -230,6 +236,9 @@ class InferenceService : Service() {
     // well as the set(): synchronizing only the setter cannot order the reads.
     private val installedModelsRefresh = Mutex()
     private val generationStartGate = GenerationStartGate()
+    private var voiceOriginChatId: String? = null
+    private val indexingDocument = MutableStateFlow(false)
+    val isIndexingDocument: StateFlow<Boolean> get() = indexingDocument
     private val serviceGenerationOwnership = ServiceGenerationOwnership()
     private val backgroundGenerationOwnership = serviceGenerationOwnership.engine
     @Volatile
@@ -421,17 +430,22 @@ class InferenceService : Service() {
         ragManager = RagManager(vectorStore, DocumentChunker) { text ->
             engine.encode(text)
         }
+        // Stored documents must be visible after service recreation, even before a model loads.
+        serviceScope.launch(Dispatchers.IO) { refreshVectorChunksList() }
         // Phase 4 — Voice I/O manager
         voiceIoManager = VoiceIoManager(this).also { mgr ->
             mgr.onSpeechResult = { text ->
+                val sourceChatId = voiceOriginChatId
+                voiceOriginChatId = null
                 _voiceInputResult.value = text
                 _voiceState.value = _voiceState.value.copy(isListening = false, partialTranscript = null)
                 publishUiEvent("Voice input captured")
-                if (_generationSettings.value.autoSendVoice && text.isNotBlank()) {
-                    generateSafely(text)
+                if (sourceChatId != null && _generationSettings.value.autoSendVoice && text.isNotBlank()) {
+                    generateSafely(text, sourceChatId = sourceChatId)
                 }
             }
             mgr.onSpeechError = { error ->
+                voiceOriginChatId = null
                 _voiceInputResult.value = null
                 _voiceState.value = _voiceState.value.copy(isListening = false)
                 publishUiEvent("Voice input error: $error")
@@ -570,7 +584,6 @@ class InferenceService : Service() {
         // ── Phase D: agent tool handler classes ─────────────────────────
         chatTools = com.prismai.llmhost.agent.tools.ChatTools(
             chatManager = chatManager,
-            chatSearchIndex = chatSearchIndex,
             transcriptStore = transcriptStore,
             currentChatId = { _currentChatId.value },
             chatSessions = { _chatSessions.value },
@@ -619,6 +632,7 @@ class InferenceService : Service() {
             memoryStore = memoryStore,
             currentChatId = { _currentChatId.value },
             refreshMemoriesList = { refreshMemoriesList() },
+            deleteMemory = { id -> deleteMemorySafely(id, fromAgent = true) },
         )
         ragHandlerTools = com.prismai.llmhost.agent.tools.RagTools(
             ragManager = ragManager,
@@ -762,7 +776,7 @@ class InferenceService : Service() {
     }
 
     fun importModel(uri: Uri): Job? {
-        if (importJob?.isActive == true) {
+        if (importJob?.isCompleted == false) {
             publishUiEvent("A model import is already running")
             return null
         }
@@ -798,6 +812,10 @@ class InferenceService : Service() {
     fun storageBreakdown(): ModelStorageManager.StorageBreakdown = modelStorageManager.getStorageBreakdown()
 
     fun clearCacheAndTempFiles(): Long {
+        if (importJob?.isCompleted == false || _modelDownloadState.value is ModelDownloadState.Running) {
+            publishUiEvent("Finish the active model import or download before clearing temporary files")
+            return 0L
+        }
         val freed = modelStorageManager.clearCacheAndTempFiles()
         publishUiEvent("Cleared ${FormatUtils.formatBytesForMessage(freed)} of cache and temp files")
         return freed
@@ -816,7 +834,6 @@ class InferenceService : Service() {
         batchImportJob?.cancel()
         batchImportJob = null
         importJob?.cancel()
-        importJob = null
         importUriByString.clear()
         WorkManager.getInstance(this).cancelUniqueWork(HuggingFaceDownloadWork.UNIQUE_WORK_NAME)
         modelImportManager.cancelImport()
@@ -849,11 +866,13 @@ class InferenceService : Service() {
                     finalizeActiveTrace = !preserveConfirmedChain,
                     preserveActiveTrace = preserveConfirmedChain,
                 )
-                modelManager.switchModel(modelId).also { loaded ->
-                    if (loaded) {
-                        modelEpoch.incrementAndGet()
-                    }
+                val loaded = modelManager.switchModel(modelId)
+                if (loaded) {
+                    modelEpoch.incrementAndGet()
                 }
+                // Searchability depends on the active encoder, including failed reloads that unload it.
+                withContext(Dispatchers.IO) { refreshVectorChunksList() }
+                loaded
             } finally {
                 if (preserveConfirmedChain) {
                     agentTrace.releaseChainPreservation(confirmedAuthorization.chainId)
@@ -889,11 +908,12 @@ class InferenceService : Service() {
                     finalizeActiveTrace = !preserveConfirmedChain,
                     preserveActiveTrace = preserveConfirmedChain,
                 )
-                modelManager.deleteModel(modelId, identity).also { deleted ->
-                    if (deleted) {
-                        modelEpoch.incrementAndGet()
-                    }
+                val deleted = modelManager.deleteModel(modelId, identity)
+                if (deleted) {
+                    modelEpoch.incrementAndGet()
+                    withContext(Dispatchers.IO) { refreshVectorChunksList() }
                 }
+                deleted
             } finally {
                 if (preserveConfirmedChain) {
                     agentTrace.releaseChainPreservation(confirmedAuthorization.chainId)
@@ -908,7 +928,9 @@ class InferenceService : Service() {
         return profile
     }
 
-    fun cancelGeneration() {
+    fun cancelGeneration() = cancelGeneration("user cancel", showStopped = true)
+
+    private fun cancelGeneration(reason: String, showStopped: Boolean) {
         benchmarkRunner.cancelGeneration()
         serviceScope.launch {
             val backgroundTaskId = backgroundGenerationOwnership.ownerId()
@@ -916,7 +938,9 @@ class InferenceService : Service() {
                 backgroundAgentManager.cancelTask(backgroundTaskId)
             } else {
                 operationMutex.withLock {
-                    cancelAndJoinGenerationLocked("user cancel")
+                    val wasGenerating = _isGenerating.value
+                    cancelAndJoinGenerationLocked(reason)
+                    if (wasGenerating && showStopped) publishUiEvent("Generation stopped")
                 }
             }
         }
@@ -993,7 +1017,7 @@ class InferenceService : Service() {
     private fun performClearTranscript(): Boolean {
         return generationStartGate.runChatTransition {
             if (_isGenerating.value || backgroundGenerationOwnership.hasOwner()) return@runChatTransition false
-            chatManager.clearTranscript()
+            if (!chatManager.clearTranscript()) return@runChatTransition false
             resetNativeConversationAsync("clear transcript")
             true
         } ?: false
@@ -1059,7 +1083,7 @@ class InferenceService : Service() {
 
     fun clearTranscript(): Boolean {
         if (confirmedChatTransitionThread.get() == true) return performClearTranscript()
-        if (_isGenerating.value) {
+        if (_isGenerating.value || generationStartGate.isStartInProgress()) {
             publishUiEvent("Cancel generation before clearing chat")
             return false
         }
@@ -1158,18 +1182,36 @@ class InferenceService : Service() {
         sendToken: String? = null,
         onAccepted: (() -> Unit)? = null,
         onRefused: ((String) -> Unit)? = null,
+        selectedDocumentId: String? = null,
     ) {
+        if (sendToken != null) _composerSendStatus.value = ComposerSendStatus(sendToken, pending = true)
         serviceScope.launch {
-            generateSafelyAndAwait(
-                prompt = prompt,
-                benchmarkPreset = benchmarkPreset,
-                preserveBenchmarkQueue = preserveBenchmarkQueue,
+            try {
+                generateSafelyAndAwait(
+                    prompt = prompt,
+                    benchmarkPreset = benchmarkPreset,
+                    preserveBenchmarkQueue = preserveBenchmarkQueue,
                     sourceChatId = sourceChatId,
                     sendToken = sendToken,
-                onAccepted = onAccepted,
-                onRefused = onRefused,
-            )
+                    onAccepted = {
+                        sendToken?.let { finishComposerSend(it) }
+                        onAccepted?.invoke()
+                    },
+                    onRefused = { reason ->
+                        sendToken?.let { finishComposerSend(it, reason) }
+                        onRefused?.invoke(reason)
+                    },
+                    selectedDocumentId = selectedDocumentId,
+                )
+            } finally {
+                sendToken?.let { finishComposerSend(it, "Send did not complete; the draft was kept") }
+            }
         }
+    }
+
+    private fun finishComposerSend(token: String, refusal: String? = null) {
+        val pending = ComposerSendStatus(token, pending = true)
+        _composerSendStatus.compareAndSet(pending, ComposerSendStatus(token, pending = false, refusal = refusal))
     }
 
     /** Reports a refusal to the caller (if any) and returns the reason as the call result. */
@@ -1188,7 +1230,11 @@ class InferenceService : Service() {
         sendToken: String? = null,
         onAccepted: (() -> Unit)? = null,
         onRefused: ((String) -> Unit)? = null,
+        selectedDocumentId: String? = null,
     ): String {
+        if (selectedDocumentId != null && initiatedByBackground) {
+            return refuseSend(onRefused, "Document questions are available in chat only")
+        }
         if (sendToken != null && !inFlightSendTokens.add(sendToken)) {
             return refuseSend(onRefused, "Duplicate send in flight")
         }
@@ -1202,6 +1248,7 @@ class InferenceService : Service() {
         var resultAgentChainId: Long? = null
         var resultRetained = false
         var launchResult = GenerationOrchestrator.GenerationLaunch.REFUSED
+        val documentAnswer = selectedDocumentId?.let { CompletableDeferred<String?>() }
         operationMutex.withLock {
             if (!initiatedByBackground && backgroundGenerationOwnership.hasOwner()) {
                 publishUiEvent("A background task currently owns the generation engine")
@@ -1218,24 +1265,27 @@ class InferenceService : Service() {
             ) {
                 throw BackgroundTaskDeferredException()
             }
-            if (!initiatedByBackground &&
-                serviceGenerationOwnership.shouldRefuseUserSend(sourceChatId, _currentChatId.value)
-            ) {
-                // The composer captured this send while its source chat was
-                // selected, but the selection changed before the operation mutex
-                // was granted. Refuse under the admission lock, before any
-                // cancellation or transcript mutation, so a send can never
-                // execute in a chat it did not originate from.
-                publishUiEvent("Chat changed before the send was admitted")
-                return refuseSend(onRefused, "Chat changed before the send was admitted")
-            }
             if (!generationStartGate.beginStart()) {
                 if (initiatedByBackground) throw BackgroundTaskDeferredException()
                 return refuseSend(onRefused, "Generation deferred while a chat transition completes")
             }
             val startGateReserved = true
             try {
-                val acceptance = generationOrchestrator.evaluateSendAcceptance(prompt, benchmarkPreset)
+                // Also hold the transition gate: some chat switches can start
+                // outside the operation mutex and must not race this snapshot.
+                val selectedChatId = _currentChatId.value
+                val chatChanged = if (sendToken != null) sourceChatId != selectedChatId
+                    else serviceGenerationOwnership.shouldRefuseUserSend(sourceChatId, selectedChatId)
+                if (!initiatedByBackground && chatChanged) {
+                    publishUiEvent("Chat changed before the send was admitted")
+                    return refuseSend(onRefused, "Chat changed before the send was admitted")
+                }
+                val settings = _generationSettings.value.clamped()
+                val memory = generationOrchestrator.preparePromptMemory(
+                    prompt, benchmarkPreset, selectedDocumentId,
+                    if (initiatedByBackground) sourceChatId else selectedChatId,
+                )
+                val acceptance = generationOrchestrator.evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId, memory, settings)
                 if (!acceptance.accepted) {
                     val reason = acceptance.reason ?: "Generation was refused"
                     publishUiEvent(reason)
@@ -1262,21 +1312,24 @@ class InferenceService : Service() {
                 }
                 val previousSessionId = generationSession
                 val previousAgentChainId = agentTrace.activeChainId
-                generationOrchestrator.generate(prompt, benchmarkPreset)
+                generationOrchestrator.generate(prompt, benchmarkPreset, selectedDocumentId, memory, settings) {
+                    documentAnswer?.complete(it)
+                }
                 launchResult = generationOrchestrator.takeLaunchResult()
                 // Authoritative admission result: only now may the caller treat the send as
-                // accepted (and clear the composer), or report the refusal.
+                // accepted, or report the refusal. A document draft stays in the composer
+                // through native tokenization, whose exact budget check can still refuse it.
                 if (launchResult.acceptsMessage()) {
-                    onAccepted?.invoke()
+                    if (selectedDocumentId == null) onAccepted?.invoke()
                 } else {
-                    onRefused?.invoke("Generation was refused")
+                    onRefused?.invoke(generationOrchestrator.takeLaunchRefusalReason() ?: "Generation was refused")
                 }
                 if (generationSession != previousSessionId) resultSessionId = generationSession
                 val startedAgentChainId = agentTrace.activeChainId
                 if (startedAgentChainId != previousAgentChainId) {
                     resultAgentChainId = startedAgentChainId
                 }
-                if (resultSessionId != null || resultAgentChainId != null) {
+                if (documentAnswer == null && (resultSessionId != null || resultAgentChainId != null)) {
                     generationOrchestrator.retainGenerationOutput(resultSessionId, resultAgentChainId)
                     resultRetained = true
                 }
@@ -1289,6 +1342,26 @@ class InferenceService : Service() {
             } finally {
                 if (startGateReserved) generationStartGate.finishStart()
             }
+        }
+        if (documentAnswer != null) {
+            if (!launchResult.acceptsMessage()) return "Document question was refused"
+            val answer = try {
+                withTimeoutOrNull(GENERATION_WAIT_MS) { documentAnswer.await() }
+            } catch (cancelled: CancellationException) {
+                withContext(NonCancellable) {
+                    operationMutex.withLock {
+                        if (resultSessionId == generationSession && generationJob != null) {
+                            cancelAndJoinGenerationLocked("document answer owner cancelled")
+                        }
+                    }
+                }
+                throw cancelled
+            }
+            if (answer == null) {
+                return refuseSend(onRefused, "No completed document answer; the question was kept")
+            }
+            onAccepted?.invoke()
+            return answer
         }
         try {
             if (!awaitGenerationSessionIdle()) {
@@ -1439,7 +1512,7 @@ class InferenceService : Service() {
 
     private suspend fun awaitGenerationSessionIdle(
         pollMs: Long = 20L,
-        maxWaitMs: Long = 30 * 60 * 1000L,
+        maxWaitMs: Long = GENERATION_WAIT_MS,
     ): Boolean {
         return com.prismai.llmhost.generation.GenerationSessionWait.awaitSessionIdle(
             isGenerating = { shouldWaitForGenerationSession() },
@@ -1834,6 +1907,9 @@ class InferenceService : Service() {
         confirmed: Boolean,
         authorization: AgentToolConfirmation.PendingToolAuthorization? = null,
     ): AgentToolResult {
+        if (!_generationSettings.value.agentEnabled) {
+            return toolFailure(call, AgentToolErrorCode.FAILED, "Agent mode is off")
+        }
         if (confirmed && authorization != null &&
             !agentToolConfirmation.isOperationOwnerCurrent(
                 authorization = authorization,
@@ -1903,15 +1979,15 @@ class InferenceService : Service() {
             "forget_fact" -> memoryTools.forgetFact(call, confirmed)
             "list_memories" -> memoryTools.listMemories(call)
             // ── RAG tools ────────────────────────────────────────────────────
-            "ingest_document" -> ragHandlerTools.ingestDocument(call, confirmed)
-            "search_documents" -> ragHandlerTools.searchDocuments(call)
+            "ingest_document" -> indexForAgent(call) { ragHandlerTools.ingestDocument(call, confirmed) }
+            "search_documents" -> searchForAgent(call) { ragHandlerTools.searchDocuments(call) }
             "list_documents" -> ragHandlerTools.listDocuments(call)
-            "delete_document" -> ragHandlerTools.deleteDocument(call, confirmed)
+            "delete_document" -> indexForAgent(call) { ragHandlerTools.deleteDocument(call, confirmed) }
             // ── Knowledge Pack tools ─────────────────────────────────────────
-            "search_knowledge" -> knowledgePackHandlerTools.searchKnowledge(call)
-            "fetch_grokipedia_article" -> knowledgePackHandlerTools.fetchGrokipediaArticle(call, confirmed)
+            "search_knowledge" -> searchForAgent(call) { knowledgePackHandlerTools.searchKnowledge(call) }
+            "fetch_grokipedia_article" -> indexForAgent(call) { knowledgePackHandlerTools.fetchGrokipediaArticle(call, confirmed) }
             "list_knowledge_packs" -> knowledgePackHandlerTools.listKnowledgePacks(call)
-            "download_knowledge_pack" -> knowledgePackHandlerTools.downloadKnowledgePack(call, confirmed)
+            "download_knowledge_pack" -> indexForAgent(call) { knowledgePackHandlerTools.downloadKnowledgePack(call, confirmed) }
             // ── Voice I/O tools ──────────────────────────────────────────────
             "voice_input" -> voiceHandlerTools.voiceInput(call)
             "speak_output" -> voiceHandlerTools.speakOutput(call)
@@ -1971,10 +2047,53 @@ class InferenceService : Service() {
         runCatching { _memories.value = memoryStore.getAllActive() }
     }
 
-    /** Public API for the memory browser UI. Deletes a single memory fact by id and refreshes the observable list. */
-    fun deleteMemory(id: String) {
-        memoryStore.delete(id)
+    /** Delete a fact only after older conversation context is durably excluded. */
+    suspend fun deleteMemory(id: String): Boolean = deleteMemorySafely(id, fromAgent = false)
+
+    private suspend fun deleteMemorySafely(id: String, fromAgent: Boolean): Boolean = operationMutex.withLock {
+        if (_isGenerating.value || backgroundGenerationOwnership.hasOwner() || agentFollowUpScheduled ||
+            (!fromAgent && (_pendingAgentToolAction.value != null || hasActiveAgentToolJobs())) ||
+            !generationStartGate.beginStart()
+        ) {
+            publishUiEvent("Finish or stop the current operation before deleting a memory")
+            return@withLock false
+        }
+        try {
+            deleteMemoryWithStableChat(id, fromAgent)
+        } finally {
+            generationStartGate.finishStart()
+        }
+    }
+
+    private suspend fun deleteMemoryWithStableChat(id: String, fromAgent: Boolean): Boolean {
+        val fact = withContext(Dispatchers.IO) { memoryStore.getAllActive().firstOrNull { it.id == id } }
+            ?: return false
+        val sourceChatId = fact.sourceChatId
+        val hasSourceChat = sourceChatId != null && _chatSessions.value.any { it.id == sourceChatId }
+        if (sourceChatId != null && sourceChatId != _currentChatId.value && (hasSourceChat || fromAgent)) {
+            publishUiEvent("Open the source chat before deleting this memory")
+            return false
+        }
+        if (sourceChatId != null && sourceChatId == _currentChatId.value) {
+            val marked = withContext(Dispatchers.IO) { chatManager.markContextBoundaryForCurrentChat(sourceChatId) }
+            if (!marked) {
+                publishUiEvent("Could not start a fresh chat context; memory was not deleted")
+                return false
+            }
+            try {
+                engine.resetConversation()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w(TAG, "could not reset native conversation after memory deletion request", error)
+                publishUiEvent("Could not reset model context; memory was not deleted")
+                return false
+            }
+        }
+        val deleted = withContext(Dispatchers.IO) { memoryStore.delete(id) }
         refreshMemoriesList()
+        if (!deleted) publishUiEvent("Could not delete memory")
+        return deleted
     }
 
     /** Public API for the memory browser UI. Reloads the observable memory list from the store. */
@@ -1984,11 +2103,17 @@ class InferenceService : Service() {
 
     /** Public API for the memory browser UI. Adds a manual memory fact and refreshes the observable list. */
     fun addMemory(fact: String, category: MemoryCategory = MemoryCategory.GENERAL, confidence: Float = 0.85f) {
+        val chatId = _currentChatId.value
+        if (chatId.isNullOrBlank()) {
+            publishUiEvent("Open a chat before saving a memory")
+            return
+        }
         memoryStore.insert(
             MemoryFact(
                 fact = fact,
                 category = category,
                 confidence = confidence,
+                sourceChatId = chatId,
             )
         )
         refreshMemoriesList()
@@ -2002,8 +2127,8 @@ class InferenceService : Service() {
      * so the chat snackbar reports it too.
      */
     suspend fun ingestDocument(id: String, title: String, text: String): String {
-        val result = ragManager.ingestDocumentWithResult(id, title, text)
-        refreshVectorChunksList()
+        val result = indexDocuments { ragManager.ingestDocumentWithResult(id, title, text) }
+        if (result == null) return "Finish the current model operation before indexing a document"
         val message = DocumentIngestMessaging.describe(
             embedded = result.embeddedCount,
             failed = result.failedCount,
@@ -2016,17 +2141,67 @@ class InferenceService : Service() {
         return message
     }
 
+    private suspend fun indexForAgent(call: AgentToolCall, action: suspend () -> AgentToolResult): AgentToolResult =
+        indexDocuments(action) ?: AgentToolResult(
+            call, success = false, summary = "Finish the current model operation before changing documents",
+        )
+
+    private suspend fun searchForAgent(call: AgentToolCall, action: suspend () -> AgentToolResult): AgentToolResult {
+        val dispatch = kotlinx.coroutines.currentCoroutineContext()[AgentToolRouter.ToolDispatch]
+            ?: return toolFailure(call, AgentToolErrorCode.FAILED, "Document search has no active chat owner")
+        // A model-issued tool can start while the preceding turn is still draining.
+        dispatch.producingGeneration?.join()
+        return withIdleModel {
+            if (!agentToolRouter.isCurrentOwner(dispatch.owner.chainId, dispatch.owner.chatId) ||
+                !_generationSettings.value.agentEnabled
+            ) {
+                toolFailure(call, AgentToolErrorCode.FAILED, "Document search no longer belongs to the active chat")
+            } else {
+                action()
+            }
+        } ?: toolFailure(call, AgentToolErrorCode.BUSY, "Finish the current model operation before searching documents")
+    }
+
+    /** Hold native ownership through encoding and index publication, without queuing work behind generation. */
+    private suspend fun <T : Any> indexDocuments(action: suspend () -> T): T? =
+        withIdleModel {
+            indexingDocument.value = true
+            try {
+                action()
+            } finally {
+                // A cancelled caller may already have reached SQLite's commit point.
+                refreshVectorChunksList()
+                indexingDocument.value = false
+            }
+        }
+
+    private suspend fun <T : Any> withIdleModel(action: suspend () -> T): T? {
+        if (!operationMutex.tryLock()) return null
+        try {
+            return if (_isGenerating.value) null else action()
+        } finally {
+            operationMutex.unlock()
+        }
+    }
+
     /** Public API for the document browser UI. Deletes all chunks for a document id. */
     fun deleteDocument(id: String): Int {
-        val count = ragManager.deleteDocument(id)
-        refreshVectorChunksList()
-        return count
+        if (!operationMutex.tryLock()) {
+            publishUiEvent("Finish the current model operation before deleting a document")
+            return 0
+        }
+        try {
+            val count = ragManager.deleteDocument(id)
+            refreshVectorChunksList()
+            return count
+        } finally {
+            operationMutex.unlock()
+        }
     }
 
     /** Public API for the document browser UI. Performs vector cosine similarity search. */
-    suspend fun queryVectorStore(query: String, topK: Int = 5): List<Pair<com.prismai.llmhost.storage.VectorChunk, Float>> {
-        return ragManager.query(query, topK = topK)
-    }
+    suspend fun queryVectorStore(query: String, topK: Int = 5): List<Pair<com.prismai.llmhost.storage.VectorChunk, Float>> =
+        withIdleModel { ragManager.query(query, topK = topK) }.orEmpty()
 
     /** Public API to force refresh vector store chunks StateFlow. */
     fun refreshVectorStore() {
@@ -2035,14 +2210,19 @@ class InferenceService : Service() {
 
     /** Public API for voice input & TTS */
     fun startVoiceInput(): Boolean {
+        if (_voiceState.value.isListening) return false
+        voiceOriginChatId = _currentChatId.value
         return voiceIoManager.startListening().also { success ->
             if (success) {
                 _voiceState.value = _voiceState.value.copy(isListening = true, partialTranscript = null)
+            } else {
+                voiceOriginChatId = null
             }
         }
     }
 
     fun stopVoiceInput() {
+        voiceOriginChatId = null
         voiceIoManager.stopListening()
         _voiceState.value = _voiceState.value.copy(isListening = false, partialTranscript = null)
     }
@@ -2074,9 +2254,11 @@ class InferenceService : Service() {
      * shown as stored and are never offered for deletion.
      */
     private fun refreshVectorChunksList() {
-        runCatching {
-            uiState._vectorDocuments.value = vectorStore.getDocumentSummaries()
-            uiState._staleVectorChunkCount.value = vectorStore.countObsoleteChunks()
+        synchronized(vectorRefreshLock) {
+            runCatching {
+                uiState._vectorDocuments.value = vectorStore.getDocumentSummaries()
+                uiState._staleVectorChunkCount.value = vectorStore.countObsoleteChunks()
+            }.onFailure { error -> Log.w(TAG, "failed to refresh stored documents", error) }
         }
     }
 
@@ -2209,18 +2391,7 @@ class InferenceService : Service() {
     }
 
     private fun persistTranscriptNow() {
-        val chatId = _currentChatId.value ?: return
-        val revision = chatManager.transcriptWriteRevision(chatId)
-        val messages = synchronized(transcriptLock) {
-            _transcript.value
-        }
-        serviceScope.launch(Dispatchers.IO) {
-            runCatching {
-                chatManager.persistTranscript(chatId, messages, revision)
-            }.onFailure { error ->
-                Log.w(TAG, "failed to persist transcript", error)
-            }
-        }
+        chatManager.persistTranscriptNow()
     }
 
     private fun touchCurrentChat(messages: List<TranscriptMessage>, updateTitle: Boolean) {
@@ -2346,7 +2517,7 @@ class InferenceService : Service() {
     override fun onTimeout(startId: Int, fgsType: Int) {
         Log.w(TAG, "foreground service timeout startId=$startId type=$fgsType")
         publishUiEvent("Generation timed out by Android foreground-service policy")
-        cancelGeneration()
+        cancelGeneration("foreground-service timeout", showStopped = false)
         stopSelf(startId)
     }
 

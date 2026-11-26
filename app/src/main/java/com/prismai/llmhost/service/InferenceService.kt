@@ -152,6 +152,10 @@ class InferenceService : Service() {
     // avoids enqueuing redundant cancellation work.
     private val teardownStarted = AtomicBoolean(false)
     private val inFlightSendTokens = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    data class DocumentSendStatus(val token: String, val pending: Boolean, val refusal: String? = null)
+
+    private val _documentSendStatus = MutableStateFlow<DocumentSendStatus?>(null)
+    val documentSendStatus: StateFlow<DocumentSendStatus?> = _documentSendStatus.asStateFlow()
     private val modelEpoch = java.util.concurrent.atomic.AtomicLong(1L)
     private val vectorRefreshLock = Any()
 
@@ -1180,18 +1184,35 @@ class InferenceService : Service() {
         onRefused: ((String) -> Unit)? = null,
         selectedDocumentId: String? = null,
     ) {
+        val documentToken = sendToken?.takeIf { selectedDocumentId != null }
+        if (documentToken != null) _documentSendStatus.value = DocumentSendStatus(documentToken, pending = true)
         serviceScope.launch {
-            generateSafelyAndAwait(
-                prompt = prompt,
-                benchmarkPreset = benchmarkPreset,
-                preserveBenchmarkQueue = preserveBenchmarkQueue,
+            try {
+                generateSafelyAndAwait(
+                    prompt = prompt,
+                    benchmarkPreset = benchmarkPreset,
+                    preserveBenchmarkQueue = preserveBenchmarkQueue,
                     sourceChatId = sourceChatId,
                     sendToken = sendToken,
-                onAccepted = onAccepted,
-                onRefused = onRefused,
-                selectedDocumentId = selectedDocumentId,
-            )
+                    onAccepted = {
+                        documentToken?.let { finishDocumentSend(it) }
+                        onAccepted?.invoke()
+                    },
+                    onRefused = { reason ->
+                        documentToken?.let { finishDocumentSend(it, reason) }
+                        onRefused?.invoke(reason)
+                    },
+                    selectedDocumentId = selectedDocumentId,
+                )
+            } finally {
+                documentToken?.let { finishDocumentSend(it, "No completed document answer; the question was kept") }
+            }
         }
+    }
+
+    private fun finishDocumentSend(token: String, refusal: String? = null) {
+        val pending = DocumentSendStatus(token, pending = true)
+        _documentSendStatus.compareAndSet(pending, DocumentSendStatus(token, pending = false, refusal = refusal))
     }
 
     /** Reports a refusal to the caller (if any) and returns the reason as the call result. */
@@ -1327,7 +1348,18 @@ class InferenceService : Service() {
         }
         if (documentAnswer != null) {
             if (!launchResult.acceptsMessage()) return "Document question was refused"
-            val answer = withTimeoutOrNull(GENERATION_WAIT_MS) { documentAnswer.await() }
+            val answer = try {
+                withTimeoutOrNull(GENERATION_WAIT_MS) { documentAnswer.await() }
+            } catch (cancelled: CancellationException) {
+                withContext(NonCancellable) {
+                    operationMutex.withLock {
+                        if (resultSessionId == generationSession && generationJob != null) {
+                            cancelAndJoinGenerationLocked("document answer owner cancelled")
+                        }
+                    }
+                }
+                throw cancelled
+            }
             if (answer == null) {
                 return refuseSend(onRefused, "No completed document answer; the question was kept")
             }
@@ -2118,13 +2150,13 @@ class InferenceService : Service() {
         )
 
     private suspend fun searchForAgent(call: AgentToolCall, action: suspend () -> AgentToolResult): AgentToolResult {
-        val chainId = agentTrace.activeChainId
-        val sourceChat = _currentChatId.value
+        val dispatch = kotlinx.coroutines.currentCoroutineContext()[AgentToolRouter.ToolDispatch]
+            ?: return toolFailure(call, AgentToolErrorCode.FAILED, "Document search has no active chat owner")
         // A model-issued tool can start while the preceding turn is still draining.
-        generationJob?.join()
+        dispatch.producingGeneration?.join()
         return withIdleModel {
-            if (chainId == null || !agentTrace.isCurrentChain(chainId) ||
-                sourceChat != _currentChatId.value || !_generationSettings.value.agentEnabled
+            if (!agentToolRouter.isCurrentOwner(dispatch.owner.chainId, dispatch.owner.chatId) ||
+                !_generationSettings.value.agentEnabled
             ) {
                 toolFailure(call, AgentToolErrorCode.FAILED, "Document search no longer belongs to the active chat")
             } else {

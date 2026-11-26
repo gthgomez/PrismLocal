@@ -116,9 +116,8 @@ class ModelReadinessAssessor(
 
         /**
          * Estimate KV-cache RAM from the model's actual attention shape:
-         *   layers × kv_heads × head_dim × (bytes/elem(K) + bytes/elem(V)) × context
-         * GQA/MQA is handled via `attention.head_count_kv`. Falls back to a coarse
-         * per-token constant only when the GGUF exposes no shape metadata.
+         * The pinned loader sizes K by each layer's KV heads and pads V to the
+         * widest layer in its non-flash path. Head widths default to layer zero.
          */
         internal fun estimateKvCacheBytes(
             contextLength: Int,
@@ -130,6 +129,7 @@ class ModelReadinessAssessor(
             kvTypeV: String,
             attentionKeyLength: Int? = null,
             attentionValueLength: Int? = null,
+            attentionKvHeadLayerSum: Long? = null,
         ): Long {
             val layers = blockCount ?: 0
             val embd = embeddingLength ?: 0
@@ -141,7 +141,8 @@ class ModelReadinessAssessor(
             val kvHeads = (attentionHeadCountKv ?: 0).takeIf { it > 0 } ?: heads ?: 1
             val keys = (attentionKeyLength ?: headDim) * kvBytesPerElement(kvTypeK)
             val values = (attentionValueLength ?: headDim) * kvBytesPerElement(kvTypeV)
-            val bytesPerToken = layers.toDouble() * kvHeads.toDouble() * (keys + values)
+            val paddedHeadLayers = layers.toLong() * kvHeads
+            val bytesPerToken = (attentionKvHeadLayerSum ?: paddedHeadLayers) * keys + paddedHeadLayers * values
             return (contextLength.toDouble() * bytesPerToken).toLong().coerceAtLeast(0L)
         }
 
@@ -272,6 +273,7 @@ class ModelReadinessAssessor(
             kvTypeV = "f16",
             attentionKeyLength = metadata?.attentionKeyLength,
             attentionValueLength = metadata?.attentionValueLength,
+            attentionKvHeadLayerSum = metadata?.attentionKvHeadLayerSum,
         )
         val baseBytes = info.bytes + runtimeOverhead + (settings.threadCount * MODEL_THREAD_SCRATCH_BYTES)
         val requiredRam = requiredMemoryWithKv(baseBytes, kvCacheEstimateBytes)

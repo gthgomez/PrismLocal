@@ -194,7 +194,10 @@ fun ChatScreen(
                         val recoveryTranscript by (service?.recoveryTranscript ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
                         val chatSessions by (service?.chatSessions ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = emptyList())
                         val currentChatId by (service?.currentChatId ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
-                        var selectedDocumentId by remember(currentChatId) { mutableStateOf<String?>(null) }
+                        var selectedDocumentId by rememberSaveable { mutableStateOf<String?>(null) }
+                        var pendingDocumentSend by rememberSaveable { mutableStateOf<ArrayList<String?>?>(null) }
+                        val documentSendStatus by (service?.documentSendStatus ?: emptyFlow())
+                            .collectAsStateWithLifecycle(initialValue = null)
                         val transcript by (service?.transcript ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = emptyList())
                         val generationSettings by (service?.generationSettings ?: emptyFlow()).collectAsStateWithLifecycle(
                             initialValue = GenerationSettings()
@@ -249,7 +252,8 @@ fun ChatScreen(
                         var prompt by rememberSaveable { mutableStateOf("") }
                         var savedAttachments by rememberSaveable { mutableStateOf(emptyList<String>()) }
                         var savedChatId by rememberSaveable { mutableStateOf<String?>(null) }
-                        var isSending by remember { mutableStateOf(false) }
+                        var isSendingChat by remember { mutableStateOf(false) }
+                        val isSending = isSendingChat || pendingDocumentSend != null
                         val attachments: List<PromptAttachment> =
                             remember(savedAttachments) {
                                 savedAttachments.mapNotNull(AttachmentTextCodec::decode)
@@ -280,9 +284,33 @@ fun ChatScreen(
                                 liveText = prompt,
                                 liveAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode),
                             ) ?: return@LaunchedEffect
+                            selectedDocumentId = null
                             prompt = loaded.first
                             savedAttachments = loaded.second.map(AttachmentTextCodec::encode)
                             savedChatId = draftStore.chatId
+                        }
+
+                        LaunchedEffect(documentSendStatus, service, currentChatId) {
+                            val (token, chatId, documentId, question) = pendingDocumentSend ?: return@LaunchedEffect
+                            // The service owns the request across activity recreation. A missing token
+                            // after service recreation leaves the draft available for another send.
+                            val status = service?.documentSendStatus?.value ?: run {
+                                if (service != null) pendingDocumentSend = null
+                                return@LaunchedEffect
+                            }
+                            if (status.token != token) {
+                                pendingDocumentSend = null
+                                return@LaunchedEffect
+                            }
+                            if (status.pending) return@LaunchedEffect
+                            pendingDocumentSend = null
+                            if (savedChatId != chatId || selectedDocumentId != documentId) return@LaunchedEffect
+                            if (status.refusal != null) {
+                                snackbarMessage = status.refusal
+                            } else if (prompt == question && savedAttachments.isEmpty()) {
+                                prompt = ""
+                                draftStore.clearIfMatches(chatId, question.orEmpty(), emptyList())
+                            }
                         }
 
                         var importStatus by remember { mutableStateOf("") }
@@ -776,31 +804,42 @@ fun ChatScreen(
                                         val originatingPrompt = prompt
                                         val originatingAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode)
                                         val sendToken = java.util.UUID.randomUUID().toString()
-                                        isSending = true
-                                        svc.generateSafely(
-                                            prompt = text,
-                                            sourceChatId = originatingChatId,
-                                            sendToken = sendToken,
-                                            selectedDocumentId = originatingDocumentId,
-                                            onAccepted = {
-                                                scope.launch {
-                                                    isSending = false
-                                                    if (currentChatId == originatingChatId) {
-                                                        if (prompt == originatingPrompt) {
-                                                            prompt = ""
+                                        if (originatingDocumentId != null) {
+                                            pendingDocumentSend = arrayListOf(
+                                                sendToken, originatingChatId, originatingDocumentId, originatingPrompt,
+                                            )
+                                            svc.generateSafely(
+                                                prompt = text,
+                                                sourceChatId = originatingChatId,
+                                                sendToken = sendToken,
+                                                selectedDocumentId = originatingDocumentId,
+                                            )
+                                        } else {
+                                            isSendingChat = true
+                                            svc.generateSafely(
+                                                prompt = text,
+                                                sourceChatId = originatingChatId,
+                                                sendToken = sendToken,
+                                                onAccepted = {
+                                                    scope.launch {
+                                                        isSendingChat = false
+                                                        if (currentChatId == originatingChatId) {
+                                                            if (prompt == originatingPrompt) {
+                                                                prompt = ""
+                                                            }
+                                                            if (savedAttachments.mapNotNull(AttachmentTextCodec::decode) == originatingAttachments) {
+                                                                savedAttachments = emptyList()
+                                                            }
                                                         }
-                                                        if (savedAttachments.mapNotNull(AttachmentTextCodec::decode) == originatingAttachments) {
-                                                            savedAttachments = emptyList()
-                                                        }
+                                                        draftStore.clearIfMatches(originatingChatId, originatingPrompt, originatingAttachments)
                                                     }
-                                                    draftStore.clearIfMatches(originatingChatId, originatingPrompt, originatingAttachments)
-                                                }
-                                            },
-                                            onRefused = { reason ->
-                                                isSending = false
-                                                snackbarMessage = reason
-                                            },
-                                        )
+                                                },
+                                                onRefused = { reason ->
+                                                    isSendingChat = false
+                                                    snackbarMessage = reason
+                                                },
+                                            )
+                                        }
                                     }
                                 }
                                 }

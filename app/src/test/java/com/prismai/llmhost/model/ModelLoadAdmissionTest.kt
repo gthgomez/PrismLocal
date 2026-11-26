@@ -25,4 +25,21 @@ class ModelLoadAdmissionTest {
         assertTrue(ModelLoadLimits.isLoadBlocked(1_000, estimate, 3_000, false))
         assertEquals(6_000L, ModelReadinessAssessor.requiredMemoryWithKv(4_000, 2_000))
     }
+
+    @Test
+    fun varyingKvHeadsSizeKeysPerLayerAndPadValuesToTheWidestLayer() {
+        val mib = 1024L * 1024
+        val estimate = ModelReadinessAssessor.estimateKvCacheBytes(
+            contextLength = 16_384,
+            blockCount = 32,
+            embeddingLength = 1024,
+            attentionHeadCount = 16,
+            attentionHeadCountKv = 4,
+            kvTypeK = "f16",
+            kvTypeV = "f16",
+            attentionKvHeadLayerSum = 96,
+        )
+        assertEquals(448 * mib, estimate)
+        assertFalse(ModelLoadLimits.isLoadBlocked(100 * mib, 100 * mib + estimate, 600 * mib, false))
+    }
 }

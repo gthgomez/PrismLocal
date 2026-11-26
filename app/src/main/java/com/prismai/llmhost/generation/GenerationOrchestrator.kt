@@ -416,7 +416,7 @@ class GenerationOrchestrator(
                 isCodingPreset = benchmarkPreset?.id == "coding",
                 notifyBenchmarkComplete = benchmarkPreset != null,
             ),
-        ) { result ->
+        ) { result, producingGeneration ->
             val agentToolCall = if (agentEnabled && result.finalReason == "EOF") {
                 AgentToolProtocol.parseToolCall(result.finalOutput)
             } else null
@@ -464,6 +464,7 @@ class GenerationOrchestrator(
                     prompt,
                     depth = 0,
                     chainId = agentChainId,
+                    producingGeneration = producingGeneration,
                 )
             }
         }
@@ -532,7 +533,7 @@ class GenerationOrchestrator(
             agentChainId = agentChainId,
             startedAt = startedAt,
             config = GenerationFlowConfig(errorLabel = "continuation"),
-        ) { result ->
+        ) { result, producingGeneration ->
             val agentToolCall = if (agentEnabled && result.finalReason == "EOF") {
                 AgentToolProtocol.parseToolCall(result.finalOutput)
             } else null
@@ -567,6 +568,7 @@ class GenerationOrchestrator(
                     "[continue]",
                     depth = 0,
                     chainId = agentChainId,
+                    producingGeneration = producingGeneration,
                 )
             }
         }
@@ -671,7 +673,7 @@ class GenerationOrchestrator(
                 checkEmptyStart = false,
                 checkReload = true,
             ),
-        ) { result ->
+        ) { result, producingGeneration ->
             val nextToolCall = if (result.finalReason == "EOF") AgentToolProtocol.parseToolCall(result.finalOutput) else null
             agentTrace.recordGenerationTurn(
                 terminalReason = result.finalReason,
@@ -692,6 +694,7 @@ class GenerationOrchestrator(
                     originalPrompt,
                     depth,
                     chainId = agentChainId,
+                    producingGeneration = producingGeneration,
                 )
             }
         }
@@ -721,7 +724,7 @@ class GenerationOrchestrator(
         messages: List<ChatMessage>? = null,
         continueFromContext: Boolean = false,
         agentChainId: Long? = null,
-        onComplete: (GenerationFlowResult) -> Unit,
+        onComplete: (GenerationFlowResult, Job?) -> Unit,
     ): Job {
         val sessionOutput = GenerationOutputAccumulator(uiState.streamState.snapshotText())
         var firstTokenAt: Long? = null
@@ -927,6 +930,7 @@ class GenerationOrchestrator(
                         generatedTokens = generatedTokens,
                         terminalDetail = terminalDetail,
                     ),
+                    kotlinx.coroutines.currentCoroutineContext()[Job],
                 )
 
                 // ── Shared cleanup tail ────────────────────────────────────

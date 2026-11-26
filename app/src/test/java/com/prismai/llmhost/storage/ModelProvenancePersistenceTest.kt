@@ -107,8 +107,9 @@ class ModelProvenancePersistenceTest {
         assertEquals("qwen2", metadata.architecture)
         assertEquals(3, metadata.blockCount)
         assertEquals(1024, metadata.embeddingLength)
-        assertEquals(8, metadata.attentionHeadCount)
+        assertEquals(16, metadata.attentionHeadCount)
         assertEquals(if (explicitKvHeads) 4 else 16, metadata.attentionHeadCountKv)
+        assertEquals(if (explicitKvHeads) 6L else 24L, metadata.attentionKvHeadLayerSum)
         assertEquals(96, metadata.attentionValueLength)
         val activation = manager.resolveActiveModelForActivation(modelId)
         assertEquals(ModelStorageManager.ModelStorageError.Code.INVALID_GGUF_HEADER,

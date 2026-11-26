@@ -136,6 +136,30 @@ class ModelStorageManagerTest {
     }
 
     @Test
+    fun priorContainerReceiptRevalidatesWithLongMetadataKey() {
+        val manager = ModelStorageManager(context)
+        val modelId = "prior-container"
+        cleanup(modelId)
+        try {
+            val bytes = validGgufBytes(metadataKey = "custom." + "x".repeat(4096))
+            val installed = manager.importModelFromStream("$modelId.gguf", bytes.size.toLong(), bytes.inputStream())
+                as ModelStorageManager.ImportResult.Success
+            val manifestFile = File(modelsDir(), "$modelId/manifest.json")
+            val manifest = org.json.JSONObject(manifestFile.readText())
+            manifest.getJSONObject("versions").getJSONObject(installed.model.versionId)
+                .getJSONObject("validation").put("status", "container_checked_v1")
+            manifestFile.writeText(manifest.toString())
+
+            val activated = manager.resolveActiveModelForActivation(modelId) as ModelStorageManager.ModelResolveResult.Success
+            assertEquals("container_checked_v2", activated.model.validation.status)
+            assertEquals(installed.model.sha256, activated.model.sha256)
+            assertEquals(installed.model.versionId, activated.model.versionId)
+        } finally {
+            cleanup(modelId)
+        }
+    }
+
+    @Test
     fun partialImportFailureCleansStaging() {
         val manager = ModelStorageManager(context)
         cleanup("partial-model")
@@ -389,12 +413,17 @@ class ModelStorageManagerTest {
         }
     }
 
-    private fun validGgufBytes(seed: Int = 1, truncateTensor: Boolean = false): ByteArray {
+    private fun validGgufBytes(
+        seed: Int = 1,
+        truncateTensor: Boolean = false,
+        metadataKey: String = "test.value",
+    ): ByteArray {
         // A well-formed container with one F32 tensor for storage tests.
         // It has no architecture or tokenizer and is not an inference model.
-        val buffer = ByteBuffer.allocate(160).order(ByteOrder.LITTLE_ENDIAN)
+        val key = metadataKey.toByteArray()
+        val buffer = ByteBuffer.allocate(150 + key.size).order(ByteOrder.LITTLE_ENDIAN)
             .put("GGUF".toByteArray()).putInt(3).putLong(1).putLong(1)
-            .putLong(10).put("test.value".toByteArray()).putInt(4).putInt(seed)
+            .putLong(key.size.toLong()).put(key).putInt(4).putInt(seed)
             .putLong(11).put("test.weight".toByteArray()).putInt(1).putLong(1).putInt(0).putLong(0)
         val tensorDataOffset = (buffer.position() + 31) / 32 * 32
         buffer.putFloat(tensorDataOffset, seed.toFloat())

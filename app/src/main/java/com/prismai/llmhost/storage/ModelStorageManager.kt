@@ -212,6 +212,7 @@ class ModelStorageManager(
         val hasChatTemplate: Boolean = false,
         val attentionKeyLength: Int? = null,
         val attentionValueLength: Int? = null,
+        val attentionKvHeadLayerSum: Long? = null,
     )
 
     data class ImportProgress(
@@ -727,6 +728,7 @@ class ModelStorageManager(
                                         .put("attention_head_count_kv", metadata.attentionHeadCountKv)
                                         .put("attention_key_length", metadata.attentionKeyLength)
                                         .put("attention_value_length", metadata.attentionValueLength)
+                                        .put("attention_kv_head_layer_sum", metadata.attentionKvHeadLayerSum)
                                         .put("has_chat_template", metadata.hasChatTemplate)
                                 )
                             }
@@ -875,13 +877,16 @@ class ModelStorageManager(
             hasChatTemplate = metadata.optBoolean("has_chat_template", false),
             attentionKeyLength = metadata.optIntOrNull("attention_key_length"),
             attentionValueLength = metadata.optIntOrNull("attention_value_length"),
+            attentionKvHeadLayerSum = metadata.optLong("attention_kv_head_layer_sum", -1).takeIf { it >= 0 },
         )
     }
 
     private fun parseGgufMetadata(reader: GgufReader, checkCancelled: () -> Unit): Pair<GgufMetadataSummary, Long> {
         val kvCount = reader.readCount(minOf(4096L, reader.remaining / 13), "metadata count")
         val keys = HashSet<String>()
-        val shapeValues = mutableMapOf<String, IntRange>()
+        val shapeValues = mutableMapOf<String, Int>()
+        val headArrays = mutableMapOf<String, HeadArraySummary>()
+        val longKeys = HashSet<String>()
         var alignment = 32L
         var architecture: String? = null
         var name: String? = null
@@ -891,9 +896,13 @@ class ModelStorageManager(
 
         repeat(kvCount.toInt()) {
             checkCancelled()
-            val key = reader.readGgufString(4_096)
-            if (key.isEmpty() || '\u0000' in key || !keys.add(key)) throw IOException("Invalid GGUF metadata key")
-            val shapeField = key.substringAfter('.', "")
+            val key = reader.readGgufString()
+            val newKey = if (key.length <= 4096) keys.add(key) else {
+                val fingerprint = MessageDigest.getInstance("SHA-256").digest(key.toByteArray(Charsets.UTF_8)).toHex()
+                longKeys.add(fingerprint)
+            }
+            if (key.isEmpty() || '\u0000' in key || !newKey) throw IOException("Invalid GGUF metadata key")
+            val shapeField = if (key.length <= 4096) key.substringAfter('.', "") else ""
             val type = reader.readU32()
             val headCounts = shapeField == "attention.head_count" || shapeField == "attention.head_count_kv"
             val value = reader.readMetadataValue(type, headCounts)
@@ -912,10 +921,10 @@ class ModelStorageManager(
                 else -> {
                     if (shapeField in GGUF_SHAPE_FIELDS) {
                         when (value) {
-                            is IntRange -> shapeValues[key] = value
+                            is HeadArraySummary -> headArrays[key] = value
                             is Number -> if (value.toLong() > 0L) {
                                 val dimension = value.toLong().coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-                                shapeValues[key] = dimension..dimension
+                                shapeValues[key] = dimension
                             }
                         }
                     }
@@ -923,22 +932,28 @@ class ModelStorageManager(
             }
         }
 
-        fun shape(field: String): IntRange? = architecture?.let { shapeValues["$it.$field"] }
-        val queryHeads = shape("attention.head_count")
+        fun shape(field: String): Int? = architecture?.let { shapeValues["$it.$field"] }
+        val queryHeadArray = headArrays["$architecture.attention.head_count"]
+        val queryHeads = queryHeadArray?.first ?: shape("attention.head_count")
+        // Native defaults each layer's KV heads to its query heads if no KV override is present.
+        val explicitKvHeads = shape("attention.head_count_kv")
+        val kvHeadArray = headArrays["$architecture.attention.head_count_kv"]
+            ?: queryHeadArray.takeIf { explicitKvHeads == null }
+        val blockCount = shape("block_count")
         return GgufMetadataSummary(
             architecture = architecture,
             name = name,
             sizeLabel = sizeLabel,
             fileType = fileType,
-            contextLength = shape("context_length")?.first,
-            blockCount = shape("block_count")?.first,
-            embeddingLength = shape("embedding_length")?.first,
-            attentionHeadCount = queryHeads?.first,
-            // llama.cpp defaults each layer's KV heads to that layer's query heads.
-            attentionHeadCountKv = shape("attention.head_count_kv")?.last ?: queryHeads?.last,
+            contextLength = shape("context_length"),
+            blockCount = blockCount,
+            embeddingLength = shape("embedding_length"),
+            attentionHeadCount = queryHeads,
+            attentionHeadCountKv = kvHeadArray?.maximum ?: explicitKvHeads ?: queryHeads,
             hasChatTemplate = hasChatTemplate,
-            attentionKeyLength = shape("attention.key_length")?.first,
-            attentionValueLength = shape("attention.value_length")?.first,
+            attentionKeyLength = shape("attention.key_length"),
+            attentionValueLength = shape("attention.value_length"),
+            attentionKvHeadLayerSum = kvHeadArray?.takeIf { it.count == blockCount }?.sum,
         ) to alignment
     }
 
@@ -979,6 +994,8 @@ class ModelStorageManager(
 
     private fun JSONObject.optIntOrNull(name: String): Int? =
         if (has(name) && !isNull(name)) optInt(name) else null
+
+    private data class HeadArraySummary(val count: Int, val first: Int, val maximum: Int, val sum: Long)
 
     private class GgufReader(private val input: DataInputStream, size: Long) {
         private val scratch = ByteArray(8)
@@ -1034,16 +1051,16 @@ class ModelStorageManager(
                     val count = readCount(minOf(1_000_000L, remaining / elementBytes), "array length")
                     when {
                         headCounts && elementType in 0..5 -> {
-                            var minimum = Int.MAX_VALUE
+                            var first = 0
                             var maximum = 0
-                            repeat(count.toInt()) {
+                            var sum = 0L
+                            repeat(count.toInt()) { index ->
                                 val heads = readScalar(elementBytes.toInt()).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-                                if (heads > 0) {
-                                    minimum = minOf(minimum, heads)
-                                    maximum = maxOf(maximum, heads)
-                                }
+                                if (index == 0) first = heads
+                                maximum = maxOf(maximum, heads)
+                                sum += heads
                             }
-                            (minimum..maximum).takeUnless { it.isEmpty() }
+                            HeadArraySummary(count.toInt(), first, maximum, sum)
                         }
                         elementType == 8 -> {
                             repeat(count.toInt()) { skipFully(readU64()) }

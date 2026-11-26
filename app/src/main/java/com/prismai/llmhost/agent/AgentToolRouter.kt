@@ -14,11 +14,14 @@ import com.prismai.llmhost.ui.ServiceUiState
 import org.json.JSONObject
 import java.io.File
 import java.util.Locale
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -72,6 +75,13 @@ class AgentToolRouter(
         val chainId: Long,
         val chatId: String,
     )
+
+    internal class ToolDispatch(
+        val owner: AgentToolJobOwner,
+        val producingGeneration: Job?,
+    ) : AbstractCoroutineContextElement(Key) {
+        companion object Key : CoroutineContext.Key<ToolDispatch>
+    }
 
     private val toolJobsLock = Any()
     private val toolJobsByChain = mutableMapOf<Long, MutableSet<OwnedToolJob>>()
@@ -303,6 +313,7 @@ class AgentToolRouter(
         originalPrompt: String,
         depth: Int,
         chainId: Long? = null,
+        producingGeneration: Job? = null,
     ) {
         val sourceChatId = currentChatId()
         if (chainId == null || sourceChatId.isNullOrBlank() || !isCurrentOwner(chainId, sourceChatId)) return
@@ -507,7 +518,9 @@ class AgentToolRouter(
                 launchOwnedToolJob(chainId, sourceChatId) toolJob@{
                     val stepStart = clock()
                     val result = try {
-                        executeTool(validatedCall, false)
+                        withContext(ToolDispatch(AgentToolJobOwner(chainId, sourceChatId), producingGeneration)) {
+                            executeTool(validatedCall, false)
+                        }
                     } catch (e: CancellationException) {
                         failTrace(chainId, "Tool execution cancelled")
                         throw e

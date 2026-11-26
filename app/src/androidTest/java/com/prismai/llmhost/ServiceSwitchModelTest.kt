@@ -203,27 +203,39 @@ class ServiceSwitchModelTest {
     }
 
     @Test
-    fun oversizedModelIsRejectedWithoutUnloadingCurrentModel() = runBlocking {
+    fun oversizedReplacementIsRejectedWithoutUnloadingPreviousVersion() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val targetContext = instrumentation.targetContext
-        stageModel(instrumentation, "modelA")
-        stageModel(instrumentation, "oversizedModel")
+        val modelId = "oversizedReplacement"
+        stageModel(instrumentation, modelId)
         val modelsDir = targetContext.getExternalFilesDir("models") ?: File(targetContext.filesDir, "models")
-        val oversizedRoot = File(modelsDir, "oversizedModel")
+        val modelRoot = File(modelsDir, modelId)
+        val manifestFile = File(modelRoot, "manifest.json")
+        val originalManifest = manifestFile.readText()
+        val replacementFile = File(modelRoot, "oversized.gguf")
         val service = bindService(targetContext)
         try {
-            assertTrue(service.service.switchModel("modelA"))
+            assertTrue(service.service.switchModel(modelId))
+            val priorVersion = service.service.activeModelInfo.value?.versionId
+            val manifest = org.json.JSONObject(originalManifest)
+            val versions = manifest.getJSONObject("versions")
+            val replacement = org.json.JSONObject(versions.getJSONObject(manifest.getString("active_version")).toString())
+                .put("file", replacementFile.name)
+            versions.put("oversized", replacement)
+            manifest.put("active_version", "oversized")
+            RandomAccessFile(replacementFile, "rw").use { it.setLength(ModelLoadLimits.HARD_CAP_BYTES + 1) }
+            manifestFile.writeText(manifest.toString())
 
-            val oversizedFile = File(oversizedRoot, "tinyllama-v0.q8_0.gguf")
-            RandomAccessFile(oversizedFile, "rw").use { it.setLength(ModelLoadLimits.HARD_CAP_BYTES + 1) }
-            assertFalse(service.service.switchModel("oversizedModel"))
+            assertFalse(service.service.switchModel(modelId))
             assertTrue(service.service.modelLoadDiagnostics.value?.message.orEmpty().contains("load cap"))
 
-            assertEquals("modelA", service.service.currentModel.value)
+            assertEquals(modelId, service.service.currentModel.value)
+            assertEquals(priorVersion, service.service.activeModelInfo.value?.versionId)
             assertFalse(service.service.isGenerating.value)
             assertFalse(service.service.debugIsGenerationForegroundActive())
         } finally {
-            oversizedRoot.deleteRecursively()
+            manifestFile.writeText(originalManifest)
+            replacementFile.delete()
             service.service.cancelGeneration()
             targetContext.unbindService(service.connection)
         }

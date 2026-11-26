@@ -92,7 +92,9 @@ class ModelManager(
 
         when (val resolved = modelStorageManager.resolveActiveModelForActivation(modelId, ModelLoadLimits.HARD_CAP_BYTES)) {
             is ModelStorageManager.ModelResolveResult.Failure -> {
-                if (uiState._currentModel.value == modelId) {
+                val loadedFile = uiState._activeModelInfo.value?.file
+                val rejectsLoadedFile = resolved.rejectedFile == null || resolved.rejectedFile == loadedFile?.canonicalFile
+                if (uiState._currentModel.value == modelId && rejectsLoadedFile) {
                     engine.unloadModel()
                     lastLoadedPlanKey = null
                     uiState.streamState.clear()

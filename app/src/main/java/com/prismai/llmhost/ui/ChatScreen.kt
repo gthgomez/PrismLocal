@@ -195,8 +195,8 @@ fun ChatScreen(
                         val chatSessions by (service?.chatSessions ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = emptyList())
                         val currentChatId by (service?.currentChatId ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = null)
                         var selectedDocumentId by rememberSaveable { mutableStateOf<String?>(null) }
-                        var pendingDocumentSend by rememberSaveable { mutableStateOf<ArrayList<String?>?>(null) }
-                        val documentSendStatus by (service?.documentSendStatus ?: emptyFlow())
+                        var pendingComposerSend by rememberSaveable { mutableStateOf<ArrayList<String?>?>(null) }
+                        val composerSendStatus by (service?.composerSendStatus ?: emptyFlow())
                             .collectAsStateWithLifecycle(initialValue = null)
                         val transcript by (service?.transcript ?: emptyFlow()).collectAsStateWithLifecycle(initialValue = emptyList())
                         val generationSettings by (service?.generationSettings ?: emptyFlow()).collectAsStateWithLifecycle(
@@ -252,8 +252,7 @@ fun ChatScreen(
                         var prompt by rememberSaveable { mutableStateOf("") }
                         var savedAttachments by rememberSaveable { mutableStateOf(emptyList<String>()) }
                         var savedChatId by rememberSaveable { mutableStateOf<String?>(null) }
-                        var isSendingChat by remember { mutableStateOf(false) }
-                        val isSending = isSendingChat || pendingDocumentSend != null
+                        val isSending = pendingComposerSend != null
                         val attachments: List<PromptAttachment> =
                             remember(savedAttachments) {
                                 savedAttachments.mapNotNull(AttachmentTextCodec::decode)
@@ -291,27 +290,32 @@ fun ChatScreen(
                             savedChatId = draftStore.chatId
                         }
 
-                        LaunchedEffect(documentSendStatus, service, currentChatId) {
-                            val (token, chatId, documentId, question) = pendingDocumentSend ?: return@LaunchedEffect
+                        LaunchedEffect(composerSendStatus, service, currentChatId) {
+                            val request = pendingComposerSend ?: return@LaunchedEffect
+                            val (token, chatId, documentId, question) = request
                             // The service owns the request across activity recreation. A missing token
                             // after service recreation leaves the draft available for another send.
-                            val status = service?.documentSendStatus?.value ?: run {
-                                if (service != null) pendingDocumentSend = null
+                            val status = service?.composerSendStatus?.value ?: run {
+                                if (service != null) pendingComposerSend = null
                                 return@LaunchedEffect
                             }
                             if (status.token != token) {
-                                pendingDocumentSend = null
+                                pendingComposerSend = null
                                 return@LaunchedEffect
                             }
                             if (status.pending) return@LaunchedEffect
-                            pendingDocumentSend = null
-                            if (savedChatId != chatId || selectedDocumentId != documentId) return@LaunchedEffect
+                            pendingComposerSend = null
                             if (status.refusal != null) {
                                 snackbarMessage = status.refusal
-                            } else if (prompt == question && savedAttachments.isEmpty()) {
-                                prompt = ""
-                                draftStore.clearIfMatches(chatId, question.orEmpty(), emptyList())
+                                return@LaunchedEffect
                             }
+                            if (documentId != null && (savedChatId != chatId || selectedDocumentId != documentId)) return@LaunchedEffect
+                            val sentAttachments = request.drop(4).filterNotNull()
+                            if (savedChatId == chatId && prompt == question && savedAttachments == sentAttachments) {
+                                prompt = ""
+                                savedAttachments = emptyList()
+                            }
+                            draftStore.clearIfMatches(chatId, question.orEmpty(), sentAttachments.mapNotNull(AttachmentTextCodec::decode))
                         }
 
                         var importStatus by remember { mutableStateOf("") }
@@ -793,52 +797,25 @@ fun ChatScreen(
                                      snackbarMessage = "Wait for document indexing to finish"
                                  } else if (selectedDocumentId != null && attachments.isNotEmpty()) {
                                      snackbarMessage = "Remove attachments before asking the selected document"
-                                 } else if (!isSendingChat && pendingDocumentSend == null) {
+                                 } else if (pendingComposerSend == null) {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 val svc = service
                                 if (text.isNotEmpty()) {
                                     if (svc == null) {
                                         snackbarMessage = "Service unavailable"
                                     } else {
-                                        val originatingChatId = currentChatId
-                                        val originatingDocumentId = selectedDocumentId
-                                        val originatingPrompt = prompt
-                                        val originatingAttachments = savedAttachments.mapNotNull(AttachmentTextCodec::decode)
-                                        val sendToken = java.util.UUID.randomUUID().toString()
-                                        if (originatingDocumentId != null) {
-                                            pendingDocumentSend = arrayListOf(
-                                                sendToken, originatingChatId, originatingDocumentId, originatingPrompt,
-                                            )
-                                            svc.generateSafely(
-                                                prompt = text,
-                                                sourceChatId = originatingChatId,
-                                                sendToken = sendToken,
-                                                selectedDocumentId = originatingDocumentId,
-                                            )
+                                        val owner = draftStore.chatId
+                                        if (svc.currentChatId.value != owner) {
+                                            snackbarMessage = "Wait for the selected chat before sending"
                                         } else {
-                                            isSendingChat = true
+                                            val sendToken = java.util.UUID.randomUUID().toString()
+                                            pendingComposerSend = arrayListOf(sendToken, owner, selectedDocumentId, prompt)
+                                                .apply { addAll(savedAttachments) }
                                             svc.generateSafely(
                                                 prompt = text,
-                                                sourceChatId = originatingChatId,
+                                                sourceChatId = owner,
                                                 sendToken = sendToken,
-                                                onAccepted = {
-                                                    scope.launch {
-                                                        isSendingChat = false
-                                                        if (currentChatId == originatingChatId) {
-                                                            if (prompt == originatingPrompt) {
-                                                                prompt = ""
-                                                            }
-                                                            if (savedAttachments.mapNotNull(AttachmentTextCodec::decode) == originatingAttachments) {
-                                                                savedAttachments = emptyList()
-                                                            }
-                                                        }
-                                                        draftStore.clearIfMatches(originatingChatId, originatingPrompt, originatingAttachments)
-                                                    }
-                                                },
-                                                onRefused = { reason ->
-                                                    isSendingChat = false
-                                                    snackbarMessage = reason
-                                                },
+                                                selectedDocumentId = selectedDocumentId,
                                             )
                                         }
                                     }

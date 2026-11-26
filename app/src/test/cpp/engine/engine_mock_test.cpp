@@ -132,11 +132,21 @@ int testDrainAcknowledgementDistinguishesInvalidBatchFromRetiredRing() {
     }
     CHECK(!batch.tokens.empty());
     const int count = static_cast<int>(batch.tokens.size());
-    // Acknowledge an incorrect tail in a still-owned session.
+    engine.setMemoryPressure(3);
+    const auto cancelDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (engine.getState(genId) != kStateCancelled && std::chrono::steady_clock::now() < cancelDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(engine.getState(genId) == kStateCancelled);
+    // A worker can report CANCELLED while its unacknowledged batch is still owned.
     CHECK(engine.acknowledgeDrainedTokens(genId, batch.drain_tail + 1, count) == DrainAcknowledgement::Invalid);
-    // Deliver the same in-flight batch after unloading its owner.
-    engine.unloadModel();
+    // A failed replacement still retires the old session and discards its ring.
+    CHECK(!engine.loadModel(""));
     CHECK(engine.acknowledgeDrainedTokens(genId, batch.drain_tail, count) == DrainAcknowledgement::Retired);
+    const auto retired = engine.drainDecodeAndState(genId, 64);
+    CHECK(retired.tokens.empty());
+    CHECK(!retired.pending);
+    CHECK(retired.state == kStateCancelled);
     return 0;
 }
 

@@ -1074,6 +1074,13 @@ struct Engine::Impl {
         if (session_to_join && session_to_join->worker.joinable()) {
             session_to_join->worker.join();
         }
+        if (session_to_join) {
+            // The caller owns the lifecycle gate (or is destroying the engine).
+            // No drain may return an unacknowledgeable batch after retirement.
+            auto* ctrl = buffers.control;
+            clearRing(ctrl);
+            ctrl->state.store(static_cast<uint32_t>(StreamState::Cancelled), std::memory_order_release);
+        }
     }
 
     void finishSession(const std::shared_ptr<GenerationSession>& session, StreamState final_state) {
@@ -1691,19 +1698,11 @@ struct Engine::Impl {
         // drain/decode/ack. recursive_mutex is required because the combined
         // drain API composes the primitive public operations below.
         auto lifecycle_lock = lifecycle_gate.enter();
-        std::shared_ptr<GenerationSession> old_session;
+        cancelAndJoinActiveSession();
         std::shared_ptr<ModelRuntime> runtime;
         {
             std::lock_guard<std::mutex> lock(mu);
             runtime = active_runtime;
-            old_session = active_session;
-            if (old_session) {
-                old_session->cancel_requested.store(true, std::memory_order_release);
-            }
-            active_session.reset();
-        }
-        if (old_session && old_session->worker.joinable()) {
-            old_session->worker.join();
         }
         if (!runtime) {
             return -1;

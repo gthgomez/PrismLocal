@@ -246,7 +246,7 @@ class ModelStorageManager(
 
     sealed class ModelResolveResult {
         data class Success(val model: ActiveModelInfo) : ModelResolveResult()
-        data class Failure(val error: ModelStorageError) : ModelResolveResult()
+        data class Failure(val error: ModelStorageError, val rejectedFile: File? = null) : ModelResolveResult()
     }
 
     fun listInstalledModels(): List<String> {
@@ -617,7 +617,8 @@ class ModelStorageManager(
                     ModelStorageError(
                         ModelStorageError.Code.FILE_TOO_LARGE,
                         "Model $modelId exceeds this build's ${maxLoadBytes / (1024 * 1024)} MiB load cap",
-                    )
+                    ),
+                    rejectedFile = modelFile.canonicalFile,
                 )
             }
             val expectedSha = activeObj.getString("sha256")

@@ -152,10 +152,10 @@ class InferenceService : Service() {
     // avoids enqueuing redundant cancellation work.
     private val teardownStarted = AtomicBoolean(false)
     private val inFlightSendTokens = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    data class DocumentSendStatus(val token: String, val pending: Boolean, val refusal: String? = null)
+    data class ComposerSendStatus(val token: String, val pending: Boolean, val refusal: String? = null)
 
-    private val _documentSendStatus = MutableStateFlow<DocumentSendStatus?>(null)
-    val documentSendStatus: StateFlow<DocumentSendStatus?> = _documentSendStatus.asStateFlow()
+    private val _composerSendStatus = MutableStateFlow<ComposerSendStatus?>(null)
+    val composerSendStatus: StateFlow<ComposerSendStatus?> = _composerSendStatus.asStateFlow()
     private val modelEpoch = java.util.concurrent.atomic.AtomicLong(1L)
     private val vectorRefreshLock = Any()
 
@@ -1184,8 +1184,7 @@ class InferenceService : Service() {
         onRefused: ((String) -> Unit)? = null,
         selectedDocumentId: String? = null,
     ) {
-        val documentToken = sendToken?.takeIf { selectedDocumentId != null }
-        if (documentToken != null) _documentSendStatus.value = DocumentSendStatus(documentToken, pending = true)
+        if (sendToken != null) _composerSendStatus.value = ComposerSendStatus(sendToken, pending = true)
         serviceScope.launch {
             try {
                 generateSafelyAndAwait(
@@ -1195,24 +1194,24 @@ class InferenceService : Service() {
                     sourceChatId = sourceChatId,
                     sendToken = sendToken,
                     onAccepted = {
-                        documentToken?.let { finishDocumentSend(it) }
+                        sendToken?.let { finishComposerSend(it) }
                         onAccepted?.invoke()
                     },
                     onRefused = { reason ->
-                        documentToken?.let { finishDocumentSend(it, reason) }
+                        sendToken?.let { finishComposerSend(it, reason) }
                         onRefused?.invoke(reason)
                     },
                     selectedDocumentId = selectedDocumentId,
                 )
             } finally {
-                documentToken?.let { finishDocumentSend(it, "No completed document answer; the question was kept") }
+                sendToken?.let { finishComposerSend(it, "Send did not complete; the draft was kept") }
             }
         }
     }
 
-    private fun finishDocumentSend(token: String, refusal: String? = null) {
-        val pending = DocumentSendStatus(token, pending = true)
-        _documentSendStatus.compareAndSet(pending, DocumentSendStatus(token, pending = false, refusal = refusal))
+    private fun finishComposerSend(token: String, refusal: String? = null) {
+        val pending = ComposerSendStatus(token, pending = true)
+        _composerSendStatus.compareAndSet(pending, ComposerSendStatus(token, pending = false, refusal = refusal))
     }
 
     /** Reports a refusal to the caller (if any) and returns the reason as the call result. */
@@ -1266,9 +1265,10 @@ class InferenceService : Service() {
             ) {
                 throw BackgroundTaskDeferredException()
             }
-            if (!initiatedByBackground &&
-                serviceGenerationOwnership.shouldRefuseUserSend(sourceChatId, _currentChatId.value)
-            ) {
+            val selectedChatId = _currentChatId.value
+            val chatChanged = if (sendToken != null) sourceChatId != selectedChatId
+                else serviceGenerationOwnership.shouldRefuseUserSend(sourceChatId, selectedChatId)
+            if (!initiatedByBackground && chatChanged) {
                 // The composer captured this send while its source chat was
                 // selected, but the selection changed before the operation mutex
                 // was granted. Refuse under the admission lock, before any

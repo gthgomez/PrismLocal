@@ -63,7 +63,7 @@ class QwenGreedyConformanceTest {
     }
 
     private fun nativeLogs(): String {
-        val command = "logcat -d --pid=${Process.myPid()} -s LlmHostNative:I llama:I"
+        val command = "logcat -d --pid=${Process.myPid()} -s LlmHostNative:I llama:I $TAG:I"
         val descriptor = InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command)
         return ParcelFileDescriptor.AutoCloseInputStream(descriptor).bufferedReader().use { it.readText() }
     }
@@ -74,8 +74,10 @@ class QwenGreedyConformanceTest {
         val settings = fixtureSettings()
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {
+            val loadMarker = "begin_qwen_fixture_load=${SystemClock.elapsedRealtime()}"
+            Log.i(TAG, loadMarker)
             assertTrue("Qwen fixture failed to load", engine.loadModel(model.absolutePath, settings))
-            val logs = nativeLogs()
+            val logs = nativeLogs().substringAfter(loadMarker, missingDelimiterValue = "")
             assertTrue("CPU-only load was not applied", logs.contains("gpu_layers_requested=0 gpu_layers_verified=0") &&
                 logs.contains("cpu_pinned=1 op_offload=0"))
             assertTrue("CPU KV and compute placement were not observed",

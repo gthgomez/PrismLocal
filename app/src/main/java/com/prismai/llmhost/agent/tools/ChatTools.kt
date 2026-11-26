@@ -47,7 +47,7 @@ class ChatTools(
                 .put("role", message.role.name.lowercase(Locale.US))
                 .put("text", message.text.compactForAgent(360)))
         }
-        val currentTitle = visibleTitle(chatSessions().firstOrNull { it.id == currentChatId() }, allMessages)
+        val currentTitle = visibleTitle(messages)
         val summary = if (messages.isEmpty()) "Current chat is empty"
         else "$currentTitle: $userTurns user turn${if (userTurns == 1) "" else "s"}, $assistantTurns assistant response${if (assistantTurns == 1) "" else "s"}"
         return AgentToolResult(call = call, success = true, summary = summary,
@@ -89,7 +89,7 @@ class ChatTools(
                 val archived = if (session.id == currentId) currentMessages else
                     transcriptStore.readTranscriptFile(transcriptStore.transcriptFile(session.id))
                 val messages = archived.modelVisibleMessages()
-                val title = visibleTitle(session, archived)
+                val title = visibleTitle(messages)
                 val haystack = buildString {
                     append(title)
                     append(' ')
@@ -117,9 +117,9 @@ class ChatTools(
                 .put("snippet_length", snippetLength).put("results", results))
     }
 
-    private fun visibleTitle(session: ChatSession?, messages: List<TranscriptMessage>): String =
-        if (messages.any { it.contextBoundaryAfter || it.documentScope != null }) ChatTitles.DEFAULT_TITLE
-        else session?.title ?: ChatTitles.DEFAULT_TITLE
+    private fun visibleTitle(messages: List<TranscriptMessage>): String =
+        messages.firstOrNull { it.role == TranscriptRole.USER && it.text.isNotBlank() }
+            ?.let { ChatTitles.fromPrompt(it.text) } ?: ChatTitles.DEFAULT_TITLE
 
     suspend fun exportChat(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return toolFailure(call, AgentToolErrorCode.CONFIRMATION_REQUIRED, "Chat export requires confirmation")

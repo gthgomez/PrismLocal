@@ -31,10 +31,9 @@ internal object ChatIdentityOperations {
         }
         return toolSuccess(
             call = call,
-            summary = "Cleared ${session.title}",
+            summary = "Cleared chat messages",
             details = JSONObject()
                 .put("chat_id", session.id)
-                .put("title", session.title)
                 .put("action", "clear_messages"),
         )
     }

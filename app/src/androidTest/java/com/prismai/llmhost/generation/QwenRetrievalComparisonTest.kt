@@ -27,7 +27,8 @@ class QwenRetrievalComparisonTest {
         }
         val suffix = UUID.randomUUID().toString()
         val ids = listOf("qualification-cedar-$suffix", "qualification-distractor-$suffix")
-        val store = VectorStore(instrumentation.targetContext)
+        val database = "qualification-$suffix.db"
+        val store = VectorStore(instrumentation.targetContext, database)
         val identity = EmbeddingIdentity(PINNED_QWEN_SHA256, VectorStore.EMBEDDING_REVISION)
         store.setEmbeddingIdentityProvider { identity }
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
@@ -47,8 +48,8 @@ class QwenRetrievalComparisonTest {
             for (question in questions) {
                 val embedding = engine.encode(question)
                 assertTrue("query embedding failed", embedding.isNotEmpty())
-                val native = store.search(embedding, topK = 20, minScore = -1f, expectedIdentity = identity)
-                    .filter { it.first.documentId in ids }
+                val native = store.search(embedding, topK = store.chunkCount(), minScore = -1f, expectedIdentity = identity)
+                assertTrue("comparison must include both fixture documents", native.map { it.first.documentId }.toSet() == ids.toSet())
                 val selected = store.searchDocument(ids[0], embedding, 3, RagManager.DEFAULT_MIN_RAG_SCORE, identity)
                 assertTrue(selected.matches.isNotEmpty())
                 assertTrue(selected.matches.all { it.first.documentId == ids[0] })
@@ -61,6 +62,7 @@ class QwenRetrievalComparisonTest {
         } finally {
             ids.forEach { store.deleteByDocument(it) }
             engine.destroySafely()
+            instrumentation.targetContext.deleteDatabase(database)
         }
     }
 

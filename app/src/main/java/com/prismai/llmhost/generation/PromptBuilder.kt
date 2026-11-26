@@ -29,7 +29,7 @@ class PromptBuilder(
 
         internal fun withQuestionMemory(question: String, factLines: String): String =
             if (factLines.isBlank()) question else
-                "For this question, my saved information is:\n$factLines\n\nQuestion: $question"
+                "Relevant saved notes for this chat:\n$factLines\n\nQuestion: $question"
 
         /**
          * Pure, Android-free assembly of the structured (role-preserving) message

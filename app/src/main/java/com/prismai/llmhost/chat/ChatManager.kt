@@ -486,10 +486,11 @@ class ChatManager(
 
     // ── Private helpers ──────────────────────────────────────────────────
 
-    private fun persistTranscriptNow() {
-        val chatId = uiState._currentChatId.value ?: return
-        val revision = transcriptWriteRevision(chatId)
-        val messages = uiState._transcript.value
+    internal fun persistTranscriptNow() {
+        val (chatId, messages, revision) = synchronized(lock) {
+            val id = uiState._currentChatId.value ?: return
+            Triple(id, uiState._transcript.value, transcriptWriteRevision(id))
+        }
         scope.launch(Dispatchers.IO) {
             persistTranscript(chatId, messages, revision)
         }

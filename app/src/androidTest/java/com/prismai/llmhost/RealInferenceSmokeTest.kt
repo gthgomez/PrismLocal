@@ -175,8 +175,12 @@ class RealInferenceSmokeTest {
             assertEquals("An impossible continuation must not move the cache", before, observedShiftPrefixLengths().size)
             val continued = engine.generate("", settings.copy(maxTokens = 88), continueFromContext = true).toList()
             assertTrue("the next feasible continuation must still work", continued.sumOf { it.tokenCount } > 0)
-            assertTrue("preserved system block must exceed the old half-window cap",
-                newShiftPrefixLength(before) > (first.maxOf { it.promptTokens } + first.sumOf { it.tokenCount }) / 2)
+            assertEquals("the entire long system prefix must be retained", 317, newShiftPrefixLength(before))
+            val replayed = engine.generate(prompt, settings).toList()
+            engine.resetConversation()
+            val cold = engine.generate(prompt, settings).toList()
+            assertEquals(first.sumOf { it.tokenCount }, replayed.sumOf { it.tokenCount })
+            assertEquals(cold.joinToString("") { it.text }, replayed.joinToString("") { it.text })
         } finally {
             engine.destroySafely()
         }

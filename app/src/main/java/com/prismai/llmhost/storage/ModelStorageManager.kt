@@ -28,19 +28,30 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.locks.ReentrantLock
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import kotlin.concurrent.withLock
 
 internal object ModelStorageLifecycleGate {
-    private val lock = Any()
+    private val lock = ReentrantLock()
     private val revisions = mutableMapOf<String, Long>()
 
-    fun <T> withLock(action: () -> T): T = synchronized(lock, action)
+    fun <T> withLock(action: () -> T): T = lock.withLock(action)
 
-    fun revision(modelId: String): Long = synchronized(lock) { revisions[modelId] ?: 0L }
+    fun <T> tryWithLock(action: () -> T): T? {
+        if (!lock.tryLock()) return null
+        try {
+            return action()
+        } finally {
+            lock.unlock()
+        }
+    }
 
-    fun advanceRevision(modelId: String): Long = synchronized(lock) {
+    fun revision(modelId: String): Long = lock.withLock { revisions[modelId] ?: 0L }
+
+    fun advanceRevision(modelId: String): Long = lock.withLock {
         val next = (revisions[modelId] ?: 0L) + 1L
         revisions[modelId] = next
         next
@@ -373,13 +384,20 @@ class ModelStorageManager(
             if (!hasReserveSpace()) {
                 return ImportResult.Failure(insufficientSpaceError(bytes))
             }
-            val validation = validateGguf(stagedModel)
+            val validation = validateGguf(stagedModel, checkCancelled)
                 ?: return ImportResult.Failure(
                     ModelStorageError(
                         ModelStorageError.Code.INVALID_GGUF_HEADER,
                         "Selected file has an unsupported GGUF version or invalid GGUF metadata",
                     )
                 )
+            checkCancelled()
+            if (!NativeLlmBridge.ggufTensorDataFits(stagedModel.absolutePath, bytes)) {
+                return ImportResult.Failure(ModelStorageError(
+                    ModelStorageError.Code.INVALID_GGUF_HEADER,
+                    "Selected GGUF has missing or invalid tensor data",
+                ))
+            }
             val sha256 = sha256(stagedModel, checkCancelled)
             // A retry of the same content and provenance should not consume another model's
             // worth of disk, but do not reuse an artifact that has lost integrity.
@@ -404,7 +422,11 @@ class ModelStorageManager(
             )
             checkCancelled()
             promoteDirectory(stagingDir, targetVersionDir)
+            val activeFile = File(targetVersionDir, MODEL_FILE)
             try {
+                if (!activeFile.isFile || activeFile.length() != bytes) {
+                    throw IOException("The promoted model does not match the staged artifact")
+                }
                 writeManifestAtomically(modelRoot, manifest)
             } catch (error: Exception) {
                 cleanup(targetVersionDir)
@@ -413,7 +435,6 @@ class ModelStorageManager(
 
             // The staged bytes were just hashed and promotion is a rename that preserves content, so
             // record the verified artifact instead of hashing the multi-gigabyte file a second time.
-            val activeFile = File(targetVersionDir, MODEL_FILE)
             ModelArtifactVerificationCache.remember(activeFile, sha256)
             ImportResult.Success(
                 ActiveModelInfo(modelId, versionId, activeFile, displayName, sha256, bytes, now, validation, integrity)
@@ -519,25 +540,27 @@ class ModelStorageManager(
         )
     }
 
-    fun clearCacheAndTempFiles(): Long {
+    fun clearCacheAndTempFiles(): Long = ModelStorageLifecycleGate.tryWithLock {
         var freed = 0L
         runCatching {
             val downloadsDir = File(context.filesDir, "hf-downloads")
             if (downloadsDir.exists()) {
-                downloadsDir.listFiles()?.forEach { file ->
-                    freed += file.length()
-                    file.delete()
+                // A worker can legitimately own recent resumable files outside the import lock.
+                val expiry = System.currentTimeMillis() - 24 * 3600 * 1000L
+                downloadsDir.listFiles()?.filter { it.isFile && it.lastModified() < expiry }?.forEach { file ->
+                    val bytes = file.length()
+                    if (file.delete()) freed += bytes
                 }
             }
             val stagingDir = File(modelsDir, IMPORT_STAGING_DIR)
             if (stagingDir.exists()) {
-                freed += stagingDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
-                stagingDir.deleteRecursively()
+                val bytes = stagingDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                if (stagingDir.deleteRecursively()) freed += bytes
             }
         }
         Log.d(TAG, "clearCacheAndTempFiles freed=$freed bytes")
-        return freed
-    }
+        freed
+    } ?: 0L
 
     private enum class HashPolicy {
         /** Never hash; used by listing and identity-snapshot paths. */
@@ -796,14 +819,14 @@ class ModelStorageManager(
         else -> null
     }
 
-    private fun validateGguf(file: File): ModelValidation? = try {
+    private fun validateGguf(file: File, checkCancelled: () -> Unit = {}): ModelValidation? = try {
         DataInputStream(file.inputStream().buffered(64 * 1024)).use { input ->
             val reader = GgufReader(input, file.length())
             if (reader.readAscii(4) != "GGUF") return@use null
             val version = reader.readU32()
             // The vendored gguf reader accepts little-endian GGUF v2 and v3.
             if (version !in 2..3) return@use null
-            val metadata = parseGgufMetadata(reader)
+            val metadata = parseGgufMetadata(reader, checkCancelled)
             ModelValidation(
                 format = "GGUF",
                 ggufVersion = version,
@@ -844,7 +867,7 @@ class ModelStorageManager(
         )
     }
 
-    private fun parseGgufMetadata(reader: GgufReader): GgufMetadataSummary {
+    private fun parseGgufMetadata(reader: GgufReader, checkCancelled: () -> Unit): GgufMetadataSummary {
         reader.readCount(reader.remaining / 24, "tensor count")
         val kvCount = reader.readCount(minOf(4096L, reader.remaining / 13), "metadata count")
         var architecture: String? = null
@@ -859,6 +882,7 @@ class ModelStorageManager(
         var hasChatTemplate = false
 
         repeat(kvCount.toInt()) {
+            checkCancelled()
             val key = reader.readGgufString()
             val type = reader.readU32()
             val value = reader.readMetadataValue(type)
@@ -902,6 +926,7 @@ class ModelStorageManager(
 
     private class GgufReader(private val input: DataInputStream, size: Long) {
         private val scratch = ByteArray(8)
+        private var metadataRead = 0L
         var remaining: Long = size
             private set
 
@@ -949,8 +974,7 @@ class ModelStorageManager(
                 9 -> {
                     val elementType = readU32()
                     val elementBytes = metadataElementBytes(elementType)
-                    val maxCount = if (elementType == 8) 1_000_000L else 1L shl 30
-                    val count = readCount(minOf(maxCount, remaining / elementBytes), "array length")
+                    val count = readCount(minOf(1_000_000L, remaining / elementBytes), "array length")
                     if (elementType == 8) {
                         repeat(count.toInt()) { skipFully(readU64()) }
                     } else {
@@ -980,12 +1004,14 @@ class ModelStorageManager(
         }
 
         private fun readFully(buffer: ByteArray, length: Int = buffer.size) {
+            checkMetadataBudget(length.toLong())
             input.readFully(buffer, 0, length)
             remaining -= length
         }
 
         private fun skipFully(bytes: Long) {
             if (bytes !in 0..remaining) throw IOException("Truncated GGUF metadata")
+            checkMetadataBudget(bytes)
             var pending = bytes
             while (pending > 0) {
                 val skipped = input.skip(pending)
@@ -997,6 +1023,11 @@ class ModelStorageManager(
                 }
             }
             remaining -= bytes
+        }
+
+        private fun checkMetadataBudget(bytes: Long) {
+            metadataRead += bytes
+            if (metadataRead > 128L * 1024 * 1024) throw IOException("GGUF metadata exceeds the import limit")
         }
     }
 

@@ -771,7 +771,7 @@ class InferenceService : Service() {
     }
 
     fun importModel(uri: Uri): Job? {
-        if (importJob?.isActive == true) {
+        if (importJob?.isCompleted == false) {
             publishUiEvent("A model import is already running")
             return null
         }
@@ -807,6 +807,10 @@ class InferenceService : Service() {
     fun storageBreakdown(): ModelStorageManager.StorageBreakdown = modelStorageManager.getStorageBreakdown()
 
     fun clearCacheAndTempFiles(): Long {
+        if (importJob?.isCompleted == false || _modelDownloadState.value is ModelDownloadState.Running) {
+            publishUiEvent("Finish the active model import or download before clearing temporary files")
+            return 0L
+        }
         val freed = modelStorageManager.clearCacheAndTempFiles()
         publishUiEvent("Cleared ${FormatUtils.formatBytesForMessage(freed)} of cache and temp files")
         return freed
@@ -825,7 +829,6 @@ class InferenceService : Service() {
         batchImportJob?.cancel()
         batchImportJob = null
         importJob?.cancel()
-        importJob = null
         importUriByString.clear()
         WorkManager.getInstance(this).cancelUniqueWork(HuggingFaceDownloadWork.UNIQUE_WORK_NAME)
         modelImportManager.cancelImport()
@@ -1257,11 +1260,12 @@ class InferenceService : Service() {
             }
             val startGateReserved = true
             try {
+                val settings = _generationSettings.value.clamped()
                 val memory = generationOrchestrator.preparePromptMemory(
                     prompt, benchmarkPreset, selectedDocumentId,
                     if (initiatedByBackground) sourceChatId else _currentChatId.value,
                 )
-                val acceptance = generationOrchestrator.evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId, memory)
+                val acceptance = generationOrchestrator.evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId, memory, settings)
                 if (!acceptance.accepted) {
                     val reason = acceptance.reason ?: "Generation was refused"
                     publishUiEvent(reason)
@@ -1288,7 +1292,7 @@ class InferenceService : Service() {
                 }
                 val previousSessionId = generationSession
                 val previousAgentChainId = agentTrace.activeChainId
-                generationOrchestrator.generate(prompt, benchmarkPreset, selectedDocumentId, memory)
+                generationOrchestrator.generate(prompt, benchmarkPreset, selectedDocumentId, memory, settings)
                 launchResult = generationOrchestrator.takeLaunchResult()
                 // Authoritative admission result: only now may the caller treat the send as
                 // accepted (and clear the composer), or report the refusal.
@@ -1935,7 +1939,7 @@ class InferenceService : Service() {
             "delete_document" -> indexForAgent(call) { ragHandlerTools.deleteDocument(call, confirmed) }
             // ── Knowledge Pack tools ─────────────────────────────────────────
             "search_knowledge" -> knowledgePackHandlerTools.searchKnowledge(call)
-            "fetch_grokipedia_article" -> knowledgePackHandlerTools.fetchGrokipediaArticle(call, confirmed)
+            "fetch_grokipedia_article" -> indexForAgent(call) { knowledgePackHandlerTools.fetchGrokipediaArticle(call, confirmed) }
             "list_knowledge_packs" -> knowledgePackHandlerTools.listKnowledgePacks(call)
             "download_knowledge_pack" -> indexForAgent(call) { knowledgePackHandlerTools.downloadKnowledgePack(call, confirmed) }
             // ── Voice I/O tools ──────────────────────────────────────────────
@@ -2326,18 +2330,7 @@ class InferenceService : Service() {
     }
 
     private fun persistTranscriptNow() {
-        val chatId = _currentChatId.value ?: return
-        val revision = chatManager.transcriptWriteRevision(chatId)
-        val messages = synchronized(transcriptLock) {
-            _transcript.value
-        }
-        serviceScope.launch(Dispatchers.IO) {
-            runCatching {
-                chatManager.persistTranscript(chatId, messages, revision)
-            }.onFailure { error ->
-                Log.w(TAG, "failed to persist transcript", error)
-            }
-        }
+        chatManager.persistTranscriptNow()
     }
 
     private fun touchCurrentChat(messages: List<TranscriptMessage>, updateTitle: Boolean) {

@@ -3,6 +3,7 @@
 #include "Engine.hpp"
 #include "runtime/HandleRegistry.hpp"
 #include "runtime/NativeErrorCode.hpp"
+#include "gguf.h"
 
 #include <android/log.h>
 
@@ -223,6 +224,31 @@ Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeCreateEngine(JNIEnv*, jcla
 extern "C" JNIEXPORT void JNICALL
 Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeDestroyEngine(JNIEnv*, jobject, jlong handle) {
     NativeHandleRegistry::instance().close(handle);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_prismai_llmhost_bridge_NativeLlmBridge_nativeGgufTensorDataFits(
+    JNIEnv* env, jclass, jstring path, jlong file_size) {
+    if (file_size < 0) return JNI_FALSE;
+    try {
+        const auto filename = toString(env, path);
+        // Validate the format using the same tensor layout/type rules as the
+        // loader, without creating a model, context or reading tensor weights.
+        std::unique_ptr<gguf_context, decltype(&gguf_free)> gguf(
+            gguf_init_from_file(filename.c_str(), {true, nullptr}), gguf_free);
+        if (!gguf || gguf_get_n_tensors(gguf.get()) <= 0) return JNI_FALSE;
+        const auto size = static_cast<uint64_t>(file_size);
+        const auto start = gguf_get_data_offset(gguf.get());
+        if (start > size) return JNI_FALSE;
+        const auto available = size - start;
+        for (int64_t i = 0; i < gguf_get_n_tensors(gguf.get()); ++i) {
+            const auto offset = gguf_get_tensor_offset(gguf.get(), i);
+            if (offset > available || gguf_get_tensor_size(gguf.get(), i) > available - offset) return JNI_FALSE;
+        }
+        return JNI_TRUE;
+    } catch (const std::exception&) {
+        return JNI_FALSE;
+    }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

@@ -106,7 +106,7 @@ class SystemTools(
         val profile = uiState.deviceCapabilityProfile.value
         val usage = withContext(Dispatchers.IO) {
             StorageUsage(
-                modelsBytes = modelStorageManager.listInstalledModelInfos().sumOf { it.bytes },
+                modelsBytes = modelStorageManager.getStorageBreakdown().installedModelsBytes,
                 exportsBytes = File(filesDir, "agent_exports").sizeRecursive(),
                 chatsBytes = chatDirectory().sizeRecursive() + chatIndexFile().sizeRecursive(),
                 benchmarkBytes = benchmarkRunsFile().sizeRecursive(),

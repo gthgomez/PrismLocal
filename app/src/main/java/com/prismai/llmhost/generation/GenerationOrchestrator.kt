@@ -204,8 +204,8 @@ class GenerationOrchestrator(
         benchmarkPreset: BenchmarkPreset?,
         selectedDocumentId: String?,
         memory: MemoryRetriever.PromptMemory,
+        baseSettings: GenerationSettings,
     ): SendAcceptance.Result {
-        val baseSettings = uiState.generationSettings.value.clamped()
         if (selectedDocumentId != null && (baseSettings.agentEnabled || benchmarkPreset != null)) {
             return SendAcceptance.Result(false, "Turn off agent mode before asking a document")
         }
@@ -231,10 +231,10 @@ class GenerationOrchestrator(
         benchmarkPreset: BenchmarkPreset?,
         selectedDocumentId: String?,
         memory: MemoryRetriever.PromptMemory,
+        baseSettings: GenerationSettings,
     ) {
         launchResult.set(GenerationLaunch.REFUSED)
         launchRefusalReason.set(null)
-        val baseSettings = uiState.generationSettings.value.clamped()
 
         // ── Direct NL → agent tool call path ────────────────────────────
         if (selectedDocumentId == null && benchmarkPreset == null && baseSettings.agentEnabled && uiState.currentModel.value != null) {
@@ -255,9 +255,9 @@ class GenerationOrchestrator(
         // only: benchmark presets were never budget-checked and must not be
         // newly refused here.
         val settings = benchmarkPreset?.applySettingsOverrides(baseSettings) ?: baseSettings
-        val agentEnabled = settings.agentEnabled
+        val agentEnabled = selectedDocumentId == null && settings.agentEnabled
         val memoryContext = memory.systemContext
-        val acceptance = evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId, memory)
+        val acceptance = evaluateSendAcceptance(prompt, benchmarkPreset, selectedDocumentId, memory, baseSettings)
         if (!acceptance.accepted) {
             refuseLaunch(acceptance.reason ?: "Request refused")
             return
@@ -306,11 +306,6 @@ class GenerationOrchestrator(
 
         if (benchmarkPreset == null && uiState.transcript.value.isEmpty()) {
             runCatching { engine.resetConversation() }
-        }
-
-        // Preset overrides apply only to this generation call — never write them into persisted UI settings.
-        if (baseSettings != uiState.generationSettings.value) {
-            uiState._generationSettings.value = baseSettings
         }
 
         val agentChainId = if (agentEnabled) {

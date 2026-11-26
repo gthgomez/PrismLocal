@@ -253,8 +253,8 @@ class ModelReadinessAssessor(
             MODEL_RUNTIME_MIN_OVERHEAD_BYTES,
             (info.bytes * quantizationOverheadMultiplier(quantization)).toLong(),
         )
-        val declaredContext = metadata?.contextLength ?: GenerationSettings.DEFAULT_CONTEXT_LENGTH
-        val activeContext = minOf(settings.contextLength, declaredContext.coerceAtLeast(GenerationSettings.MIN_CONTEXT_LENGTH))
+        // The loader allocates the requested context; n_ctx_train is a model property, not a cap.
+        val activeContext = settings.contextLength
         val kvCacheEstimateBytes = estimateKvCacheBytes(
             contextLength = activeContext,
             blockCount = metadata?.blockCount,
@@ -275,26 +275,9 @@ class ModelReadinessAssessor(
             lowMemory = profile.lowMemory,
         )
 
-        // Empirical performance override: check past benchmark runs
-        val exactRuns = completedRunsFor(info)
-        val actualAverage = exactRuns.takeIf { it.isNotEmpty() }
-            ?.map { it.tokensPerSecond }
-            ?.average()
-        // Empirical evidence override: a model that has already generated on this
-        // device is trusted over the memory projection. This is the explicit
-        // "if it can run, never stop it" path — only the hard size cap still applies.
-        val provenUsable = actualAverage != null && actualAverage >= 1.0 && info.bytes <= ModelLoadLimits.HARD_CAP_BYTES
-
-        val finalRating = if (provenUsable) {
-            if (profile.lowMemory || actualAverage!! < 2.0) ModelFitRating.RISKY else ModelFitRating.SAFE
-        } else {
-            staticRating
-        }
-
         val reason = when {
-            provenUsable -> "Proven usable on your device (avg ${FormatUtils.formatAgentTps(actualAverage!!)} tok/s across ${exactRuns.size} run${if (exactRuns.size > 1) "s" else ""})"
-            finalRating == ModelFitRating.SAFE -> "Recommended"
-            finalRating == ModelFitRating.RISKY -> if (profile.lowMemory) "May be slow; device reports low memory" else "May be slow; limited RAM headroom"
+            staticRating == ModelFitRating.SAFE -> "Recommended"
+            staticRating == ModelFitRating.RISKY -> if (profile.lowMemory) "May be slow; device reports low memory" else "May be slow; limited RAM headroom"
             else -> "Likely too large for current LMK-safe RAM headroom"
         }
 
@@ -306,9 +289,8 @@ class ModelReadinessAssessor(
             requiredRamBytes = requiredRam,
             availableRamAfterUnloadBytes = usableRamBytes,
             storageFreeBytes = profile.storageFreeBytes,
-            rating = finalRating,
+            rating = staticRating,
             reason = reason,
-            provenUsable = provenUsable,
         )
     }
 
@@ -476,9 +458,7 @@ class ModelReadinessAssessor(
                     .put("samples", readiness.performance.sampleCount),
             )
         }
-        val relevantRuns = rows.flatMap { readiness ->
-            uiState._benchmarkRuns.value.filter { run -> run.modelId == readiness.info.id && run.generatedTokens > 0 && run.decodeMs > 0L }
-        }
+        val relevantRuns = rows.flatMap { completedRunsFor(it.info) }
         val directGroups = relevantRuns.groupBy {
             listOf(
                 it.presetId ?: "",

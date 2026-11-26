@@ -47,7 +47,7 @@ class ModelStorageManagerTest {
         val model = (result as ModelStorageManager.ImportResult.Success).model
         assertEquals("valid-model", model.id)
         assertTrue(model.validation.metadataChecked)
-        assertEquals(64L, model.bytes)
+        assertEquals(validGgufBytes().size.toLong(), model.bytes)
         assertTrue(model.file.path.contains("versions"))
 
         val resolved = manager.resolveActiveModel("valid-model")
@@ -101,7 +101,7 @@ class ModelStorageManagerTest {
 
             // The v3 header advertises one KV entry. Its value advertises a
             // 100-byte string, but only 10 value bytes fit in this file.
-            val truncated = ByteBuffer.wrap(good.copyOf()).order(ByteOrder.LITTLE_ENDIAN)
+            val truncated = ByteBuffer.wrap(good.copyOf(64)).order(ByteOrder.LITTLE_ENDIAN)
                 .putLong(16, 1).putLong(24, 10).putInt(42, 8).putLong(46, 100).array()
             val result = manager.importModelFromStream(
                 "$modelId.gguf", truncated.size.toLong(), ByteArrayInputStream(truncated),
@@ -109,6 +109,26 @@ class ModelStorageManagerTest {
             assertTrue("truncated metadata must fail, got $result", result is ModelStorageManager.ImportResult.Failure)
             assertEquals(installed.model.versionId, manager.activeModelInfo(modelId)?.versionId)
             assertArrayEquals(good, installed.model.file.readBytes())
+            assertStagingEmpty()
+        } finally {
+            cleanup(modelId)
+        }
+    }
+
+    @Test
+    fun truncatedTensorDataDoesNotReplaceActiveVersion() {
+        val manager = ModelStorageManager(context)
+        val modelId = "truncated-tensors"
+        cleanup(modelId)
+        try {
+            val good = validGgufBytes()
+            val initial = manager.importModelFromStream("$modelId.gguf", good.size.toLong(), good.inputStream())
+                as ModelStorageManager.ImportResult.Success
+            val truncated = good.copyOf(130) // The F32 tensor starts at 128 and needs four bytes.
+            val result = manager.importModelFromStream("$modelId.gguf", truncated.size.toLong(), truncated.inputStream())
+            assertTrue("missing tensor bytes must fail, got $result", result is ModelStorageManager.ImportResult.Failure)
+            assertEquals(initial.model.versionId, manager.activeModelInfo(modelId)?.versionId)
+            assertArrayEquals(good, initial.model.file.readBytes())
             assertStagingEmpty()
         } finally {
             cleanup(modelId)
@@ -370,10 +390,14 @@ class ModelStorageManagerTest {
     }
 
     private fun validGgufBytes(seed: Int = 1): ByteArray {
-        // A well-formed metadata-only container for storage tests, not an inference model.
-        return ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN)
-            .put("GGUF".toByteArray()).putInt(3).putLong(0).putLong(1)
-            .putLong(10).put("test.value".toByteArray()).putInt(4).putInt(seed).array()
+        // A well-formed container with one F32 tensor for storage tests.
+        // It has no architecture or tokenizer and is not an inference model.
+        val buffer = ByteBuffer.allocate(160).order(ByteOrder.LITTLE_ENDIAN)
+            .put("GGUF".toByteArray()).putInt(3).putLong(1).putLong(1)
+            .putLong(10).put("test.value".toByteArray()).putInt(4).putInt(seed)
+            .putLong(11).put("test.weight".toByteArray()).putInt(1).putLong(1).putInt(0).putLong(0)
+        buffer.putFloat(128, seed.toFloat())
+        return buffer.array()
     }
 
     private fun cleanup(modelId: String) {

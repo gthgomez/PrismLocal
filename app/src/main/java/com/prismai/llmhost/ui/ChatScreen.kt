@@ -760,9 +760,11 @@ fun ChatScreen(
                             onContinue = { service?.continueGenerationSafely() },
                             isSending = isSending,
                             onSend = {
-                                if (isIndexingDocument) {
-                                    snackbarMessage = "Wait for document indexing to finish"
-                                } else if (!isSending) {
+                                 if (isIndexingDocument) {
+                                     snackbarMessage = "Wait for document indexing to finish"
+                                 } else if (selectedDocumentId != null && attachments.isNotEmpty()) {
+                                     snackbarMessage = "Remove attachments before asking the selected document"
+                                 } else if (!isSending) {
                                 val text = AttachmentTextExtractor.buildPrompt(prompt.trim(), attachments)
                                 val svc = service
                                 if (text.isNotEmpty()) {

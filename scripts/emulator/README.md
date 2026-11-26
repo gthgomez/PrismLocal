@@ -131,6 +131,10 @@ adb -s "$ANDROID_SERIAL" shell am instrument -w -r \
 
 For the pinned Qwen model procedure and SHA-256 see
 [`tools/inference-conformance/README.md`](../../tools/inference-conformance/README.md).
+For a local APK-only runner such as Android Lab, the same verified file can
+instead be staged as `app/src/androidTest/assets/smoke-model/qwen2.5-0.5b-instruct-q4_k_m.gguf`
+before compiling the test APK. This adds about 469 MiB of uncompressed test
+assets; do not distribute that test APK as an application build.
 The following optional Android comparison indexes only task-generated Cedar
 fixtures, compares native embedding scores with a simple lexical overlap, and
 deletes only the uniquely named test documents afterward:

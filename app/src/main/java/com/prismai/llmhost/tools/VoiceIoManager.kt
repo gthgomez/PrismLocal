@@ -39,6 +39,7 @@ class VoiceIoManager(private val context: Context) {
     private var speechRecognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var isListening = false
+    private var recognitionRequest = 0L
     private val recognizerLifecycle = RecognizerLifecycle()
     private var ttsInitialized = false
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -91,6 +92,10 @@ class VoiceIoManager(private val context: Context) {
             SpeechRecognizer.createSpeechRecognizer(context) ?: return false
         }
 
+        val request = ++recognitionRequest
+        fun deliver(action: () -> Unit) {
+            mainHandler.post { if (recognitionRequest == request) action() }
+        }
         speechRecognizer = recognizer
         recognizerLifecycle.onRecognizerCreated(recognizer)
         recognizer.setRecognitionListener(object : RecognitionListener {
@@ -106,7 +111,7 @@ class VoiceIoManager(private val context: Context) {
                 // A superseded recognizer may still deliver callbacks after a
                 // restart; drop them so its RMS cannot drive the new session.
                 if (speechRecognizer !== recognizer) return
-                mainHandler.post { onRmsDbChanged?.invoke(rmsdB) }
+                deliver { onRmsDbChanged?.invoke(rmsdB) }
             }
 
             override fun onBufferReceived(buffer: ByteArray?) {
@@ -139,7 +144,7 @@ class VoiceIoManager(private val context: Context) {
                     else -> "Unknown error ($error)"
                 }
                 Log.w(TAG, "onError: $errorMessage")
-                mainHandler.post { onSpeechError?.invoke(errorMessage) }
+                deliver { onSpeechError?.invoke(errorMessage) }
             }
 
             override fun onResults(results: Bundle?) {
@@ -149,9 +154,9 @@ class VoiceIoManager(private val context: Context) {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val text = matches?.firstOrNull()
                 if (text != null) {
-                    mainHandler.post { onSpeechResult?.invoke(text) }
+                    deliver { onSpeechResult?.invoke(text) }
                 } else {
-                    mainHandler.post { onSpeechError?.invoke("No recognition results") }
+                    deliver { onSpeechError?.invoke("No recognition results") }
                 }
             }
 
@@ -162,7 +167,7 @@ class VoiceIoManager(private val context: Context) {
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val text = matches?.firstOrNull()
                 if (text != null) {
-                    mainHandler.post { onSpeechPartialResult?.invoke(text) }
+                    deliver { onSpeechPartialResult?.invoke(text) }
                 }
             }
 
@@ -190,6 +195,7 @@ class VoiceIoManager(private val context: Context) {
 
     /** Stop listening */
     fun stopListening() {
+        recognitionRequest++
         if (!isListening) return
         isListening = false
         speechRecognizer?.stopListening()

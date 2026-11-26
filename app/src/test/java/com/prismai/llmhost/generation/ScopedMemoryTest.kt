@@ -68,7 +68,7 @@ class ScopedMemoryTest {
             memoryFactLines = memory.factLines,
         )
         assertEquals(
-            "For this question, my saved information is:\n- My preferred tea is jasmine oolong\n\nQuestion: Which tea do I prefer",
+            "Relevant saved notes for this chat:\n- My preferred tea is jasmine oolong\n\nQuestion: Which tea do I prefer",
             messages.last().content,
         )
         assertFalse(messages.any { it.content.contains("black tea") })

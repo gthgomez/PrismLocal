@@ -400,6 +400,7 @@ struct ModelRuntime {
     std::string actual_backend_name = "CPU"; // compile-time label; cpu_execution_pinned is the load decision
     llama_pos current_position = 0;
     int system_prefix_length = 0;
+    bool context_has_shifted = false;
     std::string model_path;
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
@@ -667,7 +668,7 @@ int computeSystemPrefixLength(const std::vector<llama_token>& tokens, std::size_
                               bool add_special, bool has_system_message) {
     const int detected = findSystemPrefixLength(tokens, vocab, formatted_prompt, add_special);
     // Do not compact a structured prompt when its template has no verified system boundary.
-    if (has_system_message && detected == 0) return -1;
+    if (detected == 0 && (has_system_message || systemClosingTag(formatted_prompt) != nullptr)) return -1;
     return static_cast<int>(std::min(static_cast<std::size_t>(detected), limit));
 }
 
@@ -696,6 +697,7 @@ void resetRuntimeContext(ModelRuntime& runtime, bool clear_data) {
     runtime.current_position = 0;
     runtime.active_tokens.clear();
     runtime.system_prefix_length = 0;
+    runtime.context_has_shifted = false;
     // PIR-05: a cleared KV cache can never back a reusable prefix.
     runtime.conversation.invalidate();
 }
@@ -813,6 +815,9 @@ bool shiftRuntimeContextIfNeeded(ModelRuntime& runtime, int required_tokens, boo
         runtime.conversation.markCommitted(cache_identity.key(),
                                           runtime.active_tokens.size(),
                                           runtime.conversation.last_logits_valid);
+        // The shifted tail attended to removed tokens. It remains usable for
+        // Continue, but a new prompt must be replayed against its own history.
+        runtime.context_has_shifted = true;
         LOGI("kv_cache_sliding_window_shift dropped=%d prefix=%d new_pos=%d limit=%d",
              drop_count, system_prefix_tokens, static_cast<int>(runtime.current_position), static_cast<int>(limit));
         logCacheIdentity("shift_committed", cache_identity, runtime.conversation);
@@ -1317,7 +1322,7 @@ struct Engine::Impl {
             // PIR-05: only trust the stored prefix when it was proven committed
             // under the current cache identity. Otherwise the cache is invalid and
             // the request must be replayed from scratch.
-            const bool identity_match = runtime->conversation.valid &&
+            const bool identity_match = runtime->conversation.valid && !runtime->context_has_shifted &&
                 runtime->conversation.cache_identity == cache_identity_key;
             std::size_t common_prefix = 0;
             if (identity_match) {

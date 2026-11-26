@@ -232,9 +232,10 @@ interface KnowledgePackChunkStore {
  * in the companion object. Search performs brute-force cosine similarity
  * (suitable for on-device use with up to thousands of chunks).
  */
-class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
+class VectorStore internal constructor(context: Context, databaseName: String) : VectorIndex, KnowledgePackChunkStore {
+    constructor(context: Context) : this(context, DB_NAME)
 
-    private val dbHelper = VectorDbHelper(context)
+    private val dbHelper = VectorDbHelper(context, databaseName)
     private val lock = ReentrantLock()
 
     /**
@@ -857,8 +858,8 @@ class VectorStore(context: Context) : VectorIndex, KnowledgePackChunkStore {
 
     // ---- SQLiteOpenHelper ----
 
-    private class VectorDbHelper(context: Context) : SQLiteOpenHelper(
-        context, DB_NAME, null, DB_VERSION
+    private class VectorDbHelper(context: Context, databaseName: String) : SQLiteOpenHelper(
+        context, databaseName, null, DB_VERSION
     ) {
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL(CREATE_TABLE_SQL)

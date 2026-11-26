@@ -342,7 +342,7 @@ internal fun ControlPlaneSheet(
                         ModelMetadata(
                             model = model,
                             diagnostics = modelLoadDiagnostics?.takeIf { it.modelId == model.id },
-                            readiness = modelReadiness.firstOrNull { it.info.id == model.id },
+                            readiness = modelReadiness.firstOrNull { it.info.id == model.id && it.info.sha256 == model.sha256 },
                         )
                     }
                 }

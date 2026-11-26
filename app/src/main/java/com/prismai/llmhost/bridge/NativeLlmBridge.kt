@@ -42,6 +42,12 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
 
         @JvmStatic
         private external fun nativeCreateEngine(debugHooksEnabled: Boolean): Long
+
+        internal fun ggufTensorDataFits(path: String, fileSize: Long): Boolean =
+            nativeGgufTensorDataFits(path, fileSize)
+
+        @JvmStatic
+        private external fun nativeGgufTensorDataFits(path: String, fileSize: Long): Boolean
     }
 
     // modelMutex serializes model lifecycle: load, unload, reset, destroy.

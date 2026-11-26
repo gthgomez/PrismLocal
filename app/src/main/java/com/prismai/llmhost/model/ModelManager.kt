@@ -241,9 +241,8 @@ class ModelManager(
         val profile = deviceProfiler.captureProfile()
         val fit = modelReadinessAssessor.estimateModelFit(model, profile)
         val overHardCap = model.bytes > ModelLoadLimits.HARD_CAP_BYTES
-        // Block only when the model physically cannot fit. A tight-but-fitting model
-        // (RISKY) still loads — slow is not blocked — and a model already proven on
-        // this device overrides even the physical projection.
+        // A tight-but-fitting model (RISKY) still loads. Historical benchmark
+        // settings do not establish that this load fits current memory.
         val blocked = ModelLoadLimits.isLoadBlocked(
             modelBytes = model.bytes,
             requiredRamBytes = fit.requiredRamBytes,

@@ -43,11 +43,11 @@ class NativeLlmBridge private constructor(handle: Long, private val instanceId: 
         @JvmStatic
         private external fun nativeCreateEngine(debugHooksEnabled: Boolean): Long
 
-        internal fun ggufTensorDataFits(path: String, fileSize: Long): Boolean =
-            nativeGgufTensorDataFits(path, fileSize)
+        internal fun ggmlTensorRowBytes(type: Int, width: Long): Long =
+            nativeGgmlTensorRowBytes(type, width)
 
         @JvmStatic
-        private external fun nativeGgufTensorDataFits(path: String, fileSize: Long): Boolean
+        private external fun nativeGgmlTensorRowBytes(type: Int, width: Long): Long
     }
 
     // modelMutex serializes model lifecycle: load, unload, reset, destroy.

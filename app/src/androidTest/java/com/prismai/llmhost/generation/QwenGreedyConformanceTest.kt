@@ -9,7 +9,9 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.prismai.llmhost.GenerationSettings
 import com.prismai.llmhost.bridge.ChatMessage
 import com.prismai.llmhost.bridge.NativeLlmBridge
+import com.prismai.llmhost.storage.ModelStorageManager
 import java.io.ByteArrayOutputStream
+import java.nio.file.Files
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
@@ -71,12 +73,22 @@ class QwenGreedyConformanceTest {
     @Test
     fun pinnedQwenMatchesGreedyReference() = runBlocking {
         val model = requiredPinnedQwenModel()
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val modelDirectory = Files.createTempDirectory(context.cacheDir.toPath(), "qwen-qualification-").toFile()
         val settings = fixtureSettings()
         val engine = NativeLlmBridge.create(debugHooksEnabled = false)
         try {
+            val result = model.inputStream().buffered().use { input ->
+                ModelStorageManager(context, modelDirectory)
+                    .importModelFromStream("qwen-qualification.gguf", model.length(), input)
+            }
+            assertTrue("pinned Qwen could not be imported: $result", result is ModelStorageManager.ImportResult.Success)
+            val installed = (result as ModelStorageManager.ImportResult.Success).model
+            assertTrue(installed.validation.metadataChecked)
+            assertEquals(PINNED_QWEN_SHA256, installed.sha256)
             val loadMarker = "begin_qwen_fixture_load=${SystemClock.elapsedRealtime()}"
             Log.i(TAG, loadMarker)
-            assertTrue("Qwen fixture failed to load", engine.loadModel(model.absolutePath, settings))
+            assertTrue("Qwen fixture failed to load", engine.loadModel(installed.file.absolutePath, settings))
             val logs = nativeLogs().substringAfter(loadMarker, missingDelimiterValue = "")
             assertTrue("CPU-only load was not applied", logs.contains("gpu_layers_requested=0 gpu_layers_verified=0") &&
                 logs.contains("cpu_pinned=1 op_offload=0"))
@@ -149,6 +161,7 @@ class QwenGreedyConformanceTest {
             assertEquals("The capital of France is Paris.", observedText)
         } finally {
             engine.destroySafely()
+            modelDirectory.deleteRecursively()
         }
     }
 

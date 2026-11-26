@@ -4,10 +4,10 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
 import com.prismai.llmhost.ChatSession
-import com.prismai.llmhost.AgentToolCall
 import com.prismai.llmhost.TranscriptMessage
 import com.prismai.llmhost.TranscriptRole
 import com.prismai.llmhost.agent.tools.ChatTools
+import com.prismai.llmhost.tools.AgentToolCall
 import com.prismai.llmhost.ui.ServiceUiState
 import com.prismai.llmhost.ui.UiEventBus
 import kotlinx.coroutines.CoroutineScope

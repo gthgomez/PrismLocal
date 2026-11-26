@@ -236,6 +236,7 @@ class ModelReadinessAssessor(
     internal fun estimateModelFit(
         info: ModelStorageManager.ActiveModelInfo,
         profile: DeviceCapabilityProfile,
+        settings: GenerationSettings = uiState._generationSettings.value.clamped(),
     ): ModelFitEstimate {
         val currentModelId = uiState.currentModel.value
         val activeBytes = uiState._activeModelInfo.value?.bytes
@@ -244,7 +245,6 @@ class ModelReadinessAssessor(
         val availableAfterCurrentUnload = profile.availableRamBytes + activeBytes
         val lmkThresholdBytes = (profile.availableRamBytes / 8L).coerceAtLeast(256L * 1024L * 1024L)
         val usableRamBytes = maxOf(0L, availableAfterCurrentUnload - lmkThresholdBytes)
-        val settings = uiState._generationSettings.value.clamped()
         val metadata = info.validation.metadata
         val quantization = ggufFileTypeHint(metadata?.fileType)
             ?: quantizationHint(info.fileName)
@@ -261,8 +261,9 @@ class ModelReadinessAssessor(
             embeddingLength = metadata?.embeddingLength,
             attentionHeadCount = metadata?.attentionHeadCount,
             attentionHeadCountKv = metadata?.attentionHeadCountKv,
-            kvTypeK = settings.kvCacheTypeK,
-            kvTypeV = settings.kvCacheTypeV,
+            // The loader can retry an unsupported requested KV format with F16.
+            kvTypeK = "f16",
+            kvTypeV = "f16",
         )
         val requiredRam = info.bytes +
             runtimeOverhead +

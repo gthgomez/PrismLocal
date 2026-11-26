@@ -599,6 +599,7 @@ const char* systemClosingTag(const std::string& text) {
          text[chatml_system_prefix.size()] == '\t');
     if (has_chatml_system_role) return "<|im_end|>";
     if (text.rfind("<|start_header_id|>system<|end_header_id|>", 0) == 0) return "<|eot_id|>";
+    if (text.rfind("<|system|>", 0) == 0) return "<|end|>";
     if (text.rfind("<system>", 0) == 0) return "</system>";
     return nullptr;
 }

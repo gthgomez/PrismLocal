@@ -907,9 +907,9 @@ private fun ModelMetadata(
                 "Size" to formatBytes(model.bytes),
                 "Format" to "GGUF v${model.validation.ggufVersion}",
                 "GGUF format" to if (model.validation.metadataChecked) {
-                    "Metadata checked; loading is a separate check"
+                    "Container checked; loading is a separate check"
                 } else {
-                    "Legacy header check; metadata checked on load"
+                    "Legacy header check; container checked before loading"
                 },
                 "SHA-256" to shortHash(model.sha256),
                 metadata?.architecture?.let { "Family" to it.uppercase(Locale.US) },

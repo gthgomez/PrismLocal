@@ -152,7 +152,7 @@ class ModelManager(
                     )
                     return@withContext true
                 }
-                val loadRejection = nativeLoadRejection(activeModel)
+                val loadRejection = nativeLoadRejection(activeModel, requestedSettings)
                 if (loadRejection != null) {
                     val memory = deviceProfiler.deviceMemorySnapshot()
                     uiState._runtimeStatus.value = RuntimeStatus.ERROR
@@ -237,9 +237,9 @@ class ModelManager(
         }
     }
 
-    private fun nativeLoadRejection(model: ModelStorageManager.ActiveModelInfo): NativeLoadRejection? {
+    private fun nativeLoadRejection(model: ModelStorageManager.ActiveModelInfo, settings: GenerationSettings): NativeLoadRejection? {
         val profile = deviceProfiler.captureProfile()
-        val fit = modelReadinessAssessor.estimateModelFit(model, profile)
+        val fit = modelReadinessAssessor.estimateModelFit(model, profile, settings)
         val overHardCap = model.bytes > ModelLoadLimits.HARD_CAP_BYTES
         // A tight-but-fitting model (RISKY) still loads. Historical benchmark
         // settings do not establish that this load fits current memory.

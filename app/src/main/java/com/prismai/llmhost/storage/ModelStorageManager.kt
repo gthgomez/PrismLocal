@@ -196,7 +196,7 @@ class ModelStorageManager(
         val validatedAt: String,
         val metadata: GgufMetadataSummary? = null,
     ) {
-        val metadataChecked: Boolean get() = status == METADATA_CHECKED
+        val metadataChecked: Boolean get() = status == CONTAINER_CHECKED
     }
 
     data class GgufMetadataSummary(
@@ -384,20 +384,13 @@ class ModelStorageManager(
             if (!hasReserveSpace()) {
                 return ImportResult.Failure(insufficientSpaceError(bytes))
             }
-            val validation = validateGguf(stagedModel, checkCancelled)
+            val validation = validateGguf(stagedModel, checkTensorData = true, checkCancelled = checkCancelled)
                 ?: return ImportResult.Failure(
                     ModelStorageError(
                         ModelStorageError.Code.INVALID_GGUF_HEADER,
-                        "Selected file has an unsupported GGUF version or invalid GGUF metadata",
+                        "Selected file has an unsupported GGUF version or incomplete GGUF data",
                     )
                 )
-            checkCancelled()
-            if (!NativeLlmBridge.ggufTensorDataFits(stagedModel.absolutePath, bytes)) {
-                return ImportResult.Failure(ModelStorageError(
-                    ModelStorageError.Code.INVALID_GGUF_HEADER,
-                    "Selected GGUF has missing or invalid tensor data",
-                ))
-            }
             val sha256 = sha256(stagedModel, checkCancelled)
             // A retry of the same content and provenance should not consume another model's
             // worth of disk, but do not reuse an artifact that has lost integrity.
@@ -633,12 +626,12 @@ class ModelStorageManager(
             }
             val recordedValidation = parseValidation(activeObj)
             val validation = recordedValidation
-                ?.takeIf { hashPolicy == HashPolicy.NONE || it.status == METADATA_CHECKED }
-                ?: validateGguf(modelFile)
+                ?.takeIf { hashPolicy == HashPolicy.NONE || it.metadataChecked }
+                ?: validateGguf(modelFile, checkTensorData = hashPolicy != HashPolicy.NONE)
                 ?: return ModelResolveResult.Failure(
                     ModelStorageError(
                         ModelStorageError.Code.INVALID_GGUF_HEADER,
-                        "Model $modelId has an unsupported GGUF version or invalid GGUF metadata",
+                        "Model $modelId has an unsupported GGUF version or incomplete GGUF data",
                     )
                 )
             val integrity = when (activeObj.optString("integrity", "")) {
@@ -819,24 +812,33 @@ class ModelStorageManager(
         else -> null
     }
 
-    private fun validateGguf(file: File, checkCancelled: () -> Unit = {}): ModelValidation? = try {
+    private fun validateGguf(
+        file: File,
+        checkTensorData: Boolean = false,
+        checkCancelled: () -> Unit = {},
+    ): ModelValidation? = try {
         DataInputStream(file.inputStream().buffered(64 * 1024)).use { input ->
             val reader = GgufReader(input, file.length())
             if (reader.readAscii(4) != "GGUF") return@use null
             val version = reader.readU32()
             // The vendored gguf reader accepts little-endian GGUF v2 and v3.
             if (version !in 2..3) return@use null
-            val metadata = parseGgufMetadata(reader, checkCancelled)
+            val tensorCount = reader.readCount(minOf(200_000L, reader.remaining / 24), "tensor count").toInt()
+            val (metadata, alignment) = parseGgufMetadata(reader, checkCancelled)
+            if (checkTensorData) validateTensorData(reader, tensorCount, alignment, checkCancelled)
             ModelValidation(
                 format = "GGUF",
                 ggufVersion = version,
-                status = METADATA_CHECKED,
+                status = if (checkTensorData) CONTAINER_CHECKED else "legacy_header_only",
                 validatedAt = Instant.now().toString(),
                 metadata = metadata,
             )
         }
     } catch (error: IOException) {
         Log.w(TAG, "GGUF metadata parse failed file=${file.name}", error)
+        null
+    } catch (error: ArithmeticException) {
+        Log.w(TAG, "GGUF tensor extent overflow file=${file.name}", error)
         null
     }
 
@@ -845,7 +847,7 @@ class ModelStorageManager(
         return ModelValidation(
             format = validation.optString("format", "GGUF"),
             ggufVersion = validation.optInt("gguf_version", -1),
-            status = if (validation.optString("status") == METADATA_CHECKED) METADATA_CHECKED else "legacy_header_only",
+            status = if (validation.optString("status") == CONTAINER_CHECKED) CONTAINER_CHECKED else "legacy_header_only",
             validatedAt = validation.optString("validated_at", ""),
             metadata = parseMetadataSummary(validation.optJSONObject("metadata")),
         ).takeIf { it.format == "GGUF" && it.ggufVersion in 1..4 }
@@ -867,9 +869,10 @@ class ModelStorageManager(
         )
     }
 
-    private fun parseGgufMetadata(reader: GgufReader, checkCancelled: () -> Unit): GgufMetadataSummary {
-        reader.readCount(reader.remaining / 24, "tensor count")
+    private fun parseGgufMetadata(reader: GgufReader, checkCancelled: () -> Unit): Pair<GgufMetadataSummary, Long> {
         val kvCount = reader.readCount(minOf(4096L, reader.remaining / 13), "metadata count")
+        val keys = HashSet<String>()
+        var alignment = 32L
         var architecture: String? = null
         var name: String? = null
         var sizeLabel: String? = null
@@ -884,9 +887,16 @@ class ModelStorageManager(
         repeat(kvCount.toInt()) {
             checkCancelled()
             val key = reader.readGgufString()
+            if (key.isEmpty() || '\u0000' in key || !keys.add(key)) throw IOException("Invalid GGUF metadata key")
             val type = reader.readU32()
             val value = reader.readMetadataValue(type)
             when (key) {
+                "general.alignment" -> {
+                    alignment = if (type == 4) (value as Number).toLong() else 0
+                    if (alignment <= 0 || (alignment and (alignment - 1)) != 0L) {
+                        throw IOException("Invalid GGUF alignment")
+                    }
+                }
                 "general.architecture" -> architecture = value as? String
                 "general.name" -> name = value as? String
                 "general.size_label" -> sizeLabel = value as? String
@@ -918,15 +928,51 @@ class ModelStorageManager(
             attentionHeadCount = attentionHeadCount,
             attentionHeadCountKv = attentionHeadCountKv,
             hasChatTemplate = hasChatTemplate,
-        )
+        ) to alignment
     }
+
+    /** Check the tensor directory and file extents without reading weights or invoking the model parser. */
+    private fun validateTensorData(reader: GgufReader, count: Int, alignment: Long, checkCancelled: () -> Unit) {
+        if (count == 0) throw IOException("GGUF contains no tensors")
+        val names = HashSet<String>()
+        var expectedOffset = 0L
+        var lastTensorEnd = 0L
+        repeat(count) {
+            checkCancelled()
+            val name = reader.readGgufString(63)
+            if (name.isEmpty() || '\u0000' in name || !names.add(name)) throw IOException("Invalid GGUF tensor name")
+            val dimensions = reader.readU32()
+            if (dimensions !in 1..4) throw IOException("Invalid GGUF tensor dimensions")
+            val width = reader.readCount(Long.MAX_VALUE, "tensor width")
+            var rows = 1L
+            repeat(dimensions - 1) {
+                val extent = reader.readCount(Long.MAX_VALUE, "tensor extent")
+                if (extent == 0L) throw IOException("Empty GGUF tensor")
+                rows = Math.multiplyExact(rows, extent)
+            }
+            val rowBytes = NativeLlmBridge.ggmlTensorRowBytes(reader.readU32(), width)
+            if (rowBytes <= 0) throw IOException("Unsupported GGUF tensor layout")
+            val offset = reader.readCount(Long.MAX_VALUE, "tensor offset")
+            if (offset != expectedOffset) throw IOException("Invalid GGUF tensor offset")
+            lastTensorEnd = Math.addExact(offset, Math.multiplyExact(rows, rowBytes))
+            expectedOffset = Math.addExact(lastTensorEnd, alignmentPadding(lastTensorEnd, alignment))
+        }
+        val padding = alignmentPadding(reader.headerBytesRead, alignment)
+        if (padding > reader.remaining || lastTensorEnd > reader.remaining - padding) {
+            throw IOException("Missing GGUF tensor data")
+        }
+    }
+
+    private fun alignmentPadding(offset: Long, alignment: Long): Long =
+        (alignment - offset % alignment) % alignment
 
     private fun JSONObject.optIntOrNull(name: String): Int? =
         if (has(name) && !isNull(name)) optInt(name) else null
 
     private class GgufReader(private val input: DataInputStream, size: Long) {
         private val scratch = ByteArray(8)
-        private var metadataRead = 0L
+        var headerBytesRead = 0L
+            private set
         var remaining: Long = size
             private set
 
@@ -953,8 +999,8 @@ class ModelStorageManager(
             return value
         }
 
-        fun readGgufString(): String {
-            val length = readCount(minOf(1_000_000L, remaining), "string length").toInt()
+        fun readGgufString(limit: Long = 1_000_000L): String {
+            val length = readCount(minOf(limit, remaining), "string length").toInt()
             val bytes = ByteArray(length)
             readFully(bytes)
             return bytes.toString(Charsets.UTF_8)
@@ -1026,8 +1072,8 @@ class ModelStorageManager(
         }
 
         private fun checkMetadataBudget(bytes: Long) {
-            metadataRead += bytes
-            if (metadataRead > 128L * 1024 * 1024) throw IOException("GGUF metadata exceeds the import limit")
+            headerBytesRead += bytes
+            if (headerBytesRead > 128L * 1024 * 1024) throw IOException("GGUF metadata exceeds the import limit")
         }
     }
 
@@ -1159,7 +1205,7 @@ class ModelStorageManager(
             freeBytes > MIN_FREE_SPACE_AFTER_IMPORT
 
         const val TAG = "ModelStorageManager"
-        private const val METADATA_CHECKED = "metadata_checked"
+        private const val CONTAINER_CHECKED = "container_checked_v1"
         const val MANIFEST_FILE = "manifest.json"
         const val MODEL_FILE = "model.gguf"
         const val IMPORT_STAGING_DIR = ".imports"

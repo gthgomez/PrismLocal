@@ -55,11 +55,16 @@ class ModelProvenancePersistenceTest {
         assertEquals(DownloadIntegrity.UNVERIFIED, freshManager.activeModelInfo("unverified-model")?.integrity)
         assertEquals(DownloadIntegrity.UNKNOWN_LEGACY, freshManager.activeModelInfo("legacy-model")?.integrity)
 
-        // Cache hit must not alter provenance
+        // Activation of an artifact with a current container receipt must not alter provenance.
         val cachedPinned = freshManager.resolveActiveModelForActivation("pinned-model")
         assertNotNull(cachedPinned)
         assertEquals(DownloadIntegrity.VERIFIED_PINNED, (cachedPinned as ModelStorageManager.ModelResolveResult.Success).model.integrity)
         assertEquals(true, cachedPinned.model.validation.metadataChecked)
+
+        // Legacy provenance does not imply this metadata-only artifact has weights.
+        val incomplete = freshManager.resolveActiveModelForActivation("legacy-model")
+        assertEquals(ModelStorageManager.ModelStorageError.Code.INVALID_GGUF_HEADER,
+            (incomplete as ModelStorageManager.ModelResolveResult.Failure).error.code)
     }
 
     private fun createModelWithManifest(modelsDir: File, modelId: String, integrity: String?) {
@@ -83,7 +88,7 @@ class ModelProvenancePersistenceTest {
                 JSONObject()
                     .put("format", "GGUF")
                     .put("gguf_version", 3)
-                    .put("status", "imported")
+                    .put("status", if (integrity == null) "imported" else "container_checked_v1")
                     .put("validated_at", "2026-10-09T00:00:00Z"),
             )
         if (integrity != null) {

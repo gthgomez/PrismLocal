@@ -1864,6 +1864,9 @@ class InferenceService : Service() {
         confirmed: Boolean,
         authorization: AgentToolConfirmation.PendingToolAuthorization? = null,
     ): AgentToolResult {
+        if (!_generationSettings.value.agentEnabled) {
+            return toolFailure(call, AgentToolErrorCode.FAILED, "Agent mode is off")
+        }
         if (confirmed && authorization != null &&
             !agentToolConfirmation.isOperationOwnerCurrent(
                 authorization = authorization,

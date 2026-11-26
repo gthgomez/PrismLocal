@@ -632,13 +632,11 @@ class AgentToolRouter(
 
     fun shouldContinueAfterTool(call: AgentToolCall): Boolean =
         when (call.name) {
-            // A follow-up reuses the pre-deletion original prompt, which can contain the forgotten fact.
-            "forget_fact" -> false
+            // A follow-up would replay the original prompt across the deleted data boundary.
+            "forget_fact", "clear_chat", "delete_chat", "delete_or_clear_chat" -> false
             "set_runtime_settings",
             "restore_previous_runtime_settings",
             "rename_current_chat",
-            "clear_chat",
-            "delete_or_clear_chat",
             "delete_model",
             "download_model",
             "switch_model",

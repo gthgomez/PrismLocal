@@ -124,7 +124,7 @@ class ModelStorageManagerTest {
             val good = validGgufBytes()
             val initial = manager.importModelFromStream("$modelId.gguf", good.size.toLong(), good.inputStream())
                 as ModelStorageManager.ImportResult.Success
-            val truncated = good.copyOf(130) // The F32 tensor starts at 128 and needs four bytes.
+            val truncated = validGgufBytes(truncateTensor = true)
             val result = manager.importModelFromStream("$modelId.gguf", truncated.size.toLong(), truncated.inputStream())
             assertTrue("missing tensor bytes must fail, got $result", result is ModelStorageManager.ImportResult.Failure)
             assertEquals(initial.model.versionId, manager.activeModelInfo(modelId)?.versionId)
@@ -389,14 +389,16 @@ class ModelStorageManagerTest {
         }
     }
 
-    private fun validGgufBytes(seed: Int = 1): ByteArray {
+    private fun validGgufBytes(seed: Int = 1, truncateTensor: Boolean = false): ByteArray {
         // A well-formed container with one F32 tensor for storage tests.
         // It has no architecture or tokenizer and is not an inference model.
         val buffer = ByteBuffer.allocate(160).order(ByteOrder.LITTLE_ENDIAN)
             .put("GGUF".toByteArray()).putInt(3).putLong(1).putLong(1)
             .putLong(10).put("test.value".toByteArray()).putInt(4).putInt(seed)
             .putLong(11).put("test.weight".toByteArray()).putInt(1).putLong(1).putInt(0).putLong(0)
-        buffer.putFloat(128, seed.toFloat())
+        val tensorDataOffset = (buffer.position() + 31) / 32 * 32
+        buffer.putFloat(tensorDataOffset, seed.toFloat())
+        if (truncateTensor) return buffer.array().copyOf(tensorDataOffset + 2)
         return buffer.array()
     }
 

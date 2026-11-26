@@ -64,7 +64,7 @@ class ChatTools(
     fun renameCurrentChat(call: AgentToolCall, confirmed: Boolean): AgentToolResult {
         if (!confirmed) return AgentToolResult(call, false, "Chat rename requires confirmation")
         val chatId = currentChatId() ?: return AgentToolResult(call, false, "No active chat")
-        val messages = transcript()
+        val messages = transcript().modelVisibleMessages()
         val requestedTitle = call.arguments.optString("title").takeIf { it.isNotBlank() }
             ?: messages.firstOrNull { it.role == TranscriptRole.USER }?.text?.let(ChatTitles::fromPrompt)
             ?: ChatTitles.DEFAULT_TITLE

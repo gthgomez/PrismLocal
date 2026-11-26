@@ -78,12 +78,18 @@ def stage(output: Path, local_source: Path | None) -> None:
 
     if not manifest.exists():
         contents = {"active_version": "v1", "versions": {"v1": {"file": MODEL_NAME, "sha256": SHA256}}}
+        with tempfile.NamedTemporaryFile(prefix=".smoke-manifest-", dir=output, delete=False) as tmp:
+            temporary_manifest = Path(tmp.name)
         try:
-            with manifest.open("x", encoding="utf-8", newline="\n") as target:
+            with temporary_manifest.open("w", encoding="utf-8", newline="\n") as target:
                 json.dump(contents, target, indent=2)
                 target.write("\n")
-        except FileExistsError:
-            check_manifest(manifest)
+            try:
+                os.link(temporary_manifest, manifest)
+            except FileExistsError:
+                check_manifest(manifest)
+        finally:
+            temporary_manifest.unlink(missing_ok=True)
     print(f"Verified {model} (SHA-256 {SHA256})")
 
 
